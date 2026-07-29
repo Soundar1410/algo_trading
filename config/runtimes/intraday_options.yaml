@@ -1,0 +1,13 @@
+# Intraday options strategy group.
+#
+# Owns group lifecycle and the live permission for this group — never a shared
+# execution mode. Each strategy in the group carries its own mode, so one paper
+# and one live strategy can run side by side under this supervisor.
+#
+# `enabled: false` until the Phase 1 walking skeleton exists to be started.
+
+runtime_id: intraday_options
+enabled: false
+live_execution_allowed: false
+shared_market_feed: true
+database: data/operational/intraday_options.db

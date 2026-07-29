@@ -1,0 +1,26 @@
+# Account-wide configuration.
+#
+# Secrets never appear here — they live only in the gitignored .env.
+# Execution mode is NOT set here: it belongs to each individual strategy.
+# The flags below are safety permissions, and they can only ever *block* live
+# execution, never turn a live strategy into a paper one.
+
+global:
+  # Master live kill switch. Fail-closed: stays false until the controlled-live
+  # phase (Phase 10). While false, a strategy configured `mode: live` is blocked
+  # from starting — it is never silently rerouted to paper.
+  live_trading_enabled: false
+  timezone: Asia/Kolkata
+
+# Defaults inherited by every runtime group; a runtime file overrides key by key.
+runtime_defaults:
+  enabled: false
+  live_execution_allowed: false
+  shared_market_feed: true
+
+# Defaults inherited by every strategy; runtime and strategy files override
+# these key by key. Both safety defaults are the restrictive ones.
+strategy_defaults:
+  enabled: false
+  mode: paper
+  live_approved: false

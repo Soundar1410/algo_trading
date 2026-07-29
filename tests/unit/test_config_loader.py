@@ -1,0 +1,305 @@
+"""Layered config resolution, strict validation and the live safety gate."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from common.config import (
+    ConfigError,
+    EngineKind,
+    ExecutionMode,
+    GlobalConfig,
+    ResolvedConfig,
+    RuntimeConfig,
+    Settings,
+    StrategyConfig,
+    apply_env_overrides,
+    deep_merge,
+    effective_live_gate,
+    fingerprint,
+    load_resolved_config,
+    load_runtime_config,
+    load_strategy_config,
+)
+
+GLOBAL_YAML = """
+global:
+  live_trading_enabled: false
+  timezone: Asia/Kolkata
+runtime_defaults:
+  enabled: false
+  live_execution_allowed: false
+  shared_market_feed: true
+strategy_defaults:
+  enabled: false
+  mode: paper
+  live_approved: false
+  risk:
+    max_lots: 1
+    max_daily_loss: 5000
+"""
+
+
+def _write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+@pytest.fixture
+def populated_config(config_root: Path) -> Path:
+    _write(config_root / "global.yaml", GLOBAL_YAML)
+    _write(
+        config_root / "runtimes" / "intraday_options.yaml",
+        "runtime_id: intraday_options\nenabled: true\n",
+    )
+    _write(
+        config_root / "strategies" / "io_fixture_v1.yaml",
+        "strategy_id: io_fixture_v1\nenabled: true\nengine: trading_engine\n",
+    )
+    return config_root
+
+
+# ------------------------------------------------------------- deep_merge
+def test_deep_merge_recurses_into_nested_mappings():
+    base = {"risk": {"max_lots": 1, "max_loss": 100}, "keep": True}
+    override = {"risk": {"max_loss": 250}}
+    assert deep_merge(base, override) == {
+        "risk": {"max_lots": 1, "max_loss": 250},
+        "keep": True,
+    }
+
+
+def test_deep_merge_replaces_non_mapping_values_wholesale():
+    assert deep_merge({"legs": [1, 2, 3]}, {"legs": [9]}) == {"legs": [9]}
+
+
+def test_deep_merge_does_not_mutate_its_inputs():
+    base = {"risk": {"max_lots": 1}}
+    deep_merge(base, {"risk": {"max_lots": 5}})
+    assert base == {"risk": {"max_lots": 1}}
+
+
+# ----------------------------------------------------------------- layering
+def test_runtime_inherits_global_defaults_and_overrides_them(populated_config: Path):
+    runtime = load_runtime_config(populated_config, "intraday_options")
+    assert runtime.enabled is True  # from the runtime file
+    assert runtime.live_execution_allowed is False  # inherited from global defaults
+    assert runtime.shared_market_feed is True
+
+
+def test_strategy_inherits_global_then_runtime_then_own_file(populated_config: Path):
+    _write(
+        populated_config / "runtimes" / "intraday_options.yaml",
+        "runtime_id: intraday_options\nenabled: true\n"
+        "strategy_defaults:\n  risk:\n    max_daily_loss: 2000\n",
+    )
+    strategy = load_strategy_config(
+        populated_config, "io_fixture_v1", runtime_id="intraday_options"
+    )
+    # global default survives where nothing overrode it
+    assert strategy.risk["max_lots"] == 1
+    # runtime layer beats the global layer
+    assert strategy.risk["max_daily_loss"] == 2000
+    # the strategy's own file wins outright
+    assert strategy.enabled is True
+
+
+def test_strategy_file_overrides_runtime_defaults(populated_config: Path):
+    _write(
+        populated_config / "runtimes" / "intraday_options.yaml",
+        "runtime_id: intraday_options\nenabled: true\n"
+        "strategy_defaults:\n  risk:\n    max_daily_loss: 2000\n",
+    )
+    _write(
+        populated_config / "strategies" / "io_fixture_v1.yaml",
+        "strategy_id: io_fixture_v1\nenabled: true\nrisk:\n  max_daily_loss: 750\n",
+    )
+    strategy = load_strategy_config(
+        populated_config, "io_fixture_v1", runtime_id="intraday_options"
+    )
+    assert strategy.risk["max_daily_loss"] == 750
+
+
+def test_resolved_config_carries_all_three_layers(populated_config: Path):
+    cfg = load_resolved_config(
+        populated_config, "intraday_options", "io_fixture_v1", settings=Settings()
+    )
+    assert cfg.global_config.live_trading_enabled is False
+    assert cfg.runtime.runtime_id == "intraday_options"
+    assert cfg.strategy.strategy_id == "io_fixture_v1"
+    assert cfg.strategy.mode is ExecutionMode.PAPER
+    assert cfg.strategy.engine is EngineKind.TRADING_ENGINE
+
+
+# -------------------------------------------------- strict / invalid config
+def test_unknown_key_is_rejected_not_ignored(populated_config: Path):
+    """A typo in a safety flag must fail loudly, not read as False."""
+    _write(
+        populated_config / "strategies" / "io_fixture_v1.yaml",
+        "strategy_id: io_fixture_v1\nenabled: true\nlive_aproved: true\n",
+    )
+    with pytest.raises(ConfigError, match="Invalid configuration"):
+        load_strategy_config(populated_config, "io_fixture_v1")
+
+
+def test_invalid_execution_mode_is_rejected(populated_config: Path):
+    _write(
+        populated_config / "strategies" / "io_fixture_v1.yaml",
+        "strategy_id: io_fixture_v1\nmode: simulated\n",
+    )
+    with pytest.raises(ConfigError):
+        load_strategy_config(populated_config, "io_fixture_v1")
+
+
+def test_missing_file_raises_config_error(config_root: Path):
+    _write(config_root / "global.yaml", GLOBAL_YAML)
+    with pytest.raises(ConfigError, match="not found"):
+        load_runtime_config(config_root, "does_not_exist")
+
+
+def test_malformed_yaml_raises_config_error(config_root: Path):
+    _write(config_root / "global.yaml", "global: {this is: not: valid")
+    with pytest.raises(ConfigError, match="Invalid YAML"):
+        load_runtime_config(config_root, "intraday_options")
+
+
+def test_id_mismatch_between_filename_and_body_is_rejected(populated_config: Path):
+    _write(
+        populated_config / "strategies" / "io_fixture_v1.yaml",
+        "strategy_id: something_else\nenabled: true\n",
+    )
+    with pytest.raises(ConfigError, match="mismatch"):
+        load_strategy_config(populated_config, "io_fixture_v1")
+
+
+# ------------------------------------------------------------ env overrides
+def test_env_override_can_force_live_trading_off():
+    enabled = GlobalConfig(live_trading_enabled=True)
+    settings = Settings(algo_live_trading_enabled="false")
+    assert apply_env_overrides(enabled, settings).live_trading_enabled is False
+
+
+def test_env_override_can_never_turn_live_trading_on():
+    """Enabling real money must be a deliberate file edit, never a stale export."""
+    disabled = GlobalConfig(live_trading_enabled=False)
+    settings = Settings(algo_live_trading_enabled="true")
+    assert apply_env_overrides(disabled, settings).live_trading_enabled is False
+
+
+def test_absent_env_override_leaves_config_untouched():
+    enabled = GlobalConfig(live_trading_enabled=True)
+    assert apply_env_overrides(enabled, Settings()).live_trading_enabled is True
+
+
+# --------------------------------------------------------------- live gate
+def _resolved(
+    *,
+    global_live: bool,
+    runtime_enabled: bool,
+    runtime_live_allowed: bool,
+    strategy_enabled: bool,
+    mode: ExecutionMode,
+    live_approved: bool,
+) -> ResolvedConfig:
+    return ResolvedConfig(
+        global_config=GlobalConfig(live_trading_enabled=global_live),
+        runtime=RuntimeConfig(
+            runtime_id="intraday_options",
+            enabled=runtime_enabled,
+            live_execution_allowed=runtime_live_allowed,
+        ),
+        strategy=StrategyConfig(
+            strategy_id="io_fixture_v1",
+            enabled=strategy_enabled,
+            mode=mode,
+            live_approved=live_approved,
+        ),
+    )
+
+
+_ALL_PERMISSIONS_GRANTED = {
+    "global_live": True,
+    "runtime_enabled": True,
+    "runtime_live_allowed": True,
+    "strategy_enabled": True,
+    "mode": ExecutionMode.LIVE,
+    "live_approved": True,
+}
+
+
+def test_paper_strategy_is_never_granted_live():
+    cfg = _resolved(**{**_ALL_PERMISSIONS_GRANTED, "mode": ExecutionMode.PAPER})
+    decision = effective_live_gate(cfg, preflight_passed=True)
+    assert decision.allowed is False
+    assert "paper" in decision.blocked_reasons[0]
+
+
+def test_gate_is_fail_closed_when_preflight_is_not_run():
+    """The default must block: a caller that forgets preflight gets no live path."""
+    cfg = _resolved(**_ALL_PERMISSIONS_GRANTED)
+    decision = effective_live_gate(cfg)
+    assert decision.allowed is False
+    assert any("preflight" in reason for reason in decision.blocked_reasons)
+
+
+@pytest.mark.parametrize(
+    "revoked",
+    ["global_live", "runtime_enabled", "runtime_live_allowed", "strategy_enabled", "live_approved"],
+)
+def test_every_single_revoked_permission_blocks_live(revoked: str):
+    cfg = _resolved(**{**_ALL_PERMISSIONS_GRANTED, revoked: False})
+    assert effective_live_gate(cfg, preflight_passed=True).allowed is False
+
+
+def test_gate_reports_every_failing_condition_not_just_the_first():
+    cfg = _resolved(
+        global_live=False,
+        runtime_enabled=False,
+        runtime_live_allowed=False,
+        strategy_enabled=False,
+        mode=ExecutionMode.LIVE,
+        live_approved=False,
+    )
+    decision = effective_live_gate(cfg)
+    assert len(decision.blocked_reasons) == 6
+
+
+def test_gate_allows_only_when_every_condition_holds():
+    cfg = _resolved(**_ALL_PERMISSIONS_GRANTED)
+    decision = effective_live_gate(cfg, preflight_passed=True)
+    assert decision.allowed is True
+    assert bool(decision) is True
+
+
+def test_shipped_repository_config_cannot_reach_a_live_allow(populated_config: Path):
+    """Phase 0's own config must be incapable of granting live execution."""
+    repo_config = Path(__file__).resolve().parents[2] / "config"
+    from common.config import load_global_config
+
+    assert load_global_config(repo_config).live_trading_enabled is False
+
+
+# ------------------------------------------------------------- fingerprint
+def test_fingerprint_is_stable_across_key_order():
+    a = {"b": 2, "a": {"y": 1, "x": 2}}
+    b = {"a": {"x": 2, "y": 1}, "b": 2}
+    assert fingerprint(a) == fingerprint(b)
+
+
+def test_fingerprint_changes_when_any_value_changes(populated_config: Path):
+    cfg = load_resolved_config(
+        populated_config, "intraday_options", "io_fixture_v1", settings=Settings()
+    )
+    changed = cfg.model_copy(
+        update={"strategy": cfg.strategy.model_copy(update={"live_approved": True})}
+    )
+    assert fingerprint(cfg) != fingerprint(changed)
+
+
+def test_fingerprint_is_deterministic_across_calls(populated_config: Path):
+    cfg = load_resolved_config(
+        populated_config, "intraday_options", "io_fixture_v1", settings=Settings()
+    )
+    assert fingerprint(cfg) == fingerprint(cfg)

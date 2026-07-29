@@ -13,9 +13,13 @@
 # Runtime data
 logs/
 data/runtime/
+data/cache/
+data/operational/*
+!data/operational/.gitkeep
 token_cache*.json
 *.pid
 *.lock
+!requirements.lock
 
 # Python environment and caches
 .venv/
@@ -25,6 +29,11 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
 
 # macOS and IDE files
 .DS_Store
