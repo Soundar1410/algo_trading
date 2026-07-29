@@ -270,8 +270,30 @@ def test_a_held_lock_times_out_rather_than_racing(db: Database, versions: Path, 
 
 
 # ------------------------------------------------------- shipped versions
-def test_shipped_versions_directory_is_empty_in_phase_0():
-    """Trading tables arrive in Phase 1, with their first consumer."""
+def test_shipped_migrations_start_at_the_walking_skeleton():
+    """Phase 1 adds 0001; nothing may be inserted before it."""
     from common.persistence.migrations import VERSIONS_DIR
 
-    assert discover_migrations(VERSIONS_DIR) == []
+    shipped = discover_migrations(VERSIONS_DIR)
+    assert [m.version for m in shipped] == ["0001"]
+    assert shipped[0].name == "walking_skeleton"
+
+
+def test_shipped_migrations_apply_to_a_fresh_database(tmp_path: Path):
+    """The real 0001 must survive the runner's own replay-safety rules."""
+    from common.persistence.migrations import VERSIONS_DIR
+
+    database = Database(tmp_path / "operational" / "intraday_options.db")
+    applied = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
+
+    assert [m.version for m in applied] == ["0001"]
+    assert database.integrity_check() == []
+    assert database.foreign_key_check() == []
+
+
+def test_shipped_migrations_are_idempotent(tmp_path: Path):
+    from common.persistence.migrations import VERSIONS_DIR
+
+    database = Database(tmp_path / "operational" / "intraday_options.db")
+    MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
+    assert MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending() == []

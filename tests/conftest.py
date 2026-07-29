@@ -38,3 +38,33 @@ def config_root(tmp_path: Path) -> Path:
     (root / "runtimes").mkdir(parents=True)
     (root / "strategies").mkdir(parents=True)
     return root
+
+
+# --------------------------------------------------------------- Phase 1
+#: Absolute, because ``isolated_env`` chdirs away from the repository.
+FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
+
+
+@pytest.fixture
+def tick_tape_path() -> Path:
+    """The recorded NIFTY tape: 24 ticks across six one-minute buckets."""
+    return FIXTURES_DIR / "nifty_tick_tape.json"
+
+
+@pytest.fixture
+def runtime_dirs(tmp_path: Path) -> dict[str, Path]:
+    """Isolated lock/PID/log/database locations for one test."""
+    directories = {
+        "lock_dir": tmp_path / "runtime" / "locks",
+        "pid_dir": tmp_path / "runtime" / "pid",
+        "log_dir": tmp_path / "logs",
+        "operational": tmp_path / "operational",
+    }
+    for path in directories.values():
+        path.mkdir(parents=True, exist_ok=True)
+    return directories
+
+
+@pytest.fixture
+def database_path(runtime_dirs: dict[str, Path]) -> Path:
+    return runtime_dirs["operational"] / "intraday_options.db"

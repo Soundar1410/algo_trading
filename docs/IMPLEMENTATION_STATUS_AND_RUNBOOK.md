@@ -7,8 +7,8 @@ the next phase. Updated after every phase.
 
 | | |
 |---|---|
-| **Current phase** | Phase 0 — complete, awaiting review |
-| **Next phase** | Phase 1 — walking skeleton (not started) |
+| **Current phase** | Phase 1 — complete, awaiting review |
+| **Next phase** | Phase 2 — Dhan and shared-feed hardening (not started) |
 | **Last updated** | 29 July 2026 |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.1.0` — provisional, see [Package decisions](#package-decisions) |
@@ -21,7 +21,7 @@ the next phase. Updated after every phase.
 | Phase | Scope | Status |
 |---|---|---|
 | 0 | Reference audit + minimal bootstrap | **Complete** |
-| 1 | Walking skeleton | Not started |
+| 1 | Walking skeleton | **Complete** |
 | 2 | Dhan and shared-feed hardening | Not started |
 | 3 | Preserve custom engines and policies | Not started |
 | 4 | Candle, indicator and paper-execution foundation | Not started |
@@ -42,9 +42,23 @@ table.
 ### What Phase 0 deliberately did NOT deliver
 
 Engines, strategies, brokers, market data, supervisors, dashboards,
-orchestration, LaunchAgents — and no second architecture document. The
-`migrations/versions/` directory is **empty by design**: the walking-skeleton
-tables arrive in Phase 1, with their first consumer.
+orchestration, LaunchAgents — and no second architecture document.
+
+### What Phase 1 delivered
+
+One diagonal slice, running end to end: shared feed hub → bounded IPC queue →
+spawned paper worker process → deterministic fixture signal → paper-namespaced
+order intent → `PaperBroker` fill → SQLite with `execution_mode=paper` → one
+read-only Streamlit tile → one notification → restart recovery → square-off.
+Plus migration `0001` with the ten walking-skeleton tables.
+
+### What Phase 1 deliberately did NOT deliver
+
+No real strategy (Phase 9). No `TradingEngine`, `MultiLegEngine` or
+`FixedStrikeEngine` port (Phase 3). No `DhanLiveBroker` order placement (Phase
+10). No auth bootstrap or token cache, no feed reconnect/backoff, no option
+chain (Phase 2). No bid/ask depth, latency-selected quotes, limit orders or
+partial fills (Phase 4). No LaunchAgents (Phase 8).
 
 ---
 
@@ -212,6 +226,9 @@ guard. See deviation D6.
 | **D6** | Migrations are **replay-safe rather than transactional** | `sqlite3.executescript()` issues an implicit COMMIT before running, so a migration cannot be applied and recorded in one transaction. Safety comes from enforced idempotency (`CREATE ... IF NOT EXISTS` only, destructive statements rejected) plus recording last: a crash between the two leaves the next startup replaying a no-op. |
 | **D7** | Env overrides can **only disable** live trading | `ALGO_LIVE_TRADING_ENABLED` is honoured when it parses false and ignored when true. An operator needs a fast kill switch; nobody needs to enable real money from an environment variable, where a stale export is indistinguishable from a decision. |
 | **D8** | `effective_live_gate()` exists in Phase 0 with no consumer | It can only return *blocked* in this phase (`preflight_passed` defaults False and no preflight exists). Included now because a config model that accepts `mode: live` without a fail-closed evaluator beside it is a footgun. |
+| **D9** | Feed hub fans out **completed candles, not ticks** | Spec section 6 (and core principle 6) describe distributing *normalised ticks* to workers. Aggregating once, centrally, guarantees every worker sees byte-identical bars and makes "prevent duplicate candle publication" structural rather than conventional. Cost: a worker cannot pick its own timeframe off the raw stream; it aggregates further from completed bars. A tick channel can be added in Phase 2 without reshaping the queues. |
+| **D10** | **No engine port in Phase 1** | The slice runs on a minimal `Strategy` protocol with a deterministic fixture implementation, shaped like `TradingEngine`'s signal interface but not derived from it. Porting the real engines is Phase 3, and doing it early would have meant porting them against a skeleton with no exit policies to receive them. |
+| **D11** | `PaperBroker` is **deliberately minimal here** | Bid/ask depth, latency-selected quotes, limit orders, partial fills and the full nine-rule rejection matrix are Phase 4. Phase 1 implements a fill at the submission-time quote plus adverse slippage, a recorded latency value, and exactly one rejection rule (duplicate correlation ID) — that one because it is a correctness property of idempotent submission, not a realism feature. |
 
 ---
 
@@ -241,31 +258,105 @@ common/persistence/
   database.py      WAL, foreign_keys=ON, busy_timeout, synchronous=FULL,
                    explicit transactions, read-only connection factory
   migrations.py    forward-only runner, filelock, integrity checks, replay guard
-  migrations/versions/   EMPTY BY DESIGN — Phase 1 adds 0001
+  migrations/versions/0001_walking_skeleton.sql   the ten spec tables
+
+--- added in Phase 1 ---
+
+common/models/
+  market.py        Tick, Candle — frozen, picklable, self-validating
+  trading.py       Signal, OrderIntent, Order, Fill, Position + enums
+
+common/market_data/
+  adapter.py       MarketFeedAdapter Protocol
+  recorded.py      RecordedFeedAdapter — deterministic tape replay (all tests)
+  dhan.py          DhanMarketFeedAdapter — THE ONLY module importing dhanhq
+
+common/candles/aggregator.py   completed-bars-only, session-aware, no rewrites
+common/feed/
+  hub.py           SharedFeedHub — subscribes the union once, fans out CANDLES
+  queues.py        BoundedWorkerQueue — drop-oldest, counted, never blocks
+
+common/broker/
+  base.py          Broker Protocol + Quote
+  paper.py         PaperBroker — adverse slippage, idempotent on correlation ID
+  costs.py         ChargesCalculator — config-driven rates
+  factory.py       build_broker() — consults the live gate, REFUSES live
+
+common/execution/
+  correlation.py   p_/l_ namespaced IDs, length-checked, date-validated
+  repository.py    the spec's transaction boundaries, idempotent fills
+  lifecycle.py     signal → intent → broker → fill → position
+
+common/risk/squareoff.py       cutoff before square-off; restart-safe state
+common/notifications/          Notifier Protocol, SafeNotifier, Telegram
+common/health/heartbeat.py     12 health states, rate-limited beats
+common/process/locks.py        filelock + PID-ownership; duplicate refusal
+
+strategies/intraday_options/fixture_strategy.py   TEST-ONLY signal fixture
+runtimes/intraday_options/
+  worker.py        spawn-safe module-level entrypoint; recovery sequence
+  supervisor.py    one shared feed, one child process per strategy
+dashboards/app.py  one read-only tile
 
 config/
   global.yaml                     live_trading_enabled: false
   runtimes/intraday_options.yaml  enabled: false
+  strategies/skeleton_fixture.yaml   the test fixture, mode: paper
 
-tests/unit/   94 tests
+tests/    223 unit, 38 integration, 20 end-to-end, 2 smoke (skipped)
+  fixtures/nifty_tick_tape.json    24 ticks, 6 one-minute buckets
 ```
 
-### Verification results (29 July 2026)
+### Verification results (Phase 1, 29 July 2026)
 
 | Check | Result |
 |---|---|
-| `pytest` | **94 passed** |
+| `pytest` | **281 passed, 2 skipped** |
 | `ruff check .` | **All checks passed** |
-| `ruff format --check .` | **22 files already formatted** |
-| `mypy` (strict) | **Success: no issues found in 13 source files** |
+| `ruff format --check .` | **75 files already formatted** |
+| `mypy` (strict) | **Success: no issues found in 52 source files** |
 
-All four run clean. Nothing was skipped, weakened or marked `xfail`.
+All four run clean. Nothing was skipped, weakened or marked `xfail`. The 2 skips
+are the opt-in live-feed smoke tests, which are skipped by design unless
+`ALGO_LIVE_SMOKE=1` and real credentials are present.
 
-One test was corrected during the phase: it asserted that a migration inserting a
-dangling foreign key would be caught by the post-batch `foreign_key_check`. With
-`foreign_keys=ON` the orphan is rejected at insert time instead — earlier and
-better. The test now asserts the real behaviour, and a separate test covers the
-post-batch check using rows written while enforcement was off.
+Test distribution: 223 unit, 38 integration, 20 end-to-end, 2 smoke (skipped).
+
+`mypy` scope was widened this phase from `packages = ["common"]` to include
+`strategies`, `runtimes` and `dashboards`. The new packages were otherwise
+unchecked, and widening immediately caught a real type error in the supervisor.
+
+#### Walking-skeleton gate evidence
+
+| Spec gate | Evidence |
+|---|---|
+| One feed event reaches a worker through the shared adapter | `test_the_supervisor_spawns_a_worker_that_trades` — 24 ticks in, 6 candles out, worker exit 0 |
+| One completed candle creates one deterministic paper order | `test_one_completed_candle_creates_one_deterministic_paper_order` — exactly one intent; the persisted signal's `candle_end_at` matches the bar |
+| Fill and position in SQLite with `execution_mode=paper` | `test_fill_and_position_are_persisted_with_execution_mode_paper` — every row across five tables is `paper`; every correlation ID starts `p_` |
+| One dashboard tile works | `test_the_dashboard_tile_renders_from_a_read_only_connection`, plus `test_the_dashboard_connection_cannot_write` (a write raises `readonly database`) |
+| One Telegram event works | `test_a_telegram_event_is_produced`; `test_a_failing_notifier_does_not_stop_trading` proves a raising notifier cannot stop trading |
+| **Restart restores the open paper position** | `test_restart_restores_the_open_paper_position` — quantity, average price, entry correlation ID, stop and target all match after restart; `test_a_restarted_worker_does_not_reopen_a_position_it_already_holds` proves it does not double up |
+| **Duplicate worker startup is refused** | `test_duplicate_worker_startup_is_refused` — two real `spawn` processes; the PID file names the *holder child* (not the test process), the contender exits `EXIT_DUPLICATE`, opens no session, and the holder is unaffected |
+
+#### Corrections made during this phase
+
+Three, all found by tests and fixed in the code or the test as appropriate:
+
+1. **A real bug in `build_correlation_id`.** Digit-counting accepted
+   `29-07-2026` — eight digits, but day-first — producing a valid-looking ID for
+   the year 2907 that no query would match and no operator would notice. It now
+   parses the date with `strptime` and rejects anything that is not a real
+   `YYYY-MM-DD`.
+2. **A wrong test expectation, not a code bug.** A square-off test set the
+   square-off time to the first candle, which fires before any entry can happen —
+   the worker correctly checks square-off *before* opening new positions. The
+   test was rewritten to square off on a later bar so there is a real position to
+   close, and a companion test now covers the entry-cutoff path directly.
+3. **A tautological assertion.** The duplicate-worker gate ended with
+   `assert lock_file.exists() or True`, which can never fail. It was replaced
+   with assertions that actually bind: the PID file names the holder child
+   process, the contender has a different PID, the refused worker opened no
+   session row, and the holder removes its PID file on clean exit.
 
 ---
 
@@ -315,20 +406,61 @@ cp .env.example .env                            # fill in locally
 .venv/bin/mypy
 ```
 
-Start/stop/recovery commands do not exist yet — there is nothing to start. They
-arrive in Phase 1 (`runtimes/`) and Phase 7 (`orchestration/scripts/`).
+### Start / stop / recovery
+
+```bash
+# Run the walking skeleton against a recorded tape (no credentials, no network):
+.venv/bin/python -m pytest tests/end_to_end -v
+
+# Read-only dashboard (one tile):
+.venv/bin/streamlit run dashboards/app.py
+
+# Opt-in live feed smoke test — market hours, real credentials, READ-ONLY.
+# Places no order. Skipped by default.
+ALGO_LIVE_SMOKE=1 DHAN_CLIENT_ID=... DHAN_ACCESS_TOKEN=... \
+  .venv/bin/python -m pytest tests/smoke -v
+```
+
+**Recovery.** A worker recovers automatically on restart: it acquires its lock,
+runs integrity checks, closes the previous incomplete session, adopts any open
+paper position and resumes. There is no manual recovery command, by design — an
+operator-driven recovery step is a step that gets skipped at 09:15.
+
+**Stopping.** Publish `None` to a worker's queue (the supervisor does this
+during shutdown), or terminate the process; the lock is released by the OS
+either way, so a killed worker does not block its own restart.
+
+A supervised launch entry point (`orchestration/scripts/`) and LaunchAgents
+arrive in Phase 7 and Phase 8. Phase 1 is driven from tests and the supervisor
+class, which is deliberate: the spec requires LaunchAgents only after manual
+start/stop/crash/restart tests pass.
 
 ---
 
 ## 6. Known limitations
 
-1. **No runnable trading path.** No engine, strategy, broker, market data or
-   supervisor exists. This is Phase 0's intended end state.
-2. **`dhanhq` pin unratified** — see above. Blocking for Phase 2, not Phase 1.
-3. **No trading tables.** `migrations/versions/` is empty; Phase 1 adds `0001`.
-4. **`effective_live_gate()` has no consumer** and can only return blocked
-   (deviation D8).
-5. **Migration atomicity is by replay, not transactions** (deviation D6).
+1. **The live feed adapter is unratified.** `DhanMarketFeedAdapter` was written
+   against the API surface of the installed `dhanhq==2.1.0`
+   (`MarketFeed(dhan_context, instruments, version)` with `run_forever` /
+   `get_data` / `subscribe_symbols` / `disconnect`, all verified by inspection),
+   but **the payload shape returned by `get_data` has not been observed against a
+   live connection.** Normalisation is defensive and counts unparseable frames
+   rather than guessing. No automated test exercises it. This is the single
+   largest piece of unproven code in the repository, and ratifying it is Phase 2.
+2. **`dhanhq` pin still unratified** — `2.1.0` per `CLAUDE.md`; the reference
+   repo runs `2.2.0`. The compatibility spike is Phase 2.
+3. **No authentication bootstrap.** The smoke test requires a manually supplied
+   `DHAN_ACCESS_TOKEN`. Token generation and the atomic cache are Phase 2.
+4. **No feed reconnection, backoff, resubscription or staleness detection.** The
+   recorded adapter never disconnects, so none of it is exercised. Phase 2.
+5. **The paper fill model is minimal** (deviation D11). Paper P&L from Phase 1 is
+   not yet a credible estimate of live P&L — it has no bid/ask spread cost.
+6. **Migration atomicity is by replay, not transactions** (deviation D6).
+7. **Square-off is driven by the candle clock, not a wall clock.** If the feed
+   stops before the square-off bar, square-off never triggers. A wall-clock
+   safety net belongs with the real session handling in Phase 4.
+8. **One instrument, one runtime group, one strategy shape.** Multi-strategy and
+   mixed-mode supervision are Phase 5.
 6. **Pattern-based log redaction is heuristic.** It masks `key=value` shapes with
    sensitive-looking keys, but cannot recognise a secret that appears as a bare
    token with no key. Literal redaction of known `.env` values covers that case
@@ -348,48 +480,82 @@ new runtime is started** in Phase 1 and again before LaunchAgents in Phase 8.
 
 ## 7. Safety confirmations
 
-- Live order placement is **not implemented**. `DhanLiveBroker` does not exist.
-- The live path is **fail-closed**: `effective_live_gate()` defaults
-  `preflight_passed=False`, and shipped `config/global.yaml` has
-  `live_trading_enabled: false`.
-- **No live-to-paper fallback** anywhere. A blocked live strategy refuses to run.
+Re-confirmed for Phase 1, with the code that now exists to back each claim:
+
+- Live order placement is **not implemented**. `DhanLiveBroker` does not exist —
+  there is no class, no order method, no stub.
+- **`build_broker()` refuses live in every reachable configuration.** It consults
+  `effective_live_gate()` first and raises `LiveExecutionBlocked`; even with every
+  gate open and preflight forced true, it still raises, naming Phase 10. Proven
+  by `tests/unit/test_broker_factory.py`, including one parametrised test that
+  flips each of the five gates individually.
+- **No live-to-paper fallback** anywhere. The refusal message says so explicitly,
+  and `test_a_blocked_live_strategy_is_never_rerouted_to_paper` asserts it.
+- **The supervisor refuses to spawn a non-paper worker at all**, so a live
+  strategy never reaches a process, let alone a broker.
+- **The only network-capable code is `common/market_data/dhan.py`**, it is
+  read-only (subscribe and receive), and it is reached by no default test.
+  `test_only_the_dhan_adapter_imports_the_sdk` enforces by `grep` that no other
+  module imports the SDK; `test_the_sdk_is_not_imported_at_package_import_time`
+  enforces the import stays lazy.
+- The opt-in smoke test **places no order**; it subscribes and asserts a tick.
 - No real credential was printed, committed, copied or written to any file.
-  `.env.example` holds empty placeholders only.
-- No file under `Trading_Automation` was written or modified; no secret,
-  database, token or log was copied from it.
-- No test requires credentials or network access.
+  `.env.example` holds empty placeholders only, and secrets never enter SQLite.
+- No file under `Trading_Automation` was written or modified in this phase; no
+  secret, database, token or log was copied from it. It remains a read-only
+  reference with no runtime dependency.
+- **No default test requires credentials or network access.** The 279 tests that
+  run by default use the recorded tape and fake values; the 2 that would touch
+  the network are skipped unless explicitly enabled.
 
 ---
 
-## 8. Next phase — Phase 1, walking skeleton
+## 8. Next phase — Phase 2, Dhan and shared-feed hardening
 
-One diagonal slice, proven end to end, then stop for review:
+Phase 2 makes the live data path trustworthy. Everything it covers is currently
+either unproven or absent, and it is the gate before any real strategy work.
 
-```
-start one intraday_options supervisor
-→ shared feed hub (recorded fixture in tests; opt-in live smoke test)
-→ one paper strategy worker over a bounded IPC queue
-→ one completed, validated candle
-→ deterministic test-only signal fixture
-→ order intent with a paper-namespaced correlation ID
-→ PaperBroker fill
-→ SQLite persistence with strategy_id and execution_mode=paper
-→ one Streamlit tile
-→ one Telegram event
-→ restart worker and recover the open paper position
-→ square off cleanly
-```
+1. **Authentication bootstrap and atomic token cache.** One `auth_bootstrap`
+   process generates or refreshes the access token and writes an atomic cache
+   that every supervisor and worker reads. Nothing in Phase 1 does this.
+2. **Ratify the `dhanhq` version.** Resolve `2.1.0` (per `CLAUDE.md`) against the
+   reference repo's `2.2.0` with a real compatibility spike, and record the
+   decision. This unblocks the pin, which has been provisional since Phase 0.
+3. **Ratify `DhanMarketFeedAdapter` against a live connection.** Observe the
+   actual `get_data` payload shape and replace the defensive normalisation with
+   tested code. Record a real tape from the live feed and add it to
+   `tests/fixtures/`, so future phases test against observed data rather than
+   synthetic prices.
+4. **Reconnection with bounded exponential backoff, and resubscription** without
+   duplicate subscriptions after reconnect.
+5. **Stale-instrument and session-boundary detection**, with the four-clock
+   observability the spec requires (tick, receipt, candle close, evaluation).
+6. **Bounded callback-to-IPC bridge and per-worker lag/overflow health**,
+   surfaced in the heartbeat and the dashboard rather than only counted.
+7. **Option Chain service, cache and three-second throttle.**
 
-Phase 1 also adds migration `0001`: `runtime_sessions`, `runtime_heartbeats`,
-`signals`, `order_intents`, `orders`, `fills`, `positions`, `strategy_state`,
-`notifications`, `errors`.
+**Acceptance gate:** the feed survives a forced disconnect and resubscribes
+without duplicates; a lagging worker is detected and reported rather than
+blocking the feed; the token cache survives a restart and a concurrent read; the
+Option Chain throttle holds under burst.
 
-**Acceptance gate:** one feed event reaches a worker through the shared adapter;
-one completed candle creates one deterministic paper order; fill and position
-appear in SQLite with `execution_mode=paper`; one dashboard tile and one Telegram
-event work; restart restores the open paper position; duplicate worker startup is
-refused.
+**Constraints unchanged:** paper mode only, live order placement still
+unimplemented and fail-closed, no real strategies, no engine port.
 
-**Constraints:** no real strategy (deterministic fixture only), no live order
-placement, no `MultiLegEngine` or `FixedStrikeEngine` port, one runtime, one
-instrument, one signal fixture.
+---
+
+## 9. Required Phase 1 report (spec section: Required Phase 1 report)
+
+| Item | Where |
+|---|---|
+| Files created | Section 3 |
+| Exact package versions tested | Section 4 (`dhanhq==2.1.0`, Python 3.11.9, 78 pinned packages) |
+| SDK feed/concurrency decision evidence | Section 4 and limitation 1 — API surface verified by inspection; payload shape unratified, Phase 2 |
+| Walking-skeleton flow evidence | Section 3, gate evidence table |
+| Existing-engine reuse inventory and test evidence | Section 2; no engine ported yet (deviation D10) |
+| Per-strategy mode and broker-routing evidence | `tests/unit/test_broker_factory.py` — paper routes, live refuses, never reroutes |
+| Supervisor/shared-feed/worker-process evidence | `tests/end_to_end/test_supervisor.py` — real spawned processes over real IPC queues |
+| Test/lint/type-check results | Section 3 |
+| Restart-recovery evidence | Gate evidence table |
+| Known limitations | Section 6 |
+| Live placement remains unimplemented | Section 7 |

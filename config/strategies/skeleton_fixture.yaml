@@ -1,0 +1,37 @@
+# Walking-skeleton test fixture — NOT a trading strategy.
+#
+# This exists to exercise the Phase 1 plumbing end to end. It has no market
+# hypothesis: it buys on the first completed candle and sells on the third,
+# purely so a test can assert that one candle produced exactly one order.
+#
+# Real strategies arrive in Phase 9, on the preserved engines. Do not copy this
+# file as a template for one.
+
+strategy_id: skeleton_fixture
+enabled: true
+
+# Paper only. Setting this to `live` will not start a live strategy: the broker
+# factory consults the live gate and refuses, and live order placement does not
+# exist until Phase 10.
+mode: paper
+live_approved: false
+
+engine: trading_engine
+
+risk:
+  max_position_quantity: 50
+  entry_cutoff: "15:00"
+  square_off_at: "15:15"
+
+parameters:
+  instrument: NIFTY
+  security_id: "99926000"
+  quantity: 50
+  entry_on_candle: 1
+  exit_on_candle: 3
+  candle_interval_seconds: 60
+
+  paper_execution:
+    slippage_points: 0.05
+    submission_latency_ms: 250
+    allow_ltp_fallback: true

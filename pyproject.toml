@@ -62,6 +62,14 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
 
 [tool.mypy]
 python_version = "3.11"
-packages = ["common"]
+packages = ["common", "strategies", "runtimes", "dashboards"]
 strict = true
 warn_unreachable = true
+
+# dhanhq ships no py.typed marker, so its API is untyped to mypy. The ignore is
+# scoped to that one module rather than applied globally: it is confined to
+# common/market_data/dhan.py, which is the only importer, so an untyped value
+# cannot leak into execution or persistence code without being caught.
+[[tool.mypy.overrides]]
+module = ["dhanhq.*"]
+ignore_missing_imports = true

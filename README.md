@@ -8,9 +8,14 @@ it (market data, candles, signals, risk, persistence, health) is shared, so a
 strategy that has been paper-forward-tested is the same strategy when it is later
 approved for live.
 
-> **Status: Phase 0 complete.** Repository bootstrap and reference audit only.
-> There is no runnable trading path yet — no engines, strategies, brokers, market
-> data or supervisor. See `docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md`.
+> **Status: Phase 1 complete.** The walking skeleton runs end to end on a
+> recorded feed: supervisor → shared feed hub → bounded IPC queue → spawned paper
+> worker → deterministic fixture signal → `PaperBroker` fill → SQLite → dashboard
+> tile → notification → restart recovery → square-off.
+>
+> There is still **no real strategy** (Phase 9), no engine port (Phase 3), and the
+> live Dhan feed adapter is **written but unratified** against a live connection
+> (Phase 2). See `docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md`.
 
 > **Live order placement is not implemented and is fail-closed.** `DhanLiveBroker`
 > order methods arrive in Phase 10 only, behind an explicit approval gate.
@@ -57,12 +62,19 @@ requires network access or a populated `.env`.
 ## Layout
 
 ```
-common/          config, logging, persistence  (engines/brokers/market data: later phases)
+common/          config, logging, persistence, models, market_data, candles,
+                 feed, broker, execution, risk, notifications, health, process
+strategies/      intraday_options/  (test-only fixture; real strategies: Phase 9)
+runtimes/        intraday_options/  supervisor + spawn-safe worker
+dashboards/      app.py — one read-only tile
 config/          global.yaml, runtimes/, strategies/
 data/operational/  one SQLite database per runtime group (gitignored)
 docs/            architecture spec + implementation runbook
-tests/           unit/, integration/, end_to_end/, fixtures/
+tests/           unit/, integration/, end_to_end/, smoke/, fixtures/
 ```
+
+The Dhan SDK is imported by exactly one module, `common/market_data/dhan.py`, and
+a test enforces that. Strategy, execution and persistence code never touches it.
 
 ## Execution mode
 
