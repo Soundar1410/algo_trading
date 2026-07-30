@@ -9,6 +9,23 @@ the hub can only use what is declared here.
 A Protocol rather than an ABC: the recorded adapter is not conceptually a
 subclass of a WebSocket client, and structural typing keeps the test double free
 of inherited machinery it would only have to stub out.
+
+Thread ownership
+----------------
+An adapter's ``start()`` may block for as long as the feed is live, so a real
+deployment runs it on a worker thread and stops it from somewhere else. That
+makes the threading contract part of *this* interface rather than a detail of any
+one implementation:
+
+    **The thread that called** ``start()`` **owns the connection, and is the only
+    thread permitted to close it. Every other thread may only signal intent, via**
+    ``request_stop()``.
+
+This is not a theoretical rule. ``dhanhq``'s ``MarketFeed`` drives a private
+``asyncio`` loop synchronously from whichever thread called in, and its
+``close_connection()`` waits — with no timeout — on a loop only that thread can
+advance. Calling it from anywhere else while the owner is blocked in ``recv()``
+hangs the process, which is what a live capture run did in Phase 2 Block 2.
 """
 
 from __future__ import annotations
@@ -40,8 +57,23 @@ class MarketFeedAdapter(Protocol):
         """Begin delivering ticks to ``on_tick``."""
         ...
 
+    def request_stop(self) -> None:
+        """Ask the feed to finish. Safe to call from **any** thread.
+
+        Sets a flag and returns immediately. Must **never** touch the connection:
+        the owning thread notices at its next frame boundary and closes there.
+        Idempotent, and safe before ``start()`` or after it has returned.
+
+        This is the only stop that a thread which does not own the loop may use.
+        """
+        ...
+
     def stop(self) -> None:
-        """Stop delivering and release the connection. Must be idempotent."""
+        """Stop delivering and release the connection. Must be idempotent.
+
+        Only for the thread that called ``start()``, or for any thread when no
+        ``start()`` is in flight. From anywhere else use :meth:`request_stop`.
+        """
         ...
 
     @property

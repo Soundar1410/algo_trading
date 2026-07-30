@@ -98,6 +98,25 @@ def test_no_events_are_dropped_at_normal_volume(supervisor_config, tick_tape_pat
     assert result.dropped_events["skelfix"] == 0
 
 
+def test_a_run_that_ends_on_its_own_is_not_reported_as_signalled(supervisor_config, tick_tape_path):
+    """An exhausted tape is not a shutdown signal, and must not be logged as one.
+
+    Worth its own test because the tempting implementation — "the feed thread is
+    still alive, so we must have been signalled" — is wrong: a thread that has
+    just finished its work is briefly still alive while it unwinds, so an ordinary
+    end-of-tape run would report itself as signalled about as often as the timing
+    happened to fall that way.
+    """
+    adapter = RecordedFeedAdapter(load_tick_tape(tick_tape_path))
+    supervisor = IntradayOptionsSupervisor(supervisor_config, adapter)
+    supervisor.add_worker(_worker(supervisor_config, "skelfix"))
+
+    result = supervisor.run()
+
+    assert result.stopped_by_signal is False
+    assert result.clean_feed_shutdown is True
+
+
 def test_the_supervisor_refuses_a_live_mode_worker(supervisor_config, tick_tape_path):
     """Phase 1 is paper-only; a live worker is never even spawned."""
     adapter = RecordedFeedAdapter(load_tick_tape(tick_tape_path))

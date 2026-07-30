@@ -201,8 +201,12 @@ def main(argv: list[str] | None = None) -> int:
     # the capture thread itself (see _spy above). If literally zero frames
     # arrive during the whole window there is nothing to trigger a same-thread
     # stop from, and this must NOT fall back to calling adapter.stop() here,
-    # since that is exactly the cross-thread pattern being avoided. The extra
-    # 15s covers one final frame arriving just after the deadline.
+    # since that is exactly the cross-thread pattern being avoided. (Phase 3
+    # Part 1 added adapter.request_stop() for precisely this position: it is the
+    # thread-safe half, and would be the correct call here if this script ever
+    # needs one. It is left out because there is nothing to salvage in the
+    # zero-frame case.) The extra 15s covers one final frame arriving just after
+    # the deadline.
     finished.wait(timeout=args.seconds + 15.0)
     thread.join(timeout=10.0)
 

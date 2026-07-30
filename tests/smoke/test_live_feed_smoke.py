@@ -123,7 +123,10 @@ def test_one_live_tick_reaches_the_hub(tmp_path: Path):
     thread.start()
 
     finished.wait(timeout=_TIMEOUT_SECONDS)
-    adapter.stop()
+    # request_stop(), not stop(): this is the main thread and the feed thread owns
+    # the SDK's loop. The callback above already closed it on the right thread if a
+    # tick arrived; this covers the case where none did.
+    adapter.request_stop()
     thread.join(timeout=5.0)
 
     assert received, (
@@ -166,7 +169,7 @@ def test_the_live_payload_matches_the_ratified_shape(tmp_path: Path):
     thread = threading.Thread(target=lambda: adapter.start(_collect), daemon=True)
     thread.start()
     finished.wait(timeout=_TIMEOUT_SECONDS)
-    adapter.stop()
+    adapter.request_stop()  # main thread: signal only, as above
     thread.join(timeout=5.0)
 
     assert collected, "no ticks captured; cannot ratify the payload shape"

@@ -97,8 +97,27 @@ class SharedFeedHub:
         )
         self._adapter.start(self.on_tick)
 
+    def request_stop(self) -> None:
+        """Ask the feed to finish, without flushing. Safe from another thread.
+
+        Deliberately **not** ``stop()``. The two halves of a shutdown belong to
+        different threads and different moments: this one only signals, and may be
+        called while :meth:`start` is still blocked on another thread — a signal
+        handler's case. Flushing here as well would read the aggregators while the
+        feed thread is still writing to them, which is a data race that would
+        surface as a corrupt final bar rather than as a crash.
+
+        The caller signals, waits for the feed thread to return, and only then
+        calls :meth:`stop`.
+        """
+        self._adapter.request_stop()
+
     def stop(self) -> None:
-        """Stop the adapter and flush every partial bar to its subscribers."""
+        """Stop the adapter and flush every partial bar to its subscribers.
+
+        For the thread that ran :meth:`start`, or for any thread once that call
+        has returned. See :meth:`request_stop` for the other case.
+        """
         self._adapter.stop()
         for security_id, aggregator in self._aggregators.items():
             for candle in aggregator.flush(security_id):

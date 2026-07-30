@@ -91,6 +91,15 @@ class RecordedFeedAdapter:
         # duplicate, which is why this is a set rather than a list.
         self._subscribed.update(security_ids)
 
+    def request_stop(self) -> None:
+        """Ask the replay to finish. Safe from any thread; see the Protocol.
+
+        Identical to :meth:`stop` here, and that is not a shortcut: this adapter
+        holds no connection to close, so there is nothing that only the replaying
+        thread may do. The distinction exists for adapters that own a socket.
+        """
+        self._running = False
+
     def stop(self) -> None:
         self._running = False
 

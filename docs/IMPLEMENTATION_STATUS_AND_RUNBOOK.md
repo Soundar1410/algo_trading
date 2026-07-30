@@ -7,8 +7,8 @@ the next phase. Updated after every phase.
 
 | | |
 |---|---|
-| **Current phase** | Phase 2 — **complete** (Block 1 offline + Block 2 live), awaiting review |
-| **Next phase** | Phase 3 — preserve custom engines and policies (not started) |
+| **Current phase** | Phase 3 **Part 1 — complete** (live-feed shutdown path), awaiting review |
+| **Next phase** | Phase 3 Part 2 — port `TradingEngine` and the exit-policy registry (not started) |
 | **Last updated** | 30 July 2026 |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
@@ -23,7 +23,7 @@ the next phase. Updated after every phase.
 | 0 | Reference audit + minimal bootstrap | **Complete** |
 | 1 | Walking skeleton | **Complete** |
 | 2 | Dhan and shared-feed hardening | **Complete** — Block 1 (offline) + Block 2 (live) |
-| 3 | Preserve custom engines and policies | Not started |
+| 3 | Preserve custom engines and policies | **Part 1 complete** (live-feed shutdown); Part 2 (engine port) not started |
 | 4 | Candle, indicator and paper-execution foundation | Not started |
 | 5 | Mixed-mode supervisor and persistence | Not started |
 | 6 | Paper recovery and expiry handling | Not started |
@@ -154,6 +154,92 @@ No live order placement, no `DhanLiveBroker` order methods, not even a stub
 it in the controlled-live phase, and paper mode sends no orders. No engine port
 (Phase 3). No real strategy (Phase 9). No bid/ask fill model (Phase 4). No
 LaunchAgents (Phase 8). No second architecture document.
+
+### What Phase 3 Part 1 delivered
+
+Closes **limitation 1**: the live feed can now be started and stopped. Scoped to
+that, deliberately — Part 2 (the engine port) was not begun.
+
+**The rule the fix is built on.** Extracted from the capture-script fix of Block 2
+and promoted from a comment in one script to the adapter contract itself:
+
+> The thread that called `start()` owns the adapter's connection and is the only
+> thread permitted to close it. Every other thread may only signal intent.
+
+`stop()` therefore has a thread-safe counterpart, `request_stop()`, which sets a
+flag and returns without touching the connection. This is not a stylistic
+preference. `dhanhq`'s `MarketFeed.close_connection()` (`marketfeed.py:70-85`)
+branches on `self.loop.is_running()`; from a foreign thread it takes
+`asyncio.run_coroutine_threadsafe(...).result()`, an **unbounded** wait on a loop
+that only the blocked owner thread can advance. A signal handler running on the
+owner thread deadlocks identically, because `asyncio.get_running_loop()` still
+raises there and it also takes the cross-thread branch. That is why the fix could
+not be "call `stop()` from the signal handler".
+
+| Change | Where |
+|---|---|
+| `request_stop()` added to the feed contract, with the ownership rule stated in the Protocol's own docstring | `common/market_data/adapter.py` |
+| Live adapter: `request_stop()` clears the loop flag only; `start()`'s `finally` now closes the socket, so the owner always releases it; `stop()` **refuses and logs** rather than hanging if called across threads while the loop is live | `common/market_data/dhan.py` |
+| `ReconnectingFeed.stop()` **routes** instead of delegating — signal-only from a foreign thread, direct close from the owner or when no `start()` is in flight; plus `request_stop()`, `wait_until_stopped()`, and a tick-callback handoff so a foreign thread's request is taken up on the owning thread | `common/feed/reconnect.py` |
+| `RecordedFeedAdapter.request_stop()` — same flag its replay loop already tests; it holds no connection, so there is nothing only its thread may do | `common/market_data/recorded.py` |
+| `SharedFeedHub.request_stop()` — adapter signal **without** the aggregator flush. Flushing while the feed thread is still writing would race and surface as a corrupt final bar rather than a crash | `common/feed/hub.py` |
+| Supervisor: feed on a dedicated daemon thread, `SIGTERM`/`SIGINT` handlers installed for the feed's lifetime and **restored afterwards**, ordered shutdown (signal → `request_stop` → join → flush → drain workers → release lock) | `runtimes/intraday_options/supervisor.py` |
+| Supervisor **publishes group health**: its own session (`process_role='supervisor'`, null `strategy_id`), periodic heartbeats from the otherwise-idle main thread, and `DEGRADED` + a `CRITICAL` `errors` row + a notification when the feed cannot be closed | `runtimes/intraday_options/supervisor.py` |
+| Supervisor accepts an optional `Notifier`, wrapped once in `SafeNotifier` so a channel failure can never disturb a shutdown | `runtimes/intraday_options/supervisor.py` |
+| Opt-in live smoke test now calls `request_stop()` from its main thread instead of `stop()` — it was making the exact cross-thread call the contract forbids | `tests/smoke/test_live_feed_smoke.py` |
+
+`SupervisorResult` gains `stopped_by_signal` and `clean_feed_shutdown`. Both
+default to today's values, so no existing assertion changed.
+
+**What happens when the feed cannot be stopped.** A connected socket delivering
+no frames leaves its owner blocked in `recv()` with no boundary at which to notice
+the request. The supervisor waits `DEFAULT_SHUTDOWN_GRACE` (10 s), then completes
+the rest of the shutdown — workers drained, lock released — and **never** escalates
+to the cross-thread close; the feed thread is a daemon, so process exit reclaims
+the socket.
+
+Giving up quietly would be the wrong trade, so it is not quiet: the condition
+raises a **`DEGRADED` group heartbeat that is deliberately the last one written**
+(a `STOPPED` afterwards would erase the alarm from the dashboard tile), a
+`CRITICAL` row in `errors`, and a `feed_shutdown_unclean` notification. Full
+detail, including when to expect it, is limitation 13.
+
+#### Test evidence, including the required fail-first demonstration
+
+| Test | What it proves |
+|---|---|
+| `tests/integration/test_feed_cross_thread_shutdown.py` (7 tests) | The regression the old suite could not catch. Drives a **genuinely blocking** double — `start()` pinned in a no-timeout `queue.get()`, exactly like `await ws.recv()` — with a real `threading.Thread`, and stops it from another thread. Asserts the feed thread returns, that zero closes reached the adapter cross-thread, and that the close was performed by the owning thread |
+| `tests/end_to_end/test_supervisor_signal.py` (5 tests) | A **real `SIGTERM`/`SIGINT` to a real child process** (`supervisor_signal_child.py`) running a supervisor over a feed whose `start()` never returns. Asserts exit code 0, `stopped_by_signal`, `clean_feed_shutdown`, close-on-owner-thread, workers drained with exit code 0, and no cross-thread close. Two of the five drive the **unclosable** case — a feed that delivers nothing and never honours the stop — and assert the alarm on all three channels by querying the child's real SQLite database, plus the clean-run case that must not raise one |
+
+Both were **run against the unfixed code first**, which is the point of them:
+
+```
+# The cross-thread suite, source at 433aac4 (pre-fix):
+6 failed, 1 passed in 27.35s
+  test_stopping_from_another_thread_returns_and_closes_on_the_feed_thread
+  E  AssertionError: the feed thread never returned after a cross-thread stop()
+
+# The signal suite, source at 433aac4 (pre-fix) — the child is killed *by* the
+# signal rather than handling it, and never reports a shutdown at all:
+3 failed in 2.05s
+  E  assert -15 == 0   # SIGTERM: died where it stood
+  E  assert  -2 == 0   # SIGINT:  likewise
+  E  Failed: the child reported no result
+```
+
+The one pre-fix pass is the same-thread callback stop — already correct since
+Block 2, and a useful control: the double is not simply failing everything.
+
+After the fix both suites pass, and were run **10 consecutive times** with no
+flake (threading tests earn that scrutiny).
+
+### What Phase 3 Part 1 deliberately did NOT deliver
+
+**No Part 2 work of any kind**: no `TradingEngine` port, no exit-policy registry,
+no `framework/` code. No real strategies (Phase 9). No live order placement.
+`ReconnectingFeed` is still not wired into `SharedFeedHub` — the hub holds a bare
+adapter, as before. That wiring belongs with the live path, not with this fix, and
+the contract now makes it safe whenever it happens.
 
 ---
 
@@ -328,6 +414,8 @@ guard. See deviation D6.
 | **D13** | **`LTT` is reconstructed, not parsed** | Dhan's SDK renders the exchange timestamp as `strftime('%H:%M:%S')` against UTC, discarding the date, so no timestamp parser can consume it directly. The date is recovered by choosing whichever of yesterday/today/tomorrow places the wall clock closest to receipt — correct for any true latency under twelve hours. Recorded as a deviation because it is inference rather than transmitted data. Mitigated by counting every fallback, so a format change becomes visible instead of silent. |
 | **D14** | **Authentication uses `httpx` directly, not the SDK's `DhanLogin`** | `dhanhq` 2.2.0 ships a `DhanLogin` class hitting the same endpoint, but importing it into `common/authentication/` would break the one-file SDK-isolation rule that a test enforces. Its version also has no retry policy, no rate-limit detection, and swallows every failure into a bare `Exception` — so coupling to it would cost exactly the fail-fast behaviour that protects the account from repeated rejected logins. |
 | **D15** | **Reconnection is owned by this project, not by the SDK's runner** | 2.2.0 added a `run()`/`start()` threaded loop that retries on a flat one-second sleep, with no jitter, no bounded attempt budget, and no way to distinguish reason code 807 (token expired — needs a new token) from a transient drop (needs patience). The spec requires one owner for reconnect and subscription state (line 1439) and bounded backoff with jitter (line 1555); using both would give it two owners. |
+| **D16** | **Graceful group shutdown lives in `supervisor.py`, not a separate `shutdown.py`** | The spec's runtime folder standard (section 4) lists `shutdown.py` beside `supervisor.py`, and "graceful group shutdown" as a supervisor responsibility. (The neighbouring responsibility, "group persistence and health publication", is now partly delivered too — the supervisor writes its own session and heartbeats — but that is spec-aligned rather than a deviation, so it is not recorded as one.) Phase 3 Part 1 implements the responsibility in full but keeps it in `supervisor.py`, because the shutdown is not separable from the thing being shut down: it is signal handlers scoped to the feed thread's lifetime, an ordering constraint between that thread and the aggregator flush, and the same lock the run acquired. Splitting it across a module boundary would mean exporting the feed thread, the stop event and the ownership state purely to satisfy a filename — turning an invariant the type checker can see into one a reviewer has to remember. Revisit when there is a second thing to shut down (Phase 5's mixed-mode supervisor). |
+| **D17** | **The feed runs on its own thread, contradicting the Phase 1 note that it is driven inline** | Phase 1's `supervisor.py` docstring recorded that the feed is driven on the supervisor's own thread. That was viable only for the recorded adapter, whose `start()` returns; a live adapter's does not, leaving no thread to notice a signal. Recorded as a deviation because it reverses a documented earlier decision rather than adding to it, and because it is load-bearing for limitation 13: the feed thread is a **daemon**, which is what lets the process exit even when a silent socket cannot be closed. |
 
 ---
 
@@ -423,7 +511,25 @@ scripts/
   auth_bootstrap.py      pre-market bootstrap; --status makes no network call
   capture_live_tape.py   Block 2 tape capture; read-only; scrubs the output
 
-tests/    306 unit, 78 integration, 20 end-to-end, 6 smoke (skipped)
+--- added in Phase 3 Part 1 ---
+
+common/market_data/adapter.py  request_stop() added to the Protocol; the thread-
+                               ownership rule is now part of the contract
+common/market_data/dhan.py     request_stop(); start() closes on its own thread;
+                               stop() refuses a cross-thread close rather than hang
+common/feed/reconnect.py       stop() routes by ownership; request_stop();
+                               wait_until_stopped(); owner-thread close handoff
+common/feed/hub.py             request_stop() — adapter signal without the flush
+runtimes/.../supervisor.py     feed on its own daemon thread; SIGTERM/SIGINT
+                               handlers, installed and restored; ordered shutdown;
+                               group session + heartbeats; DEGRADED/error/notify
+                               when the feed cannot be closed
+
+tests/integration/test_feed_cross_thread_shutdown.py   real threads, blocking double
+tests/end_to_end/test_supervisor_signal.py             real SIGTERM to a real process
+tests/end_to_end/supervisor_signal_child.py            its child; not a test module
+
+tests/    408 unit, 112 integration, 26 end-to-end, 6 smoke (skipped)
   fixtures/nifty_tick_tape.json                       24 ticks, 6 one-minute buckets
   fixtures/dhan_ticker_payloads_synthesised.json       SYNTHESISED in Block 1 from the
                                                        SDK's own parsers; kept permanently
@@ -565,6 +671,37 @@ This is how the flaky spawn test in section 3.1 was found: the harness runs
 slightly slower, which was enough to cross the second boundary the test depended
 on. A property worth asserting is worth asserting under load.
 
+### Verification results (Phase 3 Part 1, 30 July 2026)
+
+| Check | Command | Result |
+|---|---|---|
+| Tests | `.venv/bin/python -m pytest` | **546 passed, 6 skipped** |
+| Lint | `.venv/bin/ruff check .` | **All checks passed!** |
+| Format | `.venv/bin/ruff format --check .` | **97 files already formatted** |
+| Types | `.venv/bin/mypy` | **Success: no issues found in 64 source files** |
+
+Test distribution: 408 unit, 112 integration, 26 end-to-end, 6 smoke (skipped by
+design). The 13 new tests are 7 cross-thread shutdown tests, 5 real-signal tests
+(3 shutdown, 2 operational-visibility), and one supervisor test locking in that an
+ordinary end-of-tape run is not misreported as signalled. Nothing was weakened, skipped or marked `xfail`; every pre-existing test
+passes unchanged, including both walking-skeleton gates and all of
+`tests/integration/test_feed_reconnect.py` — the file whose blind spot this phase
+was about.
+
+The new tests are the only concurrency tests in the suite, so they were run **10
+consecutive times** on top of the full-suite runs: 10 passes, no flake.
+
+#### Phase 3 Part 1 gate evidence
+
+| Requirement (runbook §8 Part 1) | Evidence |
+|---|---|
+| The new cross-thread test fails on today's code, passes after the fix | Both runs captured in "What Phase 3 Part 1 delivered": `6 failed, 1 passed` pre-fix on the assertion *"the feed thread never returned after a cross-thread stop()"*; all pass after. The signal suite likewise fails pre-fix with the child killed **by** the signal (`-15`, `-2`) |
+| `supervisor.py` can start a live feed and stop it cleanly in response to a signal | `tests/end_to_end/test_supervisor_signal.py` — a real `SIGTERM`/`SIGINT` to a real child process over a feed whose `start()` never returns; exit code 0, `stopped_by_signal`, `clean_feed_shutdown`, workers drained |
+| A genuine `threading.Thread` cross-thread cycle against a realistically blocking double, not `_ScriptedAdapter` | `tests/integration/test_feed_cross_thread_shutdown.py` — the double blocks in a no-timeout `queue.get()`, and its `stop()` reproduces the SDK's cross-thread branch as a bounded deadlock so a failing run reports rather than hangs |
+| Every existing recorded-adapter test still passes unchanged | 546 passed, including both walking-skeleton gates. The only edits to existing test files were **additive**: `request_stop()` on `_ScriptedAdapter`, and the smoke test's illegal cross-thread `stop()` corrected to `request_stop()` |
+| Paper mode only; no engine port | No `framework/` file was read or ported; `DhanLiveBroker` still does not exist; all 12 broker-factory tests pass unchanged |
+| The residual silent-feed case is **operationally visible**, not just logged (added during review) | `test_a_feed_that_cannot_be_closed_raises_an_alarm_an_operator_would_see` queries the child process's real database and asserts a `DEGRADED` group heartbeat as the **last** state, a `CRITICAL` `errors` row, `shutdown_reason='feed_did_not_stop'`, and a `feed_shutdown_unclean` notification; `test_a_clean_run_publishes_group_health_and_ends_stopped` asserts the clean run ends `STOPPED` and raises **no** alarm |
+
 #### Phase 2 gate evidence
 
 | Requirement | Evidence |
@@ -678,6 +815,25 @@ cp .env.example .env                            # fill in locally
 ALGO_LIVE_SMOKE=1 .venv/bin/python -m pytest tests/smoke -v
 ```
 
+#### Stopping a running supervisor (Phase 3 Part 1)
+
+`SIGTERM` and `SIGINT` both trigger an orderly shutdown: the feed is asked to
+finish, the supervisor waits for its thread to return, partial bars are flushed,
+workers are drained on their sentinel, and the runtime lock is released.
+
+```bash
+kill -TERM <supervisor-pid>     # or Ctrl-C in the foreground
+```
+
+Expect `received SIGTERM; beginning orderly shutdown` in the log, followed by the
+workers exiting. **`kill -9` is not the way to stop it** — it skips all of the
+above and leaves the lock and PID files for the next start to clean up.
+
+If the log instead shows *"the feed did not finish within 10.0s of being asked to
+stop"*, the socket was connected but silent (limitation 13). Everything else still
+shut down; the connection is released by process exit. Outside market hours that
+is the expected message, not a fault.
+
 ### Authentication (Phase 2)
 
 Credentials come from `.env` only. Nothing below prints, logs or echoes a secret.
@@ -747,56 +903,43 @@ start/stop/crash/restart tests pass.
 
 ## 6. Known limitations
 
-1. **`supervisor.py` has no live-feed shutdown path at all, and
-   `ReconnectingFeed` shares an untested cross-thread race — both block live
-   readiness.** Found during Block 2 while diagnosing a real hang in
-   `scripts/capture_live_tape.py`, and deliberately **not fixed in that
-   session** — this is a design decision for the live path, not a
-   one-file patch.
+1. ~~**`supervisor.py` has no live-feed shutdown path at all, and
+   `ReconnectingFeed` shares an untested cross-thread race.**~~ **FIXED in
+   Phase 3 Part 1** (30 July 2026). The diagnosis is kept below because it is the
+   evidence for the fix's design, and because the failure mode it describes is one
+   any future adapter can reintroduce.
 
-   - **The hang, and its fix.** The capture script ran the feed's blocking
-     `start()` loop on a background thread while the main thread waited out a
-     deadline and then called `adapter.stop()` from *outside* that thread. The
-     SDK's WebSocket close handshake raced a `get_data()` call still in flight
-     on the same `asyncio` event loop from a different thread — loops are not
-     safe to drive from two threads at once — and the process hung on a live
-     connection, confirmed by a real capture run. Fixed, in that one file only,
-     by moving both the stop decision and the `adapter.stop()` call into the
-     callback the feed's own loop invokes, so it always runs on the same
-     thread that owns the loop.
-   - **`supervisor.py`'s `IntradayOptionsSupervisor.run()`** calls
-     `self._hub.start()` then `self._hub.stop()` **sequentially, on one
-     thread** — there is no second thread here, so this specific race cannot
-     occur. But that is only because every caller today passes the
-     **recorded** adapter, whose `start()` returns on its own once the tape is
-     exhausted. A live `DhanMarketFeedAdapter`'s `start()` loops
-     `while self._running:` and never returns by itself; nothing in this
-     codebase calls `adapter.stop()` concurrently to unblock it. Pointed at a
-     live feed today, the supervisor would simply **hang forever at startup**,
-     recoverable only by an external SIGTERM/SIGKILL to the whole process —
-     and this codebase installs no custom SIGTERM handler anywhere observed so
-     far (confirmed independently this session against the legacy
-     `Trading_Automation` orchestrator, which died immediately and silently on
-     SIGTERM with no shutdown log line). **There is no live-shutdown path
-     implemented, not merely an unsafe one.**
-   - **`common/feed/reconnect.py`'s `ReconnectingFeed`** — the module actually
-     meant to make a live feed stoppable and reconnectable — delegates straight
-     through to `self._adapter.start()` / `self._adapter.stop()` with no
-     thread-safety added. If it is ever driven the way a live deployment
-     requires (its `start()` on a worker thread, `.stop()` called from the
-     main thread or a signal handler), it will reproduce the **identical**
-     cross-thread hang just fixed in the capture script. This is **latent and
-     untested**: every test in `tests/integration/test_feed_reconnect.py`
-     drives it with `_ScriptedAdapter`, whose `start()` returns synchronously
-     and quickly, so no test has ever called `.stop()` from a different thread
-     than the one running `.start()`. Not yet triggered in practice only
-     because `ReconnectingFeed` is not wired into `supervisor.py` at all —
-     `SharedFeedHub` still holds a bare adapter directly.
-   - **Net effect:** the live path cannot be started safely (`supervisor.py`)
-     and cannot be stopped safely if it could (`ReconnectingFeed`). Both must
-     be addressed — deliberately, with the user's sign-off on the approach,
-     not as an incidental fix — before any live-feed deployment, and are
-     required reading before Phase 10 controlled-live work begins.
+   - **The original hang, and the Block 2 fix.** The capture script ran the feed's
+     blocking `start()` loop on a background thread while the main thread waited
+     out a deadline and then called `adapter.stop()` from *outside* that thread.
+     The SDK's WebSocket close handshake raced a `get_data()` call still in flight
+     on the same `asyncio` event loop from a different thread — loops are not safe
+     to drive from two threads at once — and the process hung on a live
+     connection, confirmed by a real capture run. Fixed then, in that one file
+     only, by moving both the stop decision and the `adapter.stop()` call into the
+     callback the feed's own loop invokes.
+   - **`supervisor.py` had no shutdown path at all**, not merely an unsafe one.
+     `run()` called `self._hub.start()` then `self._hub.stop()` sequentially on
+     one thread, which was safe only because every caller passed the **recorded**
+     adapter, whose `start()` returns once the tape is exhausted. A live
+     `DhanMarketFeedAdapter.start()` loops `while self._running:` and never
+     returns by itself, and nothing installed a SIGTERM handler anywhere in the
+     repository. Pointed at a live feed it would have hung at startup, recoverable
+     only by an external kill.
+   - **`ReconnectingFeed` carried the identical latent race**, delegating straight
+     to `self._adapter.start()` / `.stop()` with no thread-safety. Untested
+     because every test in `tests/integration/test_feed_reconnect.py` drives it
+     with `_ScriptedAdapter`, whose `start()` returns synchronously and quickly —
+     so no test had ever called `.stop()` from a different thread than `.start()`.
+   - **What now holds.** The ownership rule is part of the `MarketFeedAdapter`
+     contract, `request_stop()` is its thread-safe half, the supervisor handles
+     `SIGTERM`/`SIGINT` and shuts down in order, and both properties are covered
+     by tests that were demonstrated failing against the pre-fix code — a real
+     cross-thread start/stop cycle against a blocking double, and a real signal to
+     a real process. See "What Phase 3 Part 1 delivered" in section 1.
+   - **What is still open:** the residual silent-feed case, now limitation 13, and
+     limitation 2 below — none of this was exercised against a real socket drop.
+     Both remain required reading before Phase 10.
 2. **Reconnection is tested against a scripted double, not a real socket drop.**
    The backoff, resubscription and gap-handling logic is covered, but Dhan's
    actual disconnect behaviour — including whether a 807 frame arrives before or
@@ -838,6 +981,47 @@ start/stop/crash/restart tests pass.
     verified.
 12. **No LaunchAgents, no supervised launch entry point, no reconciliation.**
     Phases 7, 8 and 10.
+13. **A live feed can go silent and unclosable, and nothing will force it shut.**
+    Introduced by the Phase 3 Part 1 design, deliberately: the alternative is a
+    shutdown path that can itself hang. A connected feed delivering *no frames*
+    leaves its owning thread blocked in `recv()` with **no boundary at which to
+    notice a stop request**, and the only mechanism that could interrupt it from
+    outside is the cross-thread close that hangs. The supervisor waits
+    `DEFAULT_SHUTDOWN_GRACE` (10 s) and then gives up on the connection. **There is
+    no automatic escalation — no forced close, no retry, no kill.** The socket is
+    left for process exit to reclaim; the feed thread is a daemon, so the process
+    does still exit (proven by
+    `test_a_feed_that_cannot_be_closed_raises_an_alarm_an_operator_would_see`,
+    which asserts a clean exit code from a real process whose feed thread never
+    returned).
+
+    **When to expect it.** During market hours frames arrive continuously, so a
+    stop normally lands within milliseconds. The grace period is actually consumed
+    in two situations: out of hours, which is benign — and **a dead-but-open socket
+    during the session, which is an incident**, because it means the runtime has
+    been receiving nothing while believing itself connected. Those two look
+    identical at the shutdown boundary, so this condition is always reported at
+    `CRITICAL` and never downgraded by the time of day.
+
+    **How you find out** — three channels, because a log line is not an alarm and
+    nobody is tailing the file at 15:31:
+
+    | Channel | What appears | Where |
+    |---|---|---|
+    | Dashboard health tile | group heartbeat goes `DEGRADED`, and **stays** `DEGRADED` — the run deliberately does not overwrite it with `STOPPED` on the way out, so the alarm survives the tidy exit that follows | `runtime_heartbeats` where `strategy_id IS NULL` |
+    | Dashboard error text | a `CRITICAL` row, `component='feed'`, naming the grace period and saying the connection was not closed | `errors` |
+    | Notification | `feed_shutdown_unclean` via the configured notifier (Telegram when one is wired), wrapped in `SafeNotifier` so a failed send cannot disturb the shutdown | `common/notifications/` |
+
+    The run also ends with `SupervisorResult.clean_feed_shutdown=False` and
+    `runtime_sessions.shutdown_reason='feed_did_not_stop'`, so a later reader can
+    tell which runs ended this way without reconstructing it from logs.
+
+    Both halves are asserted as behaviour, not left to comments:
+    `test_a_silent_feed_cannot_be_closed_from_another_thread` for the refusal to
+    escalate, and the two real-process tests above for the alarm and for the
+    clean-run case that must **not** raise one. Revisit only with evidence about
+    how the SDK behaves on a socket that has stopped delivering — which needs
+    limitation 2 closed first.
 
 ### Operational risk noted during the audit
 
@@ -860,7 +1044,14 @@ both bootstraps in the same window.
 ## 7. Safety confirmations
 
 Re-confirmed for **Phase 2 Block 1**, with the code and tests that back each
-claim. Every statement below was re-run this phase, not carried forward:
+claim. Every statement below was re-run this phase, not carried forward.
+
+**Re-confirmed again for Phase 3 Part 1** (30 July 2026), against the full suite:
+546 passed, 6 skipped. Part 1 touched the feed's *shutdown* path only. It added no
+network call, no endpoint, no credential handling and no order surface; the four
+read-only calls listed below are still the complete set, `DhanLiveBroker` still
+does not exist, all 12 broker-factory tests pass unchanged, and no file under
+`Trading_Automation` was read for it, let alone written.
 
 - Live order placement is **not implemented**. `DhanLiveBroker` does not exist —
   there is no class, no order method, no stub.
@@ -920,52 +1111,29 @@ claim. Every statement below was re-run this phase, not carried forward:
 
 ## 8. Next phase
 
-Phase 2 is complete, both blocks. Next is Phase 3.
+Phase 2 is complete, both blocks. Phase 3 **Part 1** is complete. Next is Phase 3
+**Part 2**.
 
 ### Phase 3 — preserve custom engines and policies
 
-**Phase 3 has two parts, in strict order.** Part 1 is a dedicated fix — planned
-and reviewed on its own, before Part 2 begins, not folded into the engine port
-and not deferred further.
+**Phase 3 has two parts, in strict order.** Part 1 was a dedicated fix — planned
+and reviewed on its own, before Part 2 begins, not folded into the engine port.
 
-#### Part 1 — live-feed shutdown path (first, standalone)
+#### Part 1 — live-feed shutdown path — **COMPLETE** (30 July 2026)
 
-Closes runbook limitation 1: `supervisor.py` has **no live-feed shutdown path at
-all**, and `ReconnectingFeed` shares the **identical untested cross-thread race**
-just fixed in `scripts/capture_live_tape.py` during Phase 2 Block 2. Found then;
-deliberately not fixed then — this is that fix.
+Closed runbook limitation 1. All three requirements delivered, and the acceptance
+gate met in full:
 
-1. **Signal handling in the supervisor** — a SIGTERM/SIGINT handler that triggers
-   an orderly stop. Right now nothing in this codebase installs one; both the
-   capture script's prior bug and the legacy `Trading_Automation` orchestrator
-   (observed directly this session) simply die on SIGTERM with no shutdown log
-   line. A live `DhanMarketFeedAdapter`'s `start()` loops forever and nothing
-   today calls `.stop()` to unblock it, so the supervisor would hang at startup
-   against a live feed with no way to stop it short of an external kill.
-2. **Thread-safe stop coordination in `ReconnectingFeed`** — replace the direct
-   delegation to `self._adapter.start()` / `self._adapter.stop()`, which shares
-   the exact race the capture script hit (the SDK's `asyncio` loop is not safe
-   to drive from two threads at once). Needs to support the real deployment
-   shape: `.start()` blocking on a worker thread, `.stop()` called from the main
-   thread or a signal handler.
-3. **A test that exercises a real cross-thread start/stop cycle.** A genuine
-   `threading.Thread` running `.start()`, with `.stop()` called from a different
-   thread against a realistically blocking adapter double — not
-   `_ScriptedAdapter`, whose synchronous, quick-returning `start()` is exactly
-   why `tests/integration/test_feed_reconnect.py` never caught this. The new
-   test must be shown to **fail against the current code first**, then pass
-   after the fix — proving it would have caught the original bug, not just that
-   it passes.
+| Required | Status |
+|---|---|
+| Signal handling in the supervisor | **Done** — `SIGTERM`/`SIGINT` handlers, installed for the feed's lifetime and restored after; ordered shutdown; the feed moved to its own daemon thread so the main thread is free to receive them |
+| Thread-safe stop coordination in `ReconnectingFeed` | **Done** — ownership rule promoted into the `MarketFeedAdapter` contract; `stop()` routes by ownership; `request_stop()` is the thread-safe half; `wait_until_stopped()` lets a caller join on the real thing |
+| A real cross-thread start/stop test, **failing first** | **Done** — `tests/integration/test_feed_cross_thread_shutdown.py`, plus a real-signal end-to-end suite. Pre-fix and post-fix output recorded in section 1 |
 
-**Acceptance gate (Part 1):** the new cross-thread test fails on today's code,
-passes after the fix; `supervisor.py` can start a live feed and stop it cleanly
-in response to a signal; every existing recorded-adapter test — including both
-walking-skeleton gates — still passes unchanged.
+What it changed, why, and the residual limitation: see "What Phase 3 Part 1
+delivered" (section 1), the Part 1 gate evidence (section 4), and limitation 13.
 
-**Show a plan for Part 1 first** (Plan Mode, reviewed) before any `TradingEngine`
-work begins.
-
-#### Part 2 — port `TradingEngine` and the exit-policy registry
+#### Part 2 — port `TradingEngine` and the exit-policy registry — **NOT STARTED**
 
 Spec: "Port or adapt `TradingEngine` without changing signal/execution behaviour."
 The ordering rule from `CLAUDE.md` governs this part: **port the regression
@@ -1038,7 +1206,7 @@ actual completion — nothing is deferred or marked not-performed.
 | Exercise real auth + a real market-data call on the chosen version | **Delivered** | Block 2 steps 1–2: real TOTP login (one transient timeout, one successful retry), `GET /v2/profile` accepted, `POST /marketfeed/ltp` returned NIFTY 50 LTP `24274.2` |
 | `DhanMarketFeedAdapter` payload shape ratified | **Delivered — ratified from source *and* confirmed live** | Section 3.1 defects 1–4 for the source ratification; Block 2 step 3's real capture matches it exactly, no divergence |
 | Test coverage from a recorded/replayed fixture captured from the real response | **Delivered** | `tests/fixtures/dhan_ticker_payloads_real.json`, captured by `scripts/capture_live_tape.py`. Kept *alongside*, not in place of, `dhan_ticker_payloads_synthesised.json` — a real single-instrument ticker-mode capture cannot supply the Quote/OI/status/untraded-instrument frames the synthesised fixture exists to exercise, so replacing it outright would have silently dropped branch coverage. `source` field distinguishes the two in each file |
-| Feed reconnect and resubscription to the same instruments | **Delivered against a scripted double; a real cross-thread hang was found and fixed in a related script, but the reconnect module itself remains unexercised this way** | `common/feed/reconnect.py`; the identical latent race found in `capture_live_tape.py` (limitation 1) was traced into `ReconnectingFeed` and left unfixed by deliberate decision — see limitation 1 |
+| Feed reconnect and resubscription to the same instruments | **Delivered against a scripted double; a real cross-thread hang was found and fixed in a related script, but the reconnect module itself remains unexercised this way** | `common/feed/reconnect.py`; the identical latent race found in `capture_live_tape.py` (limitation 1) was traced into `ReconnectingFeed` and left unfixed by deliberate decision — see limitation 1. **Phase 3 Part 1 fixed it and closed the test gap**: `ReconnectingFeed` is now driven by real threads against a blocking double. Reconnect against a *real socket drop* is still open (limitation 2) |
 | Aggregator produces no corrupt or duplicate bar across the gap | **Delivered** | Three dedicated tests; `mark_feed_gap` discards rather than publishes |
 | Option-chain 3s-per-underlying/expiry data throttle | **Delivered** | `common/market_data/option_chain.py`; burst tests including 8 real threads; **exercised live** in Block 2 step 4 (225-strike NIFTY chain; a second immediate call was served from cache, not a second API call) |
 | Order-rate limiter stays out of scope | **Confirmed out of scope** | Spec section 14; `test_the_service_exposes_no_order_capability` |
@@ -1048,4 +1216,4 @@ actual completion — nothing is deferred or marked not-performed.
 | `Trading_Automation` untouched | **Confirmed** | Read-only reference; newest `.py` mtime unchanged. (A separate, still-running legacy component — `weekly_strategies` — was independently inspected read-only during Block 2 and found to be paper-mode only; the `option_strategies` legacy orchestrator was stopped by explicit user instruction mid-session, unrelated to this repository) |
 | Test, lint, format, type-check output | **Delivered** | Section 4 verification table: **533 passed, 6 skipped**, ruff clean, mypy clean, after the fixture split (see "What Phase 2 Block 2 delivered") |
 | New deviations recorded | **Delivered** | D12–D15 in section 2.3 |
-| Real cross-thread shutdown hang found, diagnosed and fixed | **Delivered, scoped to one file** | `scripts/capture_live_tape.py` only; the identical untested flaw in `common/feed/reconnect.py`'s `ReconnectingFeed` and the complete absence of a live-feed shutdown path in `runtimes/intraday_options/supervisor.py` were found, deliberately **not** fixed this session, and recorded as limitation 1 — blocking live readiness until addressed |
+| Real cross-thread shutdown hang found, diagnosed and fixed | **Delivered, scoped to one file** | `scripts/capture_live_tape.py` only; the identical untested flaw in `common/feed/reconnect.py`'s `ReconnectingFeed` and the complete absence of a live-feed shutdown path in `runtimes/intraday_options/supervisor.py` were found, deliberately **not** fixed this session, and recorded as limitation 1 — blocking live readiness until addressed. **Both closed in Phase 3 Part 1** (30 July 2026); see section 1 |

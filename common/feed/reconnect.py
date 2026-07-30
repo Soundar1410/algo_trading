@@ -22,11 +22,22 @@ Candle integrity across the gap is not this module's own invention: it delegates
 to :meth:`~common.candles.aggregator.CandleAggregator.mark_feed_gap`, which
 discards any bar that was open during the outage rather than publishing one
 stitched from the ticks either side of it.
+
+Thread ownership
+----------------
+This is the module a live deployment actually stops, so it enforces the ownership
+rule stated in :mod:`common.market_data.adapter`: ``start()`` blocks on a worker
+thread, and ``stop()`` arrives from the main thread or a signal handler. Those are
+different threads, and the adapter's connection may only be closed by the one
+running its loop. :meth:`ReconnectingFeed.stop` therefore *routes* rather than
+delegates — see its docstring. Getting this wrong is not hypothetical: the
+identical pattern hung a real capture run in Phase 2 Block 2.
 """
 
 from __future__ import annotations
 
 import random
+import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -163,6 +174,22 @@ class ReconnectingFeed:
         self._staleness_seconds = staleness_seconds
         self._security_ids: list[str] = []
         self._stopped = False
+        #: Guards the ownership bookkeeping below. Held only for flag reads and
+        #: writes, never across a call into the adapter.
+        self._lock = threading.Lock()
+        #: The thread-safe way another thread signals intent to stop. The bool
+        #: above stays as well: it is what the reconnect loop and mypy read.
+        self._stop_requested = threading.Event()
+        #: Clear only while a ``start()`` is in flight, so a caller can join on
+        #: the feed having actually come back rather than merely being asked to.
+        self._finished = threading.Event()
+        self._finished.set()
+        #: Ident of the thread inside :meth:`start`, i.e. the one that owns the
+        #: adapter's loop. ``None`` means no loop is running and any thread may
+        #: close the adapter.
+        self._owner_thread: int | None = None
+        #: Whether the adapter has been closed for the current run.
+        self._closed = False
         #: Consecutive failures, not lifetime failures. The attempt budget is
         #: meant to bound one *unrecovered* outage; counting for the whole session
         #: would kill a runtime on its ninth instant recovery of the day.
@@ -199,7 +226,13 @@ class ReconnectingFeed:
 
     # ---------------------------------------------------------------- running
     def start(self, on_tick: TickCallback) -> None:
-        """Run the feed, reconnecting until stopped or the budget is exhausted."""
+        """Run the feed, reconnecting until stopped or the budget is exhausted.
+
+        Blocks for the life of the feed. **This thread becomes the owner** of the
+        adapter's loop and is the only one that will close its connection —
+        including on the way out of an exception, and including when the stop was
+        requested from somewhere else entirely.
+        """
         if not self._security_ids:
             raise FeedUnavailableError("Refusing to start the feed with no subscriptions")
 
@@ -209,7 +242,23 @@ class ReconnectingFeed:
         # and concluding that the callback-driven stop below is unreachable —
         # ``stop()`` can be called from inside ``on_tick``, which mypy cannot see.)
         self._consecutive_failures = 0
+        with self._lock:
+            self._owner_thread = threading.get_ident()
+            self._closed = False
+        self._finished.clear()
+        try:
+            self._run(on_tick)
+        finally:
+            # Whatever happened — clean end, stop request, or a failure that blew
+            # the attempt budget — the socket is released here, on the thread that
+            # opened it. No other thread is permitted to do this.
+            self._close_owned_adapter()
+            with self._lock:
+                self._owner_thread = None
+            self._finished.set()
 
+    def _run(self, on_tick: TickCallback) -> None:
+        """The reconnect loop itself. Always called with ownership established."""
         while not self.stopped():
             try:
                 self._mark_connected()
@@ -255,12 +304,73 @@ class ReconnectingFeed:
         self.health.connected = False
 
     def stop(self) -> None:
-        """Stop for good. Idempotent, and suppresses further reconnection."""
+        """Stop for good. Idempotent, suppresses reconnection, safe from any thread.
+
+        Routes rather than delegates, which is the whole point of this method:
+
+        * **Another thread is inside** :meth:`start` — the deployment shape, and a
+          signal handler's case. Record the intent and ask the adapter to finish
+          via :meth:`~common.market_data.adapter.MarketFeedAdapter.request_stop`,
+          then return immediately. The connection is *not* touched here; its owner
+          closes it as it unwinds. Reaching across is what hung a real capture run.
+        * **This thread owns the loop** — ``stop()`` called from inside ``on_tick``,
+          the pattern ``scripts/capture_live_tape.py`` uses. Close directly: the
+          adapter's loop has already handed control back to this thread.
+        * **No** ``start()`` **is running** — nothing owns the adapter, so any
+          thread may close it. Close directly.
+
+        Returning before the feed has actually finished is deliberate in the first
+        case: a signal handler must not block. :meth:`wait_until_stopped` is how a
+        caller joins on the shutdown having completed.
+        """
         self._stopped = True
+        self._stop_requested.set()
+        self.health.connected = False
+
+        with self._lock:
+            owner = self._owner_thread
+        if owner is not None and owner != threading.get_ident():
+            self._adapter.request_stop()
+            return
+        self._close_owned_adapter()
+
+    def request_stop(self) -> None:
+        """Signal intent to stop without touching the connection. Any thread.
+
+        Present because a :class:`ReconnectingFeed` is itself a
+        :class:`~common.market_data.adapter.MarketFeedAdapter`, so it can be
+        wrapped in turn — and because a caller that knows it does not own the loop
+        can say so explicitly rather than relying on :meth:`stop` to work it out.
+        """
+        self._stopped = True
+        self._stop_requested.set()
+        self._adapter.request_stop()
+
+    def wait_until_stopped(self, timeout: float | None = None) -> bool:
+        """Wait for a running :meth:`start` to return. ``False`` means it did not.
+
+        A ``False`` here is the honest report of the one case nothing can force:
+        an adapter blocked on a connection that is delivering no frames has no
+        boundary at which to notice the stop request, and only its owning thread
+        could close it. The caller decides what to do about that; the one thing
+        this class will not do is reach across and close it anyway.
+        """
+        return self._finished.wait(timeout=timeout)
+
+    # ---------------------------------------------------------------- internals
+    def _close_owned_adapter(self) -> None:
+        """Close the adapter exactly once, from a thread entitled to do it.
+
+        Callers must have established that already — either by owning the loop or
+        by there being no loop to own.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
         self.health.connected = False
         self._adapter.stop()
 
-    # ---------------------------------------------------------------- internals
     def _wrap(self, on_tick: TickCallback) -> TickCallback:
         """Track per-instrument freshness, and clear degraded state on real data.
 
@@ -278,6 +388,13 @@ class ReconnectingFeed:
                 self._consecutive_failures = 0
                 _log.info("feed no longer degraded: fresh tick for %s", tick.security_id)
             on_tick(tick)
+            if self._stop_requested.is_set():
+                # A stop asked for by another thread, taken up here — inside the
+                # callback the adapter's own loop invokes, so it runs on the
+                # thread that owns that loop. This is the same handoff
+                # ``scripts/capture_live_tape.py`` performs, and the reason the
+                # close never has to cross a thread boundary.
+                self._close_owned_adapter()
 
         return _observe
 

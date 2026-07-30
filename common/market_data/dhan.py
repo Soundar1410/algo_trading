@@ -42,6 +42,7 @@ Phase 1 wrote this defensively and got three things wrong, all corrected here:
 from __future__ import annotations
 
 import struct
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -208,6 +209,10 @@ class DhanMarketFeedAdapter:
         self._security_ids: set[str] = set()
         self._feed: Any = None
         self._running = False
+        #: Ident of the thread currently inside :meth:`start`, i.e. the thread
+        #: that owns the SDK's asyncio loop. ``None`` when no loop is running,
+        #: which is the only state in which any thread may close the socket.
+        self._owner_thread: int | None = None
         self.counters = FeedCounters()
         #: Set when Dhan sends a server-disconnection frame. Read by the
         #: reconnect layer to decide whether a new token is required.
@@ -249,7 +254,12 @@ class DhanMarketFeedAdapter:
 
     # ---------------------------------------------------------------- lifecycle
     def start(self, on_tick: TickCallback) -> None:
-        """Connect and pump ticks into ``on_tick`` until :meth:`stop`."""
+        """Connect and pump ticks into ``on_tick`` until stopped.
+
+        Blocks for the life of the feed, and the calling thread becomes the owner
+        of the SDK's event loop: only it may close the socket. Another thread
+        stops this loop with :meth:`request_stop`, never :meth:`stop`.
+        """
         if not self._security_ids:
             raise DhanFeedError("Refusing to start the Dhan feed with no subscriptions")
 
@@ -270,6 +280,7 @@ class DhanMarketFeedAdapter:
 
         self._install_disconnect_probe()
         self._running = True
+        self._owner_thread = threading.get_ident()
         _log.info("dhan feed starting instruments=%d", len(self._security_ids))
         try:
             while self._running:
@@ -280,12 +291,54 @@ class DhanMarketFeedAdapter:
                     on_tick(tick)
         finally:
             self._running = False
+            # This thread owns the SDK's event loop, so this thread closes the
+            # socket — including when the loop is unwound by an exception, and
+            # including when the exit was triggered by request_stop() from
+            # somewhere else. No other thread may do this; see the module
+            # docstring of common.market_data.adapter.
+            self.stop()
+            self._owner_thread = None
+
+    def request_stop(self) -> None:
+        """Ask the feed loop to finish. Safe from any thread; closes nothing.
+
+        Sets the flag :meth:`start`'s loop already tests, so the loop exits at its
+        next frame boundary and closes the socket itself. That is the whole point:
+        ``MarketFeed.close_connection()`` called from a foreign thread waits on
+        ``run_coroutine_threadsafe(...).result()``, which cannot complete while
+        the owning thread is blocked in ``recv()``.
+
+        The cost is that the stop lands at the *next frame*, so a socket that is
+        delivering nothing at all will not notice. Nothing can safely force that
+        case from outside the owning thread; the supervisor bounds it with a grace
+        period instead of reaching across.
+        """
+        self._running = False
 
     def stop(self) -> None:
-        """Stop delivering and close the socket. Idempotent."""
+        """Stop delivering and close the socket. Idempotent.
+
+        For the owning thread, or for any thread when no ``start()`` is running.
+        From another thread while the feed is live, use :meth:`request_stop` —
+        this method would hang there, as a live capture run proved in Phase 2.
+        """
         self._running = False
         feed, self._feed = self._feed, None
         if feed is None:
+            return
+        owner = self._owner_thread
+        if owner is not None and owner != threading.get_ident():
+            # Refuse rather than hang. Reaching a live SDK loop from a foreign
+            # thread is the defect this contract exists to prevent, so it fails
+            # loudly instead of silently reproducing it. The flag is still
+            # cleared above, so the owner will close on its way out.
+            self._feed = feed
+            _log.error(
+                "refusing to close the dhan feed from thread %s; it is owned by %s. "
+                "Use request_stop() from another thread.",
+                threading.get_ident(),
+                owner,
+            )
             return
         try:
             # close_connection() is the *synchronous* wrapper. Phase 1 called
