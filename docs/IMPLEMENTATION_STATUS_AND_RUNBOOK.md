@@ -924,8 +924,51 @@ Phase 2 is complete, both blocks. Next is Phase 3.
 
 ### Phase 3 — preserve custom engines and policies
 
+**Phase 3 has two parts, in strict order.** Part 1 is a dedicated fix — planned
+and reviewed on its own, before Part 2 begins, not folded into the engine port
+and not deferred further.
+
+#### Part 1 — live-feed shutdown path (first, standalone)
+
+Closes runbook limitation 1: `supervisor.py` has **no live-feed shutdown path at
+all**, and `ReconnectingFeed` shares the **identical untested cross-thread race**
+just fixed in `scripts/capture_live_tape.py` during Phase 2 Block 2. Found then;
+deliberately not fixed then — this is that fix.
+
+1. **Signal handling in the supervisor** — a SIGTERM/SIGINT handler that triggers
+   an orderly stop. Right now nothing in this codebase installs one; both the
+   capture script's prior bug and the legacy `Trading_Automation` orchestrator
+   (observed directly this session) simply die on SIGTERM with no shutdown log
+   line. A live `DhanMarketFeedAdapter`'s `start()` loops forever and nothing
+   today calls `.stop()` to unblock it, so the supervisor would hang at startup
+   against a live feed with no way to stop it short of an external kill.
+2. **Thread-safe stop coordination in `ReconnectingFeed`** — replace the direct
+   delegation to `self._adapter.start()` / `self._adapter.stop()`, which shares
+   the exact race the capture script hit (the SDK's `asyncio` loop is not safe
+   to drive from two threads at once). Needs to support the real deployment
+   shape: `.start()` blocking on a worker thread, `.stop()` called from the main
+   thread or a signal handler.
+3. **A test that exercises a real cross-thread start/stop cycle.** A genuine
+   `threading.Thread` running `.start()`, with `.stop()` called from a different
+   thread against a realistically blocking adapter double — not
+   `_ScriptedAdapter`, whose synchronous, quick-returning `start()` is exactly
+   why `tests/integration/test_feed_reconnect.py` never caught this. The new
+   test must be shown to **fail against the current code first**, then pass
+   after the fix — proving it would have caught the original bug, not just that
+   it passes.
+
+**Acceptance gate (Part 1):** the new cross-thread test fails on today's code,
+passes after the fix; `supervisor.py` can start a live feed and stop it cleanly
+in response to a signal; every existing recorded-adapter test — including both
+walking-skeleton gates — still passes unchanged.
+
+**Show a plan for Part 1 first** (Plan Mode, reviewed) before any `TradingEngine`
+work begins.
+
+#### Part 2 — port `TradingEngine` and the exit-policy registry
+
 Spec: "Port or adapt `TradingEngine` without changing signal/execution behaviour."
-The ordering rule from `CLAUDE.md` governs the whole phase: **port the regression
+The ordering rule from `CLAUDE.md` governs this part: **port the regression
 tests before changing any internals.**
 
 1. **Port `TradingEngine`** (`framework/execution/engine.py`, 617 lines) with its
@@ -952,12 +995,13 @@ schedules each for "when the first consumer is scheduled", and there is no
 consumer yet. Porting 1,668 lines of engine with no strategy to exercise them
 would produce untested code that merely looks finished.
 
-**Acceptance gate:** the ported engine's own regression tests pass unmodified; the
-ten exit policies pass theirs; both walking-skeleton gates still pass; live is
-still fail-closed.
+**Acceptance gate (Part 2):** the ported engine's own regression tests pass
+unmodified; the ten exit policies pass theirs; both walking-skeleton gates still
+pass; live is still fail-closed.
 
-**Constraints unchanged:** paper mode only, live order placement unimplemented and
-fail-closed, no real strategies (Phase 9), no second architecture document.
+**Constraints unchanged, both parts:** paper mode only, live order placement
+unimplemented and fail-closed, no real strategies (Phase 9), no second
+architecture document.
 
 ---
 
