@@ -78,6 +78,10 @@ class _Bar:
     volume: int = 0
     tick_count: int = 0
     last_tick_at: datetime | None = None
+    #: Set when the feed was known to be disconnected while this interval was
+    #: open. Such a bar is discarded rather than published — see
+    #: :meth:`CandleAggregator.mark_feed_gap`.
+    spans_feed_gap: bool = False
 
     def absorb(self, tick: Tick) -> None:
         self.high = max(self.high, tick.last_price)
@@ -113,6 +117,8 @@ class CandleAggregator:
     _published: set[tuple[str, datetime]] = field(default_factory=set, init=False)
     rejected_out_of_session: int = field(default=0, init=False)
     rejected_late: int = field(default=0, init=False)
+    #: Bars discarded because the feed was down while they were open.
+    dropped_gap_candles: int = field(default=0, init=False)
 
     def add(self, tick: Tick) -> Candle | None:
         """Feed one tick. Returns a candle only when this tick *completed* one.
@@ -148,17 +154,50 @@ class CandleAggregator:
         self._open_bars[tick.security_id] = self._new_bar(tick, bucket_start, bucket_end)
         return completed
 
+    def mark_feed_gap(self, security_id: str | None = None) -> int:
+        """Record that the feed was lost, invalidating any bar currently open.
+
+        A bar that was open across a disconnect is missing every tick that
+        occurred during the outage. Publishing it would emit a bar stitched from
+        the ticks either side of a hole — a corrupt bar wearing a valid bar's
+        type, indistinguishable downstream from a real one. So it is discarded
+        and counted instead.
+
+        Intervals *entirely* inside the outage produce no bar at all, which needs
+        no special handling: no ticks means no bar was ever opened for them.
+
+        Duplicate publication across a reconnect is prevented separately and
+        structurally, by :attr:`_published` — which is why the hub must keep the
+        same aggregator instance across a reconnect rather than building a new
+        one. A fresh aggregator would forget what it had already published.
+
+        Returns the number of bars discarded. Full candle-continuity policy is
+        Phase 4; this is the conservative floor that cannot emit bad data.
+        """
+        keys = [security_id] if security_id is not None else list(self._open_bars)
+        discarded = 0
+        for key in keys:
+            bar = self._open_bars.get(key)
+            if bar is not None:
+                bar.spans_feed_gap = True
+                discarded += 1
+        return discarded
+
     def flush(self, security_id: str | None = None) -> Iterator[Candle]:
         """Close open bars — used at session end and on shutdown.
 
         A flushed bar is a real completed bar for the interval it covers; it is
-        published only once, like any other.
+        published only once, like any other. A bar marked by
+        :meth:`mark_feed_gap` is dropped rather than yielded.
         """
         keys = [security_id] if security_id is not None else list(self._open_bars)
         for key in keys:
             bar = self._open_bars.pop(key, None)
-            if bar is not None:
-                yield self._complete(bar)
+            if bar is None:
+                continue
+            candle = self._complete(bar)
+            if candle is not None:
+                yield candle
 
     def _new_bar(self, tick: Tick, start_at: datetime, end_at: datetime) -> _Bar:
         return _Bar(
@@ -175,12 +214,17 @@ class CandleAggregator:
             last_tick_at=tick.exchange_time,
         )
 
-    def _complete(self, bar: _Bar) -> Candle:
+    def _complete(self, bar: _Bar) -> Candle | None:
         key = (bar.security_id, bar.start_at)
         if key in self._published:
             raise RuntimeError(
                 f"Candle for {bar.security_id} at {bar.start_at.isoformat()} "
                 "was already published — duplicate publication is forbidden"
             )
+        # Marked as published either way: the interval is closed, and a later
+        # tick must not be able to open it again and publish a second version.
         self._published.add(key)
+        if bar.spans_feed_gap:
+            self.dropped_gap_candles += 1
+            return None
         return bar.freeze()

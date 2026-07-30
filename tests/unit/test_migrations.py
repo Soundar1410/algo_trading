@@ -271,24 +271,93 @@ def test_a_held_lock_times_out_rather_than_racing(db: Database, versions: Path, 
 
 # ------------------------------------------------------- shipped versions
 def test_shipped_migrations_start_at_the_walking_skeleton():
-    """Phase 1 adds 0001; nothing may be inserted before it."""
+    """0001 is the walking skeleton and nothing may be inserted before it.
+
+    Migrations are forward-only, so an earlier number appearing later would mean
+    a database that skipped it never gets it.
+    """
     from common.persistence.migrations import VERSIONS_DIR
 
     shipped = discover_migrations(VERSIONS_DIR)
-    assert [m.version for m in shipped] == ["0001"]
+    assert [m.version for m in shipped] == ["0001", "0002"]
     assert shipped[0].name == "walking_skeleton"
+    assert shipped[1].name == "feed_and_auth_health"
 
 
 def test_shipped_migrations_apply_to_a_fresh_database(tmp_path: Path):
-    """The real 0001 must survive the runner's own replay-safety rules."""
+    """The real migrations must survive the runner's own replay-safety rules."""
     from common.persistence.migrations import VERSIONS_DIR
 
     database = Database(tmp_path / "operational" / "intraday_options.db")
     applied = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
 
-    assert [m.version for m in applied] == ["0001"]
+    assert [m.version for m in applied] == ["0001", "0002"]
     assert database.integrity_check() == []
     assert database.foreign_key_check() == []
+
+
+def test_0002_upgrades_a_database_created_by_0001_alone(tmp_path: Path):
+    """The real upgrade path: an existing paper database must not need rebuilding.
+
+    Applying 0001 by itself, then the full set, proves 0002 is purely additive
+    rather than only working on a database built from scratch.
+    """
+    from common.persistence.migrations import VERSIONS_DIR, discover_migrations
+
+    only_0001 = tmp_path / "just_first"
+    only_0001.mkdir()
+    first = discover_migrations(VERSIONS_DIR)[0]
+    (only_0001 / first.path.name).write_text(
+        first.path.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+
+    database = Database(tmp_path / "operational" / "intraday_options.db")
+    MigrationRunner(database, versions_dir=only_0001).run_pending()
+
+    # Put a row in a 0001 table, so a destructive 0002 would be detectable.
+    with database.transaction() as conn:
+        conn.execute(
+            "INSERT INTO runtime_sessions (runtime_id, execution_mode, process_role, "
+            "pid, started_at) VALUES (?, 'paper', 'worker', 1, '2026-07-30T09:15:00Z')",
+            ("intraday_options",),
+        )
+
+    applied = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
+
+    assert [m.version for m in applied] == ["0002"]
+    with database.connect() as conn:
+        survivors = conn.execute("SELECT COUNT(*) FROM runtime_sessions").fetchone()[0]
+        tables = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+    assert survivors == 1, "0002 must not disturb existing rows"
+    assert {"auth_events", "feed_events", "option_chain_snapshots"} <= tables
+    assert database.integrity_check() == []
+
+
+def test_no_phase_two_table_can_store_a_secret(tmp_path: Path):
+    """Structural check on the schema, not on call sites.
+
+    A column named for a token or credential is an invitation to write one, and
+    the spec forbids persisting secrets to SQLite outright.
+    """
+    from common.persistence.migrations import VERSIONS_DIR
+
+    database = Database(tmp_path / "operational" / "intraday_options.db")
+    MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
+
+    forbidden = ("token", "secret", "pin", "password", "totp", "client_id", "access")
+    with database.connect() as conn:
+        for table in ("auth_events", "feed_events", "option_chain_snapshots"):
+            columns = [row["name"] for row in conn.execute(f"PRAGMA table_info({table})")]
+            for column in columns:
+                lowered = column.lower()
+                for word in forbidden:
+                    # token_expiry and token_source name metadata, not the token.
+                    if lowered in {"token_expiry", "token_source"}:
+                        continue
+                    assert word not in lowered, f"{table}.{column} looks like a secret store"
 
 
 def test_shipped_migrations_are_idempotent(tmp_path: Path):

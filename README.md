@@ -8,14 +8,20 @@ it (market data, candles, signals, risk, persistence, health) is shared, so a
 strategy that has been paper-forward-tested is the same strategy when it is later
 approved for live.
 
-> **Status: Phase 1 complete.** The walking skeleton runs end to end on a
-> recorded feed: supervisor → shared feed hub → bounded IPC queue → spawned paper
-> worker → deterministic fixture signal → `PaperBroker` fill → SQLite → dashboard
-> tile → notification → restart recovery → square-off.
+> **Status: Phase 2, Block 1 complete.** The walking skeleton (Phase 1) runs end
+> to end on a recorded feed. Phase 2 adds the authentication bootstrap with TOTP,
+> a crash-safe token cache, feed reconnect/resubscription, and the option-chain
+> three-second throttle — all built and tested **offline**.
 >
-> There is still **no real strategy** (Phase 9), no engine port (Phase 3), and the
-> live Dhan feed adapter is **written but unratified** against a live connection
-> (Phase 2). See `docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md`.
+> The `dhanhq` pin is now **ratified at `2.2.0`** (2.1.0 is yanked upstream and
+> cannot resubscribe on `websockets>=14`), and the feed payload shape is ratified
+> from SDK source — which corrected three real defects, including an `LTT` bug
+> that silently bucketed every candle by arrival time instead of exchange time.
+>
+> **Not yet run against Dhan's servers.** Authentication, subscription and
+> reconnection are unproven live, and the tape fixture is synthesised rather than
+> captured. That is Block 2. There is also still **no real strategy** (Phase 9)
+> and no engine port (Phase 3). See `docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md`.
 
 > **Live order placement is not implemented and is fail-closed.** `DhanLiveBroker`
 > order methods arrive in Phase 10 only, behind an explicit approval gate.
@@ -57,18 +63,39 @@ log record by `common.logging.SecretRedactingFilter`.
 ```
 
 Tests use fake credentials and synthetic data. No test places an order, and none
-requires network access or a populated `.env`.
+requires network access or a populated `.env` — verified by running the suite with
+every credential unset and IP socket creation blocked.
+
+## Authentication
+
+```bash
+.venv/bin/python -m scripts.auth_bootstrap --status   # local state, no network
+.venv/bin/python -m scripts.auth_bootstrap            # pre-market bootstrap
+```
+
+The bootstrap derives a TOTP locally with `pyotp`, exchanges client id + PIN +
+TOTP for a 24-hour access token, and caches it atomically at
+`data/cache/token_cache.json` (mode `0600`). Every runtime reads that cache; none
+generates its own token.
+
+A rejected PIN or TOTP costs **exactly one** request to Dhan and then records a
+cooldown, so neither a re-run nor eight simultaneous workers can turn one bad
+credential into repeated rejected logins. Re-run with `--force` after fixing
+`.env`.
 
 ## Layout
 
 ```
 common/          config, logging, persistence, models, market_data, candles,
-                 feed, broker, execution, risk, notifications, health, process
+                 feed, broker, execution, risk, notifications, health, process,
+                 authentication
 strategies/      intraday_options/  (test-only fixture; real strategies: Phase 9)
 runtimes/        intraday_options/  supervisor + spawn-safe worker
 dashboards/      app.py — one read-only tile
+scripts/         auth_bootstrap.py, capture_live_tape.py (read-only)
 config/          global.yaml, runtimes/, strategies/
 data/operational/  one SQLite database per runtime group (gitignored)
+data/cache/      token_cache.json — mode 0600 (gitignored)
 docs/            architecture spec + implementation runbook
 tests/           unit/, integration/, end_to_end/, smoke/, fixtures/
 ```

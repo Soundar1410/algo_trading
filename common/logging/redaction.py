@@ -55,6 +55,7 @@ _SENSITIVE_KEYS = (
     "accesstoken",
     "api_key",
     "apikey",
+    "app_secret",
     "authorization",
     "bot_token",
     "client_id",
@@ -62,6 +63,12 @@ _SENSITIVE_KEYS = (
     "dhan_client_id",
     "dhan_pin",
     "dhan_totp_secret",
+    # Dhan's own query-parameter and header spelling. Listed explicitly because
+    # `\bclientid\b` cannot match inside `dhanClientId` — there is no word
+    # boundary between "dhan" and "Client", so the camelCase form slipped through
+    # pattern redaction entirely and was only caught when the literal value
+    # happened to be registered.
+    "dhanclientid",
     "password",
     "pin",
     "secret",
@@ -74,9 +81,16 @@ _SENSITIVE_KEYS = (
 _KEY_ALTERNATION = "|".join(sorted(_SENSITIVE_KEYS, key=len, reverse=True))
 
 #: ``key=value``, ``key: value``, ``"key": "value"`` — quoted or bare.
+#:
+#: ``&`` terminates a value so each query parameter of a URL is matched on its
+#: own. Without it the value match ran greedily to the next whitespace, so
+#: ``?dhanClientId=X&pin=Y&totp=Z`` collapsed into a single redaction starting at
+#: the first *recognised* key — masking later secrets only by accident of
+#: ordering, leaving earlier ones exposed, and destroying any non-secret
+#: parameter that trailed one.
 _PATTERN_RULES: tuple[Pattern[str], ...] = (
     re.compile(
-        rf'(?i)(["\']?\b(?:{_KEY_ALTERNATION})\b["\']?\s*[:=]\s*)(["\']?)([^\s,;}}\)"\']+)(\2)'
+        rf'(?i)(["\']?\b(?:{_KEY_ALTERNATION})\b["\']?\s*[:=]\s*)(["\']?)([^\s,;&}}\)"\']+)(\2)'
     ),
 )
 
@@ -146,6 +160,10 @@ def secrets_from_settings(settings: object) -> tuple[str, ...]:
         "dhan_client_id",
         "dhan_pin",
         "dhan_totp_secret",
+        # Added in Phase 2. Its absence here was a real gap: the field existed
+        # nowhere, so once introduced it would have been the one credential in
+        # .env that pattern redaction alone had to catch.
+        "dhan_access_token",
         "telegram_bot_token",
         "telegram_chat_id",
     ):

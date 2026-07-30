@@ -12,10 +12,19 @@ license = { text = "Proprietary" }
 authors = [{ name = "Soundarraj" }]
 
 dependencies = [
-    # Dhan SDK. Pinned exactly, never a range: the feed/auth surface changed
-    # between 2.1 (DhanContext) and 2.2 (documented breaking changes). The
-    # compatibility spike that ratifies this pin is a Phase 2 deliverable.
-    "dhanhq==2.1.0",
+    # Dhan SDK. Pinned exactly, never a range. Ratified in Phase 2 by the
+    # compatibility spike the spec requires; see the runbook for the evidence.
+    # 2.1.0 was rejected: it is *yanked* on PyPI ("Breaking changes"), its
+    # subscribe_symbols/unsubscribe_symbols read `ws.closed` which no longer
+    # exists on websockets>=14 (so resubscription after reconnect raises
+    # AttributeError), and its disconnect() never closes the socket. 2.2.0 fixes
+    # all three. The tick/quote payload builders are byte-identical across the
+    # two versions, so normalisation is unaffected by the bump.
+    "dhanhq==2.2.0",
+    # Pinned as a floor, not left to the SDK: 2.2.0 guards the `ws.closed`
+    # removal, so we require a websockets new enough to have removed it rather
+    # than silently resolving to a pre-14 release where the guard is moot.
+    "websockets>=14",
     "pandas>=2.2",
     "numpy>=1.26",
     "pandas-ta-classic>=0.3",     # indicators, behind one adapter (Phase 4)
@@ -62,7 +71,7 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
 
 [tool.mypy]
 python_version = "3.11"
-packages = ["common", "strategies", "runtimes", "dashboards"]
+packages = ["common", "strategies", "runtimes", "dashboards", "scripts"]
 strict = true
 warn_unreachable = true
 

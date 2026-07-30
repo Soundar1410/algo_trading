@@ -63,6 +63,7 @@ class SharedFeedHub:
         self._aggregators: dict[str, CandleAggregator] = {}
         self.tick_count = 0
         self.candle_count = 0
+        self.gap_candles_discarded = 0
         self.last_tick_at: datetime | None = None
 
     # ------------------------------------------------------------ wiring
@@ -102,6 +103,25 @@ class SharedFeedHub:
         for security_id, aggregator in self._aggregators.items():
             for candle in aggregator.flush(security_id):
                 self._fan_out(candle)
+
+    def mark_feed_gap(self) -> int:
+        """Invalidate every open bar because the feed was lost.
+
+        Wired to :class:`~common.feed.reconnect.ReconnectingFeed` as its
+        ``on_feed_gap`` hook. Any bar open during the outage is missing the ticks
+        that occurred while the socket was down, so publishing it would emit a
+        bar stitched across a hole — see the aggregator for the full argument.
+
+        Note that the aggregators are **not** rebuilt here, and must not be: each
+        one's record of what it has already published is what makes duplicate
+        publication across a reconnect structurally impossible. A fresh
+        aggregator would have forgotten.
+        """
+        discarded = 0
+        for security_id, aggregator in self._aggregators.items():
+            discarded += aggregator.mark_feed_gap(security_id)
+        self.gap_candles_discarded += discarded
+        return discarded
 
     def on_tick(self, tick: Tick) -> None:
         """Feed-callback path: validate minimally, aggregate, publish. Nothing else."""

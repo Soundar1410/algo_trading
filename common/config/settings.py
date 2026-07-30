@@ -34,6 +34,12 @@ class Settings(BaseSettings):
     dhan_pin: SecretStr | None = None
     dhan_totp_secret: SecretStr | None = None
 
+    # Manual override for the token the auth bootstrap would otherwise mint. Kept
+    # because it is occasionally the fastest way to work around an auth outage,
+    # and because Phase 1's smoke test used it. The bootstrap prefers it over the
+    # cache when it is still valid, and ignores it once expired.
+    dhan_access_token: SecretStr | None = None
+
     telegram_bot_token: SecretStr | None = None
     telegram_chat_id: SecretStr | None = None
 
@@ -57,6 +63,11 @@ class Settings(BaseSettings):
             v is not None and v.get_secret_value() != ""
             for v in (self.dhan_client_id, self.dhan_pin, self.dhan_totp_secret)
         )
+
+    def has_dhan_access_token(self) -> bool:
+        """True when a token was supplied directly, bypassing generation."""
+        token = self.dhan_access_token
+        return token is not None and token.get_secret_value() != ""
 
     def has_telegram_credentials(self) -> bool:
         """True when Telegram can be used. Notifications are never required."""

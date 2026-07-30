@@ -173,3 +173,140 @@ def test_structured_context_is_appended(tmp_path: Path):
     contents = (tmp_path / "algo_trading.log").read_text(encoding="utf-8")
     assert "strategy_id=io_fixture_v1" in contents
     assert "execution_mode=paper" in contents
+
+
+# --------------------------------------------- Phase 2: the auth secret surface
+#
+# Phase 2 introduces DHAN_ACCESS_TOKEN and a runtime-minted token, and starts
+# logging URLs that carry credentials as query parameters. Two real gaps were
+# found and closed while writing these tests, and both are asserted below.
+
+PHASE2_SETTINGS = Settings(
+    dhan_client_id="1100112233",
+    dhan_pin="4821",
+    dhan_totp_secret="JBSWY3DPEHPK3PXP",
+    dhan_access_token="eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjQ4NzE1MzI4MDB9.fakesignature",
+    telegram_bot_token="7654321:AAH9fakeTokenValueForTests",
+    telegram_chat_id="-1001234567890",
+)
+
+
+def test_the_manual_access_token_is_a_known_secret_value():
+    """DHAN_ACCESS_TOKEN was absent from secrets_from_settings before Phase 2.
+
+    Without it, the one credential a user can paste into .env would have been the
+    only one relying on pattern matching alone.
+    """
+    values = secrets_from_settings(PHASE2_SETTINGS)
+    assert PHASE2_SETTINGS.dhan_access_token is not None
+    assert PHASE2_SETTINGS.dhan_access_token.get_secret_value() in values
+
+
+def test_a_runtime_minted_token_is_masked_once_registered():
+    """A generated token was never in .env, so value redaction cannot know it
+    until the bootstrap hands it over.
+
+    The gap is specifically a token appearing *without* a sensitive key beside
+    it — pattern redaction has nothing to anchor on there, so registering the
+    literal value is the only thing that masks it. This is why the bootstrap
+    calls `on_token_minted` the moment the token exists, before anything can log
+    it.
+    """
+    minted = "eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjQ4NzE1MzI4MDF9.mintedatruntime"
+    bare = f"validated {minted} against /v2/profile"
+
+    redactor = SecretRedactingFilter(secrets_from_settings(Settings()))
+    assert minted in redactor.redact(bare), (
+        "an unregistered token with no key beside it cannot be pattern-matched; "
+        "if this ever passes, this test no longer proves add_secrets is needed"
+    )
+
+    redactor.add_secrets([minted])
+    assert minted not in redactor.redact(bare)
+    assert REDACTED in redactor.redact(bare)
+
+
+def test_the_auth_url_is_redacted_parameter_by_parameter():
+    """The exact shape the login logs on failure.
+
+    `dhanClientId` needed adding to the key list: `\\bclientid\\b` cannot match
+    inside `dhanClientId`, because there is no word boundary between "dhan" and
+    "Client". Pattern redaction — which exists precisely for values not present
+    in .env — was letting the camelCase spelling through.
+    """
+    redactor = SecretRedactingFilter()  # deliberately no literal secrets
+    url = (
+        "https://auth.dhan.co/app/generateAccessToken?dhanClientId=1100112233&pin=4821&totp=654321"
+    )
+    masked = redactor.redact(url)
+    for secret in ("1100112233", "4821", "654321"):
+        assert secret not in masked, f"{secret} leaked from the auth URL"
+
+
+def test_query_parameter_order_does_not_change_what_is_masked():
+    """Previously the greedy value match swallowed everything to the next space.
+
+    That masked later secrets only by accident of ordering and left earlier ones
+    exposed, so the property has to hold under permutation.
+    """
+    redactor = SecretRedactingFilter()
+    for url in (
+        "https://auth.dhan.co/x?dhanClientId=1100112233&pin=4821&totp=654321",
+        "https://auth.dhan.co/x?totp=654321&pin=4821&dhanClientId=1100112233",
+        "https://auth.dhan.co/x?pin=4821&dhanClientId=1100112233&totp=654321",
+    ):
+        masked = redactor.redact(url)
+        for secret in ("1100112233", "4821", "654321"):
+            assert secret not in masked, f"{secret} leaked from {url}"
+
+
+def test_a_non_secret_parameter_survives_redaction():
+    """The greedy match used to destroy whatever trailed a secret.
+
+    Masking everything is safe but useless: a log line that cannot say which
+    instrument or segment was involved does not help anyone debug.
+    """
+    redactor = SecretRedactingFilter()
+    masked = redactor.redact(
+        "https://api.dhan.co/v2/profile?dhanClientId=1100112233&segment=NSE_FNO"
+    )
+    assert "1100112233" not in masked
+    assert "segment=NSE_FNO" in masked
+
+
+def test_the_access_token_header_is_masked():
+    """Dhan sends the token in an `access-token` header, hyphen not underscore."""
+    redactor = SecretRedactingFilter()
+    masked = redactor.redact(
+        "headers={'access-token': 'eyJhbGciOi.payload.sig', 'dhanClientId': '1100112233'}"
+    )
+    assert "eyJhbGciOi.payload.sig" not in masked
+    assert "1100112233" not in masked
+
+
+def test_an_echoed_credential_in_a_response_body_is_masked():
+    """A broker echoing our input back is a leak vector value redaction alone
+    would catch only if the value came from .env."""
+    redactor = SecretRedactingFilter()
+    masked = redactor.redact(
+        'auth failed: {"errorMessage": "bad pin", "pin": "9999", "totp": "111222"}'
+    )
+    assert "9999" not in masked
+    assert "111222" not in masked
+
+
+def test_a_rejection_reason_carries_no_credential(tmp_path: Path):
+    """End to end through a real handler: the cooldown reason gets logged."""
+    from common.authentication import RejectionCooldown
+
+    setup_logging(log_dir=tmp_path, settings=PHASE2_SETTINGS, console=False)
+    cooldown = RejectionCooldown(tmp_path / "rejected.json")
+    cooldown.record("Dhan rejected the credentials (HTTP 401): Invalid PIN")
+    logging.getLogger("phase2").error(
+        "auth failed for dhanClientId=1100112233 pin=4821 totp=654321"
+    )
+    logging.shutdown()
+
+    contents = (tmp_path / "algo_trading.log").read_text(encoding="utf-8")
+    for secret in ("1100112233", "4821", "654321", "JBSWY3DPEHPK3PXP"):
+        assert secret not in contents, f"{secret} reached the log file"

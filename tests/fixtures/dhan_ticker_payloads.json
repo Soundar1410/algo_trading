@@ -1,0 +1,99 @@
+{
+  "source": "synthesised",
+  "note": "Produced in Block 1 by packing Dhan's documented binary layouts and running them through the installed dhanhq marketfeed.process_data(), so the shape is the SDK's own rather than hand-written. Replaced by real captured payloads in Block 2. Contains no credentials or account data.",
+  "sdk_version": "2.2.0",
+  "frames": [
+    {
+      "label": "ticker",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 2,
+        "security_id": 49081,
+        "LTP": "187.45",
+        "LTT": "08:35:03"
+      }
+    },
+    {
+      "label": "ticker",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 2,
+        "security_id": 49081,
+        "LTP": "187.60",
+        "LTT": "08:35:15"
+      }
+    },
+    {
+      "label": "ticker",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 2,
+        "security_id": 49081,
+        "LTP": "186.90",
+        "LTT": "08:35:34"
+      }
+    },
+    {
+      "label": "ticker",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 2,
+        "security_id": 13,
+        "LTP": "24875.30",
+        "LTT": "08:35:08"
+      }
+    },
+    {
+      "label": "ticker_no_trade_yet",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 2,
+        "security_id": 49082,
+        "LTP": "0.05",
+        "LTT": "00:00:00"
+      }
+    },
+    {
+      "label": "quote",
+      "payload": {
+        "type": "Quote Data",
+        "exchange_segment": 2,
+        "security_id": 49081,
+        "LTP": "187.55",
+        "LTQ": 75,
+        "LTT": "08:35:47",
+        "avg_price": "187.55",
+        "volume": 128400,
+        "total_sell_quantity": 0,
+        "total_buy_quantity": 0,
+        "open": "187.55",
+        "close": "187.55",
+        "high": "188.55",
+        "low": "186.55"
+      }
+    },
+    {
+      "label": "prev_close",
+      "payload": {
+        "type": "Previous Close",
+        "exchange_segment": 2,
+        "security_id": 49081,
+        "prev_close": "190.10",
+        "prev_OI": 4500
+      }
+    },
+    {
+      "label": "oi",
+      "payload": {
+        "type": "OI Data",
+        "exchange_segment": 2,
+        "security_id": 49081,
+        "OI": 512300
+      }
+    },
+    {
+      "label": "status",
+      "payload": "Markets Open"
+    }
+  ]
+}
