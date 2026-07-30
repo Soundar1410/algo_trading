@@ -7,8 +7,8 @@ the next phase. Updated after every phase.
 
 | | |
 |---|---|
-| **Current phase** | Phase 2 — Block 1 (offline) complete, awaiting review |
-| **Next phase** | Phase 2 Block 2 — live read-only ratification, on explicit go |
+| **Current phase** | Phase 2 — **complete** (Block 1 offline + Block 2 live), awaiting review |
+| **Next phase** | Phase 3 — preserve custom engines and policies (not started) |
 | **Last updated** | 30 July 2026 |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
@@ -22,7 +22,7 @@ the next phase. Updated after every phase.
 |---|---|---|
 | 0 | Reference audit + minimal bootstrap | **Complete** |
 | 1 | Walking skeleton | **Complete** |
-| 2 | Dhan and shared-feed hardening | **Block 1 complete** (offline). Block 2 (live) pending an explicit go |
+| 2 | Dhan and shared-feed hardening | **Complete** — Block 1 (offline) + Block 2 (live) |
 | 3 | Preserve custom engines and policies | Not started |
 | 4 | Candle, indicator and paper-execution foundation | Not started |
 | 5 | Mixed-mode supervisor and persistence | Not started |
@@ -95,10 +95,57 @@ type-checked with an empty `.env` and no network:
    `secrets_from_settings()`, runtime-minted tokens registered with the redactor
    the moment they exist, and two real redaction gaps closed (section 3.1).
 
-**Block 2 — live, not yet run.** Five read-only steps, gated on an explicit
-instruction that `.env` is populated: bootstrap → one `/marketfeed/ltp` call →
-capture a real tape → one `/optionchain` call → re-run the suite against the
-captured fixture. See section 5.
+### What Phase 2 Block 2 delivered
+
+**Block 2 — live, complete (30 July 2026).** Five read-only steps, run in order
+against real Dhan servers with real credentials, each confirmed read-only before
+being called:
+
+1. **`scripts/auth_bootstrap.py`** — real TOTP login (`POST
+   auth.dhan.co/app/generateAccessToken`), one transient network timeout followed
+   by a successful retry, then validation via `GET /v2/profile` → accepted. Token
+   cached. The logged auth URL showed `dhanClientId`/`pin`/`totp` all masked
+   individually — the `dhanClientId` pattern-key fix (section 3.1) holding against
+   a real request, not just its unit test.
+2. **One read-only market-data call** — `POST /v2/marketfeed/ltp` for NIFTY 50 via
+   the SDK's own REST client → `{"IDX_I": {"13": {"last_price": 24274.2}}}`.
+3. **`scripts/capture_live_tape.py`** — captured 122 real frames (121 ticks + 1
+   `Previous Close`) over 30s. **Found and fixed a real hang** on the first
+   attempt: the script's main thread called `adapter.stop()` from outside the
+   thread driving the SDK's `asyncio` loop, racing the WebSocket close handshake
+   against an in-flight `get_data()` call — confirmed by a live run, then fixed by
+   moving the stop decision into the callback the feed's own loop invokes, so it
+   always runs on the same thread. Scoped to this one script; **the identical
+   latent flaw was found in `common/feed/reconnect.py` and left unfixed** — see
+   the known-limitations entry below.
+4. **One `/optionchain` call through `OptionChainService`** — NIFTY, expiry
+   2026-08-04, 225 strikes returned; a second immediate call for the same key was
+   served from cache (`api_calls` stayed at 1), confirming the throttle/dedup
+   works against the real endpoint, not just a scripted double.
+5. **Full suite re-run against the real capture** — surfaced a real fixture/test
+   coverage gap (9 failures: tests referencing frame kinds — Quote, OI, an
+   untraded instrument — that a real single-instrument ticker-mode capture cannot
+   produce). Resolved by keeping **two fixtures**, not one replacing the other —
+   see "Fixture split" below. Final state: 533 passed, 6 skipped, `ruff`/`mypy`
+   clean.
+
+**Payload shape ratified live, matching Block 1's source inference exactly** —
+same keys, same types (`LTP` a formatted string, `LTT` as `HH:MM:SS`), no
+divergence. Real auth-log output confirmed both redaction fixes from section 3.1
+hold outside their unit tests.
+
+**Fixture split (post-Step-5 follow-up).** `tests/fixtures/dhan_ticker_payloads_synthesised.json`
+(Block 1, restored byte-for-byte from git after being briefly overwritten) is
+kept **permanently** as the exhaustive branch-coverage fixture — it alone can
+supply Quote/OI/status/untraded-instrument frames. `tests/fixtures/dhan_ticker_payloads_real.json`
+(Block 2's capture) is kept **permanently** alongside it, used only to ratify
+that the observed shape matches source inference. Neither replaces the other;
+`capture_live_tape.py`'s default output path now targets the `_real` file
+explicitly so a future recapture cannot overwrite the synthesised one. Coverage
+was confirmed equal-or-better, not just "tests pass": 520 previously-passing +
+9 previously-broken (now fixed, identical assertions, repointed at the
+synthesised fixture) + 4 new (real-fixture ratification, credential scan
+parametrised over both files) = 533.
 
 ### What Phase 2 deliberately did NOT deliver
 
@@ -377,10 +424,15 @@ scripts/
   capture_live_tape.py   Block 2 tape capture; read-only; scrubs the output
 
 tests/    306 unit, 78 integration, 20 end-to-end, 6 smoke (skipped)
-  fixtures/nifty_tick_tape.json         24 ticks, 6 one-minute buckets
-  fixtures/dhan_ticker_payloads.json    SYNTHESISED in Block 1 from the SDK's
-                                        own parsers; replaced by a real capture
-                                        in Block 2
+  fixtures/nifty_tick_tape.json                       24 ticks, 6 one-minute buckets
+  fixtures/dhan_ticker_payloads_synthesised.json       SYNTHESISED in Block 1 from the
+                                                       SDK's own parsers; kept permanently
+                                                       for exhaustive branch coverage
+                                                       (Quote/OI/status/untraded frames a
+                                                       real capture cannot supply)
+  fixtures/dhan_ticker_payloads_real.json              CAPTURED in Block 2 from a real
+                                                       connection; proves the observed
+                                                       shape matches source inference
 ```
 
 ### 3.1 Defects found and corrected in Phase 2
@@ -563,18 +615,22 @@ on. A property worth asserting is worth asserting under load.
 - **Regression evidence:** all 281 Phase 1 tests pass unchanged on 2.2.0,
   including both walking-skeleton acceptance gates and the SDK-isolation test.
 
-### Still unratified after Block 1
+### Ratified after Block 2 (30 July 2026)
 
-Honest scope of what source inspection can and cannot establish:
+Honest scope of what was actually established, and what still hasn't been:
 
 - **Ratified from source:** the `get_data()` payload *shape*, because
   `process_data()` constructs the dict itself from the binary frame — the wire
   contributes bytes, not keys.
-- **NOT yet ratified against Dhan's servers:** that authentication succeeds, that
-  the WebSocket accepts our subscription packet, that reconnection behaves as
-  expected against a real disconnect, and that live `LTP`/`LTT` *values* look as
-  the source implies. Those are Block 2, and the runbook will say plainly whether
-  they were performed.
+- **Ratified live in Block 2:** authentication (`generateAccessToken` +
+  `GET /v2/profile`), the WebSocket accepting our subscription packet
+  (122 real frames captured), a real market-data REST call (`/marketfeed/ltp`),
+  a real option-chain call, and that live `LTP`/`LTT` *values* match what the
+  source implied — no divergence found.
+- **Still NOT ratified against a real connection:** reconnection behaviour
+  against an actual disconnect (backoff, resubscription and gap-handling are
+  tested only against a scripted double — limitation 2), and whether a 807
+  frame arrives before or after the socket closes in practice.
 
 ### Everything else
 
@@ -652,17 +708,25 @@ A rejected TOTP is often a drifted local clock rather than a wrong secret; the
 error message says so and how to check, because the two produce identical
 responses from Dhan.
 
-### Block 2 — live read-only ratification
+### Block 2 — live read-only ratification (completed 30 July 2026)
 
 Run **only** with `.env` populated, during market hours. Every call is read-only
-and none can place, modify or cancel an order.
+and none can place, modify or cancel an order. The commands below are what was
+actually run to close out Block 2:
 
 ```bash
-.venv/bin/python -m scripts.auth_bootstrap            # 1. auth + validate
-.venv/bin/python -m scripts.capture_live_tape --seconds 30   # 2. record a tape
+.venv/bin/python -m scripts.auth_bootstrap                    # 1. auth + validate
+# 2. one read-only /marketfeed/ltp call — via the SDK's own REST client
+#    (dhanhq._market_feed.MarketFeed(dhan_context).ticker_data(...)), a one-off
+#    verification rather than a checked-in script; see runbook history.
+.venv/bin/python -m scripts.capture_live_tape --seconds 30    # 3. record a tape
+# 4. one /optionchain call — via common.market_data.option_chain.OptionChainService
+#    wrapping dhanhq._option_chain.OptionChain, likewise a one-off verification.
+.venv/bin/python -m pytest                                    # 5. full suite vs real fixture
+
+# Repeatable regression path for future live checks (not what ran this session):
 ALGO_LIVE_SMOKE=1 ALGO_SMOKE_EXPIRY=YYYY-MM-DD \
-  .venv/bin/python -m pytest tests/smoke -v           # 3. feed + option chain
-.venv/bin/python -m pytest                            # 4. suite vs real fixture
+  .venv/bin/python -m pytest tests/smoke -v
 ```
 
 **Recovery.** A worker recovers automatically on restart: it acquires its lock,
@@ -683,12 +747,56 @@ start/stop/crash/restart tests pass.
 
 ## 6. Known limitations
 
-1. **Nothing has been run against Dhan's servers yet.** Block 1 ratified the
-   payload *shape* from SDK source — which is sound, because `process_data()`
-   builds the dict itself — but **authentication, subscription, reconnection and
-   live `LTP`/`LTT` values remain unproven against a real connection.** The tape
-   fixture is currently **synthesised**, not captured. This is the largest
-   remaining piece of unexercised code, and Block 2 is what closes it.
+1. **`supervisor.py` has no live-feed shutdown path at all, and
+   `ReconnectingFeed` shares an untested cross-thread race — both block live
+   readiness.** Found during Block 2 while diagnosing a real hang in
+   `scripts/capture_live_tape.py`, and deliberately **not fixed in that
+   session** — this is a design decision for the live path, not a
+   one-file patch.
+
+   - **The hang, and its fix.** The capture script ran the feed's blocking
+     `start()` loop on a background thread while the main thread waited out a
+     deadline and then called `adapter.stop()` from *outside* that thread. The
+     SDK's WebSocket close handshake raced a `get_data()` call still in flight
+     on the same `asyncio` event loop from a different thread — loops are not
+     safe to drive from two threads at once — and the process hung on a live
+     connection, confirmed by a real capture run. Fixed, in that one file only,
+     by moving both the stop decision and the `adapter.stop()` call into the
+     callback the feed's own loop invokes, so it always runs on the same
+     thread that owns the loop.
+   - **`supervisor.py`'s `IntradayOptionsSupervisor.run()`** calls
+     `self._hub.start()` then `self._hub.stop()` **sequentially, on one
+     thread** — there is no second thread here, so this specific race cannot
+     occur. But that is only because every caller today passes the
+     **recorded** adapter, whose `start()` returns on its own once the tape is
+     exhausted. A live `DhanMarketFeedAdapter`'s `start()` loops
+     `while self._running:` and never returns by itself; nothing in this
+     codebase calls `adapter.stop()` concurrently to unblock it. Pointed at a
+     live feed today, the supervisor would simply **hang forever at startup**,
+     recoverable only by an external SIGTERM/SIGKILL to the whole process —
+     and this codebase installs no custom SIGTERM handler anywhere observed so
+     far (confirmed independently this session against the legacy
+     `Trading_Automation` orchestrator, which died immediately and silently on
+     SIGTERM with no shutdown log line). **There is no live-shutdown path
+     implemented, not merely an unsafe one.**
+   - **`common/feed/reconnect.py`'s `ReconnectingFeed`** — the module actually
+     meant to make a live feed stoppable and reconnectable — delegates straight
+     through to `self._adapter.start()` / `self._adapter.stop()` with no
+     thread-safety added. If it is ever driven the way a live deployment
+     requires (its `start()` on a worker thread, `.stop()` called from the
+     main thread or a signal handler), it will reproduce the **identical**
+     cross-thread hang just fixed in the capture script. This is **latent and
+     untested**: every test in `tests/integration/test_feed_reconnect.py`
+     drives it with `_ScriptedAdapter`, whose `start()` returns synchronously
+     and quickly, so no test has ever called `.stop()` from a different thread
+     than the one running `.start()`. Not yet triggered in practice only
+     because `ReconnectingFeed` is not wired into `supervisor.py` at all —
+     `SharedFeedHub` still holds a bare adapter directly.
+   - **Net effect:** the live path cannot be started safely (`supervisor.py`)
+     and cannot be stopped safely if it could (`ReconnectingFeed`). Both must
+     be addressed — deliberately, with the user's sign-off on the approach,
+     not as an incidental fix — before any live-feed deployment, and are
+     required reading before Phase 10 controlled-live work begins.
 2. **Reconnection is tested against a scripted double, not a real socket drop.**
    The backoff, resubscription and gap-handling logic is covered, but Dhan's
    actual disconnect behaviour — including whether a 807 frame arrives before or
@@ -710,12 +818,13 @@ start/stop/crash/restart tests pass.
 8. **One instrument, one runtime group, one strategy shape.** Multi-strategy and
    mixed-mode supervision are Phase 5.
 9. **Pattern-based log redaction remains heuristic.** It masks `key=value` shapes
-   with sensitive-looking keys and every literal value from `.env`, and Phase 2
-   closed two real gaps in it (section 3.1). But a secret arriving from a third
-   party as a bare token with no key beside it can only be caught by literal
-   redaction, which requires knowing the value. The bootstrap therefore registers
-   each minted token with the redactor the moment it exists — before anything can
-   log it — which closes the case we control.
+    with sensitive-looking keys and every literal value from `.env`, and Phase 2
+    closed two real gaps in it (section 3.1) — both confirmed holding against real
+    auth-log output in Block 2. But a secret arriving from a third party as a bare
+    token with no key beside it can only be caught by literal redaction, which
+    requires knowing the value. The bootstrap therefore registers each minted
+    token with the redactor the moment it exists — before anything can log it —
+    which closes the case we control.
 10. **The rejection cooldown fails *open* on a corrupt file.** A malformed
     cooldown record is treated as absent, so a damaged file cannot permanently
     lock out authentication. That is deliberate: the protection it offers is
@@ -811,14 +920,9 @@ claim. Every statement below was re-run this phase, not carried forward:
 
 ## 8. Next phase
 
-### 8.1 Immediately next — Phase 2 Block 2 (live ratification)
+Phase 2 is complete, both blocks. Next is Phase 3.
 
-Not a new phase: the remaining half of this one. Five read-only steps, gated on an
-explicit instruction that `.env` is populated, during market hours. Commands in
-section 5. Until it runs, limitation 1 stands and the tape fixture stays marked
-**synthesised**.
-
-### 8.2 Then — Phase 3, preserve custom engines and policies
+### Phase 3 — preserve custom engines and policies
 
 Spec: "Port or adapt `TradingEngine` without changing signal/execution behaviour."
 The ordering rule from `CLAUDE.md` governs the whole phase: **port the regression
@@ -877,26 +981,27 @@ fail-closed, no real strategies (Phase 9), no second architecture document.
 
 ## 10. Required Phase 2 report
 
-Against the phase's own stated scope. **Block 2 items are marked as not performed
-rather than described as complete.**
+Against the phase's own stated scope, both blocks. Every row below reflects
+actual completion — nothing is deferred or marked not-performed.
 
 | Item | Status | Where |
 |---|---|---|
-| Dhan authentication bootstrap, reusing the proven TOTP logic | **Delivered** (Block 1) | `common/authentication/`; ported from the reference's `dhan_auth.py` / `manager.py` / `token_store.py` / `jwt_utils.py`, translated to `httpx` + `filelock` |
-| Atomic token cache; crash cannot leave a partial file | **Delivered** | Section 4 gate table; `test_a_crash_between_write_and_replace_leaves_the_old_cache_intact` |
-| Correct file permissions; never logged, never committed | **Delivered** | `0600` asserted; `token_cache*.json` and `data/cache/` gitignored; redaction tests |
+| Dhan authentication bootstrap, reusing the proven TOTP logic | **Delivered** | `common/authentication/`; ported from the reference's `dhan_auth.py` / `manager.py` / `token_store.py` / `jwt_utils.py`, translated to `httpx` + `filelock`; **exercised live** in Block 2 step 1 |
+| Atomic token cache; crash cannot leave a partial file | **Delivered** | Section 4 gate table; `test_a_crash_between_write_and_replace_leaves_the_old_cache_intact`; real token cached live in Block 2 |
+| Correct file permissions; never logged, never committed | **Delivered** | `0600` asserted; `token_cache*.json` and `data/cache/` gitignored; redaction tests; confirmed against real auth-log output in Block 2 |
 | Fail closed on wrong PIN/TOTP, one attempt, no lockout risk from retries | **Delivered** | Section 3.1 defect 5; cooldown; four spawned processes → one attempt |
 | `dhanhq` version spike, with a recommendation and evidence | **Delivered — pin changed to `2.2.0`** | Section 4 evidence table; deviation D12 |
-| Exercise real auth + a real market-data call on the chosen version | **NOT PERFORMED** | Block 2 steps 1–2. The pin rests on source inspection and the PyPI yank, not on a live call |
-| `DhanMarketFeedAdapter` payload shape ratified | **Shape ratified from SDK source; values NOT observed live** | Section 3.1 defects 1–4; `process_data()` builds the dict itself, so the shape is determined by SDK code |
-| Test coverage from a recorded/replayed fixture captured from the real response | **Fixture is SYNTHESISED, not captured** | `tests/fixtures/dhan_ticker_payloads.json` is generated by driving the SDK's own parsers. Block 2 step 3 replaces it. Marked in the file itself |
-| Feed reconnect and resubscription to the same instruments | **Delivered** (against a scripted double) | `common/feed/reconnect.py`; limitation 2 |
+| Exercise real auth + a real market-data call on the chosen version | **Delivered** | Block 2 steps 1–2: real TOTP login (one transient timeout, one successful retry), `GET /v2/profile` accepted, `POST /marketfeed/ltp` returned NIFTY 50 LTP `24274.2` |
+| `DhanMarketFeedAdapter` payload shape ratified | **Delivered — ratified from source *and* confirmed live** | Section 3.1 defects 1–4 for the source ratification; Block 2 step 3's real capture matches it exactly, no divergence |
+| Test coverage from a recorded/replayed fixture captured from the real response | **Delivered** | `tests/fixtures/dhan_ticker_payloads_real.json`, captured by `scripts/capture_live_tape.py`. Kept *alongside*, not in place of, `dhan_ticker_payloads_synthesised.json` — a real single-instrument ticker-mode capture cannot supply the Quote/OI/status/untraded-instrument frames the synthesised fixture exists to exercise, so replacing it outright would have silently dropped branch coverage. `source` field distinguishes the two in each file |
+| Feed reconnect and resubscription to the same instruments | **Delivered against a scripted double; a real cross-thread hang was found and fixed in a related script, but the reconnect module itself remains unexercised this way** | `common/feed/reconnect.py`; the identical latent race found in `capture_live_tape.py` (limitation 1) was traced into `ReconnectingFeed` and left unfixed by deliberate decision — see limitation 1 |
 | Aggregator produces no corrupt or duplicate bar across the gap | **Delivered** | Three dedicated tests; `mark_feed_gap` discards rather than publishes |
-| Option-chain 3s-per-underlying/expiry data throttle | **Delivered** | `common/market_data/option_chain.py`; burst tests including 8 real threads |
+| Option-chain 3s-per-underlying/expiry data throttle | **Delivered** | `common/market_data/option_chain.py`; burst tests including 8 real threads; **exercised live** in Block 2 step 4 (225-strike NIFTY chain; a second immediate call was served from cache, not a second API call) |
 | Order-rate limiter stays out of scope | **Confirmed out of scope** | Spec section 14; `test_the_service_exposes_no_order_capability` |
 | `build_broker()` still refuses live in every configuration | **Confirmed** | All 12 broker-factory tests pass unchanged |
-| No live order placement, no stub | **Confirmed** | `DhanLiveBroker` does not exist |
-| Credentials never printed, logged, committed, or written to fixtures/runbook | **Confirmed** | Section 7; redaction gaps closed in section 3.1 |
-| `Trading_Automation` untouched | **Confirmed** | Read-only reference; newest `.py` mtime unchanged |
-| Test, lint, format, type-check output | **Delivered** | Section 4 verification table: 529 passed / 6 skipped, ruff clean, mypy clean |
+| No live order placement, no stub | **Confirmed** | `DhanLiveBroker` does not exist; no order-capable endpoint was called at any point in Block 2 |
+| Credentials never printed, logged, committed, or written to fixtures/runbook | **Confirmed** | Section 7; redaction gaps closed in section 3.1 and confirmed against real Block 2 log output |
+| `Trading_Automation` untouched | **Confirmed** | Read-only reference; newest `.py` mtime unchanged. (A separate, still-running legacy component — `weekly_strategies` — was independently inspected read-only during Block 2 and found to be paper-mode only; the `option_strategies` legacy orchestrator was stopped by explicit user instruction mid-session, unrelated to this repository) |
+| Test, lint, format, type-check output | **Delivered** | Section 4 verification table: **533 passed, 6 skipped**, ruff clean, mypy clean, after the fixture split (see "What Phase 2 Block 2 delivered") |
 | New deviations recorded | **Delivered** | D12–D15 in section 2.3 |
+| Real cross-thread shutdown hang found, diagnosed and fixed | **Delivered, scoped to one file** | `scripts/capture_live_tape.py` only; the identical untested flaw in `common/feed/reconnect.py`'s `ReconnectingFeed` and the complete absence of a live-feed shutdown path in `runtimes/intraday_options/supervisor.py` were found, deliberately **not** fixed this session, and recorded as limitation 1 — blocking live readiness until addressed |

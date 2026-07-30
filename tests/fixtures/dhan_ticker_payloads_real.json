@@ -1,0 +1,1362 @@
+{
+  "source": "captured",
+  "note": "Raw payloads recorded from a live Dhan market-feed connection during Block 2 ratification. Read-only capture; no order was placed. Scrubbed of credential-shaped keys and verified below.",
+  "sdk_version": "2.2.0",
+  "captured_at": "2026-07-30T09:59:39.548717+00:00",
+  "instruments": [
+    "13"
+  ],
+  "segment": 0,
+  "counters": {
+    "ticks": 121,
+    "non_tick_frames": 1,
+    "malformed_payloads": 0,
+    "exchange_time_fallbacks": 0,
+    "untraded_frames": 0,
+    "empty_frames": 0
+  },
+  "frames": [
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:09.749198+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24307.95",
+        "LTT": "15:29:09"
+      }
+    },
+    {
+      "label": "previous_close",
+      "captured_at": "2026-07-30T09:59:09.751228+00:00",
+      "payload": {
+        "type": "Previous Close",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "prev_close": "24250.20",
+        "prev_OI": 0
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:09.776093+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24304.95",
+        "LTT": "15:29:09"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:10.015539+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24306.25",
+        "LTT": "15:29:10"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:10.263553+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24306.10",
+        "LTT": "15:29:10"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:10.522475+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24305.25",
+        "LTT": "15:29:10"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:10.759671+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24305.85",
+        "LTT": "15:29:10"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:11.017052+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24305.90",
+        "LTT": "15:29:11"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:11.265336+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24305.70",
+        "LTT": "15:29:11"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:11.527406+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24304.90",
+        "LTT": "15:29:11"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:11.755601+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24305.05",
+        "LTT": "15:29:11"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:12.043181+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24306.60",
+        "LTT": "15:29:12"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:12.271554+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24305.65",
+        "LTT": "15:29:12"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:12.540914+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24305.30",
+        "LTT": "15:29:12"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:12.757647+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24305.85",
+        "LTT": "15:29:12"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:13.062458+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24304.85",
+        "LTT": "15:29:13"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:13.271953+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24303.25",
+        "LTT": "15:29:13"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:13.586687+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24303.55",
+        "LTT": "15:29:13"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:13.755743+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24306.85",
+        "LTT": "15:29:13"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:14.111436+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24307.10",
+        "LTT": "15:29:14"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:14.261338+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24307.00",
+        "LTT": "15:29:14"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:14.530211+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24306.90",
+        "LTT": "15:29:14"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:14.767005+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24305.15",
+        "LTT": "15:29:14"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:15.034192+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24305.55",
+        "LTT": "15:29:15"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:15.259723+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24305.55",
+        "LTT": "15:29:15"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:15.517217+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24306.00",
+        "LTT": "15:29:15"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:15.764676+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24304.55",
+        "LTT": "15:29:15"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:16.022847+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24302.95",
+        "LTT": "15:29:16"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:16.261955+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24305.30",
+        "LTT": "15:29:16"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:16.531296+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24304.20",
+        "LTT": "15:29:16"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:16.756667+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24306.30",
+        "LTT": "15:29:16"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:17.027213+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24304.10",
+        "LTT": "15:29:17"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:17.265158+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24304.90",
+        "LTT": "15:29:17"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:17.524007+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24306.10",
+        "LTT": "15:29:17"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:17.781712+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24304.45",
+        "LTT": "15:29:17"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:18.030154+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24303.70",
+        "LTT": "15:29:18"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:18.305234+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24304.70",
+        "LTT": "15:29:18"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:18.536571+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24304.70",
+        "LTT": "15:29:18"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:18.829925+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24303.35",
+        "LTT": "15:29:18"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:19.021443+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24301.75",
+        "LTT": "15:29:19"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:19.355146+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24302.25",
+        "LTT": "15:29:19"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:19.536616+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24304.30",
+        "LTT": "15:29:19"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:19.782779+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24302.10",
+        "LTT": "15:29:19"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:20.033198+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24303.35",
+        "LTT": "15:29:20"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:20.259614+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24304.85",
+        "LTT": "15:29:20"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:20.528122+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24302.70",
+        "LTT": "15:29:20"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:20.764590+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24302.45",
+        "LTT": "15:29:20"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:21.043783+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24302.40",
+        "LTT": "15:29:21"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:21.262321+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24303.55",
+        "LTT": "15:29:21"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:21.520005+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24302.30",
+        "LTT": "15:29:21"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:21.763518+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24301.70",
+        "LTT": "15:29:21"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:22.016447+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24300.90",
+        "LTT": "15:29:22"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:22.264188+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24301.40",
+        "LTT": "15:29:22"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:22.515105+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24301.95",
+        "LTT": "15:29:22"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:22.761641+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24300.95",
+        "LTT": "15:29:22"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:23.025505+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24299.30",
+        "LTT": "15:29:23"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:23.258959+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24298.65",
+        "LTT": "15:29:23"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:23.551374+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24300.10",
+        "LTT": "15:29:23"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:23.758388+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24301.05",
+        "LTT": "15:29:23"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:24.072822+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24299.80",
+        "LTT": "15:29:24"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:24.267230+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24301.30",
+        "LTT": "15:29:24"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:24.504745+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24302.10",
+        "LTT": "15:29:24"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:24.773496+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24299.95",
+        "LTT": "15:29:24"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:25.032183+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24299.40",
+        "LTT": "15:29:25"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:25.270861+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24299.30",
+        "LTT": "15:29:25"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:25.513911+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24297.45",
+        "LTT": "15:29:25"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:25.790295+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24298.55",
+        "LTT": "15:29:25"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:26.018993+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24298.20",
+        "LTT": "15:29:26"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:26.265957+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24298.60",
+        "LTT": "15:29:26"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:26.504436+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24299.75",
+        "LTT": "15:29:26"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:26.761239+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24300.00",
+        "LTT": "15:29:26"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:27.019326+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24300.25",
+        "LTT": "15:29:27"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:27.256650+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24300.35",
+        "LTT": "15:29:27"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:27.513690+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24300.50",
+        "LTT": "15:29:27"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:27.772597+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24301.30",
+        "LTT": "15:29:27"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:28.009898+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24300.85",
+        "LTT": "15:29:28"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:28.270857+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24301.55",
+        "LTT": "15:29:28"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:28.508064+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24301.65",
+        "LTT": "15:29:28"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:28.792773+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24301.30",
+        "LTT": "15:29:28"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:29.020932+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24300.60",
+        "LTT": "15:29:29"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:29.316069+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24300.85",
+        "LTT": "15:29:29"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:29.509315+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24301.90",
+        "LTT": "15:29:29"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:29.838930+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24303.85",
+        "LTT": "15:29:29"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:30.042916+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24303.40",
+        "LTT": "15:29:30"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:30.263228+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24304.25",
+        "LTT": "15:29:30"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:30.521810+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24304.35",
+        "LTT": "15:29:30"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:30.780445+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24304.90",
+        "LTT": "15:29:30"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:31.049275+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24300.35",
+        "LTT": "15:29:31"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:31.286616+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24300.20",
+        "LTT": "15:29:31"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:31.523572+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24303.00",
+        "LTT": "15:29:31"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:31.785093+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24301.95",
+        "LTT": "15:29:31"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:32.020728+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24294.85",
+        "LTT": "15:29:32"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:32.270330+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24296.50",
+        "LTT": "15:29:32"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:32.508765+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24298.70",
+        "LTT": "15:29:32"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:32.807595+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24296.30",
+        "LTT": "15:29:32"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:33.013725+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24298.45",
+        "LTT": "15:29:33"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:33.270348+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24296.80",
+        "LTT": "15:29:33"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:33.510132+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24298.95",
+        "LTT": "15:29:33"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:33.753564+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24297.40",
+        "LTT": "15:29:33"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:34.035709+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24299.40",
+        "LTT": "15:29:34"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:34.257190+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24299.00",
+        "LTT": "15:29:34"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:34.560100+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24298.85",
+        "LTT": "15:29:34"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:34.762855+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24300.70",
+        "LTT": "15:29:34"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:35.083289+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24300.70",
+        "LTT": "15:29:35"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:35.278589+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24292.75",
+        "LTT": "15:29:35"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:35.516590+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24292.75",
+        "LTT": "15:29:35"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:35.775340+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24293.50",
+        "LTT": "15:29:35"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:36.015400+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24295.45",
+        "LTT": "15:29:36"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:36.262764+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24295.05",
+        "LTT": "15:29:36"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:36.542737+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24295.50",
+        "LTT": "15:29:36"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:36.764477+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24296.50",
+        "LTT": "15:29:36"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:37.020323+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24294.45",
+        "LTT": "15:29:37"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:37.271036+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24296.35",
+        "LTT": "15:29:37"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:37.509834+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24297.15",
+        "LTT": "15:29:37"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:37.768469+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24296.50",
+        "LTT": "15:29:37"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:38.015067+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24298.60",
+        "LTT": "15:29:38"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:38.283131+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24300.15",
+        "LTT": "15:29:38"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:38.510852+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24299.50",
+        "LTT": "15:29:38"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:38.769814+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24296.95",
+        "LTT": "15:29:38"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:39.008600+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24300.60",
+        "LTT": "15:29:39"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:39.277223+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24301.30",
+        "LTT": "15:29:39"
+      }
+    },
+    {
+      "label": "ticker_data",
+      "captured_at": "2026-07-30T09:59:39.516529+00:00",
+      "payload": {
+        "type": "Ticker Data",
+        "exchange_segment": 0,
+        "security_id": 13,
+        "LTP": "24300.50",
+        "LTT": "15:29:39"
+      }
+    }
+  ]
+}

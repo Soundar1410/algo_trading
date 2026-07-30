@@ -4,10 +4,14 @@
     .venv/bin/python -m scripts.capture_live_tape [--seconds 30] [--security-id 13]
 
 Subscribes to one or more instruments, records the **raw payloads** that
-``get_data()`` returns, and writes them to ``tests/fixtures/dhan_ticker_payloads.json``.
-Replaces the Block 1 fixture — which was synthesised by driving the SDK's own
-parsers — with observed data, so every later phase tests against what Dhan
-actually sends.
+``get_data()`` returns, and writes them to
+``tests/fixtures/dhan_ticker_payloads_real.json``. This is deliberately a
+*separate* file from ``dhan_ticker_payloads_synthesised.json`` (the Block 1
+fixture, built by driving the SDK's own parsers): a real single-instrument
+ticker-mode capture cannot naturally produce a Quote-mode frame, an OI frame, a
+market-status string, or an untraded-instrument frame, so the synthesised
+fixture stays as the exhaustive code-path fixture while this one proves the
+observed shape matches what was inferred from source.
 
 **Read-only.** It opens the market-feed WebSocket and nothing else. It places no
 order, and there is no import path from this file to a broker adapter. Requires
@@ -87,8 +91,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--out",
         type=Path,
-        default=Path("tests/fixtures/dhan_ticker_payloads.json"),
-        help="Fixture path to write.",
+        default=Path("tests/fixtures/dhan_ticker_payloads_real.json"),
+        help=(
+            "Fixture path to write. Defaults to the real-capture fixture, kept "
+            "separate from dhan_ticker_payloads_synthesised.json — that file "
+            "exercises normalisation branches (Quote/OI/status/untraded frames) "
+            "a real single-instrument ticker-mode capture cannot produce, and "
+            "must never be overwritten by this script."
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -137,12 +147,30 @@ def main(argv: list[str] | None = None) -> int:
     captured: list[dict[str, Any]] = []
     lock = threading.Lock()
     finished = threading.Event()
+    deadline = time.monotonic() + args.seconds
 
     def _record_raw() -> None:
-        """Drive the feed, recording each raw payload before normalisation."""
+        """Drive the feed, recording each raw payload before normalisation.
+
+        The stop decision, and the ``adapter.stop()`` call itself, both happen
+        *here* — inside the callback that the feed's own loop invokes, on the
+        same thread that is driving the SDK's asyncio event loop via
+        ``adapter.start()``. That is the fix for a hang observed on a real
+        connection: the previous version waited on the main thread and called
+        ``adapter.stop()`` from there after the deadline, which raced the SDK's
+        WebSocket close handshake against a `get_data()` call still in flight
+        on the *same* event loop from a *different* thread — asyncio loops are
+        not safe to drive from two threads at once. Calling `stop()` from
+        inside this callback means it always lands after `get_data()` has
+        already returned control to this thread, so `close_connection()`
+        resolves via the loop's synchronous `run_until_complete` branch rather
+        than the cross-thread one, with nothing else touching the loop
+        concurrently.
+        """
         original_normalise = adapter.normalise
 
         def _spy(payload: object) -> Any:
+            stop_now = False
             with lock:
                 if len(captured) < args.max_frames:
                     captured.append(
@@ -152,8 +180,11 @@ def main(argv: list[str] | None = None) -> int:
                             "payload": _scrub(payload),
                         }
                     )
-                else:
-                    finished.set()
+                if len(captured) >= args.max_frames or time.monotonic() >= deadline:
+                    stop_now = True
+            if stop_now and not finished.is_set():
+                finished.set()
+                adapter.stop()  # same thread as adapter.start()'s loop — see above
             return original_normalise(payload)
 
         adapter.normalise = _spy  # type: ignore[method-assign]
@@ -166,15 +197,24 @@ def main(argv: list[str] | None = None) -> int:
     thread = threading.Thread(target=_record_raw, daemon=True)
     thread.start()
 
-    deadline = time.monotonic() + args.seconds
-    while time.monotonic() < deadline and not finished.is_set():
-        time.sleep(0.2)
-
-    adapter.stop()
+    # A watchdog, not the stop trigger — the actual stop() call happens inside
+    # the capture thread itself (see _spy above). If literally zero frames
+    # arrive during the whole window there is nothing to trigger a same-thread
+    # stop from, and this must NOT fall back to calling adapter.stop() here,
+    # since that is exactly the cross-thread pattern being avoided. The extra
+    # 15s covers one final frame arriving just after the deadline.
+    finished.wait(timeout=args.seconds + 15.0)
     thread.join(timeout=10.0)
 
     with lock:
         frames = list(captured)
+
+    if not finished.is_set():
+        print(
+            "No stop signal within the capture window — most likely zero frames "
+            "arrived at all (check market hours and the security id). The capture "
+            "thread is a daemon and will be reclaimed when this process exits."
+        )
 
     if not frames:
         print(

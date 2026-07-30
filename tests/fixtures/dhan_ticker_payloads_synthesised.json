@@ -1,6 +1,6 @@
 {
   "source": "synthesised",
-  "note": "Produced in Block 1 by packing Dhan's documented binary layouts and running them through the installed dhanhq marketfeed.process_data(), so the shape is the SDK's own rather than hand-written. Replaced by real captured payloads in Block 2. Contains no credentials or account data.",
+  "note": "SYNTHESISED, not captured -- produced in Block 1 by packing Dhan's documented binary layouts and running them through the installed dhanhq marketfeed.process_data(), so the shape is the SDK's own rather than hand-written. Deliberately kept alongside dhan_ticker_payloads_real.json (Block 2's real capture): this file exists solely to exercise every normalisation branch (Quote/OI/Previous-Close/status/untraded-instrument frames) that a real single-instrument ticker-mode capture cannot naturally produce. Do not delete when a new real tape is captured. Contains no credentials or account data.",
   "sdk_version": "2.2.0",
   "frames": [
     {
