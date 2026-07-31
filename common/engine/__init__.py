@@ -14,6 +14,7 @@ from .config import EngineConfig, SessionConfig
 from .daily_guard import DailyRiskConfig, DailyRiskGuard, DailyRiskState
 from .engine import TradingEngine
 from .feed import MarketDataFeed, MarketDataStatus, SimulatedFeed
+from .hub_feed import HubTickFeed
 from .models import (
     ExitReason,
     Moneyness,
@@ -50,6 +51,7 @@ __all__ = [
     "ExecutionGateway",
     "ExitReason",
     "FillOutcome",
+    "HubTickFeed",
     "InMemoryGateway",
     "MarketDataFeed",
     "MarketDataStatus",

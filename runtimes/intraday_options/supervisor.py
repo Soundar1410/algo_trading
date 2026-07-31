@@ -52,15 +52,17 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import os
+import queue as queue_module
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from common.config.models import ExecutionMode
 from common.execution import ExecutionRepository
-from common.feed import SharedFeedHub
+from common.feed import DEFAULT_TICK_MAX_DEPTH, SharedFeedHub
 from common.feed.hub import WorkerChannel, build_channel
 from common.health import HealthState, HeartbeatWriter
 from common.logging import get_logger
@@ -105,6 +107,10 @@ class SupervisorConfig:
     log_dir: Path
     candle_interval_seconds: int = 60
     queue_depth: int = DEFAULT_QUEUE_DEPTH
+    #: Depth of a worker's opt-in tick queue. Sized from a measured tick rate
+    #: rather than the candle queue's assumptions — see
+    #: :data:`common.feed.queues.DEFAULT_TICK_MAX_DEPTH`.
+    tick_queue_depth: int = DEFAULT_TICK_MAX_DEPTH
 
 
 @dataclass
@@ -137,6 +143,11 @@ class IntradayOptionsSupervisor:
         self._hub = SharedFeedHub(adapter, interval_seconds=config.candle_interval_seconds)
         self._workers: list[tuple[WorkerConfig, WorkerChannel]] = []
         self._processes: dict[str, mp.process.BaseProcess] = {}
+        #: Upstream control queues, one per tick-channel worker. The child puts a
+        #: security_id on its queue when its engine subscribes to a contract at
+        #: runtime; this process drains them and asks the hub, which applies the
+        #: request on the feed thread. See :meth:`_drain_control_queues`.
+        self._control_queues: dict[str, Any] = {}
         # Wrapped once, here: a notification channel must never be able to abort a
         # shutdown, and the alarm this class raises is sent while the runtime is
         # already in trouble — the worst moment to discover an unwrapped timeout.
@@ -146,8 +157,22 @@ class IntradayOptionsSupervisor:
     def hub(self) -> SharedFeedHub:
         return self._hub
 
-    def add_worker(self, worker_config: WorkerConfig) -> WorkerChannel:
-        """Register a strategy. Its queue is created here, before any spawn."""
+    def add_worker(
+        self,
+        worker_config: WorkerConfig,
+        *,
+        tick_channel: bool = False,
+    ) -> WorkerChannel:
+        """Register a strategy. Its queues are created here, before any spawn.
+
+        ``tick_channel=True`` additionally gives the worker the opt-in raw-tick
+        queue the ported engine reads, and an upstream control queue for the
+        runtime subscriptions it makes. The opt-in lives here rather than on
+        :class:`WorkerConfig` because Part 2b-ii-A deliberately leaves
+        ``worker.py`` untouched, so the walking-skeleton gates keep measuring
+        exactly what they measured before; Part 2b-ii-B is where the child
+        actually receives these queues.
+        """
         if worker_config.execution_mode is not ExecutionMode.PAPER:
             # Phase 1 has no live path at all. The broker factory would refuse
             # anyway; refusing here too means the supervisor never even spawns
@@ -161,10 +186,18 @@ class IntradayOptionsSupervisor:
             worker_config.strategy_id,
             [worker_config.security_id],
             max_depth=self._config.queue_depth,
+            tick_channel=tick_channel,
+            tick_max_depth=self._config.tick_queue_depth,
         )
         self._hub.register(channel)
         self._workers.append((worker_config, channel))
+        if tick_channel:
+            self._control_queues[worker_config.strategy_id] = mp.get_context("spawn").Queue()
         return channel
+
+    def control_queue(self, strategy_id: str) -> Any | None:
+        """The upstream subscription-request queue for one worker, if it has one."""
+        return self._control_queues.get(strategy_id)
 
     def run(
         self,
@@ -262,8 +295,38 @@ class IntradayOptionsSupervisor:
             )
             return result
         finally:
+            self._release_queues()
             database.close()
             lock.release()
+
+    def _release_queues(self) -> None:
+        """Stop undelivered events from holding this process open at exit.
+
+        A ``multiprocessing.Queue`` flushes through a feeder thread, and that
+        thread is **joined at interpreter exit**. If nothing drained the queue and
+        the pipe buffer is full, the join never completes and the process hangs
+        with no error — measured at ~65 KB of undelivered ticks, which the tick
+        channel reaches in a few hundred events.
+
+        That is the shape of failure Phase 3 Part 1 exists to prevent: a shutdown
+        path that can itself hang. So at shutdown — after the sentinel, after the
+        workers have been joined — undelivered market data is abandoned rather
+        than flushed. This is the same judgement the queues already make under
+        load: a lagging consumer gets the freshest data or none, never a stalled
+        producer. Nothing here is a trading record; those went to SQLite before
+        the broker was ever called.
+        """
+        for _, channel in self._workers:
+            for queue in (channel.queue, channel.tick_queue):
+                if queue is None:
+                    continue
+                cancel = getattr(queue.raw, "cancel_join_thread", None)
+                if cancel is not None:
+                    cancel()
+        for control_queue in self._control_queues.values():
+            cancel = getattr(control_queue, "cancel_join_thread", None)
+            if cancel is not None:
+                cancel()
 
     def _publish_final_health(
         self,
@@ -333,11 +396,17 @@ class IntradayOptionsSupervisor:
             feed_thread.start()
             heartbeat.beat(HealthState.running_for(ExecutionMode.PAPER), force=True)
             # The main thread has nothing else to do while the feed runs, so it
-            # spends the wait keeping the group's heartbeat fresh. Without this the
-            # dashboard would show one beat at startup and then a heartbeat age
-            # that climbs all session — indistinguishable from a dead supervisor.
+            # spends the wait keeping the group's heartbeat fresh and forwarding
+            # workers' runtime subscription requests. Without the beat the
+            # dashboard would show one at startup and then a heartbeat age that
+            # climbs all session — indistinguishable from a dead supervisor.
             while not wake.wait(timeout=HEARTBEAT_POLL_SECONDS):
+                self._drain_control_queues()
                 self._beat_running(heartbeat)
+            # Once more after the wake: a request that arrived in the same instant
+            # the feed finished is still worth applying, and costs nothing if the
+            # queues are empty.
+            self._drain_control_queues()
             if signalled.is_set():
                 result.stopped_by_signal = True
                 _log.info("shutdown requested; asking the feed to finish")
@@ -355,6 +424,33 @@ class IntradayOptionsSupervisor:
 
         if failure:
             raise failure[0]
+
+    def _drain_control_queues(self) -> None:
+        """Forward workers' runtime subscription requests to the hub.
+
+        Non-blocking, and it never calls the adapter itself: ``request_subscription``
+        only enqueues, and the hub applies it on the feed thread — the one thread
+        permitted to touch the connection. This method therefore stays safe to call
+        from the main thread while the feed thread is inside ``recv()``.
+
+        A malformed entry is logged and dropped rather than allowed to kill the
+        supervisor's loop: the child that sent it is the one with the problem, and
+        taking the whole group down with it would be a worse outcome.
+        """
+        for strategy_id, control_queue in self._control_queues.items():
+            while True:
+                try:
+                    security_id = control_queue.get_nowait()
+                except queue_module.Empty:
+                    break
+                if not isinstance(security_id, str) or not security_id:
+                    _log.warning(
+                        "ignoring a malformed subscription request from %s: %r",
+                        strategy_id,
+                        security_id,
+                    )
+                    continue
+                self._hub.request_subscription(strategy_id, security_id)
 
     def _beat_running(self, heartbeat: HeartbeatWriter) -> None:
         """One rate-limited liveness beat, carrying the group's queue picture."""

@@ -1,0 +1,141 @@
+"""The engine's tick source inside a worker process: the hub's tick channel.
+
+Phase 3 Part 2b-ii-A. :mod:`common.engine.feed` already named this module before
+it existed — "They meet in Part 2b-ii, where the hub's new tick channel is wrapped
+in a ``MarketDataFeed`` implementation reading the worker's queue" — and this is
+that implementation.
+
+It is the consumer half of a two-hop path::
+
+    supervisor process                       worker process
+    ------------------                       --------------
+    SharedFeedHub.on_tick                    HubTickFeed.run()
+      └─ tick_queue.publish(tick)  ──────▶     └─ engine.on_tick(tick)
+                                                   └─ feed.subscribe(contract)
+    hub.request_subscription(...)  ◀──────       └─ control_queue.put(...)
+
+Three things make this more than a queue drain.
+
+**The sentinel is a square-off request.** The supervisor publishes ``None`` per
+worker at shutdown, so a ``SIGTERM`` delivered only to the supervisor still
+reaches each worker's engine in-band. Honouring it *here* is the D18 boundary
+exactly: this loop is the thread that invokes ``engine.on_tick``, so the engine's
+positions and the feed are closed by the thread that owns them, not by whoever
+sent the signal.
+
+**Subscriptions travel upstream, not to a broker.** The engine picks an option
+contract at runtime and calls ``feed.subscribe(security_id)``. This process holds
+no connection, so the request is forwarded to the hub, which applies it on its own
+feed thread. ``unsubscribe`` deliberately does not propagate to the adapter — the
+subscription belongs to the group, and dropping it would starve any other worker
+holding the same instrument.
+
+**``stop()`` is still the owning thread's.** The engine calls it from
+``_handle_square_off``, which runs on this loop's thread. The Part 1 ownership rule
+therefore holds here with no new mechanism: nothing outside this thread ever ends
+the run except by way of the sentinel above.
+"""
+
+from __future__ import annotations
+
+import queue as queue_module
+from collections.abc import Callable
+from typing import Any
+
+from common.logging import get_logger
+from common.models import Tick
+
+from .feed import MarketDataFeed
+
+log = get_logger(__name__)
+
+#: How long to block on the queue before re-checking the running flag. Short
+#: enough that a ``stop()`` from inside a tick callback is noticed promptly,
+#: long enough not to spin.
+DEFAULT_POLL_SECONDS = 0.5
+
+#: How long a run tolerates an empty queue before concluding the tape is
+#: finished. ``None`` disables it, for a live session that must outlast a quiet
+#: patch. Mirrors the worker's own ``idle_timeout_seconds``.
+DEFAULT_IDLE_TIMEOUT_SECONDS: float | None = 10.0
+
+
+class HubTickFeed(MarketDataFeed):
+    """A :class:`MarketDataFeed` over one worker's bounded tick queue."""
+
+    def __init__(
+        self,
+        tick_queue: Any,
+        *,
+        request_subscription: Callable[[str], None] | None = None,
+        on_square_off: Callable[[str], None] | None = None,
+        poll_seconds: float = DEFAULT_POLL_SECONDS,
+        idle_timeout_seconds: float | None = DEFAULT_IDLE_TIMEOUT_SECONDS,
+    ) -> None:
+        super().__init__()
+        self._queue = tick_queue
+        self._request_subscription = request_subscription
+        self._on_square_off = on_square_off
+        self._poll = poll_seconds
+        self._idle_timeout = idle_timeout_seconds
+        #: Observable outcome, so a worker can report *why* the run ended rather
+        #: than inferring it. Set before ``run()`` returns, never cleared.
+        self.stopped_by_sentinel = False
+        self.stopped_by_idle_timeout = False
+        self.ticks_received = 0
+
+    # ---------------------------------------------------------------- running
+    def run(self) -> None:
+        """Drain ticks into the registered handler until stopped or idle.
+
+        Ends in exactly three ways: the sentinel (an orderly shutdown asked for
+        from the supervisor), :meth:`stop` from inside a tick callback (the
+        engine's own square-off), or the idle timeout (an exhausted tape).
+        """
+        self._running = True
+        idle_seconds = 0.0
+        try:
+            while self._running:
+                try:
+                    item = self._queue.get(timeout=self._poll)
+                except queue_module.Empty:
+                    idle_seconds += self._poll
+                    if self._idle_timeout is not None and idle_seconds >= self._idle_timeout:
+                        self.stopped_by_idle_timeout = True
+                        log.info(
+                            "no ticks for %.1fs; treating the stream as finished",
+                            idle_seconds,
+                        )
+                        return
+                    continue
+
+                idle_seconds = 0.0
+
+                if item is None:
+                    # The supervisor's shutdown sentinel. Tell the engine and let
+                    # it square off on this thread — see the module docstring.
+                    self.stopped_by_sentinel = True
+                    log.info("shutdown sentinel received; asking the engine to square off")
+                    if self._on_square_off is not None:
+                        self._on_square_off("supervisor sentinel")
+                    return
+
+                tick: Tick = item
+                self.ticks_received += 1
+                self._emit(tick)
+        finally:
+            self._running = False
+
+    # ---------------------------------------------------------- subscriptions
+    def _do_subscribe(self, security_id: str) -> None:
+        """Forward upstream; this process owns no connection to subscribe on."""
+        if self._request_subscription is None:
+            log.warning(
+                "no subscription channel wired; ticks for %s will never arrive",
+                security_id,
+            )
+            return
+        self._request_subscription(security_id)
+
+    def _do_unsubscribe(self, security_id: str) -> None:
+        """Deliberately a no-op upstream. See the module docstring."""

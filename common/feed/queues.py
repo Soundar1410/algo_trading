@@ -24,6 +24,20 @@ from typing import Any
 
 DEFAULT_MAX_DEPTH = 1000
 
+#: Depth for a worker's **tick** channel (Phase 3 Part 2b-ii-A). Sized from the
+#: only tick-rate evidence this repository has — its own Phase 2 Block 2 live
+#: capture, 121 ticks over 30 s for one instrument in ticker mode, ~4 ticks/s.
+#: An engine worker holds the underlying plus at most one option contract at a
+#: time; sizing generously at ~10 ticks/s/instrument peak gives ~20-30 ticks/s,
+#: so this is roughly 60-70 s of buffer at that peak and ~8 minutes at the
+#: measured rate (~400 KB pickled).
+#:
+#: The reasoning is the candle queue's, applied to a different arrival rate:
+#: deep enough that a briefly busy worker loses nothing, shallow enough that a
+#: wedged one is detected rather than accumulating a day of stale data. A worker
+#: more than a minute behind on ticks is producing stale risk decisions anyway.
+DEFAULT_TICK_MAX_DEPTH = 2048
+
 
 @dataclass(frozen=True)
 class QueueStats:

@@ -7,8 +7,8 @@ the next phase. Updated after every phase.
 
 | | |
 |---|---|
-| **Current phase** | Phase 3 **Part 1 — complete** (live-feed shutdown path); **Part 2a — complete** (exit-policy registry); **Part 2b-i — complete** (signal ownership + `TradingEngine` core port), awaiting review |
-| **Next phase** | Phase 3 Part 2b-ii — hub tick channel, worker wiring, `LifecycleGateway` (see section 8) |
+| **Current phase** | Phase 3 **Part 1 — complete** (live-feed shutdown path); **Part 2a — complete** (exit-policy registry); **Part 2b-i — complete** (signal ownership + `TradingEngine` core port); **Part 2b-ii-A — complete** (hub tick channel, runtime subscription, `HubTickFeed`), awaiting review |
+| **Next phase** | Phase 3 Part 2b-ii-B — `LifecycleGateway`, the `SquareOffAuthority` reconciliation, worker wiring (see section 8) |
 | **Last updated** | 31 July 2026 |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
@@ -23,7 +23,7 @@ the next phase. Updated after every phase.
 | 0 | Reference audit + minimal bootstrap | **Complete** |
 | 1 | Walking skeleton | **Complete** |
 | 2 | Dhan and shared-feed hardening | **Complete** — Block 1 (offline) + Block 2 (live) |
-| 3 | Preserve custom engines and policies | **Part 1 complete** (live-feed shutdown); **Part 2a complete** (exit registry + SuperTrend port); **Part 2b-i complete** (signal ownership + engine core); Part 2b-ii (tick channel, worker wiring, persistence bridge) not started |
+| 3 | Preserve custom engines and policies | **Part 1 complete** (live-feed shutdown); **Part 2a complete** (exit registry + SuperTrend port); **Part 2b-i complete** (signal ownership + engine core); **Part 2b-ii-A complete** (the feed seam: tick channel, runtime subscription, `HubTickFeed`); Part 2b-ii-B (persistence bridge, square-off reconciliation, worker wiring) not started |
 | 4 | Candle, indicator and paper-execution foundation | Not started |
 | 5 | Mixed-mode supervisor and persistence | Not started |
 | 6 | Paper recovery and expiry handling | Not started |
@@ -465,6 +465,98 @@ No ADX/ATR indicators, and therefore no real regime classifier.
 
 ---
 
+### What Phase 3 Part 2b-ii-A delivered
+
+Part 2b-ii was split, as Part 2 and Part 2b already had been. The feed seam and the
+execution seam are independent, and the acceptance gate cannot be measured until
+both land — so **2b-ii-A** is the feed seam alone, with `worker.py`,
+`FixtureSignalStrategy` and both walking-skeleton gates **untouched**, and
+**2b-ii-B** is the execution seam and the wiring. See section 8.
+
+#### The square-off decision, confirmed against the spec
+
+Section 8 required this be confirmed before implementing, and it is — though the
+implementation itself is 2b-ii-B's. Two passages decide it, both pointing the same
+way as the leading candidate:
+
+| Spec passage | What it settles |
+|---|---|
+| Execution §10 *Intraday square-off* — "Square-off is a runtime responsibility… **A process restart must not reset the square-off state** or allow new entries after the cutoff." | `MarketSession`'s `_squared_off` is an in-memory latch a restart resets. It cannot own the decision. |
+| Architecture §13 *Risk hierarchy* — "Intraday square-off time" is a **Runtime-level** control; "Entry cutoff" and "Exit time" are **Strategy-level**. | The policy owns square-off; `MarketSession.can_enter` and the holiday calendar stay. |
+
+**One thing section 8's framing did not cover.** `SessionConfig.square_off_time` and
+`SquareOffPolicy.square_off_at` are *separately configured*, so removing the second
+decider still leaves two configured times free to drift apart. The reconciliation
+therefore derives one from the other at wiring time rather than only removing the
+duplicate decision. Agreed shape, for 2b-ii-B:
+
+* `TradingEngine` gains an injected `SquareOffAuthority` (`due(ts)` / `completed(ts)`),
+  replacing the direct `session.is_past_square_off(...)` call at `engine.py:453`.
+  The default implementation wraps the session clock, so every ported engine test
+  and every offline run is unchanged.
+* The worker injects an implementation backed by `SquareOffPolicy` +
+  `SquareOffState`, loaded at startup — so an engine restarted at 15:25 reads
+  `COMPLETED` and does not re-close a position the previous process already closed.
+* `SessionConfig` is built *from* `SquareOffPolicy`, so the two times cannot drift.
+* `MarketSession` keeps `can_enter`, `is_open` and the holiday calendar.
+
+#### What was built
+
+| Piece | What it does |
+|---|---|
+| Hub tick channel | A **second** bounded queue per worker, opt-in. Separate rather than mixed-type because the two streams have very different arrival rates and therefore different depths — and because keeping them apart is what leaves the candle path bit-for-bit unaffected. `WorkerChannel` stays frozen; it gains `tick_queue` and a mutable `dynamic_ids` set, so the registration record and the runtime additions stay distinguishable |
+| `request_subscription()` | Thread-safe, enqueue-and-return. Applied at the top of `on_tick`, on the thread that owns the connection — Part 1's rule and D18's, one layer out (**D24**) |
+| Supervisor control queues | One `mp.Queue` per opted-in worker, drained every heartbeat-loop iteration. The child's end is 2b-ii-B's |
+| `common/engine/hub_feed.py` | `HubTickFeed`, the `MarketDataFeed` the ported engine consumes. Maps the supervisor's `None` sentinel to a square-off request — section 8's item 3 — and forwards `subscribe()` upstream |
+| `_release_queues()` | The fix for a real hang found here, not anticipated (**D25**) |
+| `DEFAULT_TICK_MAX_DEPTH = 2048` | Sized from the only tick-rate measurement this repository has: Block 2's live capture, 121 ticks / 30 s for one instrument (~4/s). Two instruments at a generous ~10/s peak is ~60-70 s of buffer |
+
+#### Finding: undelivered ticks wedged the supervisor's own exit
+
+Not a test artefact, and worth stating plainly because it was found by a hang
+rather than by reasoning. A `multiprocessing.Queue` joins its feeder thread at
+interpreter exit; a producer holding undelivered events behind a full pipe never
+exits, with **no error and no exit code**. Isolated and measured: 324 items × 200 B
+≈ 65 KB reproduces it (`exitcode=None, alive=True`), and `cancel_join_thread()`
+clears it (`exitcode=0`).
+
+The candle channel never came close — it carries six bars where the tick channel
+carries thousands of ticks. So the tick channel introduced a shutdown path that
+could itself hang, which is precisely the failure Part 1 exists to prevent. Fixed
+at the cause (**D25**) and pinned by
+`test_undelivered_ticks_do_not_wedge_the_supervisors_exit`, which drives >400
+undelivered ticks through a real supervised run.
+
+#### Test evidence
+
+**39 new tests**, all passing; suite **620 → 659**.
+
+| Group | Count | What it covers |
+|---|---|---|
+| `tests/integration/test_feed_tick_channel.py` | 18 | Opt-in routing, the candle channel proven unchanged, the runtime-subscription round trip and its negative control, sizing at the measured live rate, drop-oldest/counted/non-blocking under an undersized queue, and the no-ticks-no-subscription residual asserted as a fact |
+| `tests/integration/test_hub_tick_feed.py` | 12 | Delivery, the sentinel → square-off mapping, idle timeout, `stop()` from inside a tick callback, upstream subscription forwarding |
+| `tests/integration/test_engine_over_hub.py` | 4 | **The Part 2b-ii-A gate.** A real hub → real bounded queue → real `HubTickFeed` → real `TradingEngine` → real Part 2a exit policy, on the deployed two-thread topology |
+| `tests/end_to_end/test_supervisor.py` (extended) | 5 | Opt-in plumbing, the control-queue hop, a malformed request not killing the group, and the wedge regression |
+
+Two test doubles here pace themselves deliberately rather than sleeping, and the
+reason is worth recording: the hub applies a pending subscription **at a tick
+boundary**, so a double that goes silent while waiting for the round trip
+reproduces limitation 15 instead of testing the round trip. Both keep the
+underlying ticking, bounded, so a failure is an assertion rather than a hang.
+
+### What Phase 3 Part 2b-ii-A deliberately did NOT deliver
+
+No `LifecycleGateway` and no persisted-`Position` bridge. No `SquareOffAuthority`
+implementation — the decision is confirmed and its shape agreed, but the code is
+2b-ii-B's. No worker engine path: `worker.py` and `FixtureSignalStrategy` are
+**untouched**, and the child does not yet receive the tick or control queues, so
+both walking-skeleton gates still exercise exactly what they did before. No
+entry-block-on-tick-drop (it needs the engine wired). No adapter-level
+unsubscribe. No `MultiLegEngine`/`FixedStrikeEngine`, no real strategy, no live
+order placement.
+
+---
+
 ## 2. Reference-repository reuse inventory
 
 Audited read-only on 29 July 2026. **No file under `Trading_Automation` was
@@ -644,6 +736,10 @@ guard. See deviation D6.
 | **D21** | **Regime tagger ported null-classifier only** | ~120 lines of 421. The one real classifier (`adx_atr`) is built on ADX and ATR, which Part 2a deliberately did not port because nothing consumed them. The regime axis is purely observational — it tags trades and changes no trading decision — so a tagger that labels everything `UNCLASSIFIED` is exactly the reference's own behaviour with `regime.enabled: false`, which is also this repository's default. The registry and contract came across intact, so adding the classifier later is a new file plus one decorator. |
 | **D22** | **The Part 2b test-port list was wrong, and is corrected** | Section 8 listed four reference suites. Verified against the source: `test_opening_candle_coverage.py` (670) exercises **`FixedStrikeEngine`** via `nifty_fixed_strike_wide_sell.app.build_engine` and never touches `TradingEngine` — excluded. `test_session_candle_gating.py` holds **one** `TradingEngine` test of three; the others need MultiLeg/FixedStrike. `test_mfe_mae.py` tests `PositionManager`/`PaperBroker`, not the engine, but is worth porting for the MFE/MAE contract. `test_premium_candle_exit.py` (9 tests) is the only end-to-end engine suite and builds the **real EMA-cross strategy**, which `CLAUDE.md` defers to Phase 9 — so its nine properties are rebuilt against a test-only double, with the real Part 2a exit policy still making the exit decision. The diff-fidelity loss on those nine is real: they prove the engine's behaviour, not that a ported strategy still matches itself. There is also **no upstream coverage of the signal path at all**, so the ten gate tests are written here. **The rebuilt nine are the one part of this port that is not diff-provable, so the property-by-property mapping is written out below rather than asserted** — including the one property that does not map. |
 
+| **D23** | **The engine aggregates the underlying a second time, beside the hub** | D9 aggregates centrally so every worker provably sees identical bars. A worker driving the ported `TradingEngine` off the new tick channel builds its own bars from the same ticks, so that guarantee no longer holds for it: a dropped tick quietly changes *that worker's* OHLC rather than removing a whole bar visibly. Accepted because the alternative is worse — the hub aggregates at 60 s while the engine wants `cfg.timeframe`, so hub-fed bars would need a new candle→candle aggregator plus an injected entry point bypassing `_on_underlying_tick`, which the ported session-gating test pins attribute by attribute. It also moves *toward* spec section 6, which describes distributing normalised ticks; D9 was always the deviation. Mitigated three ways: the depth is sized from a measured tick rate (`DEFAULT_TICK_MAX_DEPTH`, and a test asserts zero drops at that rate), every drop is counted and surfaced in `queue_stats()`, and Part 2b-ii-B blocks new entries for the day once a drop occurs. Recorded as limitation 14. |
+| **D24** | **Runtime subscriptions are applied at a tick boundary, not when requested** | The engine picks an option contract mid-session, but the hub subscribes a fixed union at `start()` and the worker is a different process. `request_subscription()` enqueues and returns; `on_tick` drains it and calls `adapter.subscribe()` on the thread that owns the connection. The same shape as Part 1's `request_stop()` and D18's `request_square_off()`, one layer out. Notably this is *stricter than necessary*: `dhanhq` 2.2.0's `subscribe_symbols` routes through `asyncio.run_coroutine_threadsafe` and would tolerate a cross-thread call, unlike `close_connection`. Relying on that would put this repository's ownership rule inside the SDK, where an upgrade could revoke it silently. Cost: a subscription needs a tick to be applied — limitation 15. |
+| **D25** | **Undelivered queue contents are abandoned at shutdown, not flushed** | A `multiprocessing.Queue` joins its feeder thread at interpreter exit, so a producer holding undelivered events behind a full pipe never exits — **measured at ~65 KB**, which the tick channel reaches in a few hundred ticks. This was found as a real hang in Part 2b-ii-A, not reasoned about in advance. `_release_queues()` therefore calls `cancel_join_thread()` on the queues the supervisor owns, after the sentinel and after the workers are joined. Recorded as a deviation because it discards data on a shutdown path: the same judgement the queues already make under load (a lagging consumer gets the freshest data or none, never a stalled producer), and nothing at risk is a trading record — those reach SQLite before the broker is called. The alternative is a shutdown that can itself hang, which is the failure Part 1 exists to prevent. |
+
 #### D22 in detail: the rebuilt premium-candle mapping
 
 Every other port in Phase 3 is provable by diff — sorted test-name lists, identical
@@ -810,7 +906,9 @@ common/market_data/dhan.py     request_stop(); start() closes on its own thread;
                                stop() refuses a cross-thread close rather than hang
 common/feed/reconnect.py       stop() routes by ownership; request_stop();
                                wait_until_stopped(); owner-thread close handoff
-common/feed/hub.py             request_stop() — adapter signal without the flush
+common/feed/hub.py             request_stop() — adapter signal without the flush;
+                               request_subscription() — same shape, one layer out
+                               (Part 2b-ii-A, D24)
 runtimes/.../supervisor.py     feed on its own daemon thread; SIGTERM/SIGINT
                                handlers, installed and restored; ordered shutdown;
                                group session + heartbeats; DEGRADED/error/notify
@@ -850,7 +948,28 @@ tests/unit/test_engine_session_gating.py             1, ported verbatim
 tests/integration/test_engine_premium_candle_exit.py 12, rebuilt (D22)
 tests/integration/test_engine_square_off.py          10, new: the signal-ownership gate
 
-tests/    408 unit, 112 integration, 26 end-to-end, 6 smoke (skipped)
+--- Phase 3 Part 2b-ii-A (the feed seam) ---
+
+common/feed/queues.py          DEFAULT_TICK_MAX_DEPTH = 2048, sized from a
+                               measured tick rate (Block 2: ~4 ticks/s/instrument)
+common/feed/hub.py             opt-in tick channel; request_subscription() applied
+                               at the on_tick boundary (D24); drop_subscription();
+                               queue_stats() covers both queues
+common/engine/hub_feed.py      HubTickFeed — the MarketDataFeed the engine consumes;
+                               sentinel None -> square-off request; subscribe()
+                               forwarded upstream
+runtimes/.../supervisor.py     per-worker tick + control queues (opt-in via
+                               add_worker(tick_channel=True)); control queues
+                               drained each heartbeat iteration; _release_queues()
+                               so undelivered ticks cannot wedge exit (D25)
+
+tests/integration/test_feed_tick_channel.py          18, new: routing, sizing, D24
+tests/integration/test_hub_tick_feed.py              12, new: the worker-side feed
+tests/integration/test_engine_over_hub.py            4, new: the Part 2b-ii-A gate
+tests/end_to_end/test_supervisor.py                  +5: plumbing, control-queue
+                                                     hop, the D25 wedge regression
+
+tests/    460 unit, 168 integration, 31 end-to-end, 6 smoke (skipped)
   fixtures/nifty_tick_tape.json                       24 ticks, 6 one-minute buckets
   fixtures/dhan_ticker_payloads_synthesised.json       SYNTHESISED in Block 1 from the
                                                        SDK's own parsers; kept permanently
@@ -1073,6 +1192,62 @@ signal-ownership suite was run **10 consecutive times**: 10 clean, no flake.
 Note that `pytest` here must be invoked without an extra `-q`: `addopts = "-q"` is
 already set in `pyproject.toml`, so a second one suppresses the summary line
 entirely and a run can look like it produced no result at all.
+
+### Verification results (Phase 3 Part 2b-ii-A, 31 July 2026)
+
+| Check | Command | Result |
+|---|---|---|
+| Tests | `.venv/bin/python -m pytest` | **659 passed, 6 skipped** |
+| Lint | `.venv/bin/ruff check .` | **All checks passed!** |
+| Format | `.venv/bin/ruff format --check .` | **143 files already formatted** |
+| Types | `.venv/bin/mypy` | **Success: no issues found in 101 source files** |
+
+Test distribution: 460 unit (unchanged), 168 integration (was 134), 31 end-to-end
+(was 26), 6 smoke (skipped by design). All 39 new tests are integration or
+end-to-end, which is where a seam between threads and processes can actually be
+observed.
+
+**Baseline measured again, not assumed**, by the same method Part 2b-i used —
+`HEAD` (`40038c6`) checked out into a detached worktree and run with the same
+interpreter: **620 passed, 6 skipped**. Working tree: **659 passed, 6 skipped**.
+The delta is exactly +39 with an identical skip count, so no pre-existing test was
+modified, silenced or newly skipped.
+
+```bash
+git worktree add /tmp/baseline-2biiA HEAD --detach
+cd /tmp/baseline-2biiA && PYTHONPATH=$PWD /Volumes/Trading/algo_trading/.venv/bin/python -m pytest
+git worktree remove /tmp/baseline-2biiA --force
+```
+
+**Every test crossing a thread or process boundary ran 10 consecutive times** — the
+standing rule from Parts 1, 2a and 2b-i — covering the two new suites, the gate,
+the cross-thread shutdown suite, the supervisor, the signal suite and the walking
+skeleton: `72 passed` on all ten runs, 22.2-22.6 s each. No flake.
+
+**The duplicate-worker race was re-measured, not assumed safe.** Part 2b-i recorded
+that re-exporting an engine symbol pushed child import cost 0.382 s → 0.604 s and
+lost a 0.5 s race. `common.engine.hub_feed` therefore must not enter the worker's
+import graph, and does not:
+
+```
+$ python -c "import runtimes.intraday_options.worker; ..."
+common.engine modules: []
+common.exit modules:   []
+median worker import: 0.111s over 5 runs
+```
+
+#### Phase 3 Part 2b-ii-A gate evidence
+
+| Requirement (runbook §8 Part 2b-ii item 1) | Evidence |
+|---|---|
+| A tick channel alongside the completed-candle stream | `test_an_opted_in_worker_receives_the_raw_ticks_in_order`; the candle path proven untouched by `test_the_candle_channel_is_unchanged_by_the_tick_channel` (bar-for-bar equality between an opted-in and a plain worker) |
+| Opt-in per worker | `test_a_worker_that_did_not_opt_in_has_no_tick_queue` (and `hub.ticks_published == 0`); `test_a_worker_gets_no_tick_channel_unless_it_asks` through a real supervised run |
+| Part 1's bounded-queue + drop-oldest-and-count policy reused | `test_an_undersized_tick_queue_drops_the_oldest_and_counts_it`; `test_publishing_ticks_never_blocks_the_feed_callback` |
+| **Sized for realistic tick arrival, not candle-rate assumptions** | `test_a_minute_at_the_measured_live_rate_drops_nothing` — four minutes of two instruments at Block 2's measured 4 ticks/s against the real default depth, zero drops; `test_the_default_tick_depth_buffers_more_than_a_minute_of_peak_arrival` pins the stated justification as arithmetic |
+| The engine actually runs on it | `tests/integration/test_engine_over_hub.py` — real hub, real bounded queue, real `HubTickFeed`, real `TradingEngine`, real Part 2a exit policy, on the deployed two-thread topology; the contract is chosen mid-session and proven absent from the configured union |
+| Supervisor sentinel reaches the engine (item 3, the half that is A's) | `test_the_shutdown_sentinel_asks_the_engine_to_square_off`; `test_ticks_queued_after_the_sentinel_are_not_delivered` |
+| Live still fail-closed | Unchanged: the only new adapter call is `subscribe()`, which is read-only. All 12 `tests/unit/test_broker_factory.py` tests pass; no `DhanLiveBroker` order method exists |
+| Both walking-skeleton gates still pass | `tests/end_to_end/test_walking_skeleton.py` unchanged and green, 10 consecutive runs; `worker.py` and `FixtureSignalStrategy` untouched |
 
 #### Phase 3 Part 2b-i gate evidence
 
@@ -1417,6 +1592,40 @@ start/stop/crash/restart tests pass.
     clean-run case that must **not** raise one. Revisit only with evidence about
     how the SDK behaves on a socket that has stopped delivering — which needs
     limitation 2 closed first.
+14. **A dropped tick silently corrupts one worker's bars, rather than removing one
+    visibly.** Introduced by the Part 2b-ii-A tick channel, deliberately (**D23**).
+    D9's guarantee is that every worker sees byte-identical bars because there is
+    exactly one aggregator per instrument; a worker driving the ported engine off
+    raw ticks builds its own, so under queue overflow its OHLC quietly differs from
+    the hub's for that interval. This is *worse in kind* than a candle-channel drop,
+    which loses a whole bar and is obvious.
+
+    **Why it is accepted:** the alternative needs a candle→candle aggregator (the
+    hub runs at 60 s, the engine wants `cfg.timeframe`) plus an engine entry point
+    bypassing `_on_underlying_tick`, which the ported session-gating test pins
+    attribute by attribute. It also moves toward spec section 6 — distributing
+    normalised ticks is what the spec describes, and D9 was always the deviation.
+
+    **What bounds it:** the depth is sized from a measured rate rather than a guess
+    (`DEFAULT_TICK_MAX_DEPTH = 2048`, ~60-70 s of buffer at a generous peak, with
+    `test_a_minute_at_the_measured_live_rate_drops_nothing` asserting zero drops at
+    Block 2's observed 4 ticks/s), and every drop is counted in `queue_stats()` and
+    logged at `WARNING`. **Not yet closed:** the entry-block-on-drop that turns a
+    counted drop into a refusal to trade needs the engine wired into the worker, so
+    it lands in Part 2b-ii-B. Until then a drop is visible but not acted on.
+15. **A runtime subscription needs a tick to be applied.** The hub applies pending
+    subscriptions at the top of `on_tick`, on the thread that owns the connection
+    (**D24**), so a feed delivering nothing never applies one — the same shape as
+    limitation 13, and bounded by the same reasoning: during market hours frames
+    arrive continuously, and `start()` drains once before the adapter loop for
+    anything requested at startup. Asserted rather than assumed by
+    `test_a_subscription_requested_while_no_ticks_flow_is_never_applied`.
+
+    Consequence when it bites: the engine's pending entry never fills, because it
+    deliberately waits for a *fresh* tick on the chosen contract rather than using a
+    cached price. That is the safe direction — no entry rather than an entry at a
+    stale price — but it is silent today. Worth an alarm alongside 2b-ii-B's
+    entry-block work.
 
 ### Operational risk noted during the audit
 
@@ -1531,17 +1740,18 @@ does not exist, all 12 broker-factory tests pass unchanged, and no file under
 
 ## 8. Next phase
 
-Phase 2 is complete, both blocks. Phase 3 **Part 1**, **Part 2a** and **Part 2b-i**
-are complete. Next is Phase 3 **Part 2b-ii**.
+Phase 2 is complete, both blocks. Phase 3 **Part 1**, **Part 2a**, **Part 2b-i** and
+**Part 2b-ii-A** are complete. Next is Phase 3 **Part 2b-ii-B**.
 
 ### Phase 3 — preserve custom engines and policies
 
-**Phase 3 has four parts, in strict order.** Part 1 was a dedicated fix — planned
+**Phase 3 has five parts, in strict order.** Part 1 was a dedicated fix — planned
 and reviewed on its own, before the port began, not folded into it. Part 2 was
-then split twice: the exit registry does not depend on `TradingEngine`, so it was
-ported and proven on its own (Part 2a); and the engine's port is separable from the
-seams that wire it in, so the port landed first (Part 2b-i) and the wiring follows
-(Part 2b-ii).
+then split three times: the exit registry does not depend on `TradingEngine`, so it
+was ported and proven on its own (Part 2a); the engine's port is separable from the
+seams that wire it in, so the port landed first (Part 2b-i); and the two remaining
+seams are independent of each other, so the feed seam landed on its own
+(Part 2b-ii-A) and the execution seam follows (Part 2b-ii-B).
 
 #### Part 1 — live-feed shutdown path — **COMPLETE** (30 July 2026)
 
@@ -1584,30 +1794,62 @@ evidence in section 4.
 The original blocker text is preserved in the git history of this file; the
 resolution and the reason it took the shape it did are now in D18.
 
-#### Part 2b-ii — wire the engine in — **NOT STARTED**
+#### Part 2b-ii-A — the feed seam — **COMPLETE** (31 July 2026)
 
-The engine exists and is proven offline. What remains is every seam between it and
-the rest of the runtime. In rough dependency order:
+Delivered item 1 of the Part 2b-ii list below, the half of item 3 that belongs to
+the feed (the sentinel → `request_square_off` mapping), and the **confirmation**
+item 4 required before anything could be implemented. 39 new tests, suite 620 →
+659, both walking-skeleton gates re-measured and green. Full record: "What Phase 3
+Part 2b-ii-A delivered" (section 1), deviations D23-D25, limitations 14 and 15, and
+the Part 2b-ii-A gate evidence in section 4.
 
-1. **Add a tick channel to the shared feed hub.** Deviation D9 reserved this
-   ("a tick channel can be added alongside this one without reshaping the queues").
-   The engine is tick-driven — underlying ticks build candles, option ticks drive
-   risk management and pending-entry fills — and a worker today receives only
-   completed candles, so without this the engine's tick routing has no data source.
-   The types already line up: the hub produces `common.models.Tick`, which is what
-   the ported engine reads.
+It also **found and fixed a real hang**: undelivered ticks on a
+`multiprocessing.Queue` blocked the supervisor's own process exit, with no error
+and no exit code, at a measured ~65 KB. The candle channel never came close; the
+tick channel reaches it in a few hundred ticks. That is a shutdown path that can
+itself hang, which is the failure Part 1 exists to prevent — fixed at the cause
+(D25) and pinned by a regression test.
+
+**`worker.py` and `FixtureSignalStrategy` are still untouched**, so the gates keep
+measuring what they measured before. The child does not yet receive the tick or
+control queues; that is 2b-ii-B.
+
+#### Part 2b-ii-B — the execution seam and the wiring — **NOT STARTED**
+
+The remaining seams between the engine and the runtime. In rough dependency order,
+carrying forward the original numbering:
+
 2. **Ship `LifecycleGateway`.** The `ExecutionGateway` seam exists and
    `InMemoryGateway` fills it offline; the real one builds a `common.models.Signal`
    and drives the existing `OrderLifecycle`, so every engine open and close is
    persisted with a correlation ID, a fill row and `execution_mode`. **This is the
    remaining acceptance-gate item**: the test that pairs a real persisted
    `Position` with a real exit engine needs this to exist.
+
+   **Two hazards identified during 2b-ii-A planning — design for them, do not
+   discover them.** First, `signals` carries `UNIQUE (strategy_id, execution_mode,
+   instrument, candle_end_at)` (`0001_walking_skeleton.sql:86`) and the engine is
+   *not* candle-driven: two legs on one contract inside one second would collide,
+   and `record_signal` returns `None`, which `handle_signal` turns into a silent
+   skip. A suppressed **close** — a square-off, say — would leave a position open
+   while the engine believed it closed. Second, and consequently, a gateway call
+   that did not trade must **raise**, never fabricate a `FillOutcome`: a loud
+   failure leaves the position open in the database where restart recovery adopts
+   it, which is recoverable; a phantom close is not.
 3. **Wire the engine into `worker.py`**, behind the process's single signal
    installer: `with shutdown_signals(engine.request_square_off): engine.run()`,
-   using `common/process/signals.py`. The supervisor's queue sentinel (`None`) must
-   also map to `request_square_off()`, so a `SIGTERM` delivered only to the
-   supervisor still reaches each worker's engine in-band.
-4. **Reconcile `MarketSession` with `SquareOffPolicy`.** Both now answer "may I
+   using `common/process/signals.py`. The supervisor's queue sentinel (`None`) is
+   already mapped to `request_square_off()` by `HubTickFeed` (2b-ii-A); what remains
+   is the child receiving its tick and control queues and constructing the engine.
+4. **Reconcile `MarketSession` with `SquareOffPolicy`** — **decision confirmed in
+   2b-ii-A, implementation outstanding.** See "The square-off decision, confirmed
+   against the spec" in section 1 for the two spec passages that settle it and the
+   agreed shape (`SquareOffAuthority`, persisted-state implementation, and
+   `SessionConfig` derived from `SquareOffPolicy` so the two configured times cannot
+   drift). The analysis below is retained because it is the reasoning the decision
+   rests on.
+
+   Both now answer "may I
    enter?" and "is it square-off time?", from different state. Running both against
    one position means two square-off deciders, which is how a position gets closed
    twice. Decide which owns the decision before wiring, not during.
@@ -1643,8 +1885,13 @@ the rest of the runtime. In rough dependency order:
    ownership-and-signalling shape as D18, one layer down — and it keeps
    `MarketSession`'s genuinely additive parts (`can_enter`'s entry window, the
    holiday calendar) without letting its clock-only view of square-off compete.
-   Confirm against spec section 12 before implementing; it is recorded here as the
-   leading candidate, not as a decision already taken.
+   ~~Confirm against spec section 12 before implementing; it is recorded here as the
+   leading candidate, not as a decision already taken.~~ **Confirmed in 2b-ii-A**,
+   and by execution §10 / architecture §13 rather than §12 — §12 describes what a
+   restart must restore, while §10 states the rule directly ("a process restart must
+   not reset the square-off state") and §13 places square-off at **runtime** level
+   and the entry cutoff at **strategy** level. Both point the same way as the
+   candidate above.
 5. **Retain strategy-wise broker-factory routing** with the Phase 1 safety gate
    (deviation D5) — the engine's arrival must not reintroduce building a live
    broker from `mode: live` alone.
@@ -1655,8 +1902,12 @@ the rest of the runtime. In rough dependency order:
 Two smaller things worth carrying forward, both recorded in section 1: the latent
 race in `test_duplicate_worker_startup_is_refused` (a 0.5 s window that spawn import
 cost can exceed), and the fact that `worker.py` and `FixtureSignalStrategy` were
-deliberately left untouched in 2b-i so the walking-skeleton gates stayed honest —
-2b-ii is where that changes, and the gates must be re-measured when it does.
+deliberately left untouched in 2b-i so the walking-skeleton gates stayed honest.
+**Both still hold after 2b-ii-A**, which also left `worker.py` untouched and
+re-measured the import cost (zero `common.engine` modules in the worker's graph,
+0.111 s median). **2b-ii-B is where that changes** — it puts the engine in the
+child, which is exactly what pushed import cost past the window last time, so the
+measurement must be repeated and the gates re-run before it is called done.
 
 **Explicitly not in Phase 3:** `MultiLegEngine` and `FixedStrikeEngine`. The spec
 schedules each for "when the first consumer is scheduled", and there is no
@@ -1676,10 +1927,20 @@ real-`Position`-vs-real-exit-engine test is met for the engine's own `OpenPositi
 and deferred for the *persisted* `Position` to 2b-ii, which is where the bridge
 between them is built. Detail in section 4.
 
-**Acceptance gate (Part 2b-ii):** a worker drives the real engine off the hub's
-tick channel end to end; a real persisted `Position` is proven against a real exit
-engine; a real `SIGINT`/`SIGTERM` to a real worker child squares off and exits 0;
-both walking-skeleton gates still pass; live is still fail-closed.
+**Acceptance gate (Part 2b-ii-A) — met:** the real engine is driven off the hub's
+tick channel end to end, on the deployed two-thread topology, with a real Part 2a
+exit policy closing a position (`tests/integration/test_engine_over_hub.py`); the
+channel is sized and proven against a *measured* tick rate rather than candle-rate
+assumptions; the supervisor's sentinel reaches the engine as a square-off request;
+both walking-skeleton gates still pass, re-measured; live is still fail-closed. The
+persisted-`Position` half is explicitly **not** claimed here — it needs
+`LifecycleGateway`. Detail in section 4.
+
+**Acceptance gate (Part 2b-ii-B):** a real persisted `Position` is proven against a
+real exit engine, reconciling between the engine's view and the database after a
+full open→update→close cycle; restart recovery works with the engine wired, not
+just the fixture strategy; a real `SIGINT`/`SIGTERM` to a real worker child squares
+off and exits 0; both walking-skeleton gates still pass; live is still fail-closed.
 
 **Constraints unchanged, all parts:** paper mode only, live order placement
 unimplemented and fail-closed, no real strategies (Phase 9), no second
