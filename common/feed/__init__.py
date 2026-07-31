@@ -6,9 +6,11 @@ from .hub import SharedFeedHub, WorkerChannel, build_channel
 from .queues import (
     DEFAULT_MAX_DEPTH,
     DEFAULT_TICK_MAX_DEPTH,
+    DROP_NOTICE_EVERY,
     BoundedWorkerQueue,
     QueueStats,
     TickDropNotice,
+    drop_notice_cadence,
 )
 from .reconnect import (
     FeedHealth,
@@ -20,6 +22,7 @@ from .reconnect import (
 __all__ = [
     "DEFAULT_MAX_DEPTH",
     "DEFAULT_TICK_MAX_DEPTH",
+    "DROP_NOTICE_EVERY",
     "BoundedWorkerQueue",
     "FeedHealth",
     "FeedUnavailableError",
@@ -30,4 +33,5 @@ __all__ = [
     "TickDropNotice",
     "WorkerChannel",
     "build_channel",
+    "drop_notice_cadence",
 ]

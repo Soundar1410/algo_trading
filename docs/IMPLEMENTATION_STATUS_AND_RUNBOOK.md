@@ -661,32 +661,61 @@ never trap an open position — asserted, not asserted-in-a-comment.
 Not anticipated in the plan, and found by an existing 2b-ii-A test failing rather
 than by reasoning. `test_an_undersized_tick_queue_drops_the_oldest_and_counts_it`
 broke because the freshest item on the queue was now a notice rather than a tick.
-Reading the captured log made the second, larger point visible: the drop counter was
-advancing **two per incoming tick** rather than one, because publishing the notice
-into an already-full queue itself evicts an item.
-
-So the notice doubles the loss rate for as long as the overflow lasts. Accepted, and
-the reasoning is the same judgement the queues already make: the data being displaced
-is data the engine has just been told not to trust, the condition is already an
-incident, and publishing last is what makes delivery essentially certain — the notice
-is always the newest item, so a consumer that catches up at all receives it. The
-alternative, notifying on a bounded cadence, keeps the queue cleaner but loses the
-notice entirely on a short burst in a shallow queue, which fails at exactly the job
-the notice exists to do.
+Reading the captured log made the second point visible: the drop counter was
+advancing **two per incoming tick**, because publishing the notice into an
+already-full queue itself evicts an item.
 
 The existing test was **narrowed, not weakened**: the drop-oldest property is now
 asserted over the ticks (the candle channel has always needed the same narrowing for
 its `None` sentinel), and a new assertion was added that the notice is present.
 
+**Corrected after first commit, on measurement rather than argument.** The
+paragraph that stood here justified one-notice-per-drop on the grounds that a
+bounded cadence "loses the notice entirely on a short burst in a shallow queue".
+That was wrong twice over, and both errors are recorded rather than quietly fixed.
+
+First, the doubling of the *counter* is not a doubling of *tick* loss — the counter
+also counts evicted notices. Measured properly (ticks published minus ticks
+delivered) against a lagging consumer, 6000 ticks:
+
+| depth | policy | ticks delivered | extra lost | ticks processed before told |
+|---|---|---|---|---|
+| **2048** (deployed) | one per drop | 5284 | **358** (6.3%) | 4393 |
+| | cadence of 8 | 5590 | **52** (0.9%) | 4699 |
+| 256 | one per drop | 2738 | 1112 (29%) | 481 |
+| | cadence of 8 | 3689 | 161 (4%) | 517 |
+
+So one-per-drop bought a **6.5% earlier block for roughly seven times the data
+loss** — a trade worth making only if the latency mattered, and at four thousand
+ticks either way it does not.
+
+Second, the claim about short bursts was tested against a cadence of *64*, which was
+never the alternative. Swept across depths 4-2048 and run lengths 12-4000, a cadence
+of 8 reported every overflow at depth 8 and above. It did lose the notice at
+**depth 4** — which turned out to be the real invariant, and a sharper one than the
+original claim: a notice survives only while it is inside the retained window, and
+roughly one tick is published per drop, so *a cadence at or above the queue depth
+lets every notice be evicted before the next is sent*. `drop_notice_cadence()`
+therefore clamps to `min(8, depth // 2)`; at the deployed depth it returns 8
+unchanged, so the clamp only bites on the shallow queues that appear in tests.
+
+Two process notes worth keeping, because both were near misses. The first sweep that
+produced this conclusion **conflated "no overflow occurred" with "notice lost"** —
+the deep rows had simply never dropped anything — and would have supported the
+opposite conclusion if read as printed. And the parametrised regression written from
+it initially included three cells that never overflow; the guard
+`assert dropped > 0, "this case must actually overflow to mean anything"` is what
+caught that, and is kept for the next person.
+
 #### Test evidence, including the required fail-first demonstration
 
-**67 new tests**, all passing; suite **659 → 726** (6 skipped).
+**81 new tests**, all passing; suite **659 → 740** (6 skipped).
 
 | Group | Count | What it covers |
 |---|---|---|
 | `tests/unit/test_engine_square_off_authority.py` | 29 | The default authority's exact truth table; the persisted one against a **real** `ExecutionRepository` — `COMPLETED` suppresses, `FAILED` retries, inherited `IN_PROGRESS` retries and says so, the attempt written before the close and the completion after, one write not one per tick, an unreadable value failing *towards* squaring off, and no leakage across strategies or trading dates; the derived session times and the both-arguments refusal |
 | `tests/integration/test_engine_lifecycle_gateway.py` | 21 | **The B-1 gate.** A real engine over real SQLite: open → premium walk → the real Part 2a policy fires → close, then the engine's `Trade` reconciled against the persisted rows field by field. Plus both hazards: three executions on one contract in one second producing three rows, a suppressed signal raising and leaving the position **open** in the database, and a broker rejection raising rather than returning a fill |
-| `tests/integration/test_tick_drop_blocks_entries.py` | 17 | Real hub overflow → notice → feed → engine refuses the entry, with the same tape entering normally as the control; an open position still exiting after a drop; the latch holding the first reason; the pickle round trip; and the 2b-ii-A sizing mitigation re-asserted so this block cannot fire on a healthy run |
+| `tests/integration/test_tick_drop_blocks_entries.py` | 31 | Real hub overflow → notice → feed → engine refuses the entry, with the same tape entering normally as the control; an open position still exiting after a drop; the latch holding the first reason; the pickle round trip; the 2b-ii-A sizing mitigation re-asserted so this block cannot fire on a healthy run; and a 12-cell depth x run-length sweep pinning that **every** overflow is reported, which is the guarantee the cadence rests on |
 
 **Fail-first, run against the unchanged source.** New modules give only import
 errors, which is weak evidence, so the defect itself was demonstrated directly:
@@ -916,7 +945,7 @@ guard. See deviation D6.
 | **D25** | **Undelivered queue contents are abandoned at shutdown, not flushed** | A `multiprocessing.Queue` joins its feeder thread at interpreter exit, so a producer holding undelivered events behind a full pipe never exits — **measured at ~65 KB**, which the tick channel reaches in a few hundred ticks. This was found as a real hang in Part 2b-ii-A, not reasoned about in advance. `_release_queues()` therefore calls `cancel_join_thread()` on the queues the supervisor owns, after the sentinel and after the workers are joined. Recorded as a deviation because it discards data on a shutdown path: the same judgement the queues already make under load (a lagging consumer gets the freshest data or none, never a stalled producer), and nothing at risk is a trading record — those reach SQLite before the broker is called. The alternative is a shutdown that can itself hang, which is the failure Part 1 exists to prevent. |
 | **D26** | **Engine-originated `signals` rows carry a synthesised one-second window, with a microsecond disambiguator** | The dedup key is `(strategy_id, execution_mode, instrument, candle_end_at)`, which assumes a candle-driven producer. `TradingEngine` is tick-driven, so it has no bar to record and no natural uniqueness: an exit and a re-entry on one contract inside one second would collide, and `record_signal` turns a collision into a silent `None`. `LifecycleGateway` therefore records a degenerate bar — all four OHLC values are the reference price, the window is one second ending at the execution decision — and takes `max(ts, last_used_for_this_instrument + 1µs)`. Recorded as a deviation because the `candle_*` columns now mean something different depending on which producer wrote the row: for a candle-driven strategy they are the bar evaluated, for the engine they are the instant decided. Inventing a five-minute bar the engine never evaluated would have preserved the column's apparent meaning while destroying its truth. Per instrument rather than global, because the constraint does not span instruments and pushing unrelated contracts apart would distort their timestamps for nothing. Monotonic rather than random, so the rows stay in execution order |
 | **D27** | **`LifecycleGateway` reports a charges total with no component breakdown** | `InMemoryGateway` populates six components (brokerage, exchange, STT, SEBI, GST, stamp duty) because it calls `ChargesCalculator.for_leg` itself. The persisted path cannot: `PaperBroker` calls `total_for_leg` and `Fill` carries only the total, which is the number that reaches SQLite. Recomputing the split from rates inside the gateway would produce a breakdown that could silently disagree with the persisted total — two answers to one question, which is the failure mode D19 and D20 were both written to avoid. `Trade.charges` is unaffected: `PositionManager` sums the totals. Revisit if and when `Fill` carries a breakdown |
-| **D28** | **A dropped tick is reported to the worker in band, on the queue that dropped it** | The drop is detected and counted in the supervisor's process; the consumer that must act on it runs in the child. There is no other parent→child channel, and the tick queue already carries the `None` shutdown sentinel, so a `TickDropNotice` rides beside it. Two costs, both accepted deliberately. It is matched by **type**, not identity, because it crosses a pickle boundary — a module-level singleton would not survive. And publishing it into an already-full queue itself evicts an item, so **the loss rate doubles for as long as the overflow lasts** (measured: the drop counter advancing two per incoming tick). Accepted because the displaced data is data the engine has just been told not to trust, the condition is already an incident, and publishing last is what makes delivery near-certain — the notice is always the newest item. The bounded-cadence alternative keeps the queue cleaner but loses the notice entirely on a short burst in a shallow queue, failing at the one job it has |
+| **D28** | **A dropped tick is reported to the worker in band, on a cadence** | The drop is detected and counted in the supervisor's process; the consumer that must act on it runs in the child. There is no other parent→child channel, and the tick queue already carries the `None` shutdown sentinel, so a `TickDropNotice` rides beside it. It is matched by **type**, not identity, because it crosses a pickle boundary — a module-level singleton would not survive. **The cadence was corrected after the part was first committed, on measurement rather than argument.** The notice is pushed into a queue that is full by definition, so it evicts a real tick. One notice per drop — the first implementation — cost **358 extra lost ticks per 6000** at the deployed depth of 2048 against a lagging consumer (6.3% of delivery), to make the entry block engage **6.5% sooner** (after 4393 ticks rather than 4699). A cadence of 8 costs **52** (0.9%) for that same latency: roughly seven times less data for a difference in blocking latency that is not material when both are in the thousands. The original justification recorded here — that a bounded cadence "loses the notice entirely on a short burst in a shallow queue" — was **wrong**, and is corrected rather than quietly dropped: it was true of a cadence of 64, which was never the alternative on the table. The cadence is clamped to `min(8, depth // 2)` (`drop_notice_cadence`), which is the invariant it actually depends on: a notice reaches the consumer only while it is inside the retained window, and roughly one tick is published per drop, so a cadence at or above the depth lets every notice be evicted before the next is sent. Swept across depths 4-2048 and run lengths 12-4000: a fixed 8 reported every overflow at depth 8 and above but **lost the notice entirely at depth 4**; clamped, every overflowing case reported. At the deployed depth the clamp returns 8 unchanged, so it only bites on the shallow queues that appear in tests. |
 | **D29** | **A square-off left `IN_PROGRESS` by a dead process is retried, not honoured** | `SquareOffPolicy.trigger_at` returns `NONE` for `IN_PROGRESS`, which is right for the process that wrote it — it is mid-attempt — and wrong for a process that reads it at startup, because whoever owned that attempt is gone. Honouring it literally would leave a position open past square-off with nothing that will ever close it, which is the failure execution §10 exists to prevent; §10's own staged behaviour includes a retry window for exactly this. `PersistedSquareOffAuthority` therefore normalises an inherited `IN_PROGRESS` to `PENDING` at load and logs it at `WARNING`. Recorded as a deviation because it changes what a persisted state means depending on who read it. `trigger_at` is untouched and its unit test still passes: the normalisation is one layer up |
 
 #### D22 in detail: the rebuilt premium-candle mapping
@@ -1163,18 +1192,18 @@ common/engine/engine.py        square_off_authority injected; public block_entri
                                and entries_blocked
 common/engine/config.py        SessionConfig.from_square_off_policy(); from_resolved
                                refuses a session and a policy together
-common/feed/queues.py          TickDropNotice (D28)
-common/feed/hub.py             publishes the notice on a dropped tick
+common/feed/queues.py          TickDropNotice + drop_notice_cadence() (D28)
+common/feed/hub.py             publishes the notice on a cadence, per worker
 common/engine/hub_feed.py      recognises the notice; on_tick_dropped hook;
                                ticks_dropped_upstream
 
 tests/unit/test_engine_square_off_authority.py       29, new
 tests/integration/test_engine_lifecycle_gateway.py   21, new: the B-1 gate
-tests/integration/test_tick_drop_blocks_entries.py   17, new: limitation 14 closed
+tests/integration/test_tick_drop_blocks_entries.py   31, new: limitation 14 closed
 tests/integration/test_feed_tick_channel.py          1 narrowed (drop-oldest now
                                                      asserted over the ticks)
 
-tests/    489 unit, 206 integration, 31 end-to-end, 6 smoke (skipped)
+tests/    489 unit, 220 integration, 31 end-to-end, 6 smoke (skipped)
   fixtures/nifty_tick_tape.json                       24 ticks, 6 one-minute buckets
   fixtures/dhan_ticker_payloads_synthesised.json       SYNTHESISED in Block 1 from the
                                                        SDK's own parsers; kept permanently
@@ -1445,19 +1474,19 @@ median worker import: 0.111s over 5 runs
 
 | Check | Command | Result |
 |---|---|---|
-| Tests | `python -m pytest` | **726 passed, 6 skipped** |
+| Tests | `python -m pytest` | **740 passed, 6 skipped** |
 | Lint | `ruff check .` | **All checks passed!** |
 | Format | `ruff format --check .` | **148 files already formatted** |
 | Types | `mypy` | **Success: no issues found in 103 source files** |
 
-Test distribution: 489 unit (was 460), 206 integration (was 168), 31 end-to-end
+Test distribution: 489 unit (was 460), 220 integration (was 168), 31 end-to-end
 (unchanged), 6 smoke (skipped by design). End-to-end is unchanged on purpose —
 B-1 does not touch a process boundary.
 
 **Baseline measured again, not assumed**, by the same method Parts 2b-i and 2b-ii-A
 used — `HEAD` (`80ed04a`) checked out into a detached worktree and run with the same
-interpreter: **659 passed, 6 skipped**. Working tree: **726 passed, 6 skipped**. The
-delta is exactly +67 with an identical skip count, so no pre-existing test was
+interpreter: **659 passed, 6 skipped**. Working tree: **740 passed, 6 skipped**. The
+delta is exactly +81 with an identical skip count, so no pre-existing test was
 silenced or newly skipped.
 
 One pre-existing test *was* modified, and it is called out rather than buried:
@@ -1469,10 +1498,10 @@ has always needed for its `None` sentinel — and it gained an assertion that th
 notice is present. That failure is also what surfaced the doubled loss rate recorded
 in D28.
 
-**The four threading-adjacent suites ran 10 consecutive times** — the standing rule
+**The five threading-adjacent suites ran 10 consecutive times** — the standing rule
 from Parts 1, 2a, 2b-i and 2b-ii-A — covering both new integration suites, the
-2b-ii-A gate and the `HubTickFeed` suite: `54 passed` on all ten runs, 13.9-14.3 s
-each. No flake.
+2b-ii-A gate, the `HubTickFeed` suite and the tick-channel suite: `86 passed` on all
+ten runs, 14.0-14.4 s each. No flake.
 
 **The duplicate-worker race was re-measured, not assumed safe**, because B-1 is the
 part immediately before the one that will threaten it:
@@ -1514,6 +1543,7 @@ this part.
 | The duplicate decider is gone, not bypassed | `test_the_session_no_longer_answers_the_square_off_question`; the default authority's truth table pinned by a five-case parametrisation so the moved behaviour is recorded rather than trusted |
 | The two configured times cannot drift | `test_the_session_times_are_derived_from_the_policy`, `test_a_moved_policy_moves_both_session_boundaries`, and `test_supplying_both_a_session_and_a_policy_is_refused` |
 | Limitation 14's entry block | `test_a_real_hub_overflow_blocks_a_real_engines_entries` (nothing hand-published), with `test_the_same_tape_does_enter_without_a_drop` as the control and `test_an_open_position_still_exits_after_a_drop` proving the block is entry-side only |
+| The notice reaches the child on every overflow | `test_every_overflow_is_reported_at_every_depth` — 12 cells of depth x run length, each asserted to actually overflow first — plus `test_the_cadence_is_clamped_below_the_queue_depth` for the invariant and `test_the_notice_is_sent_on_a_cadence_not_once_per_drop` so the measured trade-off cannot be reverted silently |
 | Both walking-skeleton gates | `2 passed in 0.85s`, with the spawn import cost re-measured at 0.100 s median / zero `common.engine` modules |
 | Live still fail-closed | `DhanLiveBroker` absent; broker-factory and read-only-script suites pass unchanged |
 

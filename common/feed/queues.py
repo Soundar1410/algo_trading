@@ -51,16 +51,48 @@ class TickDropNotice:
     already how the shutdown sentinel travels, so the notice travels in band beside
     it.
 
-    Two consequences worth stating. It crosses a pickle boundary, so consumers must
-    match on **type**, not on identity with a module-level singleton. And it is
-    itself subject to the drop-oldest policy: under sustained overflow a notice can
-    age out of the queue — but every further drop enqueues another, and the latch it
-    triggers needs only one to arrive, so the guarantee is "at least one gets
-    through", not "none is lost".
+    It crosses a pickle boundary, so consumers must match on **type**, not on
+    identity with a module-level singleton.
+
+    It is also subject to the drop-oldest policy itself: under sustained overflow a
+    notice can age out before the consumer reaches it. That is why it is re-sent on
+    a cadence (see :data:`DROP_NOTICE_EVERY`) rather than once — the guarantee is
+    "at least one gets through", not "none is lost", and the latch it triggers needs
+    only one.
     """
 
     #: The channel's running drop total at the moment the notice was raised.
     dropped: int
+
+
+#: Send a drop notice on the first drop, then every this-many drops.
+#:
+#: Publishing one per dropped tick was the first implementation and is **measured**
+#: to be the wrong trade: a notice pushed into an already-full queue evicts a real
+#: tick, so at the deployed depth of 2048 it cost 358 extra lost ticks per 6000
+#: (6.3%) against a lagging consumer, to make the entry block engage 6.5% sooner
+#: (4393 ticks vs 4699). A cadence of 8 costs 52 (0.9%) for that same latency.
+#: Full comparison in the runbook, deviation D28.
+DROP_NOTICE_EVERY = 8
+
+
+def drop_notice_cadence(max_depth: int) -> int:
+    """How many drops between notices on a queue of this depth.
+
+    :data:`DROP_NOTICE_EVERY`, **clamped below half the depth**. The clamp is not a
+    tuning knob; it enforces the invariant the cadence depends on. A notice only
+    reaches the consumer if it is still inside the retained window when the consumer
+    catches up, and roughly one tick is published per drop — so a cadence at or
+    above the depth lets every notice be evicted before the next is sent, and the
+    drop goes unreported entirely.
+
+    Measured across depths 4-2048 and run lengths 12-4000: a fixed cadence of 8
+    reported every overflow at depth 8 and above but **lost the notice at depth 4**;
+    clamped, every overflowing case at every depth was reported. Deployed depth is
+    ``DEFAULT_TICK_MAX_DEPTH`` (2048), where this returns 8 unchanged — the clamp
+    only bites on the shallow queues that appear in tests.
+    """
+    return max(1, min(DROP_NOTICE_EVERY, max_depth // 2))
 
 
 @dataclass(frozen=True)

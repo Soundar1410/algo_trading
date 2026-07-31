@@ -71,7 +71,13 @@ from common.logging import get_logger
 from common.market_data.adapter import MarketFeedAdapter
 from common.models import Candle, Tick
 
-from .queues import DEFAULT_TICK_MAX_DEPTH, BoundedWorkerQueue, QueueStats, TickDropNotice
+from .queues import (
+    DEFAULT_TICK_MAX_DEPTH,
+    BoundedWorkerQueue,
+    QueueStats,
+    TickDropNotice,
+    drop_notice_cadence,
+)
 
 _log = get_logger(__name__)
 
@@ -120,6 +126,8 @@ class SharedFeedHub:
         #: ``append``/``popleft`` are atomic under the GIL, so a request can be
         #: enqueued from any thread without a lock on the callback path.
         self._pending_subscriptions: deque[tuple[str, str]] = deque()
+        #: strategy_id -> the drop total at which that worker was last notified.
+        self._last_drop_notice: dict[str, int] = {}
         self.tick_count = 0
         self.candle_count = 0
         self.ticks_published = 0
@@ -313,7 +321,22 @@ class SharedFeedHub:
                 # notice rides the same queue as the ticks and the shutdown
                 # sentinel; the engine turns it into a refusal to take new entries
                 # for the rest of the day.
-                channel.tick_queue.publish(TickDropNotice(dropped=channel.tick_queue.dropped))
+                #
+                # On a cadence, not per drop: the notice is pushed into a queue that
+                # is by definition full, so it evicts a real tick. One per drop was
+                # measured to cost 7x the ticks for a 6.5% earlier block. See
+                # DROP_NOTICE_EVERY.
+                self._notify_drop(channel)
+
+    def _notify_drop(self, channel: WorkerChannel) -> None:
+        if channel.tick_queue is None:
+            return
+        dropped = channel.tick_queue.dropped
+        last = self._last_drop_notice.get(channel.strategy_id, 0)
+        if last != 0 and dropped - last < drop_notice_cadence(channel.tick_queue.max_depth):
+            return
+        self._last_drop_notice[channel.strategy_id] = dropped
+        channel.tick_queue.publish(TickDropNotice(dropped=dropped))
 
     def _fan_out(self, candle: Candle) -> None:
         self.candle_count += 1

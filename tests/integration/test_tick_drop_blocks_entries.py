@@ -37,7 +37,13 @@ from common.engine.hub_feed import HubTickFeed
 from common.engine.positions import InMemoryGateway, PositionManager
 from common.engine.selection import OptionSelector, SimulatedOptionChainResolver
 from common.feed.hub import SharedFeedHub, WorkerChannel, build_channel
-from common.feed.queues import BoundedWorkerQueue, TickDropNotice
+from common.feed.queues import (
+    DEFAULT_TICK_MAX_DEPTH,
+    DROP_NOTICE_EVERY,
+    BoundedWorkerQueue,
+    TickDropNotice,
+    drop_notice_cadence,
+)
 from common.models import Tick
 from strategies.intraday_options.engine_fixture_strategy import EngineFixtureStrategy
 
@@ -223,6 +229,80 @@ def test_the_notice_arrives_whatever_the_queue_depth(depth: int) -> None:
         [_tick(UNDERLYING, 24000.0 + i, _ts(9, 16, i % 60)) for i in range(300)], depth=depth
     )
     assert channel.tick_queue is not None
+    assert any(isinstance(item, TickDropNotice) for item in _drain(channel.tick_queue))
+
+
+def test_the_notice_is_sent_on_a_cadence_not_once_per_drop() -> None:
+    """The notice competes for space with the ticks it reports on.
+
+    It is pushed into a queue that is full by definition, so it evicts a real tick.
+    One per drop was the first implementation and was **measured** to be the wrong
+    trade — at the deployed depth it cost 358 extra lost ticks per 6000 against a
+    lagging consumer (6.3%) to make the entry block engage 6.5% sooner, where a
+    cadence of 8 costs 52 (0.9%) for the same latency. See D28.
+
+    Pinned as a ratio rather than an exact count so the test says what it means: far
+    fewer notices than drops, but never none.
+    """
+    channel = _overflowing_run(
+        [_tick(UNDERLYING, 24000.0 + i, _ts(9, 16, i % 60)) for i in range(300)], depth=16
+    )
+    assert channel.tick_queue is not None
+    notices = [item for item in _drain(channel.tick_queue) if isinstance(item, TickDropNotice)]
+    # Notices seen is bounded by what survives eviction, so compare against the
+    # drops that *happened*, which is the number one-per-drop would have produced.
+    assert channel.tick_queue.dropped > 100
+    assert len(notices) < channel.tick_queue.dropped / DROP_NOTICE_EVERY
+    assert notices, "a cadence that never reports is worse than no cadence at all"
+
+
+def test_the_cadence_is_clamped_below_the_queue_depth() -> None:
+    """The invariant the cadence depends on, stated as an assertion.
+
+    A notice reaches the consumer only if it is still inside the retained window,
+    and roughly one tick is published per drop — so a cadence at or above the depth
+    lets every notice be evicted before the next is sent. Measured: a fixed cadence
+    of 8 reported every overflow at depth 8 and above but **lost the notice entirely
+    at depth 4**.
+    """
+    assert drop_notice_cadence(DEFAULT_TICK_MAX_DEPTH) == DROP_NOTICE_EVERY
+    assert drop_notice_cadence(16) == DROP_NOTICE_EVERY  # the clamp does not bite here
+    assert drop_notice_cadence(4) == 2
+    assert drop_notice_cadence(2) == 1
+    assert drop_notice_cadence(1) == 1, "never zero — that would divide the world by nothing"
+
+
+@pytest.mark.parametrize(
+    ("depth", "n_ticks"),
+    # Only pairs where n_ticks > depth: a case that never overflows proves nothing,
+    # and the first draft of this sweep silently included three such cells.
+    [
+        (4, 30),
+        (4, 80),
+        (4, 200),
+        (8, 30),
+        (8, 80),
+        (8, 200),
+        (16, 30),
+        (16, 80),
+        (16, 200),
+        (64, 80),
+        (64, 200),
+        (64, 1000),
+    ],
+)
+def test_every_overflow_is_reported_at_every_depth(depth: int, n_ticks: int) -> None:
+    """The guarantee, swept rather than spot-checked.
+
+    The fixed cadence passed at depth 8+ and failed at 4, which is exactly the kind
+    of gap a single hand-picked case misses. Every cell here overflows, so every
+    cell must report.
+    """
+    channel = _overflowing_run(
+        [_tick(UNDERLYING, 24000.0 + i, _ts(9, 16, i % 60)) for i in range(n_ticks)], depth=depth
+    )
+    assert channel.tick_queue is not None
+    assert channel.tick_queue.dropped > 0, "this case must actually overflow to mean anything"
     assert any(isinstance(item, TickDropNotice) for item in _drain(channel.tick_queue))
 
 
