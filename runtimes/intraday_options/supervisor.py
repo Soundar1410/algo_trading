@@ -29,6 +29,9 @@ Shutdown, and why it is shaped like this
 1. A ``SIGTERM``/``SIGINT`` handler sets an event and returns. Nothing else: a
    handler that tried to close the feed would run on this thread while the feed
    thread owns the adapter's loop, which is the cross-thread close that hangs.
+   Installed via :func:`common.process.shutdown_signals`, which is where this
+   supervisor's own handler-installing code moved in Part 2b-i so that the engine's
+   process could reuse it rather than grow a second, competing installer.
 2. The main thread then *asks* the feed to stop (``hub.request_stop()``) and
    waits for the feed thread to return on its own.
 3. Only once it has does the main thread flush partial bars (``hub.stop()``),
@@ -49,14 +52,11 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import os
-import signal
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from types import FrameType
-from typing import Any
 
 from common.config.models import ExecutionMode
 from common.execution import ExecutionRepository
@@ -67,7 +67,7 @@ from common.logging import get_logger
 from common.market_data.adapter import MarketFeedAdapter
 from common.notifications import NotificationEvent, Notifier, NullNotifier, SafeNotifier
 from common.persistence import Database, MigrationRunner
-from common.process import DuplicateProcessError, supervisor_lock
+from common.process import DuplicateProcessError, shutdown_signals, supervisor_lock
 
 from .worker import WorkerConfig, run_worker
 
@@ -83,10 +83,6 @@ DEFAULT_QUEUE_DEPTH = 64
 #: frames arrive continuously. Exceeding it means the socket has gone quiet, not
 #: that the feed is slow — waiting longer would not help.
 DEFAULT_SHUTDOWN_GRACE = 10.0
-
-#: Signals that mean "shut down": SIGTERM from a process manager, SIGINT from a
-#: terminal. Both get the same orderly path rather than dying where they land.
-SHUTDOWN_SIGNALS = (signal.SIGTERM, signal.SIGINT)
 
 #: How often the idle main thread beats while the feed runs. The writer is
 #: rate-limited anyway; this only has to be finer than that to keep the
@@ -416,34 +412,13 @@ class IntradayOptionsSupervisor:
     def _shutdown_signals(self, on_signal: Callable[[], None]) -> Iterator[None]:
         """Install shutdown handlers for the feed's lifetime, then put them back.
 
-        The handler does the least it possibly can — set a couple of events —
-        because it runs on this thread, interrupting whatever it was doing.
-        Anything that blocks, takes a lock, or touches the feed risks deadlocking
-        against the very shutdown it is trying to start.
-
-        Restoring the previous handlers matters: this class is constructed inside
-        other people's processes, including the test suite's, and leaving our
-        handlers installed would change how ``Ctrl-C`` behaves everywhere after.
+        Delegates to :func:`common.process.shutdown_signals`, which is where this
+        method's body moved in Phase 3 Part 2b-i. Behaviour is unchanged; what
+        changed is that it is no longer the *only* place a shutdown handler is
+        installed. Part 2b gives the worker process an engine that must be told to
+        square off, and two hand-rolled installers in one codebase is how the
+        collision this phase exists to fix gets reintroduced — so there is now one
+        implementation, and this is a caller of it.
         """
-
-        def _handle(signum: int, _frame: FrameType | None) -> None:
-            _log.warning("received %s; beginning orderly shutdown", signal.Signals(signum).name)
-            on_signal()
-
-        # ``Any`` for the previous handler: it is whatever ``signal.signal``
-        # returned, and it is only ever handed straight back to it.
-        installed: list[tuple[signal.Signals, Any]] = []
-        try:
-            for signum in SHUTDOWN_SIGNALS:
-                try:
-                    installed.append((signum, signal.signal(signum, _handle)))
-                except ValueError:
-                    # Only the main thread may install handlers. A supervisor run
-                    # from a worker thread simply keeps the old behaviour: it
-                    # stops when the feed finishes, and the process's existing
-                    # handlers still apply.
-                    _log.debug("cannot install a %s handler off the main thread", signum)
+        with shutdown_signals(on_signal):
             yield
-        finally:
-            for installed_signum, previous in installed:
-                signal.signal(installed_signum, previous)
