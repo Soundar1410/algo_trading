@@ -33,8 +33,12 @@ this channel aggregates the underlying *again*, beside the hub's own aggregator,
 so a dropped tick silently changes that worker's OHLC — the disagreement D9
 exists to prevent. Three mitigations: the depth is sized from a measured tick
 rate (see ``DEFAULT_TICK_MAX_DEPTH``), every drop is counted and surfaced in
-``queue_stats()``, and the engine blocks new entries for the day once a drop
-occurs. See the runbook's deviation and limitation entries for Part 2b-ii-A.
+``queue_stats()``, and — since Part 2b-ii-B-1 — a :class:`~common.feed.queues.
+TickDropNotice` is published down the same channel so the engine in the child
+process can latch its entries off for the day. Until that notice existed this
+paragraph claimed the entry block as fact while no code performed it; the claim is
+now backed by ``tests/integration/test_tick_drop_blocks_entries.py``. See the
+runbook's deviation and limitation entries for Parts 2b-ii-A and 2b-ii-B-1.
 
 Dynamic subscription, and who calls the adapter
 -----------------------------------------------
@@ -67,7 +71,7 @@ from common.logging import get_logger
 from common.market_data.adapter import MarketFeedAdapter
 from common.models import Candle, Tick
 
-from .queues import DEFAULT_TICK_MAX_DEPTH, BoundedWorkerQueue, QueueStats
+from .queues import DEFAULT_TICK_MAX_DEPTH, BoundedWorkerQueue, QueueStats, TickDropNotice
 
 _log = get_logger(__name__)
 
@@ -304,6 +308,12 @@ class SharedFeedHub:
                     channel.tick_queue.dropped,
                     channel.tick_queue.depth(),
                 )
+                # And tell the worker, because a log line in the *supervisor's*
+                # process is not something the engine in the child can act on. The
+                # notice rides the same queue as the ticks and the shutdown
+                # sentinel; the engine turns it into a refusal to take new entries
+                # for the rest of the day.
+                channel.tick_queue.publish(TickDropNotice(dropped=channel.tick_queue.dropped))
 
     def _fan_out(self, candle: Candle) -> None:
         self.candle_count += 1

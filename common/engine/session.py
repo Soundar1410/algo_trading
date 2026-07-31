@@ -1,26 +1,32 @@
 """Trading-session helper.
 
 Ported from the reference repository's ``framework/utils/session.py``. Answers the
-three time-of-day questions the engine asks on every tick:
+time-of-day questions the engine asks on every tick:
 
 * Is the market within the active trading window?
 * May we still take a *new* signal (i.e. before ``end_time``)?
-* Have we reached the hard square-off (force-close any open position)?
+* Is today a trading day at all?
 
 Relationship to :class:`~common.risk.squareoff.SquareOffPolicy`
 --------------------------------------------------------------
-Both objects answer "may I still enter?" and "is it square-off time?", and Part
-2b-i deliberately keeps both rather than merging them mid-port. They are not
-duplicates: ``SquareOffPolicy`` is a *pure function of clock and persisted state*
-that survives a restart (it reads ``SquareOffState`` so a recovering worker
-reaches the same conclusion as the one that died), while this class is the
-engine's in-memory session calendar, including trading-day and holiday checks the
-policy has no notion of.
+Both objects used to answer "is it square-off time?", from different state, which
+meant two deciders against one position. **Part 2b-ii-B-1 settled it**: the policy
+owns square-off, because it is a pure function of clock *and persisted state* and
+therefore reaches the same conclusion after a restart, while this class knows only
+the clock. Execution §10 requires that a restart not reset square-off state, and
+architecture §13 places square-off at runtime level and the entry cutoff at
+strategy level.
 
-Running both against one position would mean two square-off deciders, which is
-how a position gets closed twice. Reconciling them is **Part 2b-ii's** job, at the
-seam where the engine is actually wired into the worker; until then the engine
-owns the decision and the worker's policy is not in that path.
+So ``is_past_square_off`` is gone, and the engine asks a
+:class:`~common.engine.square_off.SquareOffAuthority` instead. What stays here is
+what the policy has no notion of: the entry window (:meth:`can_enter`), the active
+window (:meth:`is_open`) and the trading-day/holiday calendar.
+
+``square_off`` survives as an *attribute* rather than a decision: :meth:`is_open`
+needs an upper bound and :attr:`fingerprint` must hash every value that could move
+a boundary. It is derived from the policy at wiring time — see
+:meth:`~common.engine.config.SessionConfig.from_square_off_policy` — so the two
+configured times cannot drift apart.
 """
 
 from __future__ import annotations
@@ -93,10 +99,6 @@ class MarketSession:
         """True if a *new* position may be opened (trading day, within [start, end))."""
         d = self._resolve(at)
         return self.is_trading_day(d) and self.start <= d.time() < self.end
-
-    def is_past_square_off(self, at: datetime | None = None) -> bool:
-        """True once the hard square-off time has been reached or passed."""
-        return self._resolve(at).time() >= self.square_off
 
     def __repr__(self) -> str:  # pragma: no cover - debug aid
         return (

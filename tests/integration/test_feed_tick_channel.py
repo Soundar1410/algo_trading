@@ -22,7 +22,12 @@ from pathlib import Path
 
 import pytest
 
-from common.feed import DEFAULT_TICK_MAX_DEPTH, BoundedWorkerQueue, SharedFeedHub
+from common.feed import (
+    DEFAULT_TICK_MAX_DEPTH,
+    BoundedWorkerQueue,
+    SharedFeedHub,
+    TickDropNotice,
+)
 from common.feed.hub import build_channel
 from common.market_data import RecordedFeedAdapter, load_tick_tape
 from common.models import Candle, Tick
@@ -308,9 +313,15 @@ def test_an_undersized_tick_queue_drops_the_oldest_and_counts_it():
     assert channel.tick_queue is not None
     assert channel.tick_queue.dropped > 0
     kept = _drain(channel.tick_queue)
-    # Drop-oldest: what survives is the freshest tail of the stream.
-    assert kept[-1].exchange_time == stream[-1].exchange_time
     assert len(kept) <= 10
+    # Since Part 2b-ii-B-1 the channel carries two item types, so the drop-oldest
+    # property is asserted over the ticks rather than over everything on the queue
+    # — the same narrowing the candle channel has always needed for its ``None``
+    # sentinel. The property itself is unchanged: the freshest tick survives.
+    ticks = [item for item in kept if isinstance(item, Tick)]
+    assert ticks[-1].exchange_time == stream[-1].exchange_time
+    # And the drop is now reported *to the worker*, not only to the supervisor's log.
+    assert any(isinstance(item, TickDropNotice) for item in kept)
 
 
 def test_publishing_ticks_never_blocks_the_feed_callback():

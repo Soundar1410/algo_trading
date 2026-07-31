@@ -40,6 +40,30 @@ DEFAULT_TICK_MAX_DEPTH = 2048
 
 
 @dataclass(frozen=True)
+class TickDropNotice:
+    """Sent down a worker's tick channel to say that a tick was lost upstream.
+
+    Phase 3 Part 2b-ii-B-1. The drop is detected and counted in the **hub's**
+    process, on this object's ``dropped`` counter; the consumer that needs to act
+    on it — the engine, which builds its own candles from these ticks and would
+    otherwise trade on a quietly wrong OHLC — runs in the child and cannot read
+    that counter. The only channel between them is the tick queue itself, which is
+    already how the shutdown sentinel travels, so the notice travels in band beside
+    it.
+
+    Two consequences worth stating. It crosses a pickle boundary, so consumers must
+    match on **type**, not on identity with a module-level singleton. And it is
+    itself subject to the drop-oldest policy: under sustained overflow a notice can
+    age out of the queue — but every further drop enqueues another, and the latch it
+    triggers needs only one to arrive, so the guarantee is "at least one gets
+    through", not "none is lost".
+    """
+
+    #: The channel's running drop total at the moment the notice was raised.
+    dropped: int
+
+
+@dataclass(frozen=True)
 class QueueStats:
     """A snapshot for the heartbeat. Cheap to compute, safe to log."""
 

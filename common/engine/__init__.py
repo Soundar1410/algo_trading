@@ -14,6 +14,7 @@ from .config import EngineConfig, SessionConfig
 from .daily_guard import DailyRiskConfig, DailyRiskGuard, DailyRiskState
 from .engine import TradingEngine
 from .feed import MarketDataFeed, MarketDataStatus, SimulatedFeed
+from .gateway import GatewayExecutionError, LifecycleGateway
 from .hub_feed import HubTickFeed
 from .models import (
     ExitReason,
@@ -38,6 +39,11 @@ from .selection import (
     resolve_strike,
 )
 from .session import MarketSession
+from .square_off import (
+    PersistedSquareOffAuthority,
+    SessionSquareOffAuthority,
+    SquareOffAuthority,
+)
 from .strategy import BaseStrategy, available_strategies, get_strategy, register_strategy
 
 __all__ = [
@@ -51,8 +57,10 @@ __all__ = [
     "ExecutionGateway",
     "ExitReason",
     "FillOutcome",
+    "GatewayExecutionError",
     "HubTickFeed",
     "InMemoryGateway",
+    "LifecycleGateway",
     "MarketDataFeed",
     "MarketDataStatus",
     "MarketSession",
@@ -65,15 +73,18 @@ __all__ = [
     "OptionSelector",
     "OptionType",
     "OrderSide",
+    "PersistedSquareOffAuthority",
     "PositionManager",
     "RegimeLabel",
     "RegimeTagger",
     "RiskManager",
     "SessionConfig",
+    "SessionSquareOffAuthority",
     "SessionTag",
     "SignalAction",
     "SimulatedFeed",
     "SimulatedOptionChainResolver",
+    "SquareOffAuthority",
     "StrategySignal",
     "Trade",
     "TradingEngine",

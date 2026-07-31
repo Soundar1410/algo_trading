@@ -85,6 +85,7 @@ from .reporting import (
 from .risk import opt_float
 from .selection import OptionSelector
 from .session import MarketSession
+from .square_off import SessionSquareOffAuthority, SquareOffAuthority
 from .strategy import BaseStrategy
 
 log = get_logger(__name__)
@@ -109,6 +110,7 @@ class TradingEngine:
         warmup_manager: object | None = None,
         warmup_source: object | None = None,
         square_off_event: threading.Event | None = None,
+        square_off_authority: SquareOffAuthority | None = None,
         clock: Callable[[], datetime] = now_ist,
     ) -> None:
         self.cfg = cfg
@@ -134,6 +136,13 @@ class TradingEngine:
         self._warmup_source = warmup_source
 
         self.session = MarketSession(cfg.session)
+        # Who decides square-off. The default reads the session clock, exactly as
+        # this class did inline before Part 2b-ii-B-1, so an offline run is
+        # unchanged. A worker injects the persisted-state implementation, which is
+        # the only one that survives a restart — see common.engine.square_off.
+        self._square_off: SquareOffAuthority = square_off_authority or SessionSquareOffAuthority(
+            self.session
+        )
         interval = parse_timeframe_minutes(cfg.timeframe)
         self.candles = CandleBuilder(
             interval,
@@ -390,6 +399,22 @@ class TradingEngine:
             self.strategy.status(),
         )
 
+    @property
+    def entries_blocked(self) -> str | None:
+        """Why new entries are refused for the rest of the day, or ``None``."""
+        return self._entry_blocked
+
+    def block_entries(self, reason: str) -> None:
+        """Refuse new entries for the rest of the day. Safe to call repeatedly.
+
+        The public half of the latch below, added in Part 2b-ii-B-1 so the feed
+        layer can report a dropped tick without reaching into a private. A drop
+        means this worker's own candles may be silently wrong (runbook limitation
+        14 / deviation D23), and trading on bars that might be wrong is worse than
+        not trading.
+        """
+        self._block_entries(reason)
+
     def _block_entries(self, reason: str) -> None:
         """Latch entries off for the rest of the day.
 
@@ -449,8 +474,10 @@ class TradingEngine:
             self._shutdown(tick.exchange_time)
             return
 
-        # Hard square-off takes precedence over everything else.
-        if self.session.is_past_square_off(tick.exchange_time):
+        # Hard square-off takes precedence over everything else. The authority,
+        # not the session clock: only it can tell "15:25 and nothing done yet" from
+        # "15:25 and the process that died at 15:16 already closed the book".
+        if self._square_off.due(tick.exchange_time):
             self._handle_square_off(tick.exchange_time)
             return
 
@@ -765,6 +792,9 @@ class TradingEngine:
             log.info("square-off reached; force-closing %s", pos.contract.symbol)
             self._close(pos.contract.security_id, pos.last_price, ts, ExitReason.SQUARE_OFF)
         self._squared_off = True
+        # Only now, and only if every close above returned: a completion recorded
+        # optimistically would let a restart skip a book that is still open.
+        self._square_off.completed(ts)
         log.info("trading day complete; stopping feed")
         self.feed.stop()
 

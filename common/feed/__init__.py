@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 from .hub import SharedFeedHub, WorkerChannel, build_channel
-from .queues import DEFAULT_MAX_DEPTH, DEFAULT_TICK_MAX_DEPTH, BoundedWorkerQueue, QueueStats
+from .queues import (
+    DEFAULT_MAX_DEPTH,
+    DEFAULT_TICK_MAX_DEPTH,
+    BoundedWorkerQueue,
+    QueueStats,
+    TickDropNotice,
+)
 from .reconnect import (
     FeedHealth,
     FeedUnavailableError,
@@ -21,6 +27,7 @@ __all__ = [
     "ReconnectPolicy",
     "ReconnectingFeed",
     "SharedFeedHub",
+    "TickDropNotice",
     "WorkerChannel",
     "build_channel",
 ]

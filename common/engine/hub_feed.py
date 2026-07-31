@@ -30,6 +30,13 @@ feed thread. ``unsubscribe`` deliberately does not propagate to the adapter — 
 subscription belongs to the group, and dropping it would starve any other worker
 holding the same instrument.
 
+**A dropped tick is reported in band.** The hub counts overflow in its *own*
+process, which the engine here cannot read. Part 2b-ii-B-1 therefore sends a
+:class:`~common.feed.queues.TickDropNotice` down this same queue; it is neither a
+tick nor a sentinel, so the run continues and only ``on_tick_dropped`` fires —
+which the worker wires to the engine's entry latch, because bars built from an
+incomplete tick stream may be silently wrong (runbook limitation 14).
+
 **``stop()`` is still the owning thread's.** The engine calls it from
 ``_handle_square_off``, which runs on this loop's thread. The Part 1 ownership rule
 therefore holds here with no new mechanism: nothing outside this thread ever ends
@@ -42,6 +49,7 @@ import queue as queue_module
 from collections.abc import Callable
 from typing import Any
 
+from common.feed.queues import TickDropNotice
 from common.logging import get_logger
 from common.models import Tick
 
@@ -69,6 +77,7 @@ class HubTickFeed(MarketDataFeed):
         *,
         request_subscription: Callable[[str], None] | None = None,
         on_square_off: Callable[[str], None] | None = None,
+        on_tick_dropped: Callable[[TickDropNotice], None] | None = None,
         poll_seconds: float = DEFAULT_POLL_SECONDS,
         idle_timeout_seconds: float | None = DEFAULT_IDLE_TIMEOUT_SECONDS,
     ) -> None:
@@ -76,6 +85,7 @@ class HubTickFeed(MarketDataFeed):
         self._queue = tick_queue
         self._request_subscription = request_subscription
         self._on_square_off = on_square_off
+        self._on_tick_dropped = on_tick_dropped
         self._poll = poll_seconds
         self._idle_timeout = idle_timeout_seconds
         #: Observable outcome, so a worker can report *why* the run ended rather
@@ -83,6 +93,8 @@ class HubTickFeed(MarketDataFeed):
         self.stopped_by_sentinel = False
         self.stopped_by_idle_timeout = False
         self.ticks_received = 0
+        #: Highest drop total this feed has been told about. Zero on a healthy run.
+        self.ticks_dropped_upstream = 0
 
     # ---------------------------------------------------------------- running
     def run(self) -> None:
@@ -119,6 +131,21 @@ class HubTickFeed(MarketDataFeed):
                     if self._on_square_off is not None:
                         self._on_square_off("supervisor sentinel")
                     return
+
+                if isinstance(item, TickDropNotice):
+                    # Not a tick and not a sentinel: the stream continues, but the
+                    # bars this worker builds from it may now be quietly wrong, so
+                    # the consumer is told and the run carries on. Matched by type
+                    # rather than identity because it arrives via pickle.
+                    self.ticks_dropped_upstream = max(self.ticks_dropped_upstream, item.dropped)
+                    log.warning(
+                        "the hub dropped %d tick(s) for this worker; candles built "
+                        "here may differ from the hub's for the affected interval",
+                        item.dropped,
+                    )
+                    if self._on_tick_dropped is not None:
+                        self._on_tick_dropped(item)
+                    continue
 
                 tick: Tick = item
                 self.ticks_received += 1
