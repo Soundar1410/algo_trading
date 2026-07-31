@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from .market import Candle, Tick
 from .trading import (
+    ExitReason,
     Fill,
+    OptionType,
     Order,
     OrderIntent,
+    OrderSide,
     OrderStatus,
     OrderType,
     Position,
@@ -18,9 +21,12 @@ from .trading import (
 
 __all__ = [
     "Candle",
+    "ExitReason",
     "Fill",
+    "OptionType",
     "Order",
     "OrderIntent",
+    "OrderSide",
     "OrderStatus",
     "OrderType",
     "Position",

@@ -82,3 +82,11 @@ warn_unreachable = true
 [[tool.mypy.overrides]]
 module = ["dhanhq.*"]
 ignore_missing_imports = true
+
+# pandas ships no inline types and `pandas-stubs` is a separate package. Scoped
+# to pandas itself rather than applied globally: the only importer is
+# common/indicators/supertrend.py (its vectorised warm-up form), so an untyped
+# frame cannot leak into execution or persistence code unnoticed.
+[[tool.mypy.overrides]]
+module = ["pandas.*"]
+ignore_missing_imports = true

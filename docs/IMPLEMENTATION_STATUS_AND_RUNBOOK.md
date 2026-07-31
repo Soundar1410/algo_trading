@@ -7,9 +7,9 @@ the next phase. Updated after every phase.
 
 | | |
 |---|---|
-| **Current phase** | Phase 3 **Part 1 — complete** (live-feed shutdown path), awaiting review |
-| **Next phase** | Phase 3 Part 2 — port `TradingEngine` and the exit-policy registry (not started) |
-| **Last updated** | 30 July 2026 |
+| **Current phase** | Phase 3 **Part 1 — complete** (live-feed shutdown path); **Part 2a — complete** (exit-policy registry port), awaiting review |
+| **Next phase** | Phase 3 Part 2b — port `TradingEngine` (not started; blocked on the signal-ownership collision, see section 8) |
+| **Last updated** | 31 July 2026 |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
 | **Live order placement** | **Not implemented.** Fail-closed. Phase 10 only. |
@@ -23,7 +23,7 @@ the next phase. Updated after every phase.
 | 0 | Reference audit + minimal bootstrap | **Complete** |
 | 1 | Walking skeleton | **Complete** |
 | 2 | Dhan and shared-feed hardening | **Complete** — Block 1 (offline) + Block 2 (live) |
-| 3 | Preserve custom engines and policies | **Part 1 complete** (live-feed shutdown); Part 2 (engine port) not started |
+| 3 | Preserve custom engines and policies | **Part 1 complete** (live-feed shutdown); **Part 2a complete** (exit registry + SuperTrend port); Part 2b (`TradingEngine` port) not started |
 | 4 | Candle, indicator and paper-execution foundation | Not started |
 | 5 | Mixed-mode supervisor and persistence | Not started |
 | 6 | Paper recovery and expiry handling | Not started |
@@ -241,6 +241,73 @@ no `framework/` code. No real strategies (Phase 9). No live order placement.
 adapter, as before. That wiring belongs with the live path, not with this fix, and
 the contract now makes it safe whenever it happens.
 
+> **Superseded in part, 31 July 2026.** The sentence "no exit-policy registry"
+> above describes Part 1's scope and was accurate when written. Part 2a has since
+> delivered the exit-policy registry — see the next section. `TradingEngine` is
+> still not ported, and the `ReconnectingFeed`/`SharedFeedHub` statement still
+> holds.
+
+### What Phase 3 Part 2a delivered
+
+Part 2 was split again once the exit registry turned out to be portable on its
+own: the ten exit policies depend on `SuperTrend` and a candle record, but not on
+`TradingEngine`. Porting them first means the engine port (Part 2b) lands against
+a registry that already has its regression tests passing, which is the ordering
+`CLAUDE.md` requires — tests before internals.
+
+**Ported, with import paths rewritten and nothing else of substance changed:**
+
+| Package | Modules | Source |
+|---|---|---|
+| `common/exit/` | 13 — `base`, `composite`, `__init__` (registry) + all **ten** policies | `framework/exit/` |
+| `common/indicators/` | 3 — `base` (`OHLC`, `StatefulIndicator`), `supertrend` | `framework/indicators/` |
+| `common/warmup/` | 2 — `requirements` (`WarmupRequirement`, `IndicatorScope`) | `framework/warmup/` |
+| `common/utils/` | 2 — `timeutils.parse_hhmm` | `framework/utils/` |
+| `common/models/trading.py` | `OrderSide` alias, `OptionType`, `ExitReason` (15 members) | `framework/core/models.py` |
+
+**Tests: 44 new, all passing.** `tests/unit/test_exit_engines.py` is the
+reference's own suite (34 tests) ported with import paths only — verified by
+`diff` of the sorted test-name lists (empty) and an identical `assert` count (94
+on both sides). `tests/unit/test_exit_registry_wiring.py` adds 10 guards that the
+reference suite cannot provide, because they are properties of *this* port:
+D2 (ten policies), D3 (both wiring paths), the no-`framework.*`-import rule
+enforced structurally via `ast`, and the `OrderSide is Side` identity check.
+
+**Deviations D2 and D3 confirmed against the ported code**, not merely restated
+from the Phase 0 audit — see section 2.3.
+
+**Adaptations beyond import paths.** Four, each commented at the site:
+`exit/base.py` `reset()` keeps its non-abstract no-op (`# noqa: B027`);
+`indicators/base.py` widens `update()`'s return annotation from `None` to `Any`
+to match what every implementation already returned; `indicators/supertrend.py`
+replaces the reference's `# type: ignore` on the previous-bar values with an
+explicit invariant check; and the same file's `state` property now guards `_line`
+alongside `_trend`. Everything else is import paths, `ruff format` rewrapping,
+`mypy --strict` annotations, and `bool(...)` wrappers on seven returns whose
+operands are `Any` to mypy. No exit rule's arithmetic or comparison changed.
+
+**Not ported, deliberately:** EMA, RSI, VWAP, ATR and ADX. Nothing consumes them
+yet and Phase 4 owns the indicator layer; porting five more indicators now would
+add ~440 lines with no caller and no test.
+
+#### Finding: one ported test is mislabelled (carried over from the reference)
+
+`test_momentum_close_option_premium_is_side_aware_and_consecutive`
+(`tests/unit/test_exit_engines.py:72`) does not test what its name claims. It
+makes five isolated `should_exit_closes(current, previous, ...)` calls, each
+passing the previous close explicitly. **No consecutive streak is ever built**,
+so the `_and_consecutive` half of the name is unbacked. It is also the only test
+in the file that calls `should_exit_closes()` rather than `should_exit()`.
+
+Recorded rather than fixed, on purpose. The port's whole value is that it is
+byte-comparable to the reference suite; renaming a test or adding assertions
+would break that comparison for a cosmetic gain, and the *side-awareness* half of
+the name — the part that matters for premium-stream exits — is genuinely covered.
+**Consecutive-streak behaviour on the premium stream is therefore untested, in
+this repository and in the reference.** Close it in Part 2b, where
+`MomentumCloseExit` first gets a real caller and the streak path actually runs;
+that is the point at which a new test is worth more than diff fidelity.
+
 ---
 
 ## 2. Reference-repository reuse inventory
@@ -400,8 +467,8 @@ guard. See deviation D6.
 | # | Deviation | Reason |
 |---|---|---|
 | **D1** | Config loader **written fresh**, not ported | `framework/config/loader.py` walks parent directories and `sys.path`-injects the monorepo's `common/` package to import `common.credentials`. That is exactly the cross-repo runtime dependency the spec forbids. |
-| **D2** | Exit registry has **10 policies, not the 9** the spec lists | The extra is `trailing` (`framework/exit/trailing_exit.py`). It is a real, registered, config-selectable policy and will be preserved along with the other nine. |
-| **D3** | `momentum_low_or_highest_close` is **not** in `CompositeExit._KEY_TO_ENGINE` | Deliberate in the reference repo: it evaluates on the traded option's *own premium candle stream*, not the underlying's, so strategies instantiate it directly via `get_exit_engine()`. Porting the composite map verbatim would silently drop it. Both wiring paths must be preserved. |
+| **D2** | Exit registry has **10 policies, not the 9** the spec lists | The extra is `trailing` (`framework/exit/trailing_exit.py`). It is a real, registered, config-selectable policy and will be preserved along with the other nine. **Confirmed in Part 2a**: all ten are registered in `common/exit/` and asserted by name in `test_all_ten_policies_are_registered_not_the_nine_the_spec_lists`, which also asserts `len(...) == 10` so an eleventh cannot be added silently. |
+| **D3** | `momentum_low_or_highest_close` is **not** in `CompositeExit._KEY_TO_ENGINE` | Deliberate in the reference repo: it evaluates on the traded option's *own premium candle stream*, not the underlying's, so strategies instantiate it directly via `get_exit_engine()`. Porting the composite map verbatim would silently drop it. Both wiring paths must be preserved. **Confirmed in Part 2a**: `_KEY_TO_ENGINE` was ported with its nine keys and the combined exit still absent, and three tests now pin it — the map excludes it, `get_exit_engine()` still reaches it, and no config block can select it even when the mode is named after it. |
 | **D4** | `PaperBroker` **rewritten**, not ported | The existing one fills at `ref_price ± fixed slippage` with none of the spec's required realism. Only `ChargesCalculator` carries over. |
 | **D5** | Broker factory **gains a safety gate** | The existing factory builds a live broker from `mode: live` alone. The new one must consult `effective_live_gate()` and refuse to start when blocked. This is a behavioural change, made deliberately, for safety. |
 | **D6** | Migrations are **replay-safe rather than transactional** | `sqlite3.executescript()` issues an implicit COMMIT before running, so a migration cannot be applied and recorded in one transaction. Safety comes from enforced idempotency (`CREATE ... IF NOT EXISTS` only, destructive statements rejected) plus recording last: a crash between the two leaves the next startup replaying a no-op. |
@@ -687,6 +754,36 @@ ordinary end-of-tape run is not misreported as signalled. Nothing was weakened, 
 passes unchanged, including both walking-skeleton gates and all of
 `tests/integration/test_feed_reconnect.py` — the file whose blind spot this phase
 was about.
+
+### Verification results (Phase 3 Part 2a, 31 July 2026)
+
+| Check | Command | Result |
+|---|---|---|
+| Tests | `.venv/bin/python -m pytest` | **590 passed, 6 skipped** |
+| Lint | `.venv/bin/ruff check .` | **All checks passed!** |
+| Format | `.venv/bin/ruff format --check .` | **119 files already formatted** |
+| Types | `.venv/bin/mypy` | **Success: no issues found in 84 source files** |
+
+Test distribution: 452 unit (was 408), 112 integration, 26 end-to-end, 6 smoke
+(skipped by design). The 44 new tests are all unit: 34 ported engine tests and 10
+port-specific wiring guards.
+
+**The "existing tests still pass" claim was measured, not assumed.** `HEAD`
+(`7e4d1e2`) was checked out into a detached worktree and its suite run with the
+same interpreter: **546 passed, 6 skipped**. Working tree: **590 passed, 6
+skipped**. The delta is exactly +44 and the skip count is identical, so no
+pre-existing test was modified, silenced or newly skipped. Reproduce with:
+
+```bash
+git worktree add /tmp/baseline HEAD --detach
+cd /tmp/baseline && PYTHONPATH=$PWD /Volumes/Trading/algo_trading/.venv/bin/python -m pytest
+git worktree remove /tmp/baseline --force
+```
+
+`mypy`'s source-file count rose from 64 to 84 — the 20 ported modules. Note that
+bare `mypy .` fails on a pre-existing `dashboards/app.py` dual-module-name error;
+`.venv/bin/mypy` with no arguments (which uses the configured `packages` list) is
+the project's invocation and is clean.
 
 The new tests are the only concurrency tests in the suite, so they were run **10
 consecutive times** on top of the full-suite runs: 10 passes, no flake.
@@ -1029,8 +1126,33 @@ The **legacy `Trading_Automation` system was running during the audit** — its
 `portfolio.db`, `weekly_strategies.db` and strategy log files were being written
 live. The spec requires preventing simultaneous execution of the old and new
 systems. Nothing in this repository goes near it (verified again this phase: its
-newest `.py` mtime is unchanged), but this must be settled **before any new
-runtime is started against live data** and again before LaunchAgents in Phase 8.
+newest `.py` mtime is unchanged — see the recorded baseline below), but this must
+be settled **before any new runtime is started against live data** and again
+before LaunchAgents in Phase 8.
+
+#### Recorded baseline: `Trading_Automation` newest `.py` mtime
+
+Until Phase 3 Part 2a this document asserted "mtime unchanged" without ever
+recording the value, which made the claim unfalsifiable — a later phase could
+only repeat the assertion, never test it. The baseline is now stored:
+
+```
+2026-07-28 10:29:14  option_strategies/Trading_Strategies_Automation_v2/tests/test_warmup_coordinator.py
+```
+
+Reproduce with (excludes `.venv`/site-packages, which pip may legitimately touch):
+
+```bash
+cd /Volumes/Trading/Trading_Automation
+find . -name '*.py' -not -path '*/.venv/*' -not -path '*/site-packages/*' \
+  -exec stat -f '%Sm %N' -t '%Y-%m-%d %H:%M:%S' {} + | sort -r | head -1
+```
+
+The timestamp predates this repository's first reference read (the Phase 0 audit,
+29 July 2026), so any future value newer than it means something here wrote to
+the reference tree and must be investigated before the phase is accepted.
+**Re-verified unchanged at Phase 3 Part 2a (31 July 2026), before and after the
+port's diff/test verification.**
 
 **Phase 2 adds one more instance of the same concern.** Both systems authenticate
 as the same Dhan client, and Dhan rate-limits token generation to roughly one
@@ -1111,13 +1233,15 @@ does not exist, all 12 broker-factory tests pass unchanged, and no file under
 
 ## 8. Next phase
 
-Phase 2 is complete, both blocks. Phase 3 **Part 1** is complete. Next is Phase 3
-**Part 2**.
+Phase 2 is complete, both blocks. Phase 3 **Part 1** and **Part 2a** are complete.
+Next is Phase 3 **Part 2b**.
 
 ### Phase 3 — preserve custom engines and policies
 
-**Phase 3 has two parts, in strict order.** Part 1 was a dedicated fix — planned
-and reviewed on its own, before Part 2 begins, not folded into the engine port.
+**Phase 3 has three parts, in strict order.** Part 1 was a dedicated fix — planned
+and reviewed on its own, before the port began, not folded into it. Part 2 was
+then split again: the exit registry does not depend on `TradingEngine`, so it
+could be ported and proven on its own (Part 2a) before the engine lands (Part 2b).
 
 #### Part 1 — live-feed shutdown path — **COMPLETE** (30 July 2026)
 
@@ -1133,7 +1257,22 @@ gate met in full:
 What it changed, why, and the residual limitation: see "What Phase 3 Part 1
 delivered" (section 1), the Part 1 gate evidence (section 4), and limitation 13.
 
-#### Part 2 — port `TradingEngine` and the exit-policy registry — **NOT STARTED**
+#### Part 2a — port the exit-policy registry — **COMPLETE** (31 July 2026)
+
+Delivered item 2 of the original Part 2 list: `framework/exit/` (all ten policies,
+both wiring paths), plus the `SuperTrend`/`OHLC` and `WarmupRequirement`/
+`parse_hhmm` subset the policies need, plus the three enums they read. 44 tests,
+all passing; D2 and D3 confirmed against the ported code. Full record: "What
+Phase 3 Part 2a delivered" (section 1). One carried-over mislabelled test recorded
+there rather than fixed, to keep the ported suite diff-comparable.
+
+**The registry has no caller yet.** The engines are exercised only by duck-typed
+test doubles, exactly as the reference exercised them. This repository's own
+`Position` model has none of the four attributes they read
+(`.contract.option_type`, `.side`, `.entry_price`, `.last_price`) — closing that
+gap is Part 2b's job, not a defect in the port.
+
+#### Part 2b — port `TradingEngine` — **NOT STARTED**
 
 Spec: "Port or adapt `TradingEngine` without changing signal/execution behaviour."
 The ordering rule from `CLAUDE.md` governs this part: **port the regression
@@ -1144,12 +1283,11 @@ tests before changing any internals.**
    must pass against the ported engine before a single line of it is refactored to
    fit this repository's models — otherwise there is no way to tell a port from a
    rewrite.
-2. **Port the exit-policy registry** (`framework/exit/`, 11 modules, ~700 lines)
-   and its regression tests. Both wiring paths must be preserved: the
-   `CompositeExit._KEY_TO_ENGINE` map *and* direct instantiation via
-   `get_exit_engine()`, because `momentum_low_or_highest_close` is reachable only
-   by the second (deviation D3). All **ten** policies, not the nine the spec lists
-   (deviation D2).
+2. **Wire the Part 2a registry to a real position.** The ported engines read
+   `.contract.option_type`, `.side`, `.entry_price` and `.last_price`; `Position`
+   has none of them. Either the engine carries the reference's position shape or
+   an adapter bridges the two — decide it explicitly and write the test that pairs
+   a real `Position` with a real exit engine, because nothing does that today.
 3. **Retain strategy-wise broker-factory routing**, keeping the Phase 1 safety gate
    (deviation D5) — the ported factory must not reintroduce building a live broker
    from `mode: live` alone.
@@ -1157,17 +1295,54 @@ tests before changing any internals.**
    in the tree as a test double; the walking-skeleton end-to-end tests keep using
    it, so a regression in the engine port cannot be masked by a change in the test
    harness at the same time.
+5. **Close the mislabelled-test gap** (section 1): add real consecutive-streak
+   coverage for `MomentumCloseExit` on the premium stream, once the engine gives
+   it a caller that actually walks a streak.
+
+##### Blocker: the signal-ownership collision
+
+**Part 2b cannot be started as a straight port.** Part 1 and `TradingEngine` both
+claim `SIGINT`, by the same mechanism:
+
+| | Installs | Scope | On signal |
+|---|---|---|---|
+| `runtimes/intraday_options/supervisor.py:439` | `signal.signal(SIGINT/SIGTERM, _handle)`, previous handlers saved and restored | the feed's lifetime | sets events only, then an ordered feed shutdown |
+| `framework/execution/engine.py:189` | `signal.signal(SIGINT, _on_sigint)`, previous handler saved and restored | its own run loop | mandatory square-off, then re-raises `KeyboardInterrupt` |
+
+The engine's run loop sits *inside* the supervisor's feed lifetime, so the engine
+installs second and wins delivery. On `Ctrl-C` during a strategy run the engine
+would square off and re-raise, and the supervisor's ordered feed shutdown — the
+whole of Part 1 — would be reached only via the re-raise, if at all. Save/restore
+nesting is LIFO and correct on both sides, so this does **not** show up as a
+crash; it shows up as a shutdown path that quietly stops running.
+
+Both behaviours are mandatory: square-off on `SIGINT` is a spec requirement, and
+the feed shutdown closes limitation 1. Neither may be dropped to make the port
+compile. Decide the ownership rule **before** porting, not during — the same
+mistake Part 1 was created to fix, one layer up. The likely shape is that the
+supervisor stays the sole handler installer and the engine exposes a square-off
+callback it invokes, which keeps the Part 1 contract intact and leaves the
+engine's *behaviour* unchanged while changing who triggers it. That is a
+signal/execution-behaviour-affecting change to a "port unchanged" module, so it
+needs its own recorded deviation.
 
 **Explicitly not in Phase 3:** `MultiLegEngine` and `FixedStrikeEngine`. The spec
 schedules each for "when the first consumer is scheduled", and there is no
 consumer yet. Porting 1,668 lines of engine with no strategy to exercise them
 would produce untested code that merely looks finished.
 
-**Acceptance gate (Part 2):** the ported engine's own regression tests pass
-unmodified; the ten exit policies pass theirs; both walking-skeleton gates still
-pass; live is still fail-closed.
+**Acceptance gate (Part 2a) — met:** the ten exit policies pass the reference's
+own regression suite unmodified (34 tests, names and assertion count identical to
+source); both walking-skeleton gates still pass; live is still fail-closed. See
+the Part 2a verification results in section 4.
 
-**Constraints unchanged, both parts:** paper mode only, live order placement
+**Acceptance gate (Part 2b):** the ported engine's own regression tests pass
+unmodified; a real `Position` is proven against a real exit engine; the signal
+ownership rule is decided, recorded as a deviation, and covered by a test that
+fails without it; both walking-skeleton gates still pass; live is still
+fail-closed.
+
+**Constraints unchanged, all parts:** paper mode only, live order placement
 unimplemented and fail-closed, no real strategies (Phase 9), no second
 architecture document.
 

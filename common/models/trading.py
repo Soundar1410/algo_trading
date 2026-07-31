@@ -37,6 +37,54 @@ class Side(StrEnum):
         return 1 if self is Side.BUY else -1
 
 
+#: The reference repository's name for the same enum, kept as an **alias** rather
+#: than a second type (Phase 3 Part 2a). Its members and values are identical
+#: (``BUY``/``SELL``), and the ported exit engines compare by identity —
+#: ``position.side is OrderSide.BUY``. Two distinct enums would make that check
+#: silently False against this repository's own models, which is the kind of bug
+#: that produces a wrong exit rather than an error.
+OrderSide = Side
+
+
+class OptionType(StrEnum):
+    """Option right. Ported from the reference's ``framework/core/models.py``."""
+
+    CE = "CE"  # Call
+    PE = "PE"  # Put
+
+
+class ExitReason(StrEnum):
+    """Why a position was closed (drives reporting and logs).
+
+    Ported verbatim from the reference repository, including the members this
+    repository has no consumer for yet: the exit engines set them, and dropping
+    the ones that look unused today would silently change what a ported engine
+    reports. ``StrEnum`` rather than the reference's ``str, Enum`` to match this
+    repository's convention — same runtime behaviour for comparison and
+    serialisation.
+    """
+
+    STOP_LOSS = "STOP_LOSS"
+    TRAILING_STOP = "TRAILING_STOP"
+    TARGET_PROFIT = "TARGET_PROFIT"
+    OPPOSITE_SIGNAL = "OPPOSITE_SIGNAL"
+    STRATEGY_EXIT = "STRATEGY_EXIT"
+    SQUARE_OFF = "SQUARE_OFF"
+    MANUAL = "MANUAL"
+    # Multi-leg/basket strategies: a leg-wise stop loss reuses STOP_LOSS; these
+    # two are basket-level outcomes with no single-leg equivalent above.
+    DAILY_LOSS_LIMIT = "DAILY_LOSS_LIMIT"
+    ADJUSTMENT = "ADJUSTMENT"
+    # MOMENTUM_LOW_OR_HIGHEST_CLOSE combined candle-structure exit (see
+    # common.exit.combined_candle_exit): granular reasons so a report/log can
+    # tell which rule(s) fired without re-deriving it from raw candle data.
+    MOMENTUM_LOW = "MOMENTUM_LOW"
+    MOMENTUM_HIGH = "MOMENTUM_HIGH"
+    HIGHEST_CLOSE_TRAIL = "HIGHEST_CLOSE_TRAIL"
+    LOWEST_CLOSE_TRAIL = "LOWEST_CLOSE_TRAIL"
+    MOMENTUM_AND_TRAIL = "MOMENTUM_AND_TRAIL"
+
+
 class OrderType(StrEnum):
     MARKET = "MARKET"
     LIMIT = "LIMIT"
