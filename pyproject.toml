@@ -84,9 +84,20 @@ module = ["dhanhq.*"]
 ignore_missing_imports = true
 
 # pandas ships no inline types and `pandas-stubs` is a separate package. Scoped
-# to pandas itself rather than applied globally: the only importer is
-# common/indicators/supertrend.py (its vectorised warm-up form), so an untyped
-# frame cannot leak into execution or persistence code unnoticed.
+# to pandas itself rather than applied globally: the only importers are
+# common/indicators/supertrend.py (its vectorised warm-up form) and
+# common/indicators/vectorised.py, so an untyped frame cannot leak into
+# execution or persistence code unnoticed.
 [[tool.mypy.overrides]]
 module = ["pandas.*"]
+ignore_missing_imports = true
+
+# pandas-ta-classic ships no py.typed marker. Scoped tightly for the same reason
+# as the two above, and the scope is unusually meaningful here: this library is
+# the cross-check *oracle* and must never reach the live incremental path. Its
+# only importer is common/indicators/vectorised.py, and
+# tests/unit/test_indicator_oracle_boundary.py enforces that structurally rather
+# than trusting this comment.
+[[tool.mypy.overrides]]
+module = ["pandas_ta_classic.*"]
 ignore_missing_imports = true

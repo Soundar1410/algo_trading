@@ -1,31 +1,42 @@
 """Market Regime Engine — the observational tagger the engine holds.
 
-Ported from the reference repository's ``framework/regime/`` (Phase 3 Part 2b-i),
-**null classifier only** — deviation D21. The reference package is 421 lines
-across five modules; this is the ~120 the engine actually needs.
+Ported from the reference repository's ``framework/regime/``. Phase 3 Part 2b-i
+brought the registry, the :class:`RegimeClassifier` contract and the null
+classifier; **Phase 4 Part 2 adds ``adx_atr``, closing deviation D21.**
 
-Why only the null classifier: the one real classifier (``adx_atr``) is built on
-ADX and ATR, and Part 2a deliberately did not port those two indicators because
-nothing consumed them and Phase 4 owns the indicator layer. Porting a classifier
-whose inputs do not exist would produce either a broken import or two more
-untested indicators. The regime axis is *purely observational* — it tags trades
-and changes no trading decision — so a tagger that labels everything
-``UNCLASSIFIED`` is exactly the reference's own behaviour with ``regime.enabled:
-false``, which is also this repository's default.
+D21 existed because the one real classifier is built on ADX and ATR, and Part 2a
+deliberately did not port those two indicators — nothing consumed them and Phase
+4 owned the indicator layer. Part 2 ports them, so the classifier's inputs now
+exist and the deviation has nothing left to stand on. It is also what gives ADX
+and ATR a consumer and their only 6 reference regression tests; without it they
+would be exactly the "untested code that merely looks finished" Part 2a refused
+to create.
 
-The registry and the :class:`RegimeClassifier` contract come across intact, so
-adding ``adx_atr`` later is a new file plus one decorator, with no change here.
+D21 predicted this would be "a new file plus one decorator, with no change
+here", and the file half of that turned out to be wrong. The decorator registers
+at **import time**, so a classifier in its own module is registered only if
+something imports that module — a classifier that silently does not exist is a
+worse failure than a slightly longer file. This repository had already collapsed
+the reference's five regime modules into one; ``AdxAtrClassifier`` joins them,
+and registration is then unconditional.
+
+The regime axis remains *purely observational* — it tags trades and changes no
+trading decision — and ``regime_enabled`` still defaults to false, so this ships
+available and not switched on.
 """
 
 from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
+from collections import deque
 from collections.abc import Callable
 from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
+from common.indicators.adx import ADX, ADXState
+from common.indicators.atr import ATR
 from common.indicators.base import OHLC
 
 from .models import OptionContract
@@ -132,6 +143,111 @@ class NullClassifier(RegimeClassifier):
 
     def classify(self) -> RegimeLabel:
         return RegimeLabel.UNCLASSIFIED
+
+
+@register_regime_classifier("adx_atr")
+class AdxAtrClassifier(RegimeClassifier):
+    """ADX (trend strength) + ATR (volatility) — the reference's default.
+
+    Reuses the ported stateful indicators unmodified
+    (:class:`~common.indicators.adx.ADX`, :class:`~common.indicators.atr.ATR`),
+    so it introduces no new indicator maths. Volatility is expressed as a
+    **ratio** of the current ATR to its own rolling average (``vol_ratio``),
+    which keeps the thresholds instrument- and price-level-independent — there
+    are no NIFTY-specific absolute numbers to recalibrate when the index level
+    drifts.
+
+    Decision tree (first match wins; ``volatile_first`` controls step 2 vs 3):
+
+        1. not warmed up                -> UNCLASSIFIED
+        2. vol_ratio >= vol_high        -> VOLATILE
+        3. adx >= adx_trend_min         -> TRENDING_UP / TRENDING_DOWN (+DI vs -DI)
+        4. vol_ratio <= vol_low         -> LOW_VOLATILITY
+        5. otherwise                    -> SIDEWAYS
+
+    Every threshold is config-driven, so recalibration once real trades
+    accumulate is an edit, not a code change.
+    """
+
+    def __init__(self, params: dict[str, Any] | None = None) -> None:
+        super().__init__(params)
+        p = self.params
+        self._adx_period = int(p.get("adx_period", 14))
+        self._atr_period = int(p.get("atr_period", 14))
+        self._atr_avg_window = int(p.get("atr_avg_window", 20))
+        self._adx_trend_min = float(p.get("adx_trend_min", 25.0))
+        self._vol_high = float(p.get("vol_high", 1.30))
+        self._vol_low = float(p.get("vol_low", 0.70))
+        self._volatile_first = bool(p.get("volatile_first", True))
+        # Enough ATR samples to make the average meaningful before we classify
+        # volatility off it (at least half the averaging window, min 5).
+        self._min_atr_samples = max(5, self._atr_avg_window // 2)
+        self.reset()
+
+    def reset(self) -> None:
+        self._adx = ADX(self._adx_period)
+        self._atr = ATR(self._atr_period)
+        self._atr_hist: deque[float] = deque(maxlen=self._atr_avg_window)
+
+    def observe(self, candle: OHLC) -> None:
+        self._adx.update(candle)
+        state = self._atr.update(candle)
+        self._atr_hist.append(state.value)
+
+    @property
+    def is_ready(self) -> bool:
+        return self._adx.is_ready and len(self._atr_hist) >= self._min_atr_samples
+
+    def _snapshot(self) -> tuple[float, ADXState]:
+        """Current ``(vol_ratio, adx_state)`` — shared by :meth:`classify` and
+        :meth:`diagnostics` so the two never drift apart. Only called when
+        :attr:`is_ready`."""
+        atr = self._atr.state.value
+        avg = sum(self._atr_hist) / len(self._atr_hist) if self._atr_hist else atr
+        vol_ratio = atr / avg if avg > 0 else 1.0
+        return vol_ratio, self._adx.state
+
+    def classify(self) -> RegimeLabel:
+        if not self.is_ready:
+            return RegimeLabel.UNCLASSIFIED
+
+        vol_ratio, adx_state = self._snapshot()
+        trending = adx_state.adx >= self._adx_trend_min
+
+        def _trend_label() -> RegimeLabel:
+            return (
+                RegimeLabel.TRENDING_UP
+                if adx_state.plus_di >= adx_state.minus_di
+                else RegimeLabel.TRENDING_DOWN
+            )
+
+        if self._volatile_first:
+            if vol_ratio >= self._vol_high:
+                return RegimeLabel.VOLATILE
+            if trending:
+                return _trend_label()
+        else:
+            if trending:
+                return _trend_label()
+            if vol_ratio >= self._vol_high:
+                return RegimeLabel.VOLATILE
+
+        if vol_ratio <= self._vol_low:
+            return RegimeLabel.LOW_VOLATILITY
+        return RegimeLabel.SIDEWAYS
+
+    def diagnostics(self) -> dict[str, float]:
+        """Raw values behind the last :meth:`classify` call, for recomputing the
+        label later under different thresholds (see the base-class docstring)."""
+        if not self.is_ready:
+            return {}
+        vol_ratio, adx_state = self._snapshot()
+        return {
+            "adx": round(adx_state.adx, 4),
+            "plus_di": round(adx_state.plus_di, 4),
+            "minus_di": round(adx_state.minus_di, 4),
+            "vol_ratio": round(vol_ratio, 4),
+        }
 
 
 class RegimeTagger:

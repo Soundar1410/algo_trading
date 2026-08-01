@@ -7,8 +7,8 @@ the next phase. Updated after every phase.
 
 | | |
 |---|---|
-| **Current phase** | Phase 4 **Part 1 — complete** (real contract resolution: scrip-master port, `DhanOptionChainResolver`, per-instrument exchange segments, the limitation-15 alarm; the offline rehearsal **run against the real instrument master** — it found the configured lot size wrong, 50 vs the exchange's 65 — with the market-hours half still to run), awaiting review. Phase 3 complete, all five parts |
-| **Next phase** | Phase 4 **Part 2** — the indicator layer (see section 8) |
+| **Current phase** | Phase 4 **Part 1 — complete** (real contract resolution; the offline rehearsal found the configured lot size wrong, 50 vs the exchange's 65). **Part 2 — complete** (indicator layer: EMA/RSI/VWAP/ATR/ADX, the `adx_atr` classifier closing D21, and the pandas-ta oracle), awaiting review |
+| **Next phase** | Phase 4 **Part 3** — candle continuity, session/timezone, wall-clock square-off (see section 8) |
 | **Last updated** | 1 August 2026 |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
@@ -24,7 +24,7 @@ the next phase. Updated after every phase.
 | 1 | Walking skeleton | **Complete** |
 | 2 | Dhan and shared-feed hardening | **Complete** — Block 1 (offline) + Block 2 (live) |
 | 3 | Preserve custom engines and policies | **Complete.** **Part 1 complete** (live-feed shutdown); **Part 2a complete** (exit registry + SuperTrend port); **Part 2b-i complete** (signal ownership + engine core); **Part 2b-ii-A complete** (the feed seam: tick channel, runtime subscription, `HubTickFeed`); **Part 2b-ii-B-1 complete** (the execution seam: square-off authority, `LifecycleGateway`, entry-block on tick drop); **Part 2b-ii-B-2 complete** (the wiring: worker engine path, supervisor queue delivery, engine restart recovery, D20 reporting bindings). **Phase 3 complete** — its acceptance gate is met in full |
-| 4 | Candle, indicator and paper-execution foundation | **In progress.** **Part 1 complete** (real contract resolution — closes limitation 17, alarms limitation 15). Parts 2-5 not started: indicator layer; candle continuity + wall-clock square-off; warm-up source; `PaperBroker` realism |
+| 4 | Candle, indicator and paper-execution foundation | **In progress.** **Part 1 complete** (real contract resolution — closes limitation 17, alarms limitation 15). **Part 2 complete** (indicator layer — closes D21). Parts 3-5 not started: candle continuity + wall-clock square-off; warm-up source; `PaperBroker` realism |
 | 5 | Mixed-mode supervisor and persistence | Not started |
 | 6 | Paper recovery and expiry handling | Not started |
 | 7 | Operations | Not started |
@@ -941,6 +941,156 @@ before any continuity-required strategy runs (see limitation 16). `Database` sti
 opens with thread affinity, so nothing in a worker may touch SQLite off the main
 thread — recorded as **D31** rather than worked around.
 
+### What Phase 4 Part 2 delivered — the indicator layer
+
+Ports EMA, RSI, VWAP, ATR and ADX from the reference into `common/indicators/`,
+plus the `adx_atr` regime classifier, plus a `pandas-ta-classic` cross-check
+oracle. **Closes deviation D21.** Suite 896 → 984.
+
+#### Three statements this section makes plainly, because the flattering version is available and wrong
+
+**1. Only 14 reference tests were ported — there is no ported indicator suite.**
+The reference repository has **no dedicated indicator test file**: no
+`test_indicators.py`, no per-indicator suite, and no `conftest.py` anywhere in
+its tree. What came across is 4 `ConfirmedCrossover` tests, 6 `AdxAtrClassifier`
+tests, 3 warm-up declaration tests and 1 continuity-required test — 14 functions,
+16 collected (one is parametrised ×3), all in
+`tests/unit/test_indicators_ported.py`. **Every other test covering these five
+indicators in this repository was written here**, and was therefore never
+validated against the reference's own behaviour. Phase 3 Part 2a could say "the
+ten exit policies pass the reference's own regression suite unmodified, names and
+assertion count identical to source". **No equivalent claim is available for the
+indicators, and none is made.**
+
+**2. RSI has no reference coverage whatsoever.** Nothing in the reference
+repository constructs `RSI` — not a test, not a strategy, not a framework
+consumer. A repo-wide grep returns hits only in `rsi.py` itself and its package
+`__init__`. Its correctness here rests on the `pandas-ta-classic` cross-check
+(agreement to `7.4e-16`, i.e. float precision) plus tests written in this
+repository. It is the **only** one of the five whose behaviour was never
+exercised by the system it came from, and it should be treated as the
+least-proven of the five until a strategy consumes it in Phase 9.
+
+**3. `pandas-ta-classic` is never on the live incremental path.** The adapter
+(`common/indicators/vectorised.py`) computes batch values for the cross-check
+and, from Part 4, for warm-up replay. No value the engine trades on is produced
+by it. This is a deviation from how the architecture document's
+"pandas-ta-classic adapter" bullet might be read: routing live values through the
+library would change numbers the ported regression tests were written against,
+which the project rules forbid. **Enforced structurally, not by convention** —
+`tests/unit/test_indicator_oracle_boundary.py` AST-walks every shipped package
+for the import *and* proves at import time, in a clean interpreter, that loading
+any indicator or `common.engine.regime` does not pull the library in. Verified by
+breaking it: adding the import to `regime.py` fails 2 of its tests.
+
+#### The ceiling on this part's evidence, stated rather than implied
+
+An agreement test against a different implementation catches a transcription
+error, an off-by-one in a smoothing loop, a swapped high/low, a wrong alpha. It
+**cannot** catch a formula both implementations share and both get wrong — two
+implementations of the same misunderstanding agree perfectly. Part 1 could prove
+its port against the reference's own regression test *and* against real broker
+data; Part 2 can do neither for three of the five. That is the honest ceiling and
+the green tick does not raise it.
+
+#### The tolerances, measured before they were asserted
+
+Probed against `pandas-ta-classic` 0.6.52 on a fixed-seed 300-bar series,
+comparing the last 150 bars. Each asserted tolerance is one order of magnitude
+above the measured figure and tied to a **named** structural cause — none was
+chosen by widening until a test passed:
+
+| Indicator | Measured | Asserted | Cause of the difference |
+|---|---|---|---|
+| RSI(14) | `7.4e-16` | `1e-12` | **none** — same Wilder formulation, same SMA seed |
+| VWAP | `7.5e-16` | `1e-12` | **none** — same cumulative typical-price × volume |
+| EMA(21) | `2.98e-09` | `1e-8` | first-close seed vs pandas-ta's |
+| ATR(14) | `2.85e-06` | `1e-5` | first-TR seed vs SMA-of-first-`period` seed |
+| ADX(14) | `5.87e-05` | `1e-4` | EWM from the first DX vs Wilder's second seeding pass |
+
+Every inexact case is an exponentially-forgetting smoother, so the seeding
+difference **decays** rather than accumulating. That is why the comparison runs
+on a tail, and why the fixture length and tail offset are themselves asserted:
+a shorter series legitimately diverges more, and a test that quietly shortened it
+while keeping the tolerance would be measuring nothing.
+`test_a_short_series_really_does_diverge_more` is the negative control — it
+proves the head genuinely exceeds the tail tolerance, so pinning the tail is not
+cargo cult.
+
+ADX deserves a note. The reference's own docstring says its ADX "approximates
+with a running EWM from the first DX onward — good enough for a threshold-based
+filter, **not intended for exact TA-Lib parity**." Measured agreement is far
+closer than that implies, because the seeding gap decays; the disclaimer is
+about short series, and the fixture-length assertion is what keeps it honest.
+
+#### What was built
+
+| Piece | Where |
+|---|---|
+| `EMA`/`EMAState`, and `ConfirmedCrossover` alongside it | `common/indicators/ema.py` |
+| `RSI`/`RSIState`, `VWAP`/`VWAPState`, `ATR`/`ATRState`, `ADX`/`ADXState` | `common/indicators/{rsi,vwap,atr,adx}.py` |
+| `AdxAtrClassifier`, registered as `adx_atr` | `common/engine/regime.py` |
+| The oracle adapter — `ema`, `rsi`, `atr`, `adx`, `vwap` over a frame | `common/indicators/vectorised.py` |
+| `pandas_ta_classic.*` mypy override, scoped and explained | `pyproject.toml` |
+
+`VWAP` is the only indicator overriding `warmup_requirement()`, declaring
+`IndicatorScope.SESSION_LOCAL` **and** `requires_volume=True`. It is the one case
+the `base.py` default gets wrong: warming a session-cumulative indicator with a
+prior session's candles does not seed it, it corrupts it for the whole day.
+
+#### Deviations recorded
+
+**D38 — `pandas-ta-classic` is the oracle, not the live path.** Statement 3
+above. The arch-doc bullet asks for an adapter and this delivers one; what it
+does not do is compute tradable values, because that would move numbers the
+ported regression tests were written against.
+
+**D39 — `AdxAtrClassifier` lives in `regime.py`, not its own module.** D21
+predicted "a new file plus one decorator, with no change here", and the *file*
+half of that turned out to be wrong. The decorator registers at **import time**,
+so a classifier in its own module is registered only if something imports that
+module — and a classifier that silently does not exist is a worse failure than a
+longer file. This repository had already collapsed the reference's five regime
+modules into one, so the class joins them and registration is unconditional.
+`test_registration_needs_no_second_import` proves it in a clean interpreter.
+
+#### Test evidence
+
+| File | Count | What it covers |
+|---|---|---|
+| `tests/unit/test_indicators_ported.py` | 16 | **The 14 ported reference tests** (16 collected), grouped by their source file, imports changed and nothing else |
+| `tests/unit/test_indicators_behaviour.py` | 41 | Written here. Construction validation, `reset()` including a reused-vs-fresh equality check, `is_ready` transitions per indicator, the `RuntimeError` before a first value, and each indicator's own edge — RSI pinned at 100 on an unbroken rally, ATR's first true range and its gap handling asserted against *both* candidate formulas, VWAP hand-computed, ADX's `update`/`state` agreement |
+| `tests/unit/test_indicator_oracle.py` | 9 | The cross-check at the tolerances above, plus the fixture-length assertion and the short-series negative control |
+| `tests/unit/test_indicator_oracle_boundary.py` | 9 | Statement 3, three ways: AST walk over every shipped package, a positive half so the rule cannot pass by the adapter being deleted, and clean-interpreter import proofs for all six indicators and for `common.engine.regime` |
+| `tests/unit/test_regime_classifier_wiring.py` | 13 | D21's closure: registered and resolvable, registration needing no second import, **and that it is available without being switched on** — `regime_enabled` still defaults false, and a disabled axis ignores a named classifier |
+
+**One of the new tests was wrong and the code was right.** An ATR gap test
+asserted `> 5.0` while the comment beside it derived `52/14 = 3.71`; the
+assertion contradicted its own arithmetic. Rewritten to assert the exact value
+against **both** candidate formulas — gap-aware `52/14` versus bar-only `5/14` —
+so it now says which implementation it is rejecting instead of clearing a
+threshold.
+
+**The tolerances are load-bearing, verified by breaking the code.** Changing
+ATR's Wilder alpha from `1/period` to `2/(period+1)` produced a maximum relative
+difference of `1.166e-01` — four orders of magnitude above the asserted `1e-5`,
+so the tolerance is tight enough to catch a real formula error rather than merely
+wide enough to pass.
+
+#### What Part 2 deliberately did NOT deliver
+
+No warm-up source and no injection — the oracle's batch form exists and Part 4
+wires it. No candle-continuity policy (Part 3). No `PaperBroker` change (Part 5).
+No `framework/rolling/` port, so the reference's deeper VWAP coverage
+(`CombinedVwapConfirmation`) did not come across; it is roll-confirmation logic
+belonging with multi-leg work that has no consumer here. No real strategies, so
+`ConfirmedCrossover` and RSI both ship without one — recorded rather than hidden,
+since it is the reason their coverage is what it is. Live order placement remains
+unimplemented and fail-closed; nothing in this part touches the broker, the feed,
+the engine's trading decisions or the database.
+
+---
+
 ### What Phase 4 Part 1 delivered — real contract resolution
 
 Closes **limitation 17** and alarms **limitation 15**. The part exists because the
@@ -1239,7 +1389,7 @@ guard. See deviation D6.
 | **D18** | **`TradingEngine` installs no signal handler** | The reference installed `signal.signal(SIGINT, ...)` inside `run()`, which nests inside the supervisor's own handler and silently wins delivery — the blocker section 8 recorded. Square-off on interrupt is preserved as *behaviour*; what changed is who triggers it: an externally-set `threading.Event`, acted on at boundaries owned by the thread already running the engine. The `raise KeyboardInterrupt` tail becomes a reported `stopped_by_request` flag, because a worker returns an outcome rather than an exit code derived from an exception, and a requested shutdown that completed is not a failure. The square-off arithmetic is untouched; the only behavioural difference is that the close is timestamped from the tick rather than `now_ist()`, matching every other close path in the engine. Section 8 required this be recorded as its own deviation, since it changes signal behaviour in a "port unchanged" module. |
 | **D19** | **Engine models renamed, and `AppConfig` replaced** | `Signal`→`StrategySignal` and `Position`→`OpenPosition`: both names are already taken in this repository by the *persisted* models, and two live types called `Position` is exactly the confusion that produces a wrong exit rather than an error. `Tick` and `Candle` are **reused** rather than re-ported, so the hub's bars and ticks reach the engine with no converter. `AppConfig` (294 lines) becomes `EngineConfig`, holding the six values the engine actually reads — D1 already rejected porting the reference's config layer, and a second config system would give this repository two answers to "is live enabled?". |
 | **D20** | **Reporter, report generator and notifier substituted** | The engine's three reporting seams bind to this repository's `HeartbeatWriter`/`ExecutionRepository`/`SafeNotifier` (Part 2b-ii) rather than to a ported `EngineReporter`. The reference's file-writing `ReportGenerator` and the whole `dashboard/publisher.py` stack — including its 459-line SQLite `PortfolioDatabase` — are not ported: this repository already persists every order, fill and position behind migrations and an `execution_mode` column, and a second reporting database beside it is the parallel universe the audit warns against. `summarise`/`DailySummary` (pure) did come across. |
-| **D21** | **Regime tagger ported null-classifier only** | ~120 lines of 421. The one real classifier (`adx_atr`) is built on ADX and ATR, which Part 2a deliberately did not port because nothing consumed them. The regime axis is purely observational — it tags trades and changes no trading decision — so a tagger that labels everything `UNCLASSIFIED` is exactly the reference's own behaviour with `regime.enabled: false`, which is also this repository's default. The registry and contract came across intact, so adding the classifier later is a new file plus one decorator. |
+| **D21** | ~~**Regime tagger ported null-classifier only**~~ **CLOSED** (Phase 4 Part 2) | Was ~120 lines of 421, because the one real classifier (`adx_atr`) is built on ADX and ATR and Part 2a deliberately did not port those — nothing consumed them. Part 2 ports them, so the classifier's inputs exist and `AdxAtrClassifier` is now registered. It is also what gives ADX and ATR a consumer and their only 6 reference regression tests. **The prediction that this would be "a new file plus one decorator" was half wrong** — see **D39**: the decorator registers at import time, so a classifier in its own module registers only if something imports it. The regime axis is still purely observational and `regime_enabled` still defaults to false, so this ships available and not switched on — asserted by `test_regime_classifier_wiring.py`, not merely intended. |
 | **D22** | **The Part 2b test-port list was wrong, and is corrected** | Section 8 listed four reference suites. Verified against the source: `test_opening_candle_coverage.py` (670) exercises **`FixedStrikeEngine`** via `nifty_fixed_strike_wide_sell.app.build_engine` and never touches `TradingEngine` — excluded. `test_session_candle_gating.py` holds **one** `TradingEngine` test of three; the others need MultiLeg/FixedStrike. `test_mfe_mae.py` tests `PositionManager`/`PaperBroker`, not the engine, but is worth porting for the MFE/MAE contract. `test_premium_candle_exit.py` (9 tests) is the only end-to-end engine suite and builds the **real EMA-cross strategy**, which `CLAUDE.md` defers to Phase 9 — so its nine properties are rebuilt against a test-only double, with the real Part 2a exit policy still making the exit decision. The diff-fidelity loss on those nine is real: they prove the engine's behaviour, not that a ported strategy still matches itself. There is also **no upstream coverage of the signal path at all**, so the ten gate tests are written here. **The rebuilt nine are the one part of this port that is not diff-provable, so the property-by-property mapping is written out below rather than asserted** — including the one property that does not map. |
 
 | **D23** | **The engine aggregates the underlying a second time, beside the hub** | D9 aggregates centrally so every worker provably sees identical bars. A worker driving the ported `TradingEngine` off the new tick channel builds its own bars from the same ticks, so that guarantee no longer holds for it: a dropped tick quietly changes *that worker's* OHLC rather than removing a whole bar visibly. Accepted because the alternative is worse — the hub aggregates at 60 s while the engine wants `cfg.timeframe`, so hub-fed bars would need a new candle→candle aggregator plus an injected entry point bypassing `_on_underlying_tick`, which the ported session-gating test pins attribute by attribute. It also moves *toward* spec section 6, which describes distributing normalised ticks; D9 was always the deviation. Mitigated three ways: the depth is sized from a measured tick rate (`DEFAULT_TICK_MAX_DEPTH`, and a test asserts zero drops at that rate), every drop is counted and surfaced in `queue_stats()`, and — since Part 2b-ii-B-1 — a `TickDropNotice` reaches the child so the engine blocks new entries for the day once a drop occurs (**D28**). Recorded as limitation 14. |
@@ -1257,6 +1407,8 @@ guard. See deviation D6.
 | **D35** | **A stale scrip master raises rather than falling back to the last listed expiry** | The reference returned `self._expiries[-1]` when every expiry was in the past. That resolves contracts which can no longer be traded, so it fails *towards* a silent bad entry rather than away from one. This port raises `ScripMasterError` naming the staleness. The only behaviour change from the reference in this part, and it is pinned by a test that fails against the reference's version |
 | **D36** | **The option's exchange segment is decided in the worker, not the engine** | `TradingEngine`'s feed contract is `subscribe(security_id)` — one string, no segment — and widening it means touching the engine, whose ported session-gating test pins it attribute by attribute. It does not need widening: everything the engine subscribes at runtime other than the underlying **is** an option contract, so `_subscription_sender` gives the underlying the hub's default segment and everything else `option_segment`. This also keeps instrument knowledge in the wiring, where the rest of the resolution already lives. Cost: a future runtime subscribing something that is neither would need this revisited |
 | **D37** | **`nearest_expiry` resolves "today" in IST, not in the process's local naive time** | The reference used `datetime.now().date()`. At 23:30 UTC it is already tomorrow in Mumbai, so for half an hour every night the reference would select the expiring series instead of the next one. Routed through `common.utils.timeutils.now_ist`, which is the clock the engine already uses |
+| **D38** | **`pandas-ta-classic` is the cross-check oracle, never the live incremental path** | The architecture document's Phase 4 bullet asks for a "pandas-ta-classic adapter and fixtures", and `common/indicators/vectorised.py` is one — but it computes batch values for the cross-check tests and (from Part 4) warm-up replay only. **No value the engine trades on comes from it.** Routing live values through the library would change numbers the ported regression tests were written against, which the project rules forbid weakening. Recorded as a deviation because a reader could reasonably read the arch-doc bullet as "compute indicators with pandas-ta". Enforced structurally by `tests/unit/test_indicator_oracle_boundary.py` — an AST walk over every shipped package plus clean-interpreter import proofs — rather than by this note. |
+| **D39** | **`AdxAtrClassifier` lives in `common/engine/regime.py`, not its own module** | **D21** predicted "a new file plus one decorator, with no change here", and the *file* half was wrong. `@register_regime_classifier` runs at **import time**, so a classifier in its own module is registered only if something imports that module — leaving a classifier that silently does not exist, which is a worse failure than a longer file. This repository had already collapsed the reference's five regime modules into one, so the class joins them and registration is unconditional. `test_registration_needs_no_second_import` proves it in a clean interpreter rather than by inspection. |
 
 #### D22 in detail: the rebuilt premium-candle mapping
 
@@ -1918,6 +2070,35 @@ and reported a change that never happened.
 
 `mypy` is run bare — the configured `packages` list. A bare `mypy .` still fails on
 the pre-existing `dashboards/app.py` dual-module-name error, unrelated to this part.
+
+### Verification results (Phase 4 Part 2, 1 August 2026)
+
+| Check | Command | Result |
+|---|---|---|
+| Tests | `python -m pytest` | **984 passed, 8 skipped** (was 896 + 8) |
+| Lint | `ruff check .` | **All checks passed!** |
+| Format | `ruff format --check .` | **173 files already formatted** |
+| Types | `mypy` | **Success: no issues found in 113 source files** |
+
+#### Phase 4 Part 2 gate evidence
+
+**Acceptance gate (Part 2) — met, with its ceiling stated rather than papered over.**
+
+| Requirement | Evidence |
+|---|---|
+| Reference indicator tests pass unmodified | **14 of them, and there are no more** — `tests/unit/test_indicators_ported.py`, 16 collected, imports changed and nothing else. The reference has no dedicated indicator test file; see statement 1 above for why this number is small and what it does *not* let this part claim |
+| The pandas-ta cross-check agrees within a stated, justified tolerance | `tests/unit/test_indicator_oracle.py` — five tolerances, each one order of magnitude above a measured figure and each tied to a named structural cause. Table above |
+| The tolerance is real, not decorative | Breaking ATR's Wilder alpha to `2/(period+1)` produced `1.166e-01`, four orders above the asserted `1e-5`. Restored immediately |
+| The fixture length is part of the assertion | `test_the_fixture_is_long_enough_for_the_tolerances_to_mean_anything` pins `BARS`/`TAIL`; `test_a_short_series_really_does_diverge_more` is the negative control showing the head genuinely exceeds the tail tolerance |
+| VWAP declares `SESSION_LOCAL` and `requires_volume` | The ported `test_indicator_declarations`, plus `test_resetting_vwap_starts_a_new_session_cleanly` for the behaviour the declaration exists to protect |
+| ADX and ATR have a real consumer; **D21 closed** | `AdxAtrClassifier` registered as `adx_atr`, carrying the reference's 6 classifier tests |
+| Closing D21 switched nothing on | `tests/unit/test_regime_classifier_wiring.py` — `regime_enabled` still defaults false, a disabled axis ignores a named classifier, and the default tagger is still `NullClassifier` |
+| `pandas-ta-classic` never on the live path | `tests/unit/test_indicator_oracle_boundary.py`, three ways. Verified by adding the import to `regime.py`: 2 tests fail. Restored |
+| Both walking-skeleton gates still pass | `29 passed` |
+| No default test needs credentials or network | Full suite with `DHAN_*`, `TELEGRAM_*`, `ALGO_LIVE_SMOKE` unset and `socket.socket`/`create_connection`/`getaddrinfo` raising: **984 passed, 8 skipped** |
+| Live still fail-closed | Nothing in this part touches the broker, the feed, the engine's trading decisions or the database. `DhanLiveBroker` still absent |
+| `Trading_Automation` untouched | Newest source+config mtime unchanged at the baseline: **`2026-07-28 10:29:14 .../tests/test_warmup_coordinator.py`** |
+| **Not claimed:** equivalence with Part 2a's port evidence | Part 2a proved ten exit policies against the reference's own regression suite. Three of these five indicators had no such suite and RSI had nothing at all. An agreement test against a second implementation catches transcription errors, not a shared misunderstanding of a formula |
 
 #### Phase 4 Part 1 gate evidence
 
@@ -2794,7 +2975,7 @@ independent concerns apart. **Stop for review after each part.**
 | # | Part | Closes | Gated by | Status |
 |---|---|---|---|---|
 | 1 | Real contract resolution + the live rehearsal | 17; alarms 15 | — | **COMPLETE** (1 Aug 2026) |
-| 2 | Indicator layer (EMA/RSI/VWAP/ATR/ADX) | — | — | Not started |
+| 2 | Indicator layer (EMA/RSI/VWAP/ATR/ADX) | D21 | — | **COMPLETE** (1 Aug 2026) |
 | 3 | Candle continuity, session/timezone, wall-clock square-off | 4, 7 | — | Not started |
 | 4 | Warm-up source and injection | 16 | 2, 3 | Not started |
 | 5 | `PaperBroker` realism | 5, D11 | 1 | Not started |
@@ -2808,19 +2989,16 @@ real option depth is a Full-mode subscription on a real `NSE_FNO` option
 a depth-free tape was the wrong move — Part 1 is what makes a depth-carrying tape
 possible at all.
 
-**Part 2 — the indicator layer.** Port `EMA`, `RSI`, `VWAP`, `ATR` and `ADX` from
-the reference with their regression tests unmodified; they are `StatefulIndicator`
-pairs matching the `SuperTrend` port already in the tree from Part 2a. `VWAP` must
-override `warmup_requirement()` to declare `IndicatorScope.SESSION_LOCAL` — the
-one case the default in `base.py` gets wrong.
+**Part 2 — the indicator layer — COMPLETE.** All five ported, `ConfirmedCrossover`
+with them, `AdxAtrClassifier` registered (D21 closed), and the `pandas-ta-classic`
+oracle behind a boundary test. Full record: "What Phase 4 Part 2 delivered"
+(section 1), deviations D38-D39, and the Part 2 gate evidence in section 4.
 
-`pandas-ta-classic` (0.6.52, already pinned) is the **oracle, not the live path**:
-one adapter providing the vectorised form for warm-up replay and a test-time
-cross-check. The architecture document's bullet says "adapter" and this delivers
-one, but live incremental values stay the reference's proven ones, so the ported
-regression tests hold unweakened. To be recorded as a deviation, with the
-cross-check's tolerance stated and justified (Wilder smoothing and seeding differ)
-rather than an assertion loosened to make it pass.
+**Read the three statements at the head of that section before relying on this
+part.** In short: only 14 reference tests existed to port, RSI had none at all,
+and the oracle is a cross-check rather than the live path. The port is sound and
+its evidence is thinner than Part 2a's was — both are true and the second is the
+one easily forgotten.
 
 **Part 3 — continuity and the wall clock.** `CandleAggregator.mark_feed_gap`
 discards a gap-spanning bar today, which is the conservative floor rather than a
