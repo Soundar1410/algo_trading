@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 from common.config.models import ExecutionMode
 from common.logging import get_logger
 from common.risk import SquareOffPolicy, SquareOffState, SquareOffTrigger
+from common.utils.timeutils import local_time_in
 
 if TYPE_CHECKING:  # imported for typing only, so the engine package stays light
     from common.execution.repository import ExecutionRepository
@@ -79,10 +80,18 @@ class SquareOffAuthority(Protocol):
 class SessionSquareOffAuthority:
     """Clock-only, from the session calendar. The engine's default.
 
-    This is ``MarketSession.is_past_square_off``'s body, moved rather than
-    rewritten, including its choice to read ``ts.time()`` without converting to the
-    session timezone. Keeping it byte-identical is the point: it is what lets the
-    seam land without changing a single ported engine test.
+    Originally ``MarketSession.is_past_square_off``'s body, moved rather than
+    rewritten — **including its choice to read ``ts.time()`` without converting
+    to the session timezone**, which this docstring used to defend as "keeping it
+    byte-identical is the point".
+
+    **Phase 4 Part 3 corrected that.** Byte-identical to a defect is not a
+    virtue: live ticks are UTC-aware, so an unconverted ``ts.time()`` compared
+    ``04:30`` against a ``15:15`` IST square-off and never fired during a real
+    session. It now converts through
+    :func:`~common.utils.timeutils.local_time_in`, which is what
+    :class:`~common.risk.squareoff.SquareOffPolicy` already did — the two
+    deciders agree about an instant for the first time.
 
     It persists nothing, so it cannot survive a restart — which is exactly why it
     is not the implementation a worker uses.
@@ -92,7 +101,7 @@ class SessionSquareOffAuthority:
         self._session = session
 
     def due(self, ts: datetime) -> bool:
-        return ts.time() >= self._session.square_off
+        return local_time_in(ts, self._session.timezone, argument="ts") >= self._session.square_off
 
     def completed(self, ts: datetime) -> None:
         """No-op: there is nowhere to record it, and pretending otherwise would

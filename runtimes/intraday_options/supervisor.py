@@ -64,6 +64,7 @@ from common.config.models import ExecutionMode
 from common.execution import ExecutionRepository
 from common.feed import DEFAULT_TICK_MAX_DEPTH, SharedFeedHub
 from common.feed.hub import WorkerChannel, build_channel
+from common.feed.reconnect import ReconnectingFeed
 from common.health import HealthState, HeartbeatWriter
 from common.logging import get_logger
 from common.market_data.adapter import MarketFeedAdapter
@@ -181,7 +182,22 @@ class IntradayOptionsSupervisor:
         notifier: Notifier | None = None,
     ) -> None:
         self._config = config
-        self._hub = SharedFeedHub(adapter, interval_seconds=config.candle_interval_seconds)
+        # The adapter is wrapped rather than used bare, and Phase 4 Part 3 is when
+        # that started being true. `ReconnectingFeed` had **no constructor call
+        # anywhere outside tests**, so everything Phase 2 built — bounded backoff
+        # with jitter, resubscription after a new socket, 807 token refresh — was
+        # unreachable in the deployed runtime, and so was `on_feed_gap`. That last
+        # one is why it matters here: `mark_feed_gap` is the whole of limitation
+        # 4's mitigation, and nothing was calling it.
+        #
+        # The lambda defers the `self._hub` lookup to call time, which is what
+        # lets the two refer to each other without an ordering problem.
+        #
+        # Safe for the recorded adapter every test uses: `ReconnectingFeed._run`
+        # treats a clean return as "the tape is finished", not as a failure to
+        # retry — see its comment, which names this case explicitly.
+        self._feed = ReconnectingFeed(adapter, on_feed_gap=lambda: self._hub.mark_feed_gap())
+        self._hub = SharedFeedHub(self._feed, interval_seconds=config.candle_interval_seconds)
         self._workers: list[tuple[WorkerConfig, WorkerChannel]] = []
         self._processes: dict[str, mp.process.BaseProcess] = {}
         #: Upstream control queues, one per tick-channel worker. The child puts a

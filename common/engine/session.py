@@ -22,6 +22,16 @@ So ``is_past_square_off`` is gone, and the engine asks a
 what the policy has no notion of: the entry window (:meth:`can_enter`), the active
 window (:meth:`is_open`) and the trading-day/holiday calendar.
 
+Timezone rule (Phase 4 Part 3)
+------------------------------
+Every predicate here resolves its argument **into the session's timezone** before
+comparing, through :func:`common.utils.timeutils.local_time_in`. Until Part 3 they
+read ``.time()`` straight off the argument, which is correct only when the caller
+happens to pass an IST-offset datetime. Live ticks are UTC-aware, so a 10:00 IST
+tick arrived as ``04:30+00:00`` and :meth:`is_open` returned False for the whole
+session — the engine built no candles and placed no orders, silently. A naive
+datetime is now refused rather than guessed at.
+
 ``square_off`` survives as an *attribute* rather than a decision: :meth:`is_open`
 needs an upper bound and :attr:`fingerprint` must hash every value that could move
 a boundary. It is derived from the policy at wiring time — see
@@ -31,9 +41,9 @@ configured times cannot drift apart.
 
 from __future__ import annotations
 
-from datetime import datetime, time
+from datetime import date, datetime, time
 
-from common.utils.timeutils import now_tz, parse_hhmm
+from common.utils.timeutils import local_date_in, local_time_in, now_tz, parse_hhmm
 
 from .config import SessionConfig
 
@@ -54,6 +64,13 @@ class MarketSession:
                 f"(got start={cfg.start_time}, end={cfg.end_time}, "
                 f"square_off={cfg.square_off_time})."
             )
+
+    @property
+    def timezone(self) -> str:
+        """The session's IANA zone. Public because every predicate's answer is
+        relative to it, so a caller resolving a timestamp itself must use the
+        same one — see :class:`~common.engine.square_off.SessionSquareOffAuthority`."""
+        return self._tz
 
     @property
     def fingerprint(self) -> str:
@@ -81,24 +98,42 @@ class MarketSession:
     def _resolve(self, at: datetime | None) -> datetime:
         return at if at is not None else now_tz(self._tz)
 
+    def _local(self, at: datetime | None, argument: str) -> tuple[date, time]:
+        """The session-local date and time of ``at``. **The only clock reading.**
+
+        Every predicate below goes through here so none of them can drift back
+        into reading ``.time()`` off an argument whose offset is not the
+        session's — see :func:`common.utils.timeutils.local_time_in` for what
+        that cost before Part 3.
+        """
+        moment = self._resolve(at)
+        return (
+            local_date_in(moment, self._tz, argument=argument),
+            local_time_in(moment, self._tz, argument=argument),
+        )
+
     def is_holiday(self, at: datetime | None = None) -> bool:
-        """True if ``at`` falls on a configured trading holiday."""
-        return self._resolve(at).strftime("%Y-%m-%d") in self._holidays
+        """True if ``at`` falls on a configured trading holiday, in session time."""
+        day, _ = self._local(at, "at")
+        return day.isoformat() in self._holidays
 
     def is_trading_day(self, at: datetime | None = None) -> bool:
-        """True on weekdays that are not configured holidays."""
-        d = self._resolve(at)
-        return d.weekday() < 5 and not self.is_holiday(d)
+        """True on weekdays that are not configured holidays, in session time."""
+        day, _ = self._local(at, "at")
+        return self._is_trading_day(day)
 
     def is_open(self, at: datetime | None = None) -> bool:
         """True if ``at`` is a trading day within [start_time, square_off_time]."""
-        d = self._resolve(at)
-        return self.is_trading_day(d) and self.start <= d.time() <= self.square_off
+        day, clock = self._local(at, "at")
+        return self._is_trading_day(day) and self.start <= clock <= self.square_off
 
     def can_enter(self, at: datetime | None = None) -> bool:
         """True if a *new* position may be opened (trading day, within [start, end))."""
-        d = self._resolve(at)
-        return self.is_trading_day(d) and self.start <= d.time() < self.end
+        day, clock = self._local(at, "at")
+        return self._is_trading_day(day) and self.start <= clock < self.end
+
+    def _is_trading_day(self, day: date) -> bool:
+        return day.weekday() < 5 and day.isoformat() not in self._holidays
 
     def __repr__(self) -> str:  # pragma: no cover - debug aid
         return (

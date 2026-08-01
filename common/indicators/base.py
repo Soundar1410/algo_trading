@@ -38,6 +38,12 @@ class OHLC:
     open: float | None = None
     volume: float | None = None
     start: datetime | None = None
+    #: True when this bar's interval contained a hole in the tick stream, so its
+    #: OHLC is stitched across missing data. Phase 4 Part 3. The engine does not
+    #: feed such a bar to indicators at all — see
+    #: :meth:`common.engine.strategy.BaseStrategy.on_candle_gap` — so an
+    #: indicator seeing this set means someone bypassed that rule.
+    spans_gap: bool = False
 
 
 class StatefulIndicator(ABC):

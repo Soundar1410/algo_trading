@@ -225,14 +225,20 @@ def test_premium_candle_state_does_not_leak_across_a_re_entry() -> None:
     trades instead of two. Correct behaviour is that the new series has no
     predecessor, so it holds.
     """
-    strategy = EngineFixtureStrategy(enter_on_candle=(1, 3), premium_exit=True)
+    strategy = EngineFixtureStrategy(enter_on_candle=(1, 2), premium_exit=True)
     ticks = [
         *_entry_tape(),
         *_premium_tape(CE_CONTRACT, _PREMIUM_WALK),  # trade 1: 100 in, 80 out
-        # Two more underlying candles; the second is entry #3, and spot has moved
-        # far enough that the ATM strike is 24100, not 24000.
-        _tick(UNDERLYING, 24095.0, _ts(9, 41)),  # closes candle #2
-        _tick(UNDERLYING, 24100.0, _ts(9, 46)),  # closes candle #3 -> ENTER again
+        # Two more underlying ticks; the second is the re-entry.
+        #
+        # This tape has a 20-minute hole in the *underlying* stream between 09:21
+        # and 09:41, so the 09:20 bar is stitched across four empty intervals. As
+        # of Phase 4 Part 3 the engine does not hand such a bar to the strategy at
+        # all (`spans_gap`) — it is not clean data to trade on — so that bar is not
+        # counted, and the re-entry is the strategy's **second** candle rather than
+        # its third. The count changed; what this test asserts did not.
+        _tick(UNDERLYING, 24095.0, _ts(9, 41)),  # 09:20 bar: stitched, skipped
+        _tick(UNDERLYING, 24100.0, _ts(9, 46)),  # closes candle #2 -> ENTER again
         *_premium_tape(
             CE_CONTRACT_2,
             [

@@ -53,6 +53,11 @@ class Candle:
 
     There is no ``is_complete`` flag on purpose: an incomplete candle is never
     represented by this type at all, so no consumer can forget to check it.
+
+    ``spans_gap`` does not contradict that rule. Completeness is about *whether*
+    the interval closed, which is still never in question here; ``spans_gap`` is
+    about *how* — whether the ticks that built it had a hole in the middle. See
+    the field's own note below.
     """
 
     security_id: str
@@ -67,6 +72,20 @@ class Candle:
     tick_count: int = 0
     #: Latest exchange timestamp among the ticks that built this bar.
     last_tick_at: datetime | None = None
+    #: True when this bar's interval contained a known hole in the tick stream —
+    #: its OHLC is stitched across ticks either side of missing data.
+    #:
+    #: **The hub never sets this**: :class:`~common.candles.aggregator.CandleAggregator`
+    #: *discards* a gap-spanning bar rather than publishing one, and that stays
+    #: the policy. It is set by :class:`~common.candles.builder.CandleBuilder`,
+    #: the engine's own per-chart builder (**D23**), which has no discard path —
+    #: dropping a bar there would starve an indicator silently, which runbook
+    #: limitation 14 already calls "worse in kind" than a visible loss.
+    #:
+    #: Defaults False, so every pre-Part-3 construction site is unchanged. It
+    #: travels with the bar across the IPC queue, so no consumer can receive a
+    #: stitched bar without also receiving the fact that it is one.
+    spans_gap: bool = False
 
     def __post_init__(self) -> None:
         if self.end_at <= self.start_at:

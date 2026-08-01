@@ -131,6 +131,36 @@ class BaseStrategy(ABC):
         """
         return None
 
+    def on_candle_gap(self, candle: OHLC, timestamp: datetime) -> None:
+        """A closed **underlying** bar was stitched across a hole in the tick stream.
+
+        Phase 4 Part 3, the counterpart to :meth:`on_option_candle_gap`. The
+        engine calls this **instead of** :meth:`on_candle` — the bar is *not* fed
+        to indicators and produces no signal, because its OHLC was assembled from
+        ticks either side of missing data.
+
+        **The rule this hook exists to let a strategy honour**, expressed in terms
+        of the scope its indicators already declare in
+        :mod:`common.warmup.requirements`:
+
+        * :attr:`~common.warmup.requirements.IndicatorScope.SESSION_LOCAL`
+          indicators — VWAP is the one in the tree — must be **reset**. They are
+          session-cumulative, so missing volume is not something they recover
+          from: every value for the rest of the day would be wrong by the amount
+          the hole swallowed. Use :func:`common.indicators.reset_session_local`.
+        * :attr:`~common.warmup.requirements.IndicatorScope.SESSION_SPANNING`
+          indicators — EMA, RSI, ATR, ADX, SuperTrend — should be **left alone**.
+          They are exponentially forgetting, so a missing bar decays out of them
+          on its own; resetting would throw away far more history than the hole
+          cost. That is the same convergence property Part 2 measured when it
+          justified the oracle tolerances.
+
+        Default: no-op, because a strategy holding only session-spanning
+        indicators genuinely has nothing to do. The passed ``candle`` carries
+        ``spans_gap=True`` and is supplied so a strategy can log or count it.
+        """
+        return None
+
     def status(self) -> str:
         """Short, human-readable indicator state for periodic heartbeat logs."""
         return "no indicator status"

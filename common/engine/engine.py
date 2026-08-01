@@ -581,7 +581,24 @@ class TradingEngine:
         completed = self.candles.add(tick.last_price, tick.exchange_time)
         if completed is not None:
             self._check_premium_candle_gap(tick.exchange_time)
-            self._on_candle_close(to_ohlc(completed), tick.exchange_time)
+            bar = to_ohlc(completed)
+            if bar.spans_gap:
+                # Runbook limitation 4, Phase 4 Part 3. This bar's OHLC was
+                # stitched across a hole in the tick stream, so it is not fed to
+                # indicators and produces no signal. The hub discards such a bar
+                # outright; this builder cannot (D23), so the bar exists and the
+                # engine declines to trade on it instead.
+                log.warning(
+                    "[CANDLE_GAP] %s bar %s-%s was built across a hole in the tick "
+                    "stream; skipping indicators and any signal for it. Exits, stop "
+                    "loss and square-off are unaffected.",
+                    self.label,
+                    completed.start_at.isoformat(),
+                    completed.end_at.isoformat(),
+                )
+                self.strategy.on_candle_gap(bar, tick.exchange_time)
+                return
+            self._on_candle_close(bar, tick.exchange_time)
 
     def _check_premium_candle_gap(self, ts: datetime) -> None:
         """Detect a stalled option-tick feed for the currently tracked contract.

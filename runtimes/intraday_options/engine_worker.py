@@ -60,6 +60,7 @@ from __future__ import annotations
 import queue as queue_module
 import threading
 from collections.abc import Callable
+from datetime import datetime
 from importlib import import_module
 from pathlib import Path
 from typing import Any
@@ -78,7 +79,7 @@ from common.engine.selection import (
     OptionSelector,
     SimulatedOptionChainResolver,
 )
-from common.engine.square_off import PersistedSquareOffAuthority
+from common.engine.square_off import PersistedSquareOffAuthority, SquareOffAuthority
 from common.engine.state_payload import OPEN_POSITION_KEY, read_payload
 from common.engine.strategy import BaseStrategy
 from common.execution import ExecutionRepository, OrderLifecycle
@@ -87,6 +88,7 @@ from common.health import HealthState, HeartbeatWriter
 from common.logging import get_logger
 from common.notifications import NotificationEvent, SafeNotifier
 from common.process import shutdown_signals
+from common.utils.timeutils import now_ist
 
 from .worker import (
     EngineWorkerConfig,
@@ -478,6 +480,19 @@ def _build(
 
     option_selector, option_segment = build_option_selector(config, engine_config)
 
+    # Hoisted above the feed so the wall-clock net below and the engine share **one**
+    # authority instance. Two would mean two `_load_state()` reads and two
+    # `_attempt_recorded` flags — i.e. two deciders against one position, which is
+    # the collision Part 2b-ii-B-1 settled.
+    square_off_authority = PersistedSquareOffAuthority(
+        config.square_off_policy,
+        repository,
+        runtime_id=config.runtime_id,
+        strategy_id=config.strategy_id,
+        execution_mode=config.execution_mode,
+        trading_date=config.trading_date,
+    )
+
     feed = HubTickFeed(
         tick_queue,
         request_subscription=_subscription_sender(
@@ -489,6 +504,9 @@ def _build(
         # would wait for a tick to carry it into on_tick, and a live session runs
         # with no idle timeout at all — so that wait would be unbounded.
         should_stop=lambda: bool(holder) and holder[0].square_off_requested,
+        on_poll=_wall_clock_square_off(
+            holder, square_off_authority, trading_date=config.trading_date
+        ),
         poll_seconds=engine_config.feed_poll_seconds,
         idle_timeout_seconds=config.idle_timeout_seconds,
     )
@@ -522,16 +540,9 @@ def _build(
             execution_mode=config.execution_mode,
             trading_date=config.trading_date,
         ),
-        # The only decider that survives a restart. Until this line it had no caller
-        # outside its own tests.
-        square_off_authority=PersistedSquareOffAuthority(
-            config.square_off_policy,
-            repository,
-            runtime_id=config.runtime_id,
-            strategy_id=config.strategy_id,
-            execution_mode=config.execution_mode,
-            trading_date=config.trading_date,
-        ),
+        # The only decider that survives a restart. Constructed above so the
+        # wall-clock net consults this same instance rather than a second one.
+        square_off_authority=square_off_authority,
         recover_position=_recover,
     )
     holder.append(engine)
@@ -611,6 +622,75 @@ def build_option_selector(
         ),
         segment_code(meta.fno_segment),
     )
+
+
+def _wall_clock_square_off(
+    holder: list[TradingEngine],
+    authority: SquareOffAuthority,
+    *,
+    trading_date: str,
+    clock: Callable[[], datetime] = now_ist,
+) -> Callable[[], None]:
+    """The wall-clock square-off net — runbook limitation 7.
+
+    The engine's square-off is driven by the **candle clock**: `on_tick` asks
+    `authority.due(tick.exchange_time)`. That is the right primary mechanism —
+    it is deterministic and a replay reaches the same decision — but it has one
+    failure mode, and it is the expensive one. *If the feed stops before the
+    square-off bar, square-off never triggers at all* and a position is carried
+    overnight. `squareoff.py`'s own docstring named the candle clock as the
+    design; this is the safety net it always needed.
+
+    Wired into `HubTickFeed`'s poll loop, which is the only thing in a worker
+    that runs on a timer. It fires whether ticks flow or not.
+
+    **One owner is preserved.** This does not decide anything: it asks the *same*
+    `SquareOffAuthority` the engine asks, merely supplying the clock reading the
+    tick stream failed to supply. `PersistedSquareOffAuthority` returns `False`
+    for a day already `COMPLETED`, so a restart cannot re-close — no new state
+    and no migration. The close itself goes through `request_square_off`, i.e.
+    the **D18** path the sentinel and `SIGTERM` already use, so there is no
+    second square-off code path to keep in step.
+
+    Runs on the worker's main thread (see `HubTickFeed.on_poll`), so the
+    authority's SQLite write is safe under **D31**.
+
+    Why the trading-date guard exists
+    ---------------------------------
+    `SquareOffPolicy.trigger_at` is a **time-of-day** decision — it has no notion
+    of *which* day. The candle clock never needed one, because a tick's timestamp
+    carries its own date and a replayed tape is self-consistent. A wall clock
+    does not have that property: it always reports *today*.
+
+    Without this guard, a worker whose `trading_date` is not today — a replay of
+    a recorded tape, or a worker that outlived midnight — would ask "is the wall
+    clock past 15:15?", get `True`, and square off before processing a single
+    tick. Found exactly that way: the net fired in 25 tests on first run, because
+    they replay a 2026-07-16 tape at whatever the real time happens to be.
+
+    So the wall clock is treated as authoritative only for the day it belongs to.
+    Off that day the net stays silent and the candle clock remains the only
+    decider, which is the pre-Part-3 behaviour and the safe direction.
+    """
+
+    def _check() -> None:
+        if not holder:
+            return  # constructed before the engine; nothing to ask yet
+        engine = holder[0]
+        if engine.square_off_requested:
+            return  # already asked; asking twice writes nothing but says nothing either
+        now = clock()
+        if now.date().isoformat() != trading_date:
+            return  # the wall clock speaks only for its own day; see above
+        if not authority.due(now):
+            return
+        log.warning(
+            "wall-clock square-off: the square-off time has passed with no tick to "
+            "carry it, so the close is being requested on the poll timer instead"
+        )
+        engine.request_square_off("wall clock reached the square-off time")
+
+    return _check
 
 
 def _subscription_sender(

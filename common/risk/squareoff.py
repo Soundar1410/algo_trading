@@ -63,7 +63,18 @@ class SquareOffPolicy:
         return ZoneInfo(self.timezone)
 
     def _local_time(self, moment: datetime) -> time:
-        return moment.astimezone(self.zone).timetz().replace(tzinfo=None)
+        """Delegates to the shared helper, which this method used to be.
+
+        Phase 4 Part 3 promoted this conversion into
+        :func:`common.utils.timeutils.local_time_in` because it was the only
+        place in the repository getting it right, while `MarketSession` and
+        `SessionSquareOffAuthority` compared unconverted wall times. Behaviour
+        here is unchanged in one respect and tightened in another: a naive
+        ``moment`` used to be silently read as system-local and is now refused.
+        """
+        from common.utils.timeutils import local_time_in
+
+        return local_time_in(moment, self.timezone, argument="moment")
 
     def entries_allowed(self, moment: datetime) -> bool:
         """False once the cutoff has passed — and it never becomes True again."""

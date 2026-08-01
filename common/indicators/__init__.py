@@ -39,6 +39,8 @@ the live incremental path**, and a test enforces that.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 from .adx import ADX, ADXState
 from .atr import ATR, ATRState
 from .base import OHLC, StatefulIndicator
@@ -65,5 +67,46 @@ __all__ = [
     "SuperTrend",
     "SuperTrendState",
     "VWAPState",
+    "reset_session_local",
     "supertrend",
 ]
+
+
+def reset_session_local(indicators: Iterable[StatefulIndicator]) -> list[StatefulIndicator]:
+    """Reset every session-cumulative indicator; leave the rest untouched.
+
+    The continuity rule from Phase 4 Part 3, as code rather than as prose in a
+    docstring. Call it from
+    :meth:`common.engine.strategy.BaseStrategy.on_candle_gap`.
+
+    A hole in the tick stream affects the two indicator scopes differently, and
+    the difference is not a matter of taste:
+
+    * ``SESSION_LOCAL`` (VWAP) accumulates over the day, so missing volume is
+      never recovered — every later value stays wrong by whatever the hole
+      swallowed. Resetting costs the morning's context and buys correctness for
+      the rest of the day, which is the better trade.
+    * ``SESSION_SPANNING`` (EMA, RSI, ATR, ADX, SuperTrend) are exponentially
+      forgetting: a missing bar decays out of them by itself. Resetting one
+      would discard far more history than the hole did.
+
+    Scope comes from each indicator's own ``warmup_requirement()``, so an
+    indicator added later is classified by what it declares rather than by a list
+    kept in step by hand. An indicator whose ``warmup_requirement()`` raises is
+    treated as session-local and reset — the conservative direction, since the
+    alternative is carrying state that may be corrupt.
+
+    Returns the indicators it reset, so a caller can log or count them.
+    """
+    from common.warmup.requirements import IndicatorScope
+
+    was_reset: list[StatefulIndicator] = []
+    for indicator in indicators:
+        try:
+            scope = indicator.warmup_requirement().scope
+        except Exception:
+            scope = IndicatorScope.SESSION_LOCAL
+        if scope is IndicatorScope.SESSION_LOCAL:
+            indicator.reset()
+            was_reset.append(indicator)
+    return was_reset

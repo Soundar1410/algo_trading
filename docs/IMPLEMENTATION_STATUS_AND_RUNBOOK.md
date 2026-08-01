@@ -7,8 +7,8 @@ the next phase. Updated after every phase.
 
 | | |
 |---|---|
-| **Current phase** | Phase 4 **Part 1 — complete** (real contract resolution; the offline rehearsal found the configured lot size wrong, 50 vs the exchange's 65). **Part 2 — complete** (indicator layer: EMA/RSI/VWAP/ATR/ADX, the `adx_atr` classifier closing D21, and the pandas-ta oracle), awaiting review |
-| **Next phase** | Phase 4 **Part 3** — candle continuity, session/timezone, wall-clock square-off (see section 8) |
+| **Current phase** | Phase 4 **Parts 1-3 complete**. **Part 3** (candle continuity, session/timezone, wall-clock square-off) found and fixed a **live-blocking defect**: the engine treated every real tick as out-of-session, so on a live feed it would have traded nothing, silently. Awaiting review |
+| **Next phase** | Phase 4 **Part 4** — warm-up source and injection (see section 8) |
 | **Last updated** | 1 August 2026 |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
@@ -24,7 +24,7 @@ the next phase. Updated after every phase.
 | 1 | Walking skeleton | **Complete** |
 | 2 | Dhan and shared-feed hardening | **Complete** — Block 1 (offline) + Block 2 (live) |
 | 3 | Preserve custom engines and policies | **Complete.** **Part 1 complete** (live-feed shutdown); **Part 2a complete** (exit registry + SuperTrend port); **Part 2b-i complete** (signal ownership + engine core); **Part 2b-ii-A complete** (the feed seam: tick channel, runtime subscription, `HubTickFeed`); **Part 2b-ii-B-1 complete** (the execution seam: square-off authority, `LifecycleGateway`, entry-block on tick drop); **Part 2b-ii-B-2 complete** (the wiring: worker engine path, supervisor queue delivery, engine restart recovery, D20 reporting bindings). **Phase 3 complete** — its acceptance gate is met in full |
-| 4 | Candle, indicator and paper-execution foundation | **In progress.** **Part 1 complete** (real contract resolution — closes limitation 17, alarms limitation 15). **Part 2 complete** (indicator layer — closes D21). Parts 3-5 not started: candle continuity + wall-clock square-off; warm-up source; `PaperBroker` realism |
+| 4 | Candle, indicator and paper-execution foundation | **In progress.** **Part 1 complete** (real contract resolution — closes 17, alarms 15). **Part 2 complete** (indicator layer — closes D21). **Part 3 complete** (continuity, timezone, wall-clock square-off — closes 4 and 7, and a live blocker). Parts 4-5 not started: warm-up source; `PaperBroker` realism |
 | 5 | Mixed-mode supervisor and persistence | Not started |
 | 6 | Paper recovery and expiry handling | Not started |
 | 7 | Operations | Not started |
@@ -941,6 +941,165 @@ before any continuity-required strategy runs (see limitation 16). `Database` sti
 opens with thread affinity, so nothing in a worker may touch SQLite off the main
 thread — recorded as **D31** rather than worked around.
 
+### What Phase 4 Part 3 delivered — continuity, the timezone rule, and the wall clock
+
+Closes limitations **4** and **7**, and fixes a **live-blocking defect** the
+part's own audit turned up. Suite 984 → 1063.
+
+#### The headline: the engine would have traded nothing on a live feed
+
+`MarketSession.is_open`/`can_enter`/`is_holiday` and
+`SessionSquareOffAuthority.due` compared a timestamp's **raw** wall-clock time
+against IST session bounds, with no conversion. `SquareOffPolicy` converted, so
+the two deciders resolved the same instant differently — and
+`DhanMarketFeedAdapter` produces **UTC-aware** ticks. Verified rather than
+inferred: `reconstruct_exchange_time("04:30:00", …)` returns
+`2026-08-03 04:30:00+00:00`.
+
+Demonstrated with one real-shaped tick at 10:00 IST, mid-session:
+
+```
+hub aggregator accepted the tick?  rejected_out_of_session=0  -> ACCEPTED
+engine session gate is_open?       False
+```
+
+`_on_underlying_tick` returns early when `is_open` is False, so pointed at a live
+feed the engine would have built **no candles, evaluated no signals and placed no
+orders, for the entire session**, reporting nothing wrong. The hub's own bars were
+fine — `CandleAggregator` converts — so the divergence was between the hub and
+the engine, which is the hardest kind to notice from the outside.
+
+**Why the suite could not see it.** Every fixture in the tree is IST-offset
+(`nifty_tick_tape.json` starts `2026-07-29T09:15:00+05:30`), and no test drove a
+session or square-off predicate with a UTC-aware timestamp. Part 1's live
+rehearsal proved a tick *arrives*; it never ran the engine. An aware-but-
+unconverted datetime is worse than a naive one precisely because it looks correct
+at every read site.
+
+**The fix.** One shared helper — `common.utils.timeutils.local_time_in` /
+`local_date_in` — promoted from `SquareOffPolicy._local_time`, which was the only
+place already getting it right. Every session and square-off predicate now routes
+through it, and `squareoff.py` became a caller rather than keeping a private copy.
+**A naive datetime is refused, not guessed**: system-local is the bug class being
+closed, and assuming IST would hide that a caller lost its timezone upstream.
+
+The organising assertion in `tests/unit/test_session_timezone_rule.py` is not "is
+this answer right?" but **"do these two spellings of one instant agree?"** — a
+property impossible to satisfy by accident. Against the pre-Part-3 code 14 of its
+tests fail, 10 of them the substantive agreement checks.
+
+#### Two more things the audit found
+
+**The reconnect layer was never wired.** `ReconnectingFeed` had **no constructor
+call** in `common/`, `runtimes/` or `scripts/` — only in tests. The supervisor
+passed the raw adapter to `SharedFeedHub`, so `on_feed_gap` was never supplied and
+`mark_feed_gap` never fired: limitation 4's entire existing mitigation was dead
+code in the deployed runtime, and so was Phase 2's backoff and resubscription
+work. Part 3 wires it. **Limitation 2 stays open** — none of it is exercised
+against a real socket drop, and this part does not claim otherwise.
+
+**`CandleBuilder` had no gap concept at all.** The engine builds its own bars from
+raw ticks (**D23**), and that builder has no `mark_feed_gap`, no session window
+and no duplicate guard. A twenty-minute hole yielded **one wide bar, unmarked**.
+Since the hub's discard rule protects only the hub's bars, this was the real
+continuity exposure.
+
+#### The continuity policy (limitation 4)
+
+1. **Holes are left absent. Nothing is ever forward-filled.** A forward-filled bar
+   is a fabricated print; on an option premium series it invents a price that
+   never traded and every indicator downstream consumes it as real. The
+   conservative floor `mark_feed_gap` already implemented is now the *policy*,
+   held by decision rather than by deferral.
+2. **`Candle.spans_gap`**, defaulting False. It records *how* the interval closed,
+   not *whether*, so the "no `is_complete` flag on purpose" rule is intact. It
+   travels with the bar across the IPC queue.
+3. **The hub discards; the builder emits and marks.** Deliberately different: the
+   hub fans out to every worker, so a stitched bar would corrupt all of them at
+   once, and another bar will come. The builder has no discard path, and dropping
+   a bar there would starve an indicator with no signal — the failure limitation
+   14 calls "worse in kind".
+4. **The indicator rule**, keyed off the scope Part 2 made real. A `spans_gap` bar
+   never reaches indicators or produces a signal; it reaches
+   `BaseStrategy.on_candle_gap` instead. `common.indicators.reset_session_local`
+   resets `SESSION_LOCAL` indicators (VWAP — session-cumulative, so missing volume
+   is never recovered) and leaves `SESSION_SPANNING` ones alone (EMA/RSI/ATR/ADX/
+   SuperTrend are exponentially forgetting and self-correct — the same convergence
+   Part 2 measured when justifying its tolerances).
+
+**The detection rule is bucket distance, not elapsed silence**, and the first
+implementation got that wrong. Ticks at 09:16 and 09:22 are six minutes apart —
+longer than a five-minute interval — but they land in consecutive buckets, so no
+bar is missing and nothing was stitched. Measuring elapsed time marked most bars
+on any legitimately sparse stream, which an illiquid option leg certainly is. A
+whole bar is missing only when the buckets are more than one interval apart.
+
+#### The wall-clock square-off net (limitation 7)
+
+An optional `on_poll` callable on `HubTickFeed`, invoked where `should_stop` is
+checked so it fires on the busy and idle paths alike — the only thing in a worker
+that runs on a timer. The worker injects a closure that reads `now_ist()`, asks
+the **same** `SquareOffAuthority`, and on True calls `request_square_off`.
+
+**One owner is preserved**: the authority still decides, the net only supplies the
+clock reading the tick stream failed to supply. `PersistedSquareOffAuthority`
+already returns False for a `COMPLETED` day, so a restart cannot re-close — no new
+state, no migration. The close goes through the existing **D18** path, so there is
+no second square-off code path. It runs on the worker's main thread, so the
+authority's SQLite write is safe under **D31**.
+
+**The trading-date guard, and how it was found.** `trigger_at` is a *time-of-day*
+decision with no notion of which day; a wall clock always reports today. On first
+implementation the net fired in **25 tests** before a single tick was processed,
+because they replay a 2026-07-16 tape at whatever the real time happens to be. The
+wall clock is now authoritative only for the day it belongs to; off that day the
+candle clock remains the only decider, which is the pre-Part-3 behaviour and the
+safe direction.
+
+#### Deviations recorded
+
+**D40 — session predicates refuse a naive datetime.** They used to accept one and
+read it as system-local. Fail-closed with a message naming the argument, because
+neither available guess is safe.
+
+**D41 — the hub discards a gap-spanning bar; the engine's builder emits and marks
+it.** Two builders, two behaviours, for the reasons in point 3 above. Recorded so
+the asymmetry reads as a decision rather than an oversight.
+
+**D42 — a `spans_gap` bar is skipped entirely, so the strategy does not count it.**
+`on_candle` both updates indicators and produces signals, so declining to trade on
+stitched data means the bar does not reach the strategy at all — and a strategy
+counting bars sees one fewer. Surfaced by
+`test_premium_candle_state_does_not_leak_across_a_re_entry`, whose tape has an
+incidental 20-minute underlying hole; its `enter_on_candle` moved from 3 to 2 to
+match, with the reason recorded in the test.
+
+#### Test evidence
+
+| File | Count | What it covers |
+|---|---|---|
+| `tests/unit/test_session_timezone_rule.py` | 35 | The agreement property across IST/UTC/New_York for every predicate; the exact 04:30-UTC case; hub-and-engine agreement on one real-shaped tick; that the adapter really does emit UTC (so the tests keep covering the real case); session boundaries in UTC; late-evening and small-hours date resolution; naive refused everywhere |
+| `tests/unit/test_wall_clock_square_off.py` | 13 | The net's decision: fires past the time, silent before, asks the authority rather than deciding, once not per-poll, silent off the trading date, guard compares in IST; plus the `on_poll` hook ordering and that a raising hook is not swallowed |
+| `tests/integration/test_wall_clock_square_off_threads.py` | 6 | **The limitation-7 gate**, on real threads with a real database: a feed that dies before the square-off bar still squares off, the close persisted as a real SELL through the audited path, and the run ending on the net rather than the idle timeout — plus three negative controls |
+| `tests/unit/test_candle_continuity.py` | 16 | Bucket-distance detection and its boundary; the mark landing on the stitched bar and not its successor; scaling with the interval; the hub still discarding; nothing forward-filled; the indicator scope rule including the unreadable-scope fallback |
+| `tests/integration/test_candle_gap_policy_wiring.py` | 9 | That the policy **runs**: a stitched bar reaching `on_candle_gap` and not `on_candle`, producing no position, with a clean-stream control; and `on_feed_gap` reaching the hub's aggregators through the supervisor's *own* feed |
+
+**Three properties verified by breaking the code.** Reverting the session
+predicates to unconverted comparison fails 14 tests. Reverting gap detection to
+elapsed silence fails the boundary test. Unwiring `on_feed_gap` fails 3 wiring
+tests. All restored.
+
+#### What Part 3 deliberately did NOT deliver
+
+No warm-up source (Part 4). No `PaperBroker` change (Part 5). **Limitation 2 stays
+open**: wiring `ReconnectingFeed` puts Phase 2's backoff and resubscription on the
+live path for the first time, but none of it has been exercised against a real
+socket drop, and this part claims nothing about it. The engine's own square-off
+remains candle-clock-driven by design — the wall clock is a *net*, not a
+replacement. Live order placement remains unimplemented and fail-closed.
+
+---
+
 ### What Phase 4 Part 2 delivered — the indicator layer
 
 Ports EMA, RSI, VWAP, ATR and ADX from the reference into `common/indicators/`,
@@ -1409,6 +1568,9 @@ guard. See deviation D6.
 | **D37** | **`nearest_expiry` resolves "today" in IST, not in the process's local naive time** | The reference used `datetime.now().date()`. At 23:30 UTC it is already tomorrow in Mumbai, so for half an hour every night the reference would select the expiring series instead of the next one. Routed through `common.utils.timeutils.now_ist`, which is the clock the engine already uses |
 | **D38** | **`pandas-ta-classic` is the cross-check oracle, never the live incremental path** | The architecture document's Phase 4 bullet asks for a "pandas-ta-classic adapter and fixtures", and `common/indicators/vectorised.py` is one — but it computes batch values for the cross-check tests and (from Part 4) warm-up replay only. **No value the engine trades on comes from it.** Routing live values through the library would change numbers the ported regression tests were written against, which the project rules forbid weakening. Recorded as a deviation because a reader could reasonably read the arch-doc bullet as "compute indicators with pandas-ta". Enforced structurally by `tests/unit/test_indicator_oracle_boundary.py` — an AST walk over every shipped package plus clean-interpreter import proofs — rather than by this note. |
 | **D39** | **`AdxAtrClassifier` lives in `common/engine/regime.py`, not its own module** | **D21** predicted "a new file plus one decorator, with no change here", and the *file* half was wrong. `@register_regime_classifier` runs at **import time**, so a classifier in its own module is registered only if something imports that module — leaving a classifier that silently does not exist, which is a worse failure than a longer file. This repository had already collapsed the reference's five regime modules into one, so the class joins them and registration is unconditional. `test_registration_needs_no_second_import` proves it in a clean interpreter rather than by inspection. |
+| **D40** | **Session and square-off predicates refuse a timezone-naive datetime** | They used to accept one and let Python read it as system-local, which is the bug class Part 3 exists to close; reading it as IST instead would hide that a caller lost its timezone upstream. Neither guess is safe, so `common.utils.timeutils.local_time_in` raises `NaiveDatetimeError` naming the argument. This is a behaviour change for any caller that was passing naive datetimes — none in this repository was, and a test now asserts the refusal on every predicate. |
+| **D41** | **The hub discards a gap-spanning bar; the engine's own builder emits and marks it** | Two builders, deliberately two behaviours. `CandleAggregator` fans out to *every* worker, so a stitched bar would corrupt all of them at once, and another bar is always coming — discard is affordable. `CandleBuilder` (**D23**) is one chart in one engine and has no discard path; dropping a bar there would starve an indicator with no signal that it happened, which limitation 14 already calls "worse in kind" than a visible loss. So it emits and sets `Candle.spans_gap`, and the consumer decides. Recorded so the asymmetry reads as a decision rather than an oversight. |
+| **D42** | **A `spans_gap` bar is skipped entirely, so a strategy does not count it** | `BaseStrategy.on_candle` both updates indicators and produces signals, so "do not trade on stitched data" means the bar does not reach the strategy at all — it reaches `on_candle_gap` instead. Consequence worth stating: a strategy counting bars sees one fewer, which is correct (as far as it is concerned the bar did not happen) but is a real behavioural change. Surfaced by `test_premium_candle_state_does_not_leak_across_a_re_entry`, whose tape carries an incidental 20-minute underlying hole; its `enter_on_candle` moved from 3 to 2 and the reason is recorded in the test rather than in a commit message. |
 
 #### D22 in detail: the rebuilt premium-candle mapping
 
@@ -2080,6 +2242,39 @@ the pre-existing `dashboards/app.py` dual-module-name error, unrelated to this p
 | Format | `ruff format --check .` | **173 files already formatted** |
 | Types | `mypy` | **Success: no issues found in 113 source files** |
 
+### Verification results (Phase 4 Part 3, 1 August 2026)
+
+| Check | Command | Result |
+|---|---|---|
+| Tests | `python -m pytest` | **1063 passed, 8 skipped** (was 984 + 8) |
+| Lint | `ruff check .` | **All checks passed!** |
+| Format | `ruff format --check .` | **179 files already formatted** |
+| Types | `mypy` | **Success: no issues found in 113 source files** |
+
+#### Phase 4 Part 3 gate evidence
+
+**Acceptance gate (Part 3) — met in full.**
+
+| Requirement | Evidence |
+|---|---|
+| No naive datetime reaches a session or square-off decision | `tests/unit/test_session_timezone_rule.py` — refused on all four session predicates, on the authority and on the policy. Fail-closed with the argument named |
+| The same instant produces the same decision however it is spelled | The organising assertion, parametrised over IST/UTC/New_York × pre-open/mid-session/after-square-off, for every predicate. **This is the assertion that would have caught the defect on day one** |
+| The live defect is fixed, and stays fixed | `test_a_real_utc_tick_mid_session_is_inside_the_session` and `test_the_hub_and_the_engine_agree_about_one_real_shaped_tick`; `test_the_adapter_really_does_produce_utc_ticks` pins the premise so the case cannot silently stop being covered |
+| **A feed that dies before the square-off bar still squares off, on real threads** | `tests/integration/test_wall_clock_square_off_threads.py` — a real `run_worker`, a real database, a tape that opens a position and then goes silent for ever. `orders_placed == 2` asserted so the gate cannot pass vacuously on a run that never opened anything |
+| The close is real, not just an empty book | The same suite: `order_intents` reads `["BUY", "SELL"]` and two fills, through the audited path |
+| It is the net, not the tape running dry | Run ends well inside half the idle timeout; three negative controls (square-off still in the future, trading date not today, restart of a completed day) |
+| A restart does not re-close a completed day | Two sequential real runs on one database; the order count is unchanged by the second |
+| A gap-spanning bar's fate is asserted as behaviour | `tests/unit/test_candle_continuity.py` — discarded by the hub, emitted-and-marked by the builder, never forward-filled; `tests/integration/test_candle_gap_policy_wiring.py` — not fed to indicators, produces no position, with a clean-stream control |
+| The detection rule is the right one | `test_a_silence_that_crosses_a_boundary_but_empties_no_bucket_is_not_a_gap` — the case that made the first implementation wrong, now the boundary that pins it |
+| `on_feed_gap` is wired and reaches the hub | `test_a_feed_drop_reaches_the_hubs_aggregators_through_the_supervisors_own_feed`, driven through the **supervisor's own** feed rather than a hand-assembled one. Unwiring it fails 3 tests |
+| Wrapping did not break the recorded path | `test_the_wrapper_does_not_break_a_recorded_tape` asserts a clean return with zero reconnect attempts — the property every recorded test depends on |
+| Both walking-skeleton gates pass | `29 passed` |
+| Worker import boundary re-measured | `7 passed`; **0.133 s median over 7 runs, zero `common.engine` modules** |
+| No default test needs credentials or network | Full suite with `DHAN_*`, `TELEGRAM_*`, `ALGO_LIVE_SMOKE` unset and `socket.socket`/`create_connection`/`getaddrinfo` raising: **1063 passed, 8 skipped** |
+| Live still fail-closed | `DhanLiveBroker` still absent; no broker or order path touched |
+| `Trading_Automation` untouched | Baseline unchanged: **`2026-07-28 10:29:14 .../tests/test_warmup_coordinator.py`** |
+| **Not claimed:** limitation 2 | Wiring `ReconnectingFeed` puts Phase 2's backoff and resubscription on the live path for the first time. **None of it has been exercised against a real socket drop**, so limitation 2 stays open exactly as written |
+
 #### Phase 4 Part 2 gate evidence
 
 **Acceptance gate (Part 2) — met, with its ceiling stated rather than papered over.**
@@ -2587,16 +2782,51 @@ start/stop/crash/restart tests pass.
    SDK prints the disconnect reason and returns `None`, so the code is recovered
    by wrapping `server_disconnection` on our own feed object. It is covered by a
    test, but it reads SDK internals and would need revisiting on an SDK upgrade.
-4. **A candle spanning a feed gap is discarded, not repaired.** That is the
-   conservative floor, not a continuity policy: intervals inside an outage simply
-   have no bar. A proper policy (forward-fill rules, partial-bar marking, and what
-   an indicator should do with a hole) is Phase 4.
+4. **~~A candle spanning a feed gap is discarded, not repaired.~~ CLOSED**
+   (Phase 4 Part 3). Discard is now the **policy** rather than the conservative
+   floor pending one: holes are left absent and **nothing is ever forward-filled**,
+   because a forward-filled bar is a fabricated print that every indicator
+   downstream would consume as real.
+
+   Two things had to change for that policy to mean anything. The hub's
+   `mark_feed_gap` was **never called in the deployed runtime** — `ReconnectingFeed`
+   had no constructor call outside tests, so `on_feed_gap` was never supplied. It is
+   wired now. And `CandleBuilder`, which the engine uses for its own bars (**D23**),
+   had no gap concept at all, so a twenty-minute hole produced one wide unmarked bar;
+   it now marks `Candle.spans_gap`, and the engine declines to feed such a bar to
+   indicators or trade on it (**D41**, **D42**).
+
+   **What an indicator does with a hole** is answered using the scope Part 2 made
+   real: `SESSION_LOCAL` indicators (VWAP) are reset because a session-cumulative
+   value never recovers missing volume; `SESSION_SPANNING` ones are left alone
+   because they are exponentially forgetting and self-correct. See
+   `common.indicators.reset_session_local`.
+
 5. **The paper fill model is minimal** (deviation D11). Paper P&L from Phase 1 is
    not yet a credible estimate of live P&L — it has no bid/ask spread cost.
 6. **Migration atomicity is by replay, not transactions** (deviation D6).
-7. **Square-off is driven by the candle clock, not a wall clock.** If the feed
-   stops before the square-off bar, square-off never triggers. A wall-clock
-   safety net belongs with the real session handling in Phase 4.
+7. **~~Square-off is driven by the candle clock, not a wall clock.~~ CLOSED**
+   (Phase 4 Part 3). The candle clock is still the primary trigger and still the
+   right one — it is deterministic and a replay reaches the same decision. What it
+   could not survive is the feed stopping *before* the square-off bar, which left a
+   position open overnight with nothing to notice.
+
+   A wall-clock net now runs on `HubTickFeed`'s poll loop — the only thing in a
+   worker that runs on a timer — and asks the **same** `SquareOffAuthority`. One
+   owner is preserved: the net supplies a clock reading, the authority decides, and
+   the close goes through the existing **D18** request path, so there is no second
+   square-off code path. `PersistedSquareOffAuthority` already refuses a `COMPLETED`
+   day, so a restart cannot re-close and no new state was needed.
+
+   **The wall clock speaks only for its own day.** `trigger_at` is a time-of-day
+   decision with no notion of *which* day, so a worker replaying a historical tape
+   would otherwise square off before its first tick — which is exactly what happened
+   on first implementation, in 25 tests. Off its trading date the net stays silent
+   and the candle clock remains the only decider.
+
+   Proven on real threads with a real database:
+   `tests/integration/test_wall_clock_square_off_threads.py`.
+
 8. **One instrument, one runtime group, one strategy shape.** Multi-strategy and
    mixed-mode supervision are Phase 5.
 9. **Pattern-based log redaction remains heuristic.** It masks `key=value` shapes
@@ -2976,7 +3206,7 @@ independent concerns apart. **Stop for review after each part.**
 |---|---|---|---|---|
 | 1 | Real contract resolution + the live rehearsal | 17; alarms 15 | — | **COMPLETE** (1 Aug 2026) |
 | 2 | Indicator layer (EMA/RSI/VWAP/ATR/ADX) | D21 | — | **COMPLETE** (1 Aug 2026) |
-| 3 | Candle continuity, session/timezone, wall-clock square-off | 4, 7 | — | Not started |
+| 3 | Candle continuity, session/timezone, wall-clock square-off | 4, 7, a live blocker | — | **COMPLETE** (1 Aug 2026) |
 | 4 | Warm-up source and injection | 16 | 2, 3 | Not started |
 | 5 | `PaperBroker` realism | 5, D11 | 1 | Not started |
 
@@ -3000,13 +3230,17 @@ and the oracle is a cross-check rather than the live path. The port is sound and
 its evidence is thinner than Part 2a's was — both are true and the second is the
 one easily forgotten.
 
-**Part 3 — continuity and the wall clock.** `CandleAggregator.mark_feed_gap`
-discards a gap-spanning bar today, which is the conservative floor rather than a
-policy (limitation 4). Deliver the policy — including what an indicator does with
-a hole, which Part 2 finally makes answerable — keeping discard as the default and
-marking any repaired bar as repaired. Add the wall-clock square-off net
-(limitation 7), routed through the existing `SquareOffAuthority` seam so there is
-still one owner of the decision.
+**Part 3 — continuity and the wall clock — COMPLETE.** Limitations 4 and 7 closed,
+plus a live-blocking timezone defect the audit turned up: the engine treated every
+real (UTC-aware) tick as out-of-session, so on a live feed it would have built no
+candles and placed no orders, silently. Full record: "What Phase 4 Part 3
+delivered" (section 1), deviations D40-D42, and the Part 3 gate evidence in
+section 4.
+
+**Limitation 2 is still open and Part 3 did not touch it.** Wiring
+`ReconnectingFeed` into the supervisor put Phase 2's backoff and resubscription on
+the live path for the first time — they had no production caller at all — but none
+of it has been exercised against a real socket drop.
 
 **Part 4 — the warm-up source** (limitation 16). Port `framework/warmup/manager.py`
 and `source.py` plus `framework/market_data/historical.py`; `requirements.py` is

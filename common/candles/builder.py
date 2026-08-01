@@ -54,6 +54,9 @@ class _Bar:
     volume: float
     tick_count: int
     last_tick_at: datetime
+    #: Set when a hole was detected while this bar was open. See
+    #: :meth:`CandleBuilder.add`.
+    spans_gap: bool = False
 
     def absorb(self, price: float, ts: datetime, volume_delta: float) -> None:
         self.high = max(self.high, price)
@@ -124,13 +127,37 @@ class CandleBuilder:
             self._current = self._new_bar(bucket, price, ts, volume_delta)
             return None
 
+        # Gap detection (Phase 4 Part 3, runbook limitation 4). The bar that spans
+        # a hole is still emitted — unlike the hub, this builder has no discard
+        # path, and dropping a bar here would starve an indicator with no signal
+        # that it happened — but it is *marked*, so a consumer can tell stitched
+        # data from clean data.
+        #
+        # **The test is bucket distance, not elapsed silence**, and the difference
+        # matters. Ticks at 09:16 and 09:22 are six minutes apart, which is longer
+        # than a five-minute interval — but they land in the 09:15 and 09:20
+        # buckets, so no bar is missing and nothing was stitched. Measuring
+        # elapsed time flags that as a gap and would mark most bars on any
+        # legitimately sparse stream, which an illiquid option leg certainly is.
+        #
+        # A whole bar is missing only when the buckets are more than one interval
+        # apart. That is what "a hole" means here, and it is the condition that
+        # cannot be true for a merely quiet-but-continuous stream.
+        previous_bucket = floor_to_interval(self._current.last_tick_at, self.interval * 60)
+        gapped = (bucket - previous_bucket) > timedelta(minutes=self.interval)
+
         if bucket > self._current.start_at:
-            # New bucket -> the previous bar is now closed.
+            # New bucket -> the previous bar is now closed. The empty interval sits
+            # between the two ticks, so it is the bar that was open when the stream
+            # went quiet that got stitched — mark that one, not its successor.
+            self._current.spans_gap = self._current.spans_gap or gapped
             completed = self._freeze(self._current)
             self._current = self._new_bar(bucket, price, ts, volume_delta)
             return completed
 
-        # Same bucket -> update the running bar.
+        # Same bucket -> update the running bar. (Unreachable via a gap: two ticks
+        # in one bucket cannot have a whole bucket between them. Kept for the
+        # `bucket < start_at` late-tick case, which this builder absorbs.)
         self._current.absorb(price, ts, volume_delta)
         return None
 
@@ -155,6 +182,7 @@ class CandleBuilder:
             end_at=bar.start_at + timedelta(minutes=self.interval),
             tick_count=bar.tick_count,
             last_tick_at=bar.last_tick_at,
+            spans_gap=bar.spans_gap,
         )
 
     @staticmethod
@@ -185,6 +213,7 @@ def to_ohlc(candle: Candle) -> OHLC:
     beside the builder keeps the model free of a dependency on the indicators.
     """
     return OHLC(
+        spans_gap=candle.spans_gap,
         high=candle.high,
         low=candle.low,
         close=candle.close,

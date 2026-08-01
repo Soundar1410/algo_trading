@@ -90,6 +90,7 @@ class HubTickFeed(MarketDataFeed):
         on_square_off: Callable[[str], None] | None = None,
         on_tick_dropped: Callable[[TickDropNotice], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
+        on_poll: Callable[[], None] | None = None,
         poll_seconds: float = DEFAULT_POLL_SECONDS,
         idle_timeout_seconds: float | None = DEFAULT_IDLE_TIMEOUT_SECONDS,
     ) -> None:
@@ -102,6 +103,20 @@ class HubTickFeed(MarketDataFeed):
         #: is silent. The worker wires this to ``engine.square_off_requested``; see
         #: the module docstring for why the check belongs here.
         self._should_stop = should_stop
+        #: Called on every poll wake, immediately before ``should_stop`` is asked.
+        #: **This is the only place in a worker that runs on a timer**, which is why
+        #: the wall-clock square-off net (runbook limitation 7) lives here: the
+        #: engine's own square-off is driven by the candle clock, so a feed that
+        #: goes quiet before the square-off bar would never reach it.
+        #:
+        #: It runs on the worker's *main* thread — the same one that owns the
+        #: SQLite connection — so a callback here may consult a persisting
+        #: authority without violating **D31**.
+        #:
+        #: Exceptions are deliberately **not** caught: this hook exists to make a
+        #: position close, and a net that silently swallowed its own failure would
+        #: be worse than no net at all.
+        self._on_poll = on_poll
         self._poll = poll_seconds
         self._idle_timeout = idle_timeout_seconds
         #: Observable outcome, so a worker can report *why* the run ended rather
@@ -127,6 +142,10 @@ class HubTickFeed(MarketDataFeed):
         idle_seconds = 0.0
         try:
             while self._running:
+                if self._on_poll is not None:
+                    # Before should_stop, so a net that *requests* a square-off is
+                    # noticed on this same wake rather than the next one.
+                    self._on_poll()
                 if self._should_stop is not None and self._should_stop():
                     # Checked before the blocking get, so it is asked at least once
                     # every ``poll_seconds`` no matter how quiet the stream is.
