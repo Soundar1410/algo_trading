@@ -7,9 +7,9 @@ the next phase. Updated after every phase.
 
 | | |
 |---|---|
-| **Current phase** | Phase 3 **Part 1 — complete** (live-feed shutdown path); **Part 2a — complete** (exit-policy registry); **Part 2b-i — complete** (signal ownership + `TradingEngine` core port); **Part 2b-ii-A — complete** (hub tick channel, runtime subscription, `HubTickFeed`); **Part 2b-ii-B-1 — complete** (`SquareOffAuthority`, `LifecycleGateway`, entry-block on tick drop), awaiting review |
-| **Next phase** | Phase 3 Part 2b-ii-B-2 — the wiring: worker engine path, supervisor queue delivery, engine restart recovery (see section 8) |
-| **Last updated** | 31 July 2026 |
+| **Current phase** | Phase 3 **Part 1 — complete** (live-feed shutdown path); **Part 2a — complete** (exit-policy registry); **Part 2b-i — complete** (signal ownership + `TradingEngine` core port); **Part 2b-ii-A — complete** (hub tick channel, runtime subscription, `HubTickFeed`); **Part 2b-ii-B-1 — complete** (`SquareOffAuthority`, `LifecycleGateway`, entry-block on tick drop); **Part 2b-ii-B-2 — complete** (the wiring: worker engine path, supervisor queue delivery, engine restart recovery, D20 bindings — **Phase 3 acceptance gate met in full**), awaiting review |
+| **Next phase** | Phase 4 — candle, indicator and paper-execution foundation (see section 8) |
+| **Last updated** | 1 August 2026 |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
 | **Live order placement** | **Not implemented.** Fail-closed. Phase 10 only. |
@@ -23,7 +23,7 @@ the next phase. Updated after every phase.
 | 0 | Reference audit + minimal bootstrap | **Complete** |
 | 1 | Walking skeleton | **Complete** |
 | 2 | Dhan and shared-feed hardening | **Complete** — Block 1 (offline) + Block 2 (live) |
-| 3 | Preserve custom engines and policies | **Part 1 complete** (live-feed shutdown); **Part 2a complete** (exit registry + SuperTrend port); **Part 2b-i complete** (signal ownership + engine core); **Part 2b-ii-A complete** (the feed seam: tick channel, runtime subscription, `HubTickFeed`); **Part 2b-ii-B-1 complete** (the execution seam: square-off authority, `LifecycleGateway`, entry-block on tick drop); Part 2b-ii-B-2 (the wiring: worker engine path, supervisor queue delivery, engine restart recovery) not started |
+| 3 | Preserve custom engines and policies | **Complete.** **Part 1 complete** (live-feed shutdown); **Part 2a complete** (exit registry + SuperTrend port); **Part 2b-i complete** (signal ownership + engine core); **Part 2b-ii-A complete** (the feed seam: tick channel, runtime subscription, `HubTickFeed`); **Part 2b-ii-B-1 complete** (the execution seam: square-off authority, `LifecycleGateway`, entry-block on tick drop); **Part 2b-ii-B-2 complete** (the wiring: worker engine path, supervisor queue delivery, engine restart recovery, D20 reporting bindings). **Phase 3 complete** — its acceptance gate is met in full |
 | 4 | Candle, indicator and paper-execution foundation | Not started |
 | 5 | Mixed-mode supervisor and persistence | Not started |
 | 6 | Paper recovery and expiry handling | Not started |
@@ -759,6 +759,188 @@ reporting bindings, no three-channel alarm for the engine's silent-feed residual
 No migration. No `MultiLegEngine`/`FixedStrikeEngine`, no real strategy, no live
 order placement.
 
+### What Phase 3 Part 2b-ii-B delivered — Part B-2, the wiring
+
+The last part of Phase 3. Everything the previous parts built offline is now joined
+into a deployable worker: `worker.py` gains an engine path, `supervisor.py` delivers
+the queues it had been creating and never handing over, a restarted engine adopts the
+position it already holds, and the D20 reporting protocols are bound to the stores
+this repository already has. **75 new tests**, suite **740 → 815** (6 skipped,
+unchanged).
+
+**The 2b-ii-B acceptance gate is claimed here, in full.** See the gate evidence in
+section 4.
+
+#### The import boundary, which is the risk this part owned alone
+
+Re-measured before starting, on this tree:
+
+```
+import runtimes.intraday_options.worker            0.099 s,  0 engine modules
+      + common.engine + EngineFixtureStrategy      0.301 s, 16 engine modules
+```
+
+A 3x increase, against the 0.5 s window in `test_duplicate_worker_startup_is_refused`.
+The equivalent drag cost Part 2b-i that gate.
+
+So the engine path is reached through **exactly one deferred import**, and everything
+behind it lives in a new module `runtimes/intraday_options/engine_worker.py` that
+`worker.py` never imports at module level. `EngineWorkerConfig` stays in `worker.py`
+and holds only primitives, because the child unpickles it *before* any engine import
+— a single engine-owned field would drag the package in through the dataclass
+definition itself (**D30**).
+
+That is enforced by test rather than by comment, three ways, because each catches
+something the others cannot (`tests/unit/test_worker_import_boundary.py`):
+
+| Test | Catches |
+|---|---|
+| AST of `worker.py`, module-level imports only | The **edit**, in the diff that causes it — not a number that moved a week later |
+| A fresh interpreter's `sys.modules` after `import ...worker` | A **transitive** drag through some other module, which reading `worker.py` would never reveal |
+| The positive half: importing `engine_worker` *does* load `common.engine` | A boundary satisfied by an engine path that silently never loads |
+
+Wall-clock time is deliberately not asserted — module count is the cause, and a
+`< 0.5 s` assertion would be flaky for reasons unrelated to the property.
+
+**Fail-first, demonstrated rather than argued.** Hoisting one import into `worker.py`:
+
+```
+FAILED test_the_worker_module_imports_no_engine_package_at_module_level
+FAILED test_a_clean_interpreter_loads_no_engine_module_for_a_worker
+0.324 engine_modules=17   0.307 engine_modules=17   0.308 engine_modules=17
+```
+
+After the part, nine runs: **0.102-0.161 s, median 0.110 s, zero engine modules**.
+
+#### Finding: the engine could not have run on its own thread
+
+The plan for this part put the engine on its own thread, mirroring the supervisor's
+feed thread, so a coordinating thread could bound its wait on a silent feed. **That
+would have crashed on the first fill**, and the reason is worth recording because
+nothing in the design documents made it visible:
+
+```
+ProgrammingError('SQLite objects created in a thread can only be used in that
+same thread. The object was created in thread id ... and this is thread id ...')
+```
+
+`Database.connect()` does not pass `check_same_thread=False`, so the one connection
+belongs to the worker's main thread — and every write from `LifecycleGateway` down
+goes through it. Loosening that for every user of `Database` to serve one caller
+would trade a real safety property for a workaround, so the engine stays on the main
+thread (**D31**) and the problem the second thread was for is fixed at its cause
+instead.
+
+**The silent-feed residual is now fixed, not alarmed about.** `HubTickFeed.run()`
+already wakes every `poll_seconds`, so it now asks a `should_stop` predicate on each
+wake. A square-off requested while the stream is quiet is honoured within one poll
+interval rather than waiting for a tick that may never arrive — which matters because
+a live session runs with `idle_timeout_seconds=None`, making that wait unbounded.
+Returning from the loop reaches `TradingEngine.run()`'s `finally`, which is the second
+of the two square-off boundaries **D18** already names, so nothing crosses a thread
+and the ownership rule is untouched. This closes the engine-level half of
+limitation 13.
+
+One daemon thread remains, and it deliberately touches no database: it drains the
+candle stream an engine worker does not consume (**D23**) and calls
+`request_square_off` if the supervisor's sentinel appears there — documented safe from
+any thread, which is exactly why it is the only cross-thread call.
+
+**The alarm still exists and now checks the outcome rather than a proxy.** After the
+run returns, if a square-off was requested and a position is *still open in the
+database*, the same three channels the supervisor uses fire: a `DEGRADED` heartbeat
+left as the last word, a `CRITICAL` `errors` row, and a notification. "A position is
+still open and nobody is managing it" is a sharper condition than "a thread did not
+finish", and it is the one an operator needs.
+
+#### Restart recovery, and who decides open from close
+
+The `positions` row carries `instrument`, `security_id`, `quantity` and
+`average_price` but not the option type, strike, expiry or lot size, so an
+`OptionContract` cannot be rebuilt from it. `LifecycleGateway` now writes that record
+into the existing free-form `strategy_state.payload` column on open and removes it on
+close; `PositionManager.adopt(...)` seeds an `OpenPosition` **without calling the
+gateway**, because calling it would place a second order and double the exposure
+recovery exists to prevent. No migration — the column already exists.
+
+**The gateway did not gain an open/close notion, and that was the point.** Its verbs
+are directional by design ("this class needs no notion of which a call is, and cannot
+get that judgement wrong"). So the judgement is read off `ExecutionResult.position` —
+the persisted row `apply_fill` returned, already netted by side and already flipped to
+`CLOSED` at quantity zero. The database decides; the gateway only records.
+
+Adoption is sequenced by the **engine**, at the end of `_start_day()`, because only it
+knows the order: `_start_day` calls `risk_manager.reset()`, so arming before it would
+be wiped, and the adopted contract needs `feed.subscribe()` on the same path the
+underlying just took. A recovery provider that *raises* fails closed exactly as a
+raising `warmup_spec()` does — entries latch off for the day, so an inconsistency
+produces "manage nothing new", never "trade alongside something unknown".
+
+**Two silent traps in `save_strategy_state`**, both handled once in
+`common/engine/state_payload.py` rather than at each call site:
+
+1. `payload = COALESCE(excluded.payload, payload)` means `payload=None` **preserves**
+   the column. Clearing the record by passing `None` would have left a restart
+   adopting a position that had already been closed. Clearing writes `{}`.
+2. A write replaces the whole column, so `open_position` and `day_summary` would
+   clobber each other. Every write is read-modify-write.
+
+Both are asserted against real SQL, including on the raw column value, because both
+are properties of the SQL that a mocked repository would happily agree with.
+
+#### The supervisor, delivering what it had been creating
+
+`channel.tick_queue.raw` and the control queue now reach the child; before this the
+supervisor created both and passed neither, so an engine worker would have sat on an
+empty feed. The `None` sentinel is published on the **tick** channel as well as the
+candle one — B-1 found this missing, which made `HubTickFeed`'s sentinel →
+`request_square_off` path, built in 2b-ii-A, unreachable in the deployed shape no
+matter how correct it was.
+
+Tick drops are reported under `f"{strategy_id}:ticks"`, **not summed** into the
+existing key: a dropped tick latches that worker's entries off for the day
+(limitation 14) while a dropped candle does not, and one number for both would hide
+which happened.
+
+#### Test evidence
+
+| Group | Count | What it covers |
+|---|---|---|
+| `tests/unit/test_worker_import_boundary.py` | 7 | The boundary, three ways, plus the `__init__` re-export path and the primitives-only rule for `EngineWorkerConfig` |
+| `tests/unit/test_engine_state_payload.py` | 15 | Both `save_strategy_state` traps against real SQL — including that an emptied payload writes `{}` and not NULL — plus two keys coexisting, no leakage across strategies or trading dates, and unusable stored data degrading to empty rather than refusing to start |
+| `tests/unit/test_position_manager_adopt.py` | 12 | Adoption places no order (the gateway raises on contact, so a regression fails rather than being counted), a double adopt and an `open` on top of an adopted position are both refused, the previous run's entry charges reach the closed `Trade`, and excursion restarts at zero rather than being invented |
+| `tests/integration/test_engine_worker.py` | 20 | The worker end to end through the real persisted path; both refusals (no tick queue, live mode); the D20 bindings actually writing; limitation 14's block with the same tape entering normally as the control; both sentinels; and the square-off time proven to be *derived* from the policy rather than configured twice |
+| `tests/integration/test_engine_worker_restart.py` | 10 | **The restart gate.** Two sequential real runs on one database: adopt, do not re-enter, close. Plus a test that the second run *really did signal an entry*, without which the no-re-entry assertion passes for the wrong reason — and three fail-closed cases (no contract record, a stale one, a different trading date) |
+| `tests/end_to_end/test_engine_worker_signal.py` | 5 | **The signal gate.** A real `SIGTERM` and a real `SIGINT` to a real worker child running the real engine |
+| `tests/integration/test_hub_tick_feed.py` | +3 | A silent feed honouring a square-off request, and that the check pre-empts no queued work |
+| `tests/end_to_end/test_supervisor.py` | +3 | The tick sentinel counted on the wire, the separate drop key, and an engine child proven to have received **both** queues |
+
+The signal gate waits for a position to be genuinely open in the database before
+signalling, rather than sleeping: a signal delivered to an empty book squares off
+nothing, which any implementation passes. Likewise the supervisor's engine-child test
+asserts `subscriptions_applied`, which the child can only reach by having received
+ticks on one queue and having had the other to answer on — one number proving both
+deliveries and the engine running between them.
+
+The nine threading-adjacent suites ran **10 consecutive times**: `111 passed` on all
+ten, 59.5-60.5 s each. No flake.
+
+### What Phase 3 Part 2b-ii-B-2 deliberately did NOT deliver
+
+No `MultiLegEngine`/`FixedStrikeEngine` — the spec schedules each for its first
+consumer and there still is none. No real strategy: the only `BaseStrategy` in the
+tree remains a test fixture (Phase 9). No live order placement, no `DhanLiveBroker`,
+no migration. No live option-chain resolver — the engine still selects strikes through
+`SimulatedOptionChainResolver`, so a live path would need
+`common/market_data/option_chain.py` wired in, which belongs with the live phase.
+Recorded as **limitation 17**, because it is the largest remaining gap between the
+engine as tested and an engine that could trade. The
+engine's own warm-up manager is still not injected by the worker, so an engine worker
+cold-starts its indicators; harmless for the fixture strategy, and it must be revisited
+before any continuity-required strategy runs (see limitation 16). `Database` still
+opens with thread affinity, so nothing in a worker may touch SQLite off the main
+thread — recorded as **D31** rather than worked around.
+
 ---
 
 ## 2. Reference-repository reuse inventory
@@ -947,6 +1129,9 @@ guard. See deviation D6.
 | **D27** | **`LifecycleGateway` reports a charges total with no component breakdown** | `InMemoryGateway` populates six components (brokerage, exchange, STT, SEBI, GST, stamp duty) because it calls `ChargesCalculator.for_leg` itself. The persisted path cannot: `PaperBroker` calls `total_for_leg` and `Fill` carries only the total, which is the number that reaches SQLite. Recomputing the split from rates inside the gateway would produce a breakdown that could silently disagree with the persisted total — two answers to one question, which is the failure mode D19 and D20 were both written to avoid. `Trade.charges` is unaffected: `PositionManager` sums the totals. Revisit if and when `Fill` carries a breakdown |
 | **D28** | **A dropped tick is reported to the worker in band, on a cadence** | The drop is detected and counted in the supervisor's process; the consumer that must act on it runs in the child. There is no other parent→child channel, and the tick queue already carries the `None` shutdown sentinel, so a `TickDropNotice` rides beside it. It is matched by **type**, not identity, because it crosses a pickle boundary — a module-level singleton would not survive. **The cadence was corrected after the part was first committed, on measurement rather than argument.** The notice is pushed into a queue that is full by definition, so it evicts a real tick. One notice per drop — the first implementation — cost **358 extra lost ticks per 6000** at the deployed depth of 2048 against a lagging consumer (6.3% of delivery), to make the entry block engage **6.5% sooner** (after 4393 ticks rather than 4699). A cadence of 8 costs **52** (0.9%) for that same latency: roughly seven times less data for a difference in blocking latency that is not material when both are in the thousands. The original justification recorded here — that a bounded cadence "loses the notice entirely on a short burst in a shallow queue" — was **wrong**, and is corrected rather than quietly dropped: it was true of a cadence of 64, which was never the alternative on the table. The cadence is clamped to `min(8, depth // 2)` (`drop_notice_cadence`), which is the invariant it actually depends on: a notice reaches the consumer only while it is inside the retained window, and roughly one tick is published per drop, so a cadence at or above the depth lets every notice be evicted before the next is sent. Swept across depths 4-2048 and run lengths 12-4000: a fixed 8 reported every overflow at depth 8 and above but **lost the notice entirely at depth 4**; clamped, every overflowing case reported. At the deployed depth the clamp returns 8 unchanged, so it only bites on the shallow queues that appear in tests. |
 | **D29** | **A square-off left `IN_PROGRESS` by a dead process is retried, not honoured** | `SquareOffPolicy.trigger_at` returns `NONE` for `IN_PROGRESS`, which is right for the process that wrote it — it is mid-attempt — and wrong for a process that reads it at startup, because whoever owned that attempt is gone. Honouring it literally would leave a position open past square-off with nothing that will ever close it, which is the failure execution §10 exists to prevent; §10's own staged behaviour includes a retry window for exactly this. `PersistedSquareOffAuthority` therefore normalises an inherited `IN_PROGRESS` to `PENDING` at load and logs it at `WARNING`. Recorded as a deviation because it changes what a persisted state means depending on who read it. `trigger_at` is untouched and its unit test still passes: the normalisation is one layer up |
+| **D30** | **The engine's strategy travels as a dotted `module:Class` reference plus keyword arguments, not a registry name** | The ported `common.engine.strategy.get_strategy(name, cfg)` takes exactly one positional config argument, which the engine's strategies — whose constructors are keyword-only — do not fit. Two ways out: change the ported registry to suit its first caller, or carry a form that can express what already exists. The second leaves the port untouched, which is the whole point of porting it. The reference is resolved in the child by `engine_worker.load_strategy`, which `isinstance`-checks the result against `BaseStrategy` so a typo naming another class in the same module fails at startup rather than on the first tick. It also keeps `EngineWorkerConfig` free of engine-owned types, which the import boundary requires: the child unpickles that dataclass before any engine module is loaded, so a single engine-typed field would drag the package in through the definition itself |
+| **D31** | **The engine runs on the worker's main thread; `Database` keeps its thread affinity** | Planned as a second thread, mirroring the supervisor's feed thread, so a coordinating thread could bound its wait on a silent feed. `Database.connect()` does not pass `check_same_thread=False`, so the connection belongs to the thread that created it and the first fill from `LifecycleGateway` raises `ProgrammingError`. Passing `check_same_thread=False` would have loosened a real safety property for every user of `Database` to serve one caller, so the engine stays on the main thread instead and the case the second thread existed for is fixed at its cause: `HubTickFeed` asks a `should_stop` predicate on every poll wake, so a shutdown requested during a silent stretch is honoured within one poll interval rather than waiting for a tick that may never come. Returning from that loop reaches `TradingEngine.run()`'s `finally`, which **D18** already names as the second square-off boundary, so no new mechanism is introduced. Consequence to remember: **nothing in a worker may touch SQLite off the main thread.** The one remaining helper thread drains the candle queue and calls `request_square_off`, which is documented safe from any thread precisely because it only sets a flag |
+| **D32** | **The engine's day summary goes into `strategy_state.payload`, not a report file or a second store** | **D20** deferred this binding to Part 2b-ii and warned against the reference's parallel `PortfolioDatabase`. Every leg is already persisted through `LifecycleGateway` into `signals`/`order_intents`/`orders`/`fills`/`positions`, so re-writing the trades would be exactly that parallel universe. What those tables cannot hold is the engine's own analytics — MFE/MAE, the regime tags, the exit reason it chose, the day's net — so `RepositoryReportWriter` writes only those, into the free-form column that already exists, merged so it coexists with the `open_position` record the gateway keeps there. Recorded as a deviation because the reference wrote CSV/JSON/HTML files to `report.output_dir` and this writes none |
 
 #### D22 in detail: the rebuilt premium-candle mapping
 
@@ -1203,7 +1388,52 @@ tests/integration/test_tick_drop_blocks_entries.py   31, new: limitation 14 clos
 tests/integration/test_feed_tick_channel.py          1 narrowed (drop-oldest now
                                                      asserted over the ticks)
 
-tests/    489 unit, 220 integration, 31 end-to-end, 6 smoke (skipped)
+--- Phase 3 Part 2b-ii-B-2 (the wiring) ---
+
+runtimes/intraday_options/
+  engine_worker.py             NEW. Every common.engine import in the worker process
+                               lives here, behind worker.py's one deferred import
+                               (D30/D31). Builds the engine, drives it on the MAIN
+                               thread, drains the unused candle queue on a daemon
+                               thread, recovers an open position, raises the
+                               three-channel alarm if one is left open
+  worker.py                    EngineWorkerConfig (primitives only, picklable);
+                               WorkerConfig.engine; run_worker gains tick_queue and
+                               control_queue; close_previous_session and
+                               resolved_config_stub made shared
+  supervisor.py                passes tick + control queues to the child; publishes
+                               the None sentinel on the tick channel too; reports
+                               tick drops under "<strategy_id>:ticks"
+
+common/engine/state_payload.py NEW. read_payload/merge_payload — the two
+                               save_strategy_state traps handled in one place
+common/engine/reporting_bindings.py
+                               NEW. HeartbeatEngineReporter + RepositoryReportWriter
+                               (D20 bound, D32). Deliberately NOT re-exported from
+                               common/engine/__init__.py: it needs HealthState at
+                               runtime, which would drag common.execution into every
+                               common.engine import
+common/engine/positions.py     PositionManager.adopt() — seeds a position without
+                               calling the gateway
+common/engine/models.py        AdoptedPosition
+common/engine/engine.py        recover_position hook, consulted at the end of
+                               _start_day(); fails closed if it raises
+common/engine/gateway.py       optional repository -> writes/clears the contract
+                               record; executions counter
+common/engine/hub_feed.py      should_stop, asked on every poll wake — closes the
+                               engine half of limitation 13
+
+tests/unit/test_worker_import_boundary.py            7, new: the boundary, enforced
+tests/unit/test_engine_state_payload.py              15, new
+tests/unit/test_position_manager_adopt.py            12, new
+tests/integration/test_engine_worker.py              20, new
+tests/integration/test_engine_worker_restart.py      10, new: the restart gate
+tests/end_to_end/test_engine_worker_signal.py        5, new: the signal gate
+tests/end_to_end/engine_worker_signal_child.py       child process for the above
+tests/integration/test_hub_tick_feed.py              +3
+tests/end_to_end/test_supervisor.py                  +3
+
+tests/    523 unit, 253 integration, 39 end-to-end, 6 smoke (skipped)
   fixtures/nifty_tick_tape.json                       24 ticks, 6 one-minute buckets
   fixtures/dhan_ticker_payloads_synthesised.json       SYNTHESISED in Block 1 from the
                                                        SDK's own parsers; kept permanently
@@ -1470,6 +1700,114 @@ common.exit modules:   []
 median worker import: 0.111s over 5 runs
 ```
 
+### Verification results (Phase 3 Part 2b-ii-B-2, 1 August 2026)
+
+| Check | Command | Result |
+|---|---|---|
+| Tests | `python -m pytest` | **815 passed, 6 skipped** |
+| Lint | `ruff check .` | **All checks passed!** |
+| Format | `ruff format --check .` | **158 files already formatted** |
+| Types | `mypy` | **Success: no issues found in 106 source files** |
+
+Test distribution: 523 unit (was 489), 253 integration (was 220), 39 end-to-end (was
+31), 6 smoke (skipped by design). End-to-end grew for the first time since Part 1,
+which is the point of this part: it is the one that changes the deployed process shape.
+
+**Baseline measured again, not assumed**, by the same method every part since 2b-i has
+used — `HEAD` (`faa527f`) checked out into a detached worktree and run with the same
+interpreter: **740 passed, 6 skipped**. Working tree: **815 passed, 6 skipped**. The
+delta is exactly **+75** with an identical skip count, so no pre-existing test was
+silenced or newly skipped. **No existing test was modified this part** — the three
+additions to `test_hub_tick_feed.py` and `test_supervisor.py` are appended tests, not
+edits to existing ones.
+
+**The duplicate-worker race was the risk this part owned, and it is measured on both
+sides of the boundary.** Nine runs after the change:
+
+```
+$ python -c "import runtimes.intraday_options.worker; ..."   # nine runs
+0.124 engine_modules=0   0.161 engine_modules=0   0.125 engine_modules=0
+0.142 engine_modules=0   0.110 engine_modules=0   0.102 engine_modules=0
+0.103 engine_modules=0   0.106 engine_modules=0   0.104 engine_modules=0
+```
+
+Median **0.110 s**, zero `common.engine` modules — statistically unchanged from B-1's
+0.100 s and 2b-ii-A's 0.111 s, *with the engine now wired into the worker*. Both
+walking-skeleton gates were then run explicitly: `2 passed in 0.74s`.
+
+**And measured with the boundary deliberately broken**, because a boundary nobody has
+seen fail is a boundary nobody has tested. Hoisting one `common.engine` import into
+`worker.py`:
+
+```
+0.324 engine_modules=17   0.307 engine_modules=17   0.308 engine_modules=17
+FAILED test_the_worker_module_imports_no_engine_package_at_module_level
+FAILED test_a_clean_interpreter_loads_no_engine_module_for_a_worker
+```
+
+3x the import cost and two red tests, from a one-line edit that looks harmless in
+review. That is the failure mode `tests/unit/test_worker_import_boundary.py` exists
+to make loud.
+
+**The nine threading-adjacent suites ran 10 consecutive times** — the standing rule
+from Parts 1, 2a, 2b-i, 2b-ii-A and B-1 — covering both new integration suites, the
+new signal gate, `HubTickFeed`, the tick-drop suite, the 2b-ii-A gate, the
+cross-thread shutdown suite and both supervisor suites: `111 passed` on all ten,
+59.5-60.5 s each. No flake.
+
+**Safety re-confirmed for this part.** `DhanLiveBroker` still does not exist —
+`grep -rn "DhanLiveBroker" --include="*.py"` returns four hits across three files, all
+prose in docstrings or the refusal message in `common/broker/factory.py`. All 12
+broker-factory and all read-only-script tests pass unchanged (`23 passed`). The engine
+path reaches the broker only through the **existing** `build_broker(...)` gate, using
+the same `resolved_config_stub` the fixture path uses — asserted by
+`test_live_mode_is_still_refused_on_the_engine_path`, which drives a full engine
+worker in `LIVE` mode and gets zero order intents and zero fills. No `framework.*`
+import exists anywhere, so there is still no runtime dependency on the reference tree.
+
+**Reference tree: source and config unchanged.** The recorded baseline re-run before
+the commit still returns
+`2026-07-28 10:29:14 .../option_strategies/.../tests/test_warmup_coordinator.py` — the
+same value recorded at Parts 2a, 2b-ii-A and B-1. No file under `Trading_Automation`
+was written by this project, and it was read only through `find`/`stat`.
+
+**One refinement to that check, recorded rather than glossed.** Run across *all*
+source+config extensions including `.json`, the newest file is
+`common/access_token.json` at `2026-07-31 09:03:40` — and nine files under that tree
+have mtimes from today. Every one of them is a **runtime artefact** (`.log`, `.pid`,
+`.db`, and that token cache) belonging to the separately-running legacy systems the
+"Operational risk" note already describes, which are still live and writing their own
+state. None is source or config, and none is anything this repository has code to
+write. The baseline check should therefore exclude runtime artefacts explicitly, which
+it now does; the earlier "source+config" phrasing would have swept the token cache in
+and reported a change that never happened.
+
+#### Phase 3 Part 2b-ii-B-2 gate evidence
+
+**Acceptance gate (Part 2b-ii-B-2) — met in full.**
+
+| Requirement | Evidence |
+|---|---|
+| Restart recovery works with the engine wired, not just the fixture strategy | `tests/integration/test_engine_worker_restart.py` — two sequential real `run_worker` runs on one database: the first leaves a position open, the second adopts it from the contract record, does not re-enter, and closes it. Reconciled against the persisted row (`average_price`, `entry_correlation_id`, lots derived from `quantity`) |
+| The restarted engine does not double the exposure | `test_the_restarted_engine_does_not_re_enter` (`BUY` intents stay at 1, one `positions` row), with `test_the_second_run_really_did_signal_an_entry` so that assertion cannot pass for the wrong reason |
+| Recovery fails **closed** on any inconsistency | `test_an_open_position_with_no_contract_record_blocks_entries_rather_than_trading` and `test_a_stale_contract_record_for_another_instrument_is_refused` — both leave the worker exiting 0 with entries latched off and a `CRITICAL` `errors` row, never a second position. Plus `test_recovery_does_not_reach_across_trading_dates` (spec §12) |
+| Adoption places no order | `tests/unit/test_position_manager_adopt.py` — the gateway raises on contact, so a regression fails the test rather than being counted. `test_opening_on_top_of_an_adopted_position_is_still_refused` covers the doubling directly |
+| **A real `SIGINT`/`SIGTERM` to a real worker child squares off and exits 0** | `tests/end_to_end/test_engine_worker_signal.py` — a real process running the real engine, signalled only once a position is genuinely open in the database (waited for, not slept on). Both signals: exit 0, `positions_still_open == 0`, `square_off_state == 'COMPLETED'`, `shutdown_reason == 'signal'`, and the closing leg persisted as a real `SELL` intent + fill, not a forgotten position |
+| The shutdown is prompt, not merely eventual | The same test asserts `elapsed < 30 s` after the signal; observed ~1 s |
+| `SIGINT` does not escape as a traceback | `test_sigint_does_not_escape_as_a_traceback` |
+| Both walking-skeleton gates still pass, **with the spawn import cost re-measured** | `2 passed in 0.74s`; nine runs at **0.110 s median, zero `common.engine` modules**, plus the deliberately-broken measurement above showing what the boundary prevents |
+| The import boundary is enforced, not described | `tests/unit/test_worker_import_boundary.py` — static (fails on the edit), real-interpreter `sys.modules` (catches a transitive drag), and the positive half (a dead branch cannot satisfy it) |
+| Live still fail-closed | `DhanLiveBroker` absent; `test_live_mode_is_still_refused_on_the_engine_path` drives a full engine worker in `LIVE` mode to zero intents and zero fills; broker-factory and read-only-script suites pass unchanged |
+| The supervisor delivers both queues (§8 item 5) | `test_an_engine_child_receives_both_queues_and_uses_them` — a real spawned engine child, with `subscriptions_applied` as the proof: it can only ask for a contract by having received ticks on one queue and having had the other to answer on |
+| The tick channel gets the shutdown sentinel | `test_the_tick_channel_gets_the_shutdown_sentinel_too` counts it on the wire (`published == ticks_published + 1`); `test_the_shutdown_sentinel_squares_off_the_open_position` proves the consequence |
+| Tick drops are reported (§8 item 5) | `test_tick_drops_are_reported_apart_from_candle_drops` — a separate `:ticks` key, absent for a worker with no tick channel |
+| D20 reporting bound (§8 item 8) | `test_the_day_summary_reaches_the_strategy_state_payload` (MFE/MAE genuinely non-zero, not a passing zero) and `test_running_and_terminal_heartbeats_are_published` |
+| The three-channel alarm for the engine's residual (§8 item 8) | `_raise_silent_engine_alarm`, on the sharper condition "a square-off was requested and a position is still open". The residual it guarded is itself now **fixed** — `test_a_silent_feed_still_honours_a_square_off_request` fails to terminate without the `should_stop` check |
+| Strategy-wise broker routing keeps the Phase 1 gate (§8 item 7) | The engine path calls the same `build_broker(resolved_config_stub(config), ...)`; all 12 broker-factory tests pass unchanged |
+| `PersistedSquareOffAuthority` has a real caller | `test_a_completed_square_off_is_not_repeated_after_a_restart` through a real worker; `test_the_square_off_time_is_derived_from_the_policy_not_configured_twice` pins that moving the policy moves the engine's session with it |
+| Paper only; no `MultiLegEngine`/`FixedStrikeEngine`; no real strategies | None ported. The only `BaseStrategy` in the tree remains a test fixture |
+| No migration | `strategy_state.payload` already existed (`0001_walking_skeleton.sql`); `MigrationRunner` unchanged and `schema_migrations` still has one version |
+
 ### Verification results (Phase 3 Part 2b-ii-B-1, 31 July 2026)
 
 | Check | Command | Result |
@@ -1715,6 +2053,48 @@ stop"*, the socket was connected but silent (limitation 13). Everything else sti
 shut down; the connection is released by process exit. Outside market hours that
 is the expected message, not a fault.
 
+#### Running a worker on the ported engine (Phase 3 Part 2b-ii-B-2)
+
+A worker drives the Phase 1 fixture strategy unless `WorkerConfig.engine` is set, in
+which case it drives `TradingEngine` off the hub's tick channel. The engine worker
+**must** be registered with `tick_channel=True` — without a tick queue it refuses to
+start rather than falling back:
+
+```python
+supervisor.add_worker(
+    WorkerConfig(
+        ...,
+        square_off_policy=SquareOffPolicy(),  # owns BOTH square-off times
+        engine=EngineWorkerConfig(
+            strategy_ref="package.module:ClassName",  # dotted, not a registry name (D30)
+            strategy_kwargs={...},
+            timeframe="5m",
+            lot_size=65,
+            strike_step=50,
+        ),
+    ),
+    tick_channel=True,  # required: creates the tick and control queues
+)
+```
+
+The session's entry cutoff and square-off time are **derived** from
+`square_off_policy` and must not be configured separately — that is what
+`SessionConfig.from_square_off_policy` exists to prevent (their defaults had already
+drifted fifteen minutes apart before Part 2b-ii-B-1).
+
+Stopping is the same `SIGTERM`/`SIGINT` as the supervisor, and works whether the
+signal goes to the supervisor (which sentinels both queues) or directly to the worker.
+Either way the engine squares off on the thread that owns its feed, and the closing
+order goes through the normal audited path.
+
+**What to check after an engine worker stops:**
+
+| Symptom | Meaning |
+|---|---|
+| `errors` row, `component='engine'`, *"positions are still OPEN"* | A square-off was asked for and the book is **not** flat. The health tile stays `DEGRADED`. Close the positions manually |
+| `errors` row, `component='engine.recovery'` | An open position was found whose contract could not be rebuilt. The worker ran with entries blocked and did **not** manage that position |
+| Health `BLOCK_NEW_ENTRIES` during the session | Either the entry cutoff passed, or a tick was dropped upstream and this worker latched entries off for the day (limitation 14). `dropped_events["<strategy>:ticks"]` distinguishes them |
+
 ### Authentication (Phase 2)
 
 Credentials come from `.env` only. Nothing below prints, logs or echoes a secret.
@@ -1903,6 +2283,20 @@ start/stop/crash/restart tests pass.
     clean-run case that must **not** raise one. Revisit only with evidence about
     how the SDK behaves on a socket that has stopped delivering — which needs
     limitation 2 closed first.
+
+    **The engine-level half of this is closed as of Part 2b-ii-B-2.** A worker's
+    engine used to face the same shape one layer in: a request set a flag that only
+    `on_tick` could act on, so with a silent feed and `idle_timeout_seconds=None` —
+    which is what a live session runs — the wait was unbounded. `HubTickFeed` now
+    asks a `should_stop` predicate on every poll wake, so the request is honoured
+    within one poll interval and control reaches `TradingEngine.run()`'s `finally`,
+    the second square-off boundary **D18** already names. Proven by
+    `test_a_silent_feed_still_honours_a_square_off_request`, which fails to terminate
+    without it. **The supervisor's half above is unchanged** and still open: that one
+    is a blocked `recv()` inside the SDK, which this repository has no boundary
+    inside. What remains for the engine is only the outcome check — if a square-off
+    was requested and a position is still open when the run ends, the same three
+    channels fire with `component='engine'`.
 14. **A dropped tick silently corrupts one worker's bars, rather than removing one
     visibly.** Introduced by the Part 2b-ii-A tick channel, deliberately (**D23**).
     D9's guarantee is that every worker sees byte-identical bars because there is
@@ -1955,6 +2349,56 @@ start/stop/crash/restart tests pass.
     cached price. That is the safe direction — no entry rather than an entry at a
     stale price — but it is silent today. Worth an alarm alongside 2b-ii-B's
     entry-block work.
+16. **An engine worker cold-starts its indicators.** Introduced by Part 2b-ii-B-2.
+    `TradingEngine` accepts a `warmup_manager`/`warmup_source` pair and a
+    `history_provider`, and `engine_worker` injects **none of them**, so `_warm_up()`
+    takes the cold-start path on every worker start and restart.
+
+    **Why it is accepted for now:** the only strategy in the tree is
+    `EngineFixtureStrategy`, whose `warmup_spec()` returns `None` — a deliberate
+    opt-out meaning "cold start is fine" — so nothing today is affected. Wiring a
+    warm-up source would mean choosing one (historical API, recorded tape, or the
+    hub's own bars), which is a Phase 4 decision about the candle foundation rather
+    than a wiring detail of this part.
+
+    **When it bites:** the first continuity-required strategy. The engine already
+    fails *towards* safety here — `validate_warmup_config` refuses a config that
+    disables warm-up for such a strategy, a `warmup_spec()` that raises latches
+    entries off, and a cold start on a continuity-required strategy logs a `WARNING`
+    saying its signals "must not be read as strategy edge". So this cannot silently
+    trade a wrongly-seeded indicator; it can only refuse to trade, or trade a
+    strategy that declared it did not care. Must be closed before Phase 9.
+17. **The engine trades synthetic contracts, not real ones.** Introduced by
+    Part 2b-i and unchanged by the wiring in Part 2b-ii-B-2, which is why it is
+    recorded here rather than left implicit in "what this part did not deliver".
+    `engine_worker` builds its `OptionSelector` on
+    `SimulatedOptionChainResolver`, so every contract the engine selects has a
+    **manufactured** `security_id` of the form
+    `SIM:<underlying>:<expiry>:<strike>:<CE|PE>` and a `lot_size` taken from
+    configuration rather than from the exchange.
+
+    **What that means in practice.** A paper run is internally consistent — the
+    same synthetic id is subscribed, filled, persisted and closed — so every
+    property Phase 3 proves about the engine holds. But those ids correspond to
+    nothing at the broker: a runtime subscription for one can never return real
+    ticks, and the strike/expiry the selector picks is not checked against a
+    tradable contract. **This is the single largest gap between the engine as
+    tested and an engine that could trade**, and it is entirely upstream of the
+    order path, so no amount of execution-side hardening closes it.
+
+    **Why it is still open:** the reference's Dhan resolver was deliberately not
+    ported (see `common/engine/selection.py`) because resolving real contracts
+    needs the scrip master, and this repository already has a live option-chain
+    surface — `common/market_data/option_chain.py`, with its own 3s-per-key
+    throttle and freshness rules, exercised live in Phase 2 Block 2. Wiring the
+    two together is a live-path decision, not an engine-port one.
+
+    **When it bites:** the first run against a real feed. Until an
+    `OptionChainResolver` backed by `OptionChainService` exists, an engine worker
+    pointed at live market data would subscribe to ids the broker does not
+    recognise and simply never fill — the safe direction, and silent, which is
+    the same shape as limitation 15. Must be closed before Phase 10, and before
+    any live-feed rehearsal of the engine path.
 
 ### Operational risk noted during the audit
 
@@ -2051,6 +2495,17 @@ read-only calls listed below are still the complete set, `DhanLiveBroker` still
 does not exist, all 12 broker-factory tests pass unchanged, and no file under
 `Trading_Automation` was read for it, let alone written.
 
+**Re-confirmed again for Phase 3 Part 2b-ii-B-2** (1 August 2026), against the full
+suite: 815 passed, 6 skipped. This is the part that put a real engine into a real
+worker process, so the claim is stronger than "no new call sites were added": an
+engine worker configured `execution_mode=LIVE` was **run end to end** and produced
+zero order intents and zero fills, because it reaches the broker only through the
+same `build_broker()` gate the fixture path uses
+(`test_live_mode_is_still_refused_on_the_engine_path`). `DhanLiveBroker` still does
+not exist, all 12 broker-factory and all read-only-script tests pass unchanged, and
+no file under `Trading_Automation` was written — its newest **source and config**
+mtime is unchanged at the recorded baseline.
+
 - Live order placement is **not implemented**. `DhanLiveBroker` does not exist —
   there is no class, no order method, no stub.
 - **`build_broker()` refuses live in every reachable configuration.** It consults
@@ -2109,10 +2564,32 @@ does not exist, all 12 broker-factory tests pass unchanged, and no file under
 
 ## 8. Next phase
 
-Phase 2 is complete, both blocks. Phase 3 **Part 1**, **Part 2a**, **Part 2b-i** and
-**Part 2b-ii-A** are complete. Next is Phase 3 **Part 2b-ii-B**.
+Phase 2 is complete, both blocks. **Phase 3 is complete** — all five parts, with its
+acceptance gate met in full. Next is **Phase 4**.
 
-### Phase 3 — preserve custom engines and policies
+### Phase 4 — candle, indicator and paper-execution foundation — **NOT STARTED**
+
+Scope is the architecture document's; what Phase 3 leaves on its doorstep is listed
+here so it is not rediscovered later:
+
+* **Widen `PaperBroker`.** Phase 3 kept it deliberately minimal, and
+  `InMemoryGateway`'s docstring already names Phase 4 as the owner of bid/ask depth,
+  latency, partial fills and the rejection matrix.
+* **Decide the warm-up source and inject it** (limitation 16). `engine_worker`
+  injects no `warmup_manager`, `warmup_source` or `history_provider`, so an engine
+  worker cold-starts its indicators. Harmless today because the only strategy opts
+  out, and it fails *towards* refusing to trade rather than trading a wrongly-seeded
+  indicator — but it must be closed before Phase 9, and the choice of source is a
+  candle-foundation decision, not a wiring one.
+* **Resolve real contracts** (limitation 17). The engine selects strikes through
+  `SimulatedOptionChainResolver`, so its `security_id`s are manufactured and match
+  nothing at the broker; `common/market_data/option_chain.py` exists with its
+  throttle and freshness rules and is not yet wired to the selector. This blocks any
+  live-feed rehearsal of the engine path, not just Phase 10.
+* **Alarm on limitation 15** — a runtime subscription that never applies currently
+  means a pending entry silently never fills.
+
+### Phase 3 — preserve custom engines and policies — **COMPLETE**
 
 **Phase 3 has five parts, in strict order.** Part 1 was a dedicated fix — planned
 and reviewed on its own, before the port began, not folded into it. Part 2 was
@@ -2120,7 +2597,11 @@ then split three times: the exit registry does not depend on `TradingEngine`, so
 was ported and proven on its own (Part 2a); the engine's port is separable from the
 seams that wire it in, so the port landed first (Part 2b-i); and the two remaining
 seams are independent of each other, so the feed seam landed on its own
-(Part 2b-ii-A) and the execution seam follows (Part 2b-ii-B).
+(Part 2b-ii-A) and the execution seam followed (Part 2b-ii-B, itself split into B-1,
+what is provable offline, and B-2, what changes the deployed process shape). Every
+split used the same rule, and B-2's outcome is the evidence for it: the part that
+finally put `common.engine` into a worker's process is the part where the import
+boundary, the SQLite thread affinity and the missing tick sentinel all surfaced.
 
 #### Part 1 — live-feed shutdown path — **COMPLETE** (30 July 2026)
 
@@ -2197,64 +2678,53 @@ deviations D26-D29, limitation 14, and the B-1 gate evidence in section 4. It al
 found a real cost it had not predicted: publishing the drop notice into an already
 full queue evicts an item, doubling the loss rate while the overflow lasts (D28).
 
-#### Part 2b-ii-B-2 — the wiring — **NOT STARTED**
+#### Part 2b-ii-B-2 — the wiring — **COMPLETE** (1 August 2026)
 
-What remains between the engine and a deployable worker. In rough dependency order,
-carrying forward the original numbering:
+The last part of Phase 3. Items 3, 5, 6, 7 and 8 below are all delivered; items 2 and
+4 were done in B-1. Full record: "What Phase 3 Part 2b-ii-B delivered — Part B-2"
+(section 1), deviations D30-D32, limitation 13's engine half closed, new limitation 16,
+and the B-2 gate evidence in section 4.
 
-2. ~~**Ship `LifecycleGateway`.**~~ **DONE in B-1.** Both hazards were designed for
-   rather than discovered: the `signals` UNIQUE collision is prevented by a
-   monotonic per-instrument disambiguator (**D26**), and a call that did not trade
-   raises `GatewayExecutionError` rather than fabricating a `FillOutcome`. See
-   section 1 and the B-1 gate evidence in section 4.
-3. **Wire the engine into `worker.py`**, behind the process's single signal
-   installer: `with shutdown_signals(engine.request_square_off): engine.run()`,
-   using `common/process/signals.py`. What remains is the child receiving its tick
-   and control queues and constructing the engine.
+3. **Wire the engine into `worker.py`** — **DONE.** `WorkerConfig.engine`, an
+   `EngineWorkerConfig` of primitives only, and one deferred import into
+   `runtimes/intraday_options/engine_worker.py`. The import graph is unchanged at
+   **0.110 s median, zero `common.engine` modules**, enforced by
+   `tests/unit/test_worker_import_boundary.py` rather than by convention. The
+   strategy travels as a dotted `module:Class` reference plus kwargs (**D30**), as
+   this section predicted it would have to.
 
-   **Import cost is the known hazard here, not a hypothetical one.** Re-exporting
-   `EngineFixtureStrategy` cost 0.382 s → 0.604 s per spawned child in Part 2b-i and
-   lost `test_duplicate_worker_startup_is_refused` its 0.5 s window. The worker's
-   graph is at **zero `common.engine` modules, 0.100 s median** as of B-1, so every
-   engine import must be made *lazily inside the engine branch*, and the measurement
-   repeated with both gates re-run before this part is called done.
+   One thing this section got wrong, and it is corrected rather than quietly
+   dropped: it specified
+   `with shutdown_signals(engine.request_square_off): engine.run()`. The handler also
+   has to set a local event, because the worker needs to know a shutdown was
+   requested in order to check afterwards whether the book is actually flat — the
+   same reason `supervisor._on_signal` sets `signalled`.
+5. **Deliver the queues from the supervisor** — **DONE.** Both queues reach the
+   child, the `None` sentinel is published on the tick channel as well as the candle
+   one, and tick drops are reported under `f"{strategy_id}:ticks"` rather than summed
+   into the candle key.
+6. **Restart recovery for the engine** — **DONE.** The contract record goes into
+   `strategy_state.payload` on open and is removed on close; `PositionManager.adopt`
+   seeds the book without calling the gateway; no migration. The open-vs-close
+   judgement is read off the persisted `Position` rather than added to the gateway,
+   which keeps the property that the gateway "cannot get that judgement wrong".
+7. **Retain strategy-wise broker-factory routing** — **DONE.** The engine path calls
+   the same `build_broker(resolved_config_stub(config), ...)` the fixture path does;
+   a full engine worker in `LIVE` mode produces zero intents and zero fills.
+8. **Bind the reporting protocols** — **DONE** (**D32**), and the alarm with them.
+   The residual it was written for turned out to be **fixable** rather than merely
+   reportable: `HubTickFeed` now asks `should_stop` on every poll wake, closing the
+   engine half of limitation 13. The alarm remains for the sharper condition — a
+   square-off was requested and a position is still open.
 
-   **`WorkerConfig` must stay picklable** (`spawn`), so the engine's configuration
-   travels as plain values plus a dotted `module:Class` strategy reference — the
-   registry's `get_strategy(name, cfg)` takes a single config argument that
-   `EngineFixtureStrategy`'s keyword-only constructor does not fit.
-4. ~~**Reconcile `MarketSession` with `SquareOffPolicy`.**~~ **DONE in B-1.** The
-   decision (confirmed in 2b-ii-A against execution §10 and architecture §13) is
-   implemented: `SquareOffAuthority` is injected, `MarketSession.is_past_square_off`
-   is removed, and `SessionConfig` is derived from the policy so the two configured
-   times — already fifteen minutes apart in their defaults — cannot drift. What
-   remains for B-2 is only the *wiring*: the worker constructing
-   `PersistedSquareOffAuthority` and handing it to the engine. It has no caller
-   outside its tests today.
-5. **Deliver the queues from the supervisor.** `supervisor.py` passes the child only
-   `(worker_config, channel.queue.raw)`; `channel.tick_queue.raw` and the control
-   queue are created and never handed over. It also publishes the `None` sentinel on
-   the **candle** queue only, so `HubTickFeed`'s sentinel → `request_square_off`
-   path — built in 2b-ii-A — is unreachable in the deployed shape. Report tick drops
-   in `SupervisorResult.dropped_events` too; today only candle drops are reported.
-6. **Restart recovery for the engine.** The persisted `positions` row carries
-   `instrument`, `security_id`, `quantity` and `average_price` but not the option
-   type, strike or lot size, so an `OptionContract` cannot be rebuilt from it.
-   `LifecycleGateway` should write that record into the existing free-form
-   `strategy_state.payload` column on open and clear it on close, and
-   `PositionManager` needs an `adopt(...)` that seeds an `OpenPosition` **without**
-   calling the gateway. No migration: SQLite's `ALTER TABLE ADD COLUMN` is not
-   `IF NOT EXISTS`-able and would break D6 replay-safety.
-7. **Retain strategy-wise broker-factory routing** with the Phase 1 safety gate
-   (deviation D5) — the engine's arrival must not reintroduce building a live
-   broker from `mode: live` alone.
-8. **Bind the reporting protocols** (D20) to `HeartbeatWriter` and
-   `ExecutionRepository`, and raise the three-channel alarm for the engine's
-   silent-feed residual, matching what the supervisor already does for its own.
+**The latent race in `test_duplicate_worker_startup_is_refused` was exercised and
+held.** It was also measured with the boundary deliberately broken (0.31 s, 17 engine
+modules, two red tests), so what it protects against is on record rather than
+inferred.
 
-The latent race in `test_duplicate_worker_startup_is_refused` (a 0.5 s window that
-spawn import cost can exceed) still holds, and B-2 is where it is exercised — see
-item 3.
+**One design item in this section could not be built as specified**, and the reason is
+recorded as **D31**: the engine cannot run on its own thread, because `Database`
+opens SQLite with thread affinity and the first fill would raise `ProgrammingError`.
 
 **Explicitly not in Phase 3:** `MultiLegEngine` and `FixedStrikeEngine`. The spec
 schedules each for "when the first consumer is scheduled", and there is no
@@ -2296,10 +2766,18 @@ import graph re-measured; live is still fail-closed. **Not claimed here:** resta
 recovery with the engine wired, and the real-signal-to-a-real-child test — both
 need the engine in a process, which is B-2.
 
-**Acceptance gate (Part 2b-ii-B-2):** restart recovery works with the engine wired,
-not just the fixture strategy; a real `SIGINT`/`SIGTERM` to a real worker child
-squares off and exits 0; both walking-skeleton gates still pass **with the spawn
-import cost re-measured**; live is still fail-closed.
+**Acceptance gate (Part 2b-ii-B-2) — met in full:** restart recovery works with the
+engine wired, not just the fixture strategy (`tests/integration/test_engine_worker_restart.py`,
+including three fail-closed cases); a real `SIGTERM` **and** a real `SIGINT` to a real
+worker child square off and exit 0, with the closing leg persisted through the audited
+path (`tests/end_to_end/test_engine_worker_signal.py`); both walking-skeleton gates
+still pass with the spawn import cost re-measured at 0.110 s median / zero
+`common.engine` modules, and measured again with the boundary deliberately broken;
+live is still fail-closed, including for a full engine worker configured `LIVE`.
+Detail in section 4.
+
+**Phase 3's own acceptance gate is therefore met in full.** Nothing from Parts 1
+through 2b-ii-B remains deferred.
 
 **Constraints unchanged, all parts:** paper mode only, live order placement
 unimplemented and fail-closed, no real strategies (Phase 9), no second

@@ -18,7 +18,10 @@ Porting a second, parallel reporting database beside it is precisely the
 "parallel universe" the audit's adaptation note warns against.
 
 So the engine holds two narrow protocols instead, with null implementations here.
-Part 2b-ii binds them to the existing repository and heartbeat writer.
+Part 2b-ii-B-2 bound them, in :mod:`common.engine.reporting_bindings` — a separate
+module rather than this one, because the heartbeat binding needs ``HealthState`` at
+runtime and that would pull ``common.execution`` into every ``common.engine`` import.
+This module stays what it is: protocols and a pure summariser.
 """
 
 from __future__ import annotations

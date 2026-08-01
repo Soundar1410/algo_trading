@@ -1,8 +1,14 @@
 """The ported single-leg trading engine and the collaborators it was written against.
 
-Phase 3 Part 2b-i. See :mod:`common.engine.engine` for the orchestration itself and
-the runbook (section 8) for what Part 2b-ii still owes: the hub tick channel, the
-worker wiring and the ``OrderLifecycle``-backed execution gateway.
+Phase 3 Part 2b-i, completed through Part 2b-ii-B-2. See :mod:`common.engine.engine`
+for the orchestration itself; the hub tick channel (:mod:`common.engine.hub_feed`),
+the ``OrderLifecycle``-backed gateway (:mod:`common.engine.gateway`) and the worker
+wiring (:mod:`runtimes.intraday_options.engine_worker`) all landed in Part 2b-ii.
+
+:mod:`common.engine.reporting_bindings` is deliberately **not** re-exported here: it
+needs ``HealthState`` at runtime, and pulling ``common.execution`` into every import
+of this package would undo the ``TYPE_CHECKING``-only discipline ``gateway.py`` and
+``square_off.py`` keep on purpose. Import it directly.
 
 ``MultiLegEngine`` and ``FixedStrikeEngine`` are deliberately **not** here. The
 spec schedules each for "when the first consumer is scheduled", and there is none.
@@ -17,6 +23,7 @@ from .feed import MarketDataFeed, MarketDataStatus, SimulatedFeed
 from .gateway import GatewayExecutionError, LifecycleGateway
 from .hub_feed import HubTickFeed
 from .models import (
+    AdoptedPosition,
     ExitReason,
     Moneyness,
     OpenPosition,
@@ -44,9 +51,18 @@ from .square_off import (
     SessionSquareOffAuthority,
     SquareOffAuthority,
 )
+from .state_payload import (
+    DAY_SUMMARY_KEY,
+    OPEN_POSITION_KEY,
+    merge_payload,
+    read_payload,
+)
 from .strategy import BaseStrategy, available_strategies, get_strategy, register_strategy
 
 __all__ = [
+    "DAY_SUMMARY_KEY",
+    "OPEN_POSITION_KEY",
+    "AdoptedPosition",
     "BaseStrategy",
     "DailyRiskConfig",
     "DailyRiskGuard",
@@ -91,7 +107,9 @@ __all__ = [
     "available_strategies",
     "build_regime_tagger",
     "get_strategy",
+    "merge_payload",
     "opt_float",
+    "read_payload",
     "register_risk_manager",
     "register_strategy",
     "resolve_strike",

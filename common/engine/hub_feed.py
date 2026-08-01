@@ -41,6 +41,17 @@ incomplete tick stream may be silently wrong (runbook limitation 14).
 ``_handle_square_off``, which runs on this loop's thread. The Part 1 ownership rule
 therefore holds here with no new mechanism: nothing outside this thread ever ends
 the run except by way of the sentinel above.
+
+**A silent feed still honours a shutdown.** ``run()`` wakes every ``poll_seconds``
+whether or not a tick arrived, so it can ask ``should_stop`` — which the worker wires
+to ``engine.square_off_requested`` — on each wake. Without that check a ``SIGTERM``
+arriving while the stream is quiet would set the engine's flag and then wait for a
+tick to carry it into ``on_tick``; with ``idle_timeout_seconds=None``, which is what
+a live session runs, that wait is unbounded. This is the engine-level half of runbook
+limitation 13, and it is fixed here rather than alarmed about, because the boundary
+the fix needs already existed: returning from this loop hands control to
+``TradingEngine.run()``'s ``finally``, which is the second of the two square-off
+boundaries D18 names. Nothing crosses a thread to make it happen.
 """
 
 from __future__ import annotations
@@ -78,6 +89,7 @@ class HubTickFeed(MarketDataFeed):
         request_subscription: Callable[[str], None] | None = None,
         on_square_off: Callable[[str], None] | None = None,
         on_tick_dropped: Callable[[TickDropNotice], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
         poll_seconds: float = DEFAULT_POLL_SECONDS,
         idle_timeout_seconds: float | None = DEFAULT_IDLE_TIMEOUT_SECONDS,
     ) -> None:
@@ -86,12 +98,17 @@ class HubTickFeed(MarketDataFeed):
         self._request_subscription = request_subscription
         self._on_square_off = on_square_off
         self._on_tick_dropped = on_tick_dropped
+        #: Asked on every poll wake, so a shutdown is honoured even while the stream
+        #: is silent. The worker wires this to ``engine.square_off_requested``; see
+        #: the module docstring for why the check belongs here.
+        self._should_stop = should_stop
         self._poll = poll_seconds
         self._idle_timeout = idle_timeout_seconds
         #: Observable outcome, so a worker can report *why* the run ended rather
         #: than inferring it. Set before ``run()`` returns, never cleared.
         self.stopped_by_sentinel = False
         self.stopped_by_idle_timeout = False
+        self.stopped_by_request = False
         self.ticks_received = 0
         #: Highest drop total this feed has been told about. Zero on a healthy run.
         self.ticks_dropped_upstream = 0
@@ -100,14 +117,24 @@ class HubTickFeed(MarketDataFeed):
     def run(self) -> None:
         """Drain ticks into the registered handler until stopped or idle.
 
-        Ends in exactly three ways: the sentinel (an orderly shutdown asked for
+        Ends in exactly four ways: the sentinel (an orderly shutdown asked for
         from the supervisor), :meth:`stop` from inside a tick callback (the
-        engine's own square-off), or the idle timeout (an exhausted tape).
+        engine's own square-off), ``should_stop`` answering ``True`` on a poll wake
+        (a shutdown requested while the stream was silent), or the idle timeout (an
+        exhausted tape).
         """
         self._running = True
         idle_seconds = 0.0
         try:
             while self._running:
+                if self._should_stop is not None and self._should_stop():
+                    # Checked before the blocking get, so it is asked at least once
+                    # every ``poll_seconds`` no matter how quiet the stream is.
+                    # Returning hands control to TradingEngine.run()'s finally, which
+                    # is where a request with no tick to carry it gets honoured.
+                    self.stopped_by_request = True
+                    log.info("a square-off was requested; ending the tick stream")
+                    return
                 try:
                     item = self._queue.get(timeout=self._poll)
                 except queue_module.Empty:

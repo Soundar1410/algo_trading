@@ -205,6 +205,63 @@ class PositionManager:
         )
         return position
 
+    def adopt(
+        self,
+        contract: OptionContract,
+        side: OrderSide,
+        lots: int,
+        entry_price: float,
+        entry_time: datetime,
+        *,
+        entry_charges: float = 0.0,
+        last_price: float | None = None,
+    ) -> OpenPosition:
+        """Take ownership of a position this process did not open.
+
+        Phase 3 Part 2b-ii-B-2, for restart recovery. The position is already in the
+        database — a previous process opened it and died before closing it — so
+        :meth:`open` is exactly wrong here: it would call the gateway and place a
+        **second** order, doubling the exposure the recovery exists to prevent. This
+        seeds the same in-memory state ``open`` would have left behind, and touches
+        no gateway at all.
+
+        ``entry_charges`` comes from the persisted position's own ``charges``, so the
+        resulting :class:`Trade` nets correctly on close rather than under-reporting
+        the round trip's cost by one leg.
+
+        MFE/MAE deliberately restart at zero. The excursion this position saw before
+        the restart is not recorded anywhere, and seeding a fabricated figure would
+        put a number that was never observed into the day's report; zero is visibly
+        the floor rather than plausibly the truth.
+        """
+        position_id = contract.security_id
+        if position_id in self._positions:
+            raise RuntimeError(f"Cannot adopt: a position is already open for {contract.symbol}.")
+
+        position = OpenPosition(
+            contract=contract,
+            side=side,
+            lots=lots,
+            entry_price=entry_price,
+            entry_time=entry_time,
+        )
+        if last_price is not None:
+            position.update_price(last_price)
+        self._positions[position_id] = position
+        self._entry_charges[position_id] = entry_charges
+        self._entry_breakdown[position_id] = {}
+        self._entry_regime[position_id] = None
+        self._entry_regime_features[position_id] = "{}"
+        log.info(
+            "ADOPT %s %s @ %.2f x%d (qty %d) — recovered, no order placed",
+            side.value,
+            contract.symbol,
+            entry_price,
+            lots,
+            position.quantity,
+        )
+        return position
+
     def close(
         self,
         position_id: str,

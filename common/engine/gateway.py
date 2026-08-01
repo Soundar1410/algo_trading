@@ -48,9 +48,11 @@ from common.models import Candle, OrderStatus, Side, Signal
 
 from .models import OptionContract, OrderSide
 from .positions import FillOutcome
+from .state_payload import OPEN_POSITION_KEY, merge_payload
 
 if TYPE_CHECKING:  # typing only: keeps common.execution out of the import graph
     from common.execution.lifecycle import ExecutionResult, OrderLifecycle
+    from common.execution.repository import ExecutionRepository
 
 log = get_logger(__name__)
 
@@ -83,13 +85,25 @@ class LifecycleGateway:
         strategy_id: str,
         execution_mode: ExecutionMode,
         trading_date: str,
+        repository: ExecutionRepository | None = None,
+        runtime_id: str = "",
     ) -> None:
         self._lifecycle = lifecycle
         self._strategy_id = strategy_id
         self._mode = execution_mode
         self._trading_date = trading_date
+        #: Optional, and only for the contract record described in
+        #: :meth:`_record_contract`. ``None`` disables that write entirely, which is
+        #: what every offline construction wants — the gateway's trading behaviour
+        #: does not depend on it.
+        self._repository = repository
+        self._runtime_id = runtime_id
         #: instrument -> the last ``candle_end_at`` this gateway used for it.
         self._last_window_end: dict[str, datetime] = {}
+        #: How many legs this gateway has executed. Observable so a worker can report
+        #: the true number of orders rather than inferring it from the trade count,
+        #: which halves it and misses an open position's entry entirely.
+        self.executions = 0
 
     # -------------------------------------------------------------- the verbs
     def buy(
@@ -142,7 +156,74 @@ class LifecycleGateway:
 
         result = self._lifecycle.handle_signal(signal, trading_date=self._trading_date)
         self._require_a_fill(result, side, contract)
+        self.executions += 1
+        self._record_contract(contract, lots, side, result)
         return self._outcome(result)
+
+    def _record_contract(
+        self,
+        contract: OptionContract,
+        lots: int,
+        side: Side,
+        result: ExecutionResult,
+    ) -> None:
+        """Keep ``strategy_state.payload`` agreeing with the ``positions`` row.
+
+        Restart recovery needs the option type, strike, expiry and lot size, none of
+        which the ``positions`` row carries, so an :class:`OptionContract` cannot be
+        rebuilt from it (runbook §8 item 6). This writes that record on open and
+        removes it on close.
+
+        **The database decides which this call was, not this class.** The gateway's
+        verbs are directional on purpose — closing a long is a ``sell`` — and the
+        whole reason it cannot get open-vs-close wrong is that it holds no opinion
+        about it. So the judgement is read off ``ExecutionResult.position``: the
+        persisted row that ``apply_fill`` returned, already netted by side and
+        already flipped to ``CLOSED`` at quantity zero. Adding an open/close notion
+        here to answer the same question would reintroduce exactly the judgement this
+        design removed.
+
+        A failure to write is logged, not raised. The order is already placed and
+        persisted; turning a bookkeeping problem into an exception here would
+        propagate into :class:`~common.engine.positions.PositionManager` and abandon a
+        position that genuinely exists. The cost of the missing record is that a
+        restart does not adopt the position — it stays open in the database, visible,
+        which is the same outcome the operator already has to handle.
+        """
+        if self._repository is None:
+            return
+        position = result.position
+        if position is None:  # pragma: no cover - _require_a_fill already refused
+            return
+        record = (
+            {
+                "symbol": contract.symbol,
+                "security_id": contract.security_id,
+                "strike": contract.strike,
+                "option_type": contract.option_type.value,
+                "expiry": contract.expiry,
+                "lot_size": contract.lot_size,
+                "side": side.value,
+                "lots": lots,
+            }
+            if position.is_open
+            else None
+        )
+        try:
+            merge_payload(
+                self._repository,
+                {OPEN_POSITION_KEY: record},
+                runtime_id=self._runtime_id,
+                strategy_id=self._strategy_id,
+                execution_mode=self._mode,
+                trading_date=self._trading_date,
+            )
+        except Exception:  # see the docstring: never fail the trade
+            log.exception(
+                "could not record the contract for %s; a restart will not adopt this "
+                "position, which stays open in the database",
+                contract.symbol,
+            )
 
     def _window(self, instrument: str, ts: datetime) -> tuple[datetime, datetime]:
         """A strictly increasing ``candle_end_at`` per instrument.

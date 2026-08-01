@@ -14,6 +14,28 @@ Startup follows the spec's recovery order exactly:
 
 The lock comes first. Everything after it assumes single ownership of this
 strategy's state, and that assumption has to be established before any read.
+
+Two strategy shapes, and why one of them is imported lazily
+-----------------------------------------------------------
+A worker drives either the Phase 1 candle-shaped
+:class:`~strategies.intraday_options.fixture_strategy.FixtureSignalStrategy` or, when
+:attr:`WorkerConfig.engine` is set, the ported
+:class:`~common.engine.engine.TradingEngine` off the hub's tick channel. All of the
+second path lives in :mod:`runtimes.intraday_options.engine_worker`, which **this
+module never imports at module level**.
+
+That is a measured constraint, not a style choice. Importing ``common.engine`` costs
+this module's import roughly +0.2 s (0.099 s → 0.301 s, 0 → 16 modules), every child
+pays it on ``spawn``, and the equivalent drag in Part 2b-i pushed a spawned child
+past the 0.5 s window in ``test_duplicate_worker_startup_is_refused``. The engine
+branch below therefore reaches it through exactly one deferred import, and
+``tests/unit/test_worker_import_boundary.py`` enforces that three ways — statically
+against this file, against a real interpreter's ``sys.modules``, and positively, so
+the boundary cannot be satisfied by an engine path that never loads.
+
+``EngineWorkerConfig`` lives here rather than in ``common.engine`` for the same
+reason: the child unpickles it, and unpickling it from ``common.engine`` would import
+the very package the boundary exists to keep out.
 """
 
 from __future__ import annotations
@@ -47,6 +69,55 @@ _QUEUE_POLL_SECONDS = 0.5
 
 
 @dataclass
+class EngineWorkerConfig:
+    """The ported engine's configuration, as plain picklable values.
+
+    Present on a :class:`WorkerConfig` means "drive :class:`~common.engine.engine.
+    TradingEngine` off the tick channel"; absent means the Phase 1 fixture path.
+
+    **Every field here is a primitive.** Nothing in this dataclass may be a type from
+    ``common.engine``: the child unpickles it before any engine code is imported, and
+    a single engine-owned type in a field would drag the whole package into the graph
+    the module docstring exists to protect.
+
+    The strategy travels as a dotted reference plus keyword arguments rather than a
+    registry name. ``common.engine.strategy.get_strategy(name, cfg)`` takes exactly
+    one positional config argument, which the keyword-only constructors the engine's
+    strategies actually have do not fit — so the reference form is what can express
+    them without changing the ported registry.
+    """
+
+    #: ``"package.module:ClassName"``. Resolved in the child, inside the engine
+    #: branch, by :func:`runtimes.intraday_options.engine_worker.load_strategy`.
+    strategy_ref: str
+    strategy_kwargs: dict[str, Any] = field(default_factory=dict)
+    #: Candle interval the engine builds its own bars at, e.g. ``"5m"`` (D23).
+    timeframe: str = "5m"
+    #: Human-readable name for the underlying; defaults to ``WorkerConfig.instrument``.
+    underlying_instrument: str = ""
+    lots: int = 1
+    #: Gap between tradable strikes for this underlying (e.g. 50 for NIFTY).
+    strike_step: int = 50
+    lot_size: int = 50
+    expiry: str | None = None
+    starting_capital: float = 100_000.0
+    max_daily_loss_percent: float | None = None
+    regime_enabled: bool = False
+    warmup_from_history: bool = True
+    parameters: dict[str, Any] = field(default_factory=dict)
+    #: The session's opening bound. Its *closing* bounds are derived from
+    #: ``WorkerConfig.square_off_policy`` — see
+    #: :meth:`common.engine.config.SessionConfig.from_square_off_policy` — so the two
+    #: configured square-off times cannot drift apart.
+    session_start_time: str = "09:15"
+    holidays: tuple[str, ...] = ()
+    #: How long ``HubTickFeed`` blocks on the queue before re-checking its flags —
+    #: including whether a square-off has been requested, which is what bounds a
+    #: shutdown arriving while the stream is silent.
+    feed_poll_seconds: float = 0.5
+
+
+@dataclass
 class WorkerConfig:
     """Everything a worker needs, and nothing that cannot be pickled.
 
@@ -73,6 +144,9 @@ class WorkerConfig:
     cost_rates: dict[str, Any] = field(default_factory=dict)
     square_off_policy: SquareOffPolicy = field(default_factory=SquareOffPolicy)
     config_fingerprint: str | None = None
+    #: Set to drive the ported engine instead of the fixture strategy. See the module
+    #: docstring for why the code behind it is imported lazily.
+    engine: EngineWorkerConfig | None = None
 
 
 @dataclass
@@ -85,12 +159,31 @@ class WorkerOutcome:
     square_off_completed: bool = False
     exit_code: int = 0
     error: str | None = None
+    # ---------------------------------------------------- the engine path only
+    #: Ticks the engine's feed delivered. Zero on the fixture path.
+    ticks_processed: int = 0
+    #: Completed round trips the engine booked.
+    trades_closed: int = 0
+    #: Ticks the **hub** dropped for this worker before they ever arrived, as
+    #: reported in band by a ``TickDropNotice``. Non-zero means this worker's own
+    #: candles may differ from the hub's, and entries are latched off for the day.
+    ticks_dropped_upstream: int = 0
+    #: False when the engine did not finish within the grace period after a
+    #: square-off was requested — a feed delivering nothing offers no boundary at
+    #: which to close. The run is shut down in every other respect; see
+    #: ``engine_worker._raise_silent_engine_alarm``.
+    clean_engine_shutdown: bool = True
+    #: Whether the run ended by honouring a square-off request rather than by the
+    #: stream finishing.
+    stopped_by_request: bool = False
 
 
 def run_worker(
     config: WorkerConfig,
     candle_queue: Any,
     notifier: Notifier | None = None,
+    tick_queue: Any = None,
+    control_queue: Any = None,
 ) -> WorkerOutcome:
     """Run one strategy worker to completion.
 
@@ -99,6 +192,12 @@ def run_worker(
         candle_queue: the bounded queue the hub publishes completed candles to.
         notifier: optional; defaults to a null channel so a child process never
             needs credentials.
+        tick_queue: the raw-tick channel, when the supervisor gave this worker one.
+            Required by — and only used by — the engine path.
+        control_queue: the upstream channel the engine's runtime subscriptions
+            travel back to the supervisor on. Optional even on the engine path: a
+            worker without one can still trade its configured instruments, it just
+            cannot ask for new ones, and ``HubTickFeed`` says so loudly.
     """
     setup_logging(log_dir=config.log_dir, log_file_name=f"{config.strategy_id}.log")
     outcome = WorkerOutcome()
@@ -119,7 +218,7 @@ def run_worker(
         return outcome
 
     try:
-        return _run_locked(config, candle_queue, notifier, outcome)
+        return _run_locked(config, candle_queue, notifier, outcome, tick_queue, control_queue)
     finally:
         lock.release()
 
@@ -129,6 +228,8 @@ def _run_locked(
     candle_queue: Any,
     notifier: Notifier | None,
     outcome: WorkerOutcome,
+    tick_queue: Any = None,
+    control_queue: Any = None,
 ) -> WorkerOutcome:
     database = Database(config.database_path)
     MigrationRunner(database).run_pending()
@@ -160,6 +261,32 @@ def _run_locked(
     )
     heartbeat.beat(HealthState.STARTING, force=True)
 
+    if config.engine is not None:
+        # ------------------------------------------------------------------
+        # The only deferred import in this module, and the reason it exists.
+        # Everything ``common.engine`` touches lives behind this one line, so a
+        # worker on the fixture path never loads it and never pays the ~0.2 s
+        # that cost Part 2b-i its duplicate-worker window. Enforced by
+        # tests/unit/test_worker_import_boundary.py — do not hoist this.
+        # ------------------------------------------------------------------
+        from .engine_worker import run_engine
+
+        try:
+            return run_engine(
+                config,
+                config.engine,
+                repository=repository,
+                session_id=session.id,
+                heartbeat=heartbeat,
+                notifier=safe_notifier,
+                outcome=outcome,
+                candle_queue=candle_queue,
+                tick_queue=tick_queue,
+                control_queue=control_queue,
+            )
+        finally:
+            database.close()
+
     strategy = FixtureSignalStrategy(
         strategy_id=config.strategy_id,
         security_id=config.security_id,
@@ -185,7 +312,7 @@ def _run_locked(
     # The gate lives here, not in the strategy: a live-mode strategy must fail
     # to obtain a broker at all rather than run with a paper one.
     broker = build_broker(
-        _resolved_config_stub(config),
+        resolved_config_stub(config),
         paper_execution=config.paper_execution,
         cost_rates=config.cost_rates,
     )
@@ -329,14 +456,7 @@ def _recover(
     Returns True when an open position was adopted. The strategy's own counters
     are restored too, so a recovered worker does not re-fire its entry signal.
     """
-    previous = repository.previous_incomplete_session(
-        runtime_id=config.runtime_id,
-        strategy_id=config.strategy_id,
-        exclude_session_id=session_id,
-    )
-    if previous is not None:
-        _log.info("recovering from incomplete session id=%s", previous["id"])
-        repository.close_session(int(previous["id"]), reason="recovered_after_restart")
+    close_previous_session(config, repository, session_id)
 
     positions = repository.open_positions(
         strategy_id=config.strategy_id,
@@ -367,6 +487,26 @@ def _recover(
         position.average_price,
     )
     return True
+
+
+def close_previous_session(
+    config: WorkerConfig, repository: ExecutionRepository, session_id: int
+) -> None:
+    """Close the session a previous, crashed process left open.
+
+    Shared by both strategy shapes: whichever one is driving, an incomplete session
+    row from a dead process has to be closed before this run's own bookkeeping means
+    anything. Public because :mod:`runtimes.intraday_options.engine_worker` is the
+    other caller, and duplicating it there would let the two drift.
+    """
+    previous = repository.previous_incomplete_session(
+        runtime_id=config.runtime_id,
+        strategy_id=config.strategy_id,
+        exclude_session_id=session_id,
+    )
+    if previous is not None:
+        _log.info("recovering from incomplete session id=%s", previous["id"])
+        repository.close_session(int(previous["id"]), reason="recovered_after_restart")
 
 
 def _load_square_off_state(repository: ExecutionRepository, config: WorkerConfig) -> SquareOffState:
@@ -434,7 +574,7 @@ def _maybe_square_off(
     return SquareOffState.COMPLETED, acted
 
 
-def _resolved_config_stub(config: WorkerConfig) -> Any:
+def resolved_config_stub(config: WorkerConfig) -> Any:
     """Build the ResolvedConfig the broker factory gates on.
 
     Imported lazily and constructed here so ``WorkerConfig`` stays a plain

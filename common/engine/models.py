@@ -38,6 +38,7 @@ from enum import StrEnum
 from common.models import ExitReason, OptionType, OrderSide
 
 __all__ = [
+    "AdoptedPosition",
     "ExitReason",
     "Moneyness",
     "OpenPosition",
@@ -155,6 +156,34 @@ class OpenPosition:
         if self.side is OrderSide.BUY:
             return (self.last_price - self.entry_price) * self.quantity
         return (self.entry_price - self.last_price) * self.quantity
+
+
+@dataclass(frozen=True)
+class AdoptedPosition:
+    """A position a previous process opened, rebuilt for this one to manage.
+
+    Phase 3 Part 2b-ii-B-2. The engine is handed one of these at
+    :meth:`~common.engine.engine.TradingEngine._start_day` when a restart finds an
+    open position in the database. It carries what
+    :meth:`~common.engine.positions.PositionManager.adopt` needs and nothing more —
+    in particular no order, no correlation ID and no gateway, because adopting must
+    place no order at all.
+
+    ``entry_price``, ``quantity`` and ``entry_charges`` come from the authoritative
+    ``positions`` row; the contract itself has to be rebuilt from
+    ``strategy_state.payload``, because the row cannot express an option's type,
+    strike, expiry or lot size. See :mod:`common.engine.state_payload`.
+    """
+
+    contract: OptionContract
+    side: OrderSide
+    lots: int
+    entry_price: float
+    entry_time: datetime
+    entry_charges: float = 0.0
+    #: Last traded premium, if the caller knows one. ``None`` leaves the position
+    #: marked at its entry price until the first tick arrives.
+    last_price: float | None = None
 
 
 @dataclass

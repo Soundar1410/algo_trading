@@ -16,7 +16,7 @@ from runtimes.intraday_options.supervisor import (
     IntradayOptionsSupervisor,
     SupervisorConfig,
 )
-from runtimes.intraday_options.worker import WorkerConfig
+from runtimes.intraday_options.worker import EngineWorkerConfig, WorkerConfig
 
 RUNTIME_ID = "intraday_options"
 SECURITY_ID = "99926000"
@@ -298,3 +298,110 @@ def test_undelivered_ticks_do_not_wedge_the_supervisors_exit(supervisor_config, 
     # Well past the ~65 KB that wedged it, and none of it was consumed.
     assert channel.tick_queue.published > 400
     assert result.worker_exit_codes["skelfix"] == 0
+
+
+# ------------------------------------------- delivering the queues (Part 2b-ii-B-2)
+ENGINE_STRATEGY = "strategies.intraday_options.engine_fixture_strategy:EngineFixtureStrategy"
+
+
+def _engine_worker(config: SupervisorConfig, strategy_id: str) -> WorkerConfig:
+    return _worker(
+        config,
+        strategy_id,
+        idle_timeout_seconds=3.0,
+        engine=EngineWorkerConfig(
+            strategy_ref=ENGINE_STRATEGY,
+            # One-minute bars, because that is what the recorded tape's six buckets
+            # produce; the entry then fires on the first completed one.
+            timeframe="1m",
+            strategy_kwargs={"enter_on_candle": 1},
+            lot_size=50,
+            strike_step=50,
+            feed_poll_seconds=0.05,
+        ),
+    )
+
+
+def test_the_tick_channel_gets_the_shutdown_sentinel_too(supervisor_config, tick_tape_path):
+    """Built in Part 2b-ii-A, unreachable as deployed until Part 2b-ii-B-2.
+
+    ``HubTickFeed`` turns this sentinel into ``engine.request_square_off()`` — the
+    path by which a ``SIGTERM`` delivered only to the supervisor closes each child's
+    positions. Until this part only the **candle** queue was ever sentinelled, so
+    that path could not fire in the deployed shape no matter how correct it was.
+
+    A fixture worker is used deliberately: it never drains the tick queue, so what
+    the supervisor published is still there to be counted.
+    """
+    adapter = RecordedFeedAdapter(load_tick_tape(tick_tape_path))
+    supervisor = IntradayOptionsSupervisor(supervisor_config, adapter)
+    channel = supervisor.add_worker(_worker(supervisor_config, "skelfix"), tick_channel=True)
+
+    supervisor.run()
+
+    assert channel.tick_queue is not None
+    assert channel.tick_queue.published == supervisor.hub.ticks_published + 1, (
+        "exactly one non-tick item — the shutdown sentinel — must reach the tick channel"
+    )
+
+
+def test_tick_drops_are_reported_apart_from_candle_drops(supervisor_config, tick_tape_path):
+    """One key per channel, because the two mean different things.
+
+    A dropped tick latches that worker's entries off for the day (limitation 14); a
+    dropped candle does not. Summing them into one number would hide which happened.
+    """
+    adapter = RecordedFeedAdapter(load_tick_tape(tick_tape_path))
+    supervisor = IntradayOptionsSupervisor(supervisor_config, adapter)
+    supervisor.add_worker(_worker(supervisor_config, "ticks01"), tick_channel=True)
+    supervisor.add_worker(_worker(supervisor_config, "plain01"))
+
+    result = supervisor.run()
+
+    assert result.dropped_events["ticks01"] == 0
+    assert result.dropped_events["ticks01:ticks"] == 0
+    # A worker with no tick channel has nothing to report about one.
+    assert result.dropped_events["plain01"] == 0
+    assert "plain01:ticks" not in result.dropped_events
+
+
+def test_an_engine_child_receives_both_queues_and_uses_them(
+    supervisor_config, tick_tape_path, database_path
+):
+    """The whole hop, across a real process boundary, with the real engine.
+
+    ``subscriptions_applied`` is the assertion that carries the weight: the child can
+    only ask for a contract if it *received ticks on the tick queue*, built a candle,
+    got a signal, and had a *control queue* to send the request back on. One number
+    proves both deliveries and the engine running between them.
+
+    Before this part the child was spawned with the candle queue alone, so an engine
+    worker would have sat on an empty feed until its idle timeout.
+    """
+    adapter = _LiveishAdapter(load_tick_tape(tick_tape_path), extra=800, interval=0.01)
+    supervisor = IntradayOptionsSupervisor(supervisor_config, adapter)
+    channel = supervisor.add_worker(
+        _engine_worker(supervisor_config, "engine01"), tick_channel=True
+    )
+
+    result = supervisor.run()
+
+    assert result.worker_exit_codes["engine01"] == 0
+    assert supervisor.hub.subscriptions_applied >= 1, (
+        "the child never asked for a contract, so it received no ticks or had no "
+        "control queue to answer on"
+    )
+    assert channel.dynamic_ids, "no contract was chosen at runtime"
+    # The chosen contract is one the configuration never mentioned.
+    assert all(chosen not in channel.security_ids for chosen in channel.dynamic_ids)
+    assert "engine01:ticks" in result.dropped_events
+
+    # And the child really did run the engine to completion, in its own process.
+    state = (
+        Database(database_path)
+        .connect()
+        .execute("SELECT payload FROM strategy_state WHERE strategy_id = ?", ("engine01",))
+        .fetchone()
+    )
+    assert state is not None and state["payload"], "the engine wrote no end-of-day state"
+    assert "day_summary" in state["payload"]

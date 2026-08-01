@@ -121,6 +121,12 @@ class SupervisorResult:
     candles_published: int = 0
     ticks_received: int = 0
     worker_exit_codes: dict[str, int] = field(default_factory=dict)
+    #: Drops per channel. ``strategy_id`` is the **candle** channel;
+    #: ``f"{strategy_id}:ticks"`` is the tick channel, present only for a worker that
+    #: opted into one. Kept apart rather than summed because the two mean different
+    #: things: a dropped tick latches that worker's entries off for the day (runbook
+    #: limitation 14), while a dropped candle does not, and one number for both would
+    #: hide which happened.
     dropped_events: dict[str, int] = field(default_factory=dict)
     #: Whether a shutdown signal ended the run, as opposed to the feed finishing.
     stopped_by_signal: bool = False
@@ -167,11 +173,15 @@ class IntradayOptionsSupervisor:
 
         ``tick_channel=True`` additionally gives the worker the opt-in raw-tick
         queue the ported engine reads, and an upstream control queue for the
-        runtime subscriptions it makes. The opt-in lives here rather than on
-        :class:`WorkerConfig` because Part 2b-ii-A deliberately leaves
-        ``worker.py`` untouched, so the walking-skeleton gates keep measuring
-        exactly what they measured before; Part 2b-ii-B is where the child
-        actually receives these queues.
+        runtime subscriptions it makes. Both are handed to the child at spawn
+        (Part 2b-ii-B-2); they were created and never delivered until then.
+
+        **A worker configured with an engine needs this flag.** It is not inferred
+        from ``WorkerConfig.engine``, because the opt-in also governs what the *hub*
+        publishes and that decision belongs to the group, not to one strategy's
+        configuration. An engine worker spawned without it refuses to start rather
+        than silently running the fixture path — see
+        :func:`runtimes.intraday_options.engine_worker.run_engine`.
         """
         if worker_config.execution_mode is not ExecutionMode.PAPER:
             # Phase 1 has no live path at all. The broker factory would refuse
@@ -248,7 +258,18 @@ class IntradayOptionsSupervisor:
             for worker_config, channel in self._workers:
                 process = context.Process(
                     target=run_worker,
-                    args=(worker_config, channel.queue.raw),
+                    # Both extra channels travel to the child from here. Until Part
+                    # 2b-ii-B-2 they were created and never handed over, which left
+                    # the ported engine with no way to receive a tick and no way to
+                    # ask for a subscription. A worker that did not opt in gets
+                    # ``None`` for both and is completely unaffected.
+                    args=(
+                        worker_config,
+                        channel.queue.raw,
+                        None,  # notifier: a child never needs credentials
+                        channel.tick_queue.raw if channel.tick_queue is not None else None,
+                        self._control_queues.get(worker_config.strategy_id),
+                    ),
                     name=f"{self._config.runtime_id}:{worker_config.strategy_id}",
                     daemon=False,
                 )
@@ -271,10 +292,19 @@ class IntradayOptionsSupervisor:
             result.ticks_received = self._hub.tick_count
             result.candles_published = self._hub.candle_count
 
-            # Sentinel per worker: tells a blocked consumer to stop waiting
-            # rather than relying on its idle timeout.
+            # Sentinel per worker, on **every** channel it has: tells a blocked
+            # consumer to stop waiting rather than relying on its idle timeout.
+            #
+            # The tick channel matters as much as the candle one. `HubTickFeed` turns
+            # this sentinel into `engine.request_square_off()` — which is how a
+            # SIGTERM delivered only to this process reaches each child's engine and
+            # closes its positions. That path was built in Part 2b-ii-A and was
+            # unreachable as deployed until this line, because only the candle queue
+            # was ever sentinelled.
             for _, channel in self._workers:
                 channel.queue.publish(None)
+                if channel.tick_queue is not None:
+                    channel.tick_queue.publish(None)
 
             for strategy_id, worker_process in self._processes.items():
                 worker_process.join(timeout=join_timeout)
@@ -286,6 +316,10 @@ class IntradayOptionsSupervisor:
 
             for _, channel in self._workers:
                 result.dropped_events[channel.strategy_id] = channel.queue.dropped
+                if channel.tick_queue is not None:
+                    result.dropped_events[f"{channel.strategy_id}:ticks"] = (
+                        channel.tick_queue.dropped
+                    )
 
             self._publish_final_health(
                 result,

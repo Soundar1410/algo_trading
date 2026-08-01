@@ -210,3 +210,75 @@ def test_a_tick_arriving_mid_wait_is_delivered_without_restarting_the_run():
     assert not thread.is_alive()
     assert len(seen) == 1
     assert feed.stopped_by_sentinel is True
+
+
+# ------------------------------------------------- shutdown while the feed is silent
+def test_a_silent_feed_still_honours_a_square_off_request():
+    """Phase 3 Part 2b-ii-B-2, and the reason ``should_stop`` exists.
+
+    A live session runs with ``idle_timeout_seconds=None``, so before this check a
+    ``SIGTERM`` arriving during a quiet stretch set the engine's flag and then waited
+    for a tick to carry it into ``on_tick`` — a wait with no upper bound on a
+    connected socket that has gone silent. This is the engine-level half of runbook
+    limitation 13, and it is fixed rather than alarmed about: the loop already wakes
+    every ``poll_seconds``, so it can simply ask.
+
+    Returning from ``run()`` is the sanctioned boundary, not a shortcut — it hands
+    control to ``TradingEngine.run()``'s ``finally``, which is the second of the two
+    square-off boundaries deviation D18 names.
+    """
+    q = BoundedWorkerQueue.in_process("st01:ticks", max_depth=8)
+    requested = threading.Event()
+    feed = HubTickFeed(
+        q,
+        should_stop=requested.is_set,
+        idle_timeout_seconds=None,
+        poll_seconds=0.05,
+    )
+    feed.on_tick(lambda _t: None)
+
+    done = threading.Event()
+    thread = threading.Thread(target=lambda: (feed.run(), done.set()), daemon=True)
+    thread.start()
+
+    # Nothing on the queue and no timeout: without the check this never ends.
+    assert not done.wait(timeout=0.3), "the feed ended before anything asked it to"
+
+    requested.set()
+    assert done.wait(timeout=5.0), "a square-off request did not end a silent feed"
+    thread.join(timeout=1.0)
+    assert feed.stopped_by_request is True
+    assert feed.stopped_by_sentinel is False
+    assert feed.stopped_by_idle_timeout is False
+
+
+def test_the_request_check_does_not_discard_ticks_already_queued():
+    """It is asked before the blocking get, so it must not pre-empt real work.
+
+    Ticks already delivered stay delivered; the check only decides whether to wait
+    for more.
+    """
+    ticks = [_tick(UNDERLYING, i) for i in range(3)]
+    q = _queue(ticks)
+    feed = HubTickFeed(q, should_stop=lambda: False, idle_timeout_seconds=0.3, poll_seconds=0.05)
+
+    seen: list[Tick] = []
+    feed.on_tick(seen.append)
+    feed.run()
+
+    assert [t.security_id for t in seen] == [UNDERLYING] * 3
+    assert feed.stopped_by_request is False
+
+
+def test_a_feed_with_no_should_stop_behaves_exactly_as_before():
+    """The parameter is optional, and every existing caller passes nothing."""
+    ticks = [_tick(UNDERLYING, i) for i in range(2)]
+    feed = HubTickFeed(_queue(ticks), idle_timeout_seconds=0.2, poll_seconds=0.05)
+
+    seen: list[Tick] = []
+    feed.on_tick(seen.append)
+    feed.run()
+
+    assert len(seen) == 2
+    assert feed.stopped_by_idle_timeout is True
+    assert feed.stopped_by_request is False

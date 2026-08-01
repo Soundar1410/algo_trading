@@ -72,7 +72,14 @@ from common.warmup.requirements import validate_warmup_config
 from .config import EngineConfig
 from .daily_guard import DailyRiskConfig, DailyRiskGuard
 from .feed import MarketDataFeed
-from .models import OpenPosition, OptionContract, OrderSide, SignalAction, StrategySignal
+from .models import (
+    AdoptedPosition,
+    OpenPosition,
+    OptionContract,
+    OrderSide,
+    SignalAction,
+    StrategySignal,
+)
 from .positions import PositionManager
 from .regime import build_regime_tagger
 from .reporting import (
@@ -111,6 +118,7 @@ class TradingEngine:
         warmup_source: object | None = None,
         square_off_event: threading.Event | None = None,
         square_off_authority: SquareOffAuthority | None = None,
+        recover_position: Callable[[], AdoptedPosition | None] | None = None,
         clock: Callable[[], datetime] = now_ist,
     ) -> None:
         self.cfg = cfg
@@ -143,6 +151,10 @@ class TradingEngine:
         self._square_off: SquareOffAuthority = square_off_authority or SessionSquareOffAuthority(
             self.session
         )
+        # Optional zero-arg callable returning a position a previous process left
+        # open, for this one to manage rather than re-enter. None (offline/tests, and
+        # every run with no prior state) => nothing to adopt. See _start_day.
+        self._recover_position = recover_position
         interval = parse_timeframe_minutes(cfg.timeframe)
         self.candles = CandleBuilder(
             interval,
@@ -451,7 +463,80 @@ class TradingEngine:
             self._last_option_tick_ts = None
             self._premium_gap_logged = False
         self.feed.subscribe(self.underlying_id)
+        # Last, and only here. Everything above resets; adopting before any of it
+        # would be undone by risk_manager.reset(), and adopting after _warm_up()
+        # would let the strategy see candles while the engine still believed it was
+        # flat.
+        self._adopt_recovered_position()
         log.info("new trading day initialised (fresh state)")
+
+    def _adopt_recovered_position(self) -> None:
+        """Take over a position a previous process opened, placing no order.
+
+        Phase 3 Part 2b-ii-B-2. Three things happen together, and all three are the
+        engine's rather than the caller's, because only the engine knows the order
+        they have to happen in:
+
+        1. the position enters the book via
+           :meth:`~common.engine.positions.PositionManager.adopt`, which touches no
+           gateway — placing an order here would double the exposure recovery exists
+           to prevent;
+        2. the traded contract is subscribed, on the same path the underlying just
+           was, so its premium ticks arrive and its exits can fire;
+        3. the risk manager is armed, which has to be *after* ``_start_day``'s
+           ``reset()`` and so cannot be done by whoever supplied the position.
+
+        A provider that **raises** fails closed, exactly as a raising
+        ``warmup_spec()`` does: we cannot establish whether a position is carried
+        over, and entering a new one while an old one is open is the outcome worth
+        preventing. Exits and square-off are untouched, so the block can never trap a
+        position — including one that was adopted.
+        """
+        if self._recover_position is None:
+            return
+        try:
+            recovered = self._recover_position()
+        except Exception as exc:
+            log.exception("%s: could not establish whether a position was carried over", self.label)
+            self._block_entries(
+                f"restart recovery failed ({exc}) — unable to establish whether a "
+                "position from a previous run is still open"
+            )
+            return
+        if recovered is None:
+            return
+
+        self.positions.adopt(
+            recovered.contract,
+            recovered.side,
+            recovered.lots,
+            recovered.entry_price,
+            recovered.entry_time,
+            entry_charges=recovered.entry_charges,
+            last_price=recovered.last_price,
+        )
+        self.feed.subscribe(recovered.contract.security_id)
+        self.strategy.risk_manager.new_position(recovered.lots)
+        if self._option_candles is not None:
+            # A fresh premium stream for the adopted contract. Its history is gone
+            # with the process that built it, so the first exit needing consecutive
+            # bars re-primes rather than comparing across the restart.
+            self._option_candles.retarget(security_id=recovered.contract.security_id)
+            self._option_candle_contract_id = recovered.contract.security_id
+            self._last_option_tick_ts = recovered.entry_time
+            self._premium_gap_logged = False
+        log.info(
+            "adopted %s %s x%d @ %.2f from a previous run; no order placed",
+            recovered.side.value,
+            recovered.contract.symbol,
+            recovered.lots,
+            recovered.entry_price,
+        )
+        self._notify(
+            "position_recovered",
+            f"adopted {recovered.side.value} {recovered.contract.symbol} "
+            f"@ {recovered.entry_price:.2f} from a previous run",
+        )
 
     def _end_day(self) -> None:
         summary_trades = self.positions.trades
