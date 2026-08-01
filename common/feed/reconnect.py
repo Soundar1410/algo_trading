@@ -218,11 +218,22 @@ class ReconnectingFeed:
         return self._policy
 
     # ----------------------------------------------------------- subscription
-    def subscribe(self, security_ids: Sequence[str]) -> None:
-        merged = dict.fromkeys([*self._security_ids, *(str(s) for s in security_ids)])
+    def subscribe(self, security_ids: Sequence[str], *, segment: int | None = None) -> None:
+        incoming = [str(s) for s in security_ids]
+        merged = dict.fromkeys([*self._security_ids, *incoming])
         self._security_ids = list(merged)
         self.health.expected_subscriptions = len(self._security_ids)
-        self._adapter.subscribe(self._security_ids)
+        if segment is None:
+            # Unchanged pre-Phase-4 path: re-send the whole set and let the
+            # adapter's union semantics absorb the repeats.
+            self._adapter.subscribe(self._security_ids)
+            return
+        # With a segment named, forward only the ids it applies to. Re-sending
+        # the whole set under one segment would relabel instruments subscribed
+        # earlier on a different one — for an options runtime that is the
+        # underlying and its contracts, and the relabelled half would come back
+        # from a reconnect subscribed to nothing.
+        self._adapter.subscribe(incoming, segment=segment)
 
     # ---------------------------------------------------------------- running
     def start(self, on_tick: TickCallback) -> None:

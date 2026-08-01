@@ -98,8 +98,25 @@ class EngineWorkerConfig:
     lots: int = 1
     #: Gap between tradable strikes for this underlying (e.g. 50 for NIFTY).
     strike_step: int = 50
+    #: Fallback lot size, used **only** by the ``simulated`` resolver. With
+    #: ``contract_resolver="dhan"`` the exchange's own lot size wins, because a
+    #: configured one that drifts from the contract is half of limitation 17.
     lot_size: int = 50
     expiry: str | None = None
+    #: ``"simulated"`` (default, unchanged) or ``"dhan"``. ``"dhan"`` resolves
+    #: real contracts out of the daily instrument master, so the ids the engine
+    #: subscribes and fills are ones the broker recognises — runbook limitation
+    #: 17. Left defaulted so every existing config keeps its current behaviour.
+    contract_resolver: str = "simulated"
+    #: Where the cached instrument master lives. Empty means the project's
+    #: ``data/cache``. A primitive, like everything else here, so the config
+    #: stays picklable for the spawned child.
+    scrip_master_cache_dir: str = ""
+    #: Overrides for an underlying absent from ``INDEX_REGISTRY``. All three are
+    #: needed together; empty means "look it up in the registry".
+    index_security_id: str = ""
+    index_segment: str = ""
+    fno_segment: str = ""
     starting_capital: float = 100_000.0
     max_daily_loss_percent: float | None = None
     regime_enabled: bool = False

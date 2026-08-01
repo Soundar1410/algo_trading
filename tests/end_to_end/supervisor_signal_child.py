@@ -74,7 +74,7 @@ class EndlessFeedAdapter:
     def is_running(self) -> bool:
         return self._running
 
-    def subscribe(self, security_ids: list[str]) -> None:
+    def subscribe(self, security_ids: list[str], *, segment: int | None = None) -> None:
         self._security_ids.update(str(s) for s in security_ids)
 
     def start(self, on_tick: TickCallback) -> None:

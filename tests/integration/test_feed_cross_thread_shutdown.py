@@ -112,7 +112,7 @@ class _BlockingFeedAdapter:
     def subscribed(self) -> frozenset[str]:
         return frozenset(self._security_ids)
 
-    def subscribe(self, security_ids: Sequence[str]) -> None:
+    def subscribe(self, security_ids: Sequence[str], *, segment: int | None = None) -> None:
         self._security_ids.update(str(s) for s in security_ids)
 
     def start(self, on_tick: TickCallback) -> None:

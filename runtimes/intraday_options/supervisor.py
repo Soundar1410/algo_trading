@@ -95,6 +95,41 @@ HEARTBEAT_POLL_SECONDS = 1.0
 #: `worker` sessions in the same table.
 SUPERVISOR_ROLE = "supervisor"
 
+#: How long a runtime subscription may sit unapplied before it is an incident
+#: (runbook limitation 15). Generous against the mechanism it watches: the hub
+#: applies pending subscriptions on any tick, and during market hours frames
+#: arrive continuously, so reaching this means the group has received **no**
+#: tick at all for that long — which is already an incident by itself.
+STUCK_SUBSCRIPTION_SECONDS = 30.0
+
+
+def _parse_subscription_request(request: object) -> tuple[str, int | None] | None:
+    """Normalise one control-queue entry into ``(security_id, segment)``.
+
+    Two shapes are accepted, and both are real:
+
+    * ``"49081"`` — a bare id, meaning "the hub's default segment". This is what
+      every pre-Phase-4 sender put on the queue, and the recorded-tape paths
+      still do.
+    * ``("49081", 2)`` — an id and the numeric exchange segment it lives in.
+      Phase 4 Part 1 added this so an option contract chosen mid-session is
+      subscribed on ``NSE_FNO`` rather than on the underlying's ``IDX_I``, where
+      it would be accepted and then deliver nothing.
+
+    Returns ``None`` for anything else, so the caller can log and drop it. The
+    child that sent a malformed entry is the one with the problem; taking the
+    whole group down with it would be the worse outcome.
+    """
+    if isinstance(request, str):
+        return (request, None) if request else None
+    if isinstance(request, tuple) and len(request) == 2:
+        security_id, segment = request
+        if not isinstance(security_id, str) or not security_id:
+            return None
+        if segment is None or (isinstance(segment, int) and not isinstance(segment, bool)):
+            return security_id, segment
+    return None
+
 
 @dataclass
 class SupervisorConfig:
@@ -158,6 +193,9 @@ class IntradayOptionsSupervisor:
         # shutdown, and the alarm this class raises is sent while the runtime is
         # already in trouble — the worst moment to discover an unwrapped timeout.
         self._notifier = SafeNotifier(notifier or NullNotifier())
+        #: Latched once the limitation-15 alarm has fired, so a condition that
+        #: persists produces one notification rather than one per poll.
+        self._stuck_subscription_alarmed = False
 
     @property
     def hub(self) -> SharedFeedHub:
@@ -436,6 +474,7 @@ class IntradayOptionsSupervisor:
             # climbs all session — indistinguishable from a dead supervisor.
             while not wake.wait(timeout=HEARTBEAT_POLL_SECONDS):
                 self._drain_control_queues()
+                self._check_stuck_subscription(heartbeat, repository)
                 self._beat_running(heartbeat)
             # Once more after the wake: a request that arrived in the same instant
             # the feed finished is still worth applying, and costs nothing if the
@@ -474,17 +513,19 @@ class IntradayOptionsSupervisor:
         for strategy_id, control_queue in self._control_queues.items():
             while True:
                 try:
-                    security_id = control_queue.get_nowait()
+                    request = control_queue.get_nowait()
                 except queue_module.Empty:
                     break
-                if not isinstance(security_id, str) or not security_id:
+                parsed = _parse_subscription_request(request)
+                if parsed is None:
                     _log.warning(
                         "ignoring a malformed subscription request from %s: %r",
                         strategy_id,
-                        security_id,
+                        request,
                     )
                     continue
-                self._hub.request_subscription(strategy_id, security_id)
+                security_id, segment = parsed
+                self._hub.request_subscription(strategy_id, security_id, segment=segment)
 
     def _beat_running(self, heartbeat: HeartbeatWriter) -> None:
         """One rate-limited liveness beat, carrying the group's queue picture."""
@@ -496,6 +537,63 @@ class IntradayOptionsSupervisor:
             # thing worth seeing, and summing would let three healthy queues hide it.
             queue_depth=max((s.depth for s in stats), default=0),
             dropped_events=sum(s.dropped for s in stats),
+        )
+
+    def _check_stuck_subscription(
+        self,
+        heartbeat: HeartbeatWriter,
+        repository: ExecutionRepository,
+    ) -> None:
+        """Alarm when a runtime subscription has not been applied (limitation 15).
+
+        The hub applies a pending subscription at the top of ``on_tick``, on the
+        thread that owns the connection (**D24**), so a feed delivering nothing
+        never applies one. The consequence is specific and silent: the engine
+        deliberately waits for a *fresh* tick on the contract it chose rather
+        than using a cached price, so its pending entry simply never fills. That
+        is the safe direction — no entry beats an entry at a stale price — but
+        until now nothing said so.
+
+        It matters more from Phase 4 Part 1 on. With synthetic contracts an
+        unapplied subscription was one symptom among many; with **real** ones it
+        is the single thing standing between a resolved contract and a fill, so
+        it is exactly the failure a live rehearsal is most likely to meet.
+
+        Raised **once per run**, not once per poll: this is a condition that
+        persists, and a notification every second would be noise rather than an
+        alarm. The heartbeat is left `DEGRADED` for as long as it holds.
+        """
+        age = self._hub.pending_subscription_age_seconds()
+        if age < STUCK_SUBSCRIPTION_SECONDS:
+            return
+        if self._stuck_subscription_alarmed:
+            return
+        self._stuck_subscription_alarmed = True
+
+        message = (
+            f"a runtime subscription has been waiting {age:.1f}s to be applied "
+            f"(threshold {STUCK_SUBSCRIPTION_SECONDS:.0f}s). The hub applies one only "
+            "when a tick arrives, so the feed is delivering nothing for this group. "
+            "Any engine waiting on a contract it just chose will not enter — it wants "
+            "a fresh tick and will not use a cached price. Check the feed connection."
+        )
+        _log.error("%s", message)
+        heartbeat.beat(HealthState.DEGRADED, force=True)
+        repository.record_error(
+            runtime_id=self._config.runtime_id,
+            strategy_id=None,
+            execution_mode=ExecutionMode.PAPER,
+            severity="CRITICAL",
+            component="feed",
+            message=message,
+        )
+        self._notifier.send(
+            NotificationEvent(
+                event_type="subscription_not_applied",
+                message=message,
+                runtime_id=self._config.runtime_id,
+                execution_mode=ExecutionMode.PAPER,
+            )
         )
 
     def _raise_silent_feed_alarm(

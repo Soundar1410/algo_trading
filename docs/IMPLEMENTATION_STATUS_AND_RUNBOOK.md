@@ -7,8 +7,8 @@ the next phase. Updated after every phase.
 
 | | |
 |---|---|
-| **Current phase** | Phase 3 **Part 1 — complete** (live-feed shutdown path); **Part 2a — complete** (exit-policy registry); **Part 2b-i — complete** (signal ownership + `TradingEngine` core port); **Part 2b-ii-A — complete** (hub tick channel, runtime subscription, `HubTickFeed`); **Part 2b-ii-B-1 — complete** (`SquareOffAuthority`, `LifecycleGateway`, entry-block on tick drop); **Part 2b-ii-B-2 — complete** (the wiring: worker engine path, supervisor queue delivery, engine restart recovery, D20 bindings — **Phase 3 acceptance gate met in full**), awaiting review |
-| **Next phase** | Phase 4 — candle, indicator and paper-execution foundation (see section 8) |
+| **Current phase** | Phase 4 **Part 1 — complete** (real contract resolution: scrip-master port, `DhanOptionChainResolver`, per-instrument exchange segments, the limitation-15 alarm; the offline rehearsal **run against the real instrument master** — it found the configured lot size wrong, 50 vs the exchange's 65 — with the market-hours half still to run), awaiting review. Phase 3 complete, all five parts |
+| **Next phase** | Phase 4 **Part 2** — the indicator layer (see section 8) |
 | **Last updated** | 1 August 2026 |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
@@ -24,7 +24,7 @@ the next phase. Updated after every phase.
 | 1 | Walking skeleton | **Complete** |
 | 2 | Dhan and shared-feed hardening | **Complete** — Block 1 (offline) + Block 2 (live) |
 | 3 | Preserve custom engines and policies | **Complete.** **Part 1 complete** (live-feed shutdown); **Part 2a complete** (exit registry + SuperTrend port); **Part 2b-i complete** (signal ownership + engine core); **Part 2b-ii-A complete** (the feed seam: tick channel, runtime subscription, `HubTickFeed`); **Part 2b-ii-B-1 complete** (the execution seam: square-off authority, `LifecycleGateway`, entry-block on tick drop); **Part 2b-ii-B-2 complete** (the wiring: worker engine path, supervisor queue delivery, engine restart recovery, D20 reporting bindings). **Phase 3 complete** — its acceptance gate is met in full |
-| 4 | Candle, indicator and paper-execution foundation | Not started |
+| 4 | Candle, indicator and paper-execution foundation | **In progress.** **Part 1 complete** (real contract resolution — closes limitation 17, alarms limitation 15). Parts 2-5 not started: indicator layer; candle continuity + wall-clock square-off; warm-up source; `PaperBroker` realism |
 | 5 | Mixed-mode supervisor and persistence | Not started |
 | 6 | Paper recovery and expiry handling | Not started |
 | 7 | Operations | Not started |
@@ -941,6 +941,126 @@ before any continuity-required strategy runs (see limitation 16). `Database` sti
 opens with thread affinity, so nothing in a worker may touch SQLite off the main
 thread — recorded as **D31** rather than worked around.
 
+### What Phase 4 Part 1 delivered — real contract resolution
+
+Closes **limitation 17** and alarms **limitation 15**. The part exists because the
+engine selected strikes through `SimulatedOptionChainResolver`, so every
+`security_id` it chose was of the form `SIM:<underlying>:<expiry>:<strike>:<CE|PE>`
+and matched nothing at the broker. That blocked any live-feed rehearsal of the
+engine path, and — as this part established — it also blocked Part 5.
+
+#### The runbook's own stated fix was wrong, and is corrected here
+
+Limitation 17 and section 8 both said the fix was "an `OptionChainResolver` backed
+by `OptionChainService`". **It cannot be.** Dhan's `/v2/optionchain` response is
+keyed by strike and carries prices, open interest and greeks; it has **no
+per-strike `security_id`**, so it cannot name a tradable contract at all. The
+reference repository reached the same conclusion and left the reasoning in its
+docstring — the daily instrument master is "more reliable than the rate-limited
+Option Chain API and works outside market hours" — and that is what was ported.
+
+`OptionChainService` is untouched and keeps its real job: live per-strike quotes
+and greeks. It still has **no production caller**, which is now a deliberate
+statement rather than an oversight.
+
+#### Limitation 17 was bigger than it was recorded as
+
+A real `security_id` is not sufficient to subscribe one. `DhanMarketFeedAdapter`
+held **one** `exchange_segment` for every instrument (`dhan.py:194`, applied at
+`:253`), while an options runtime needs two simultaneously: the underlying index
+is `IDX_I` (segment 0) and its contracts are `NSE_FNO` (2). This was a second,
+independent blocker inside the same goal and is fixed in the same part.
+
+**Why it would have been hard to find later.** A wrong segment does not raise.
+Dhan accepts the subscription and delivers nothing, so the failure presents as a
+quiet market — indistinguishable at a glance from out-of-hours. No existing test
+could have caught it either, because every test drove one instrument type.
+
+#### What was built
+
+| Piece | Where |
+|---|---|
+| `ScripMaster` — parses Dhan's daily `api-scrip-master.csv` into `(expiry, strike, CE/PE) → OptionRow`, with `nearest_expiry`, `strikes_for_expiry` and `atm_band` | `common/market_data/scrip_master.py` |
+| `IndexMeta` / `INDEX_REGISTRY` / `SEGMENT_CODES` / `resolve_index_meta` / `segment_code` — the underlying's spot id, its own segment, and its options' segment | same |
+| `ScripMasterCache` — a day-stamped local copy under `data/cache/`, written atomically | same |
+| `DhanOptionChainResolver` — a dict lookup, **no per-trade API call**; plus `ContractNotListed` | `common/engine/selection.py` |
+| Per-instrument exchange segments, remembered across a reconnect | `common/market_data/dhan.py`, `adapter.py`, `recorded.py`, `feed/reconnect.py`, `feed/hub.py` |
+| `build_option_selector` — the `simulated`/`dhan` switch, and where the option segment is decided | `runtimes/intraday_options/engine_worker.py` |
+| `(security_id, segment)` on the control queue, with `_parse_subscription_request` still accepting a bare id | `engine_worker.py`, `supervisor.py` |
+| The limitation-15 alarm | `supervisor.py::_check_stuck_subscription`, `hub.pending_subscription_age_seconds` |
+
+#### Deviations recorded
+
+**D33 — the resolver reads the scrip master, not the option chain.** Supersedes
+the fix named in limitation 17 and section 8. Reason above: the chain response
+carries no per-strike `security_id`. Consequence: resolution needs one CSV
+download per trading day and then costs nothing, instead of an API call per entry
+that a rate limit could delay at the worst possible moment.
+
+**D34 — `EquityScripMaster` was not ported.** The reference's NSE cash/derivative
+universe serves its equity scanner. Intraday stocks are Phase 5 and nothing here
+consumes it; porting ~110 lines of unexercised parser now is the same judgement
+Part 2a made about the five unported indicators.
+
+**D35 — a stale master raises rather than falling back to the last expiry.** The
+reference returned `self._expiries[-1]` when every listed expiry was in the past.
+That resolves contracts which can no longer be traded, so it fails *towards* a
+silent bad entry. This port raises `ScripMasterError` naming the staleness.
+Deliberately a behaviour change from the reference, and the only one.
+
+**D36 — the option's exchange segment is decided in the worker, not the engine.**
+`TradingEngine`'s feed contract is `subscribe(security_id)` — one string — and
+widening it would mean touching the engine, whose ported session-gating test pins
+it attribute by attribute. It does not need widening: everything the engine
+subscribes at runtime other than the underlying *is* an option contract, so
+`_subscription_sender` gives the underlying the hub's default and everything else
+the option segment. Cost: a future runtime that subscribed something which was
+neither would need this revisited.
+
+**D37 — `nearest_expiry` resolves "today" in IST.** The reference used a naive
+`datetime.now().date()`. At 23:30 UTC it is already tomorrow in Mumbai, so for
+half an hour a night the reference would pick the wrong series.
+
+#### Test evidence
+
+| Group | Count | What it covers |
+|---|---|---|
+| `tests/unit/test_scrip_master.py` | 37 | The reference's own regression test ported with its assertions and fixture unchanged, then: both option types, the exchange lot size, the NIFTYNXT50 prefix collision, NSE-vs-BSE filtering, unparseable rows skipped, an empty result raising, expiry selection across four dates including expiry day itself, the stale-master raise, the IST default, the ATM band and its short edge, segment resolution, the cache (fetch-once-per-day, refetch next day, no partial file on a crashing fetch, an empty cached file missing rather than resolving zero contracts, pruning), and the resolver end to end through `OptionSelector` |
+| `tests/unit/test_feed_exchange_segments.py` | 12 | An underlying and its option on different segments through one adapter; a reconnect restoring each to its own; one instrument refused a second segment; the union preserved across segments; delta-only sends; the hub forwarding a runtime subscription's segment and defaulting when none is named; `ReconnectingFeed` carrying it through and **not** relabelling earlier instruments |
+| `tests/unit/test_engine_worker_contract_resolution.py` | 22 | The default still simulated; the `dhan` path yielding real ids and `NSE_FNO`; the exchange lot size beating the configured one; selector and resolver agreeing on the expiry; an unknown resolver name refused; the build proven to reach no network; the option carrying a segment while the underlying does not; and ten malformed control-queue shapes dropped rather than crashing the group |
+| `tests/unit/test_stuck_subscription_alarm.py` | 10 | The age clock (oldest not newest, cleared on drain, no leak into a later request, cleared even for an unregistered worker) and the alarm's three channels, fired once however long the condition persists |
+| `tests/smoke/test_live_feed_smoke.py` | +2 | **The rehearsal.** Skipped by default |
+
+Suite **815 → 896**, 8 skipped (6 pre-existing + the 2 new opt-in rehearsals).
+
+**Two properties were verified by breaking the code, not by reading it.** Reverting
+the underlying-prefix guard to a `startswith` failed 5 tests — the NIFTYNXT50 rows
+were indexed into the NIFTY master and overwrote its lot size, which is precisely
+the silent mis-sizing the guard exists to stop. Restoring the reference's
+fall-back-to-last-expiry failed the stale-master test. Both were restored
+immediately afterwards.
+
+**One of the new tests initially passed for the wrong reason and was fixed rather
+than kept.** `test_non_option_instruments_are_ignored` asserted that every indexed
+row had a CE/PE option type — which every lookup is keyed by, so it would have held
+even if the `FUTIDX` row had been indexed. It now asserts on that row's security id.
+
+#### What Part 1 deliberately did NOT deliver
+
+No indicator work, no candle-continuity policy, no warm-up source, no `PaperBroker`
+change — Parts 2 through 5. No `EquityScripMaster` (**D34**). No expiry-list API
+call: the master already lists every expiry, so the endpoint would be a second
+source of the same truth. Live order placement remains unimplemented and
+fail-closed, and `build_broker` still refuses live in every configuration. The
+`simulated` resolver remains the **default**, so every existing configuration
+behaves exactly as it did.
+
+**Limitation 15 is alarmed, not closed.** The underlying condition is unchanged —
+the hub still applies a pending subscription only at a tick boundary (**D24**),
+because the alternative is a cross-thread call into the SDK's loop, which is the
+hang Part 1 of Phase 3 exists to prevent. What changed is that it can no longer
+happen silently.
+
 ---
 
 ## 2. Reference-repository reuse inventory
@@ -1132,6 +1252,11 @@ guard. See deviation D6.
 | **D30** | **The engine's strategy travels as a dotted `module:Class` reference plus keyword arguments, not a registry name** | The ported `common.engine.strategy.get_strategy(name, cfg)` takes exactly one positional config argument, which the engine's strategies — whose constructors are keyword-only — do not fit. Two ways out: change the ported registry to suit its first caller, or carry a form that can express what already exists. The second leaves the port untouched, which is the whole point of porting it. The reference is resolved in the child by `engine_worker.load_strategy`, which `isinstance`-checks the result against `BaseStrategy` so a typo naming another class in the same module fails at startup rather than on the first tick. It also keeps `EngineWorkerConfig` free of engine-owned types, which the import boundary requires: the child unpickles that dataclass before any engine module is loaded, so a single engine-typed field would drag the package in through the definition itself |
 | **D31** | **The engine runs on the worker's main thread; `Database` keeps its thread affinity** | Planned as a second thread, mirroring the supervisor's feed thread, so a coordinating thread could bound its wait on a silent feed. `Database.connect()` does not pass `check_same_thread=False`, so the connection belongs to the thread that created it and the first fill from `LifecycleGateway` raises `ProgrammingError`. Passing `check_same_thread=False` would have loosened a real safety property for every user of `Database` to serve one caller, so the engine stays on the main thread instead and the case the second thread existed for is fixed at its cause: `HubTickFeed` asks a `should_stop` predicate on every poll wake, so a shutdown requested during a silent stretch is honoured within one poll interval rather than waiting for a tick that may never come. Returning from that loop reaches `TradingEngine.run()`'s `finally`, which **D18** already names as the second square-off boundary, so no new mechanism is introduced. Consequence to remember: **nothing in a worker may touch SQLite off the main thread.** The one remaining helper thread drains the candle queue and calls `request_square_off`, which is documented safe from any thread precisely because it only sets a flag |
 | **D32** | **The engine's day summary goes into `strategy_state.payload`, not a report file or a second store** | **D20** deferred this binding to Part 2b-ii and warned against the reference's parallel `PortfolioDatabase`. Every leg is already persisted through `LifecycleGateway` into `signals`/`order_intents`/`orders`/`fills`/`positions`, so re-writing the trades would be exactly that parallel universe. What those tables cannot hold is the engine's own analytics — MFE/MAE, the regime tags, the exit reason it chose, the day's net — so `RepositoryReportWriter` writes only those, into the free-form column that already exists, merged so it coexists with the `open_position` record the gateway keeps there. Recorded as a deviation because the reference wrote CSV/JSON/HTML files to `report.output_dir` and this writes none |
+| **D33** | **The real resolver reads Dhan's daily scrip master, not `OptionChainService`** | Supersedes the fix that limitation 17 and section 8 both named. `/v2/optionchain` is keyed by strike and returns prices, OI and greeks — it carries **no per-strike `security_id`**, so it cannot name a tradable contract. The instrument master can, works outside market hours, and turns resolution into a dict lookup with no per-trade API call, so entering a position can never be delayed or refused by a rate limit. The reference reached the same conclusion and left the reasoning in its docstring. `OptionChainService` is untouched and keeps live per-strike quotes and greeks as its job |
+| **D34** | **`EquityScripMaster` was not ported** | The reference's NSE cash/derivative universe exists for its equity scanner. Intraday stocks are Phase 5 and nothing in this repository consumes it, so porting ~110 lines of parser now would produce untested code that merely looks finished — the same judgement Part 2a made about the five unported indicators |
+| **D35** | **A stale scrip master raises rather than falling back to the last listed expiry** | The reference returned `self._expiries[-1]` when every expiry was in the past. That resolves contracts which can no longer be traded, so it fails *towards* a silent bad entry rather than away from one. This port raises `ScripMasterError` naming the staleness. The only behaviour change from the reference in this part, and it is pinned by a test that fails against the reference's version |
+| **D36** | **The option's exchange segment is decided in the worker, not the engine** | `TradingEngine`'s feed contract is `subscribe(security_id)` — one string, no segment — and widening it means touching the engine, whose ported session-gating test pins it attribute by attribute. It does not need widening: everything the engine subscribes at runtime other than the underlying **is** an option contract, so `_subscription_sender` gives the underlying the hub's default segment and everything else `option_segment`. This also keeps instrument knowledge in the wiring, where the rest of the resolution already lives. Cost: a future runtime subscribing something that is neither would need this revisited |
+| **D37** | **`nearest_expiry` resolves "today" in IST, not in the process's local naive time** | The reference used `datetime.now().date()`. At 23:30 UTC it is already tomorrow in Mumbai, so for half an hour every night the reference would select the expiring series instead of the next one. Routed through `common.utils.timeutils.now_ist`, which is the clock the engine already uses |
 
 #### D22 in detail: the rebuilt premium-candle mapping
 
@@ -1782,6 +1907,78 @@ write. The baseline check should therefore exclude runtime artefacts explicitly,
 it now does; the earlier "source+config" phrasing would have swept the token cache in
 and reported a change that never happened.
 
+### Verification results (Phase 4 Part 1, 1 August 2026)
+
+| Check | Command | Result |
+|---|---|---|
+| Tests | `python -m pytest` | **896 passed, 8 skipped** (was 815 + 6) |
+| Lint | `ruff check .` | **All checks passed!** |
+| Format | `ruff format --check .` | **All files formatted** |
+| Types | `mypy` | **Success: no issues found in 107 source files** |
+
+`mypy` is run bare — the configured `packages` list. A bare `mypy .` still fails on
+the pre-existing `dashboards/app.py` dual-module-name error, unrelated to this part.
+
+#### Phase 4 Part 1 gate evidence
+
+**Acceptance gate (Part 1) — met, with one item explicitly not yet claimed.**
+
+| Requirement | Evidence |
+|---|---|
+| The reference's resolver regression test passes with its assertions unmodified | `test_existing_index_option_master_behaviour_is_preserved`, with the reference's own `dhan_scrip_master_sample.csv` copied verbatim. Only the import path and the `ScripMaster` construction differ |
+| A real contract resolves to a real `security_id` and the **exchange's** lot size, offline | `test_the_resolver_returns_a_real_security_id_not_a_synthetic_one`; `test_the_lot_size_comes_from_the_exchange_not_from_configuration`; and `test_the_exchange_lot_size_beats_the_configured_one`, which pins that a configured 50 loses to the master's 75 — the half of limitation 17 that silently mis-sizes every position |
+| No default test reaches the network for the master | `test_building_the_dhan_resolver_needs_no_network` replaces the fetcher with one that raises; plus the whole-suite run below with sockets blocked |
+| A mixed-segment subscription set is proven offline | `tests/unit/test_feed_exchange_segments.py` — an underlying on `IDX_I` and its option on `NSE_FNO` through one adapter, and a reconnect restoring **each to its own**, which is the failure that would otherwise reconnect the feed into silence |
+| One instrument cannot be moved between segments | `test_one_instrument_cannot_be_moved_to_a_second_segment` — a contradiction, refused rather than resolved by picking one |
+| The segment survives every layer between engine and socket | `ReconnectingFeed` (`test_the_reconnect_wrapper_carries_the_segment_through`, and the negative control that it does not relabel earlier instruments), the hub, and the control queue |
+| The control queue's new shape does not break the old one | `test_the_supervisor_still_reads_a_bare_id`, plus ten malformed shapes dropped rather than crashing the group — including `("8103", True)`, which without the `bool` guard would subscribe to segment 1 |
+| An engine worker configured `dhan` resolves and fills paper-only, end to end | `tests/unit/test_engine_worker_contract_resolution.py` over the real `build_option_selector`; the full engine-worker integration suite unchanged on the `simulated` default |
+| The default is unchanged, so no existing config moves | `test_the_default_is_still_the_simulated_resolver`; the 20 `test_engine_worker.py` tests and both restart/signal gates pass with no behavioural edit |
+| Limitation 15 is alarmed on all three channels, once | `tests/unit/test_stuck_subscription_alarm.py` — `CRITICAL`/`component='feed'` row, `subscription_not_applied` notification, forced `DEGRADED` heartbeat; `test_the_alarm_fires_once_however_long_it_persists` |
+| Both walking-skeleton gates still pass, with the spawn import cost re-measured | `29 passed`; **0.129 s median over 7 runs, zero `common.engine` modules**. The median is above Part 2b-ii-B-2's 0.110 s on the same machine under different load; the invariant the gate protects — **zero** engine modules — is unchanged, and that is what is asserted |
+| No default test needs credentials or network | Full suite re-run with `DHAN_*`, `TELEGRAM_*` and `ALGO_LIVE_SMOKE` unset **and** `socket.socket`/`create_connection`/`getaddrinfo` all raising: **896 passed, 8 skipped** |
+| No flake in the threading-adjacent suites | Eight suites (98 tests) run three consecutive times: `98 passed` each, 36.6-36.8 s |
+| Live still fail-closed | `DhanLiveBroker` absent; `build_broker` unchanged and all 12 factory tests pass; the new resolver touches no order path and `OptionChainService` gained no caller |
+| `Trading_Automation` untouched | Newest source+config mtime re-run against the recorded baseline: **`2026-07-28 10:29:14 .../tests/test_warmup_coordinator.py`** — unchanged |
+| **The offline half of the rehearsal has been RUN against the real master** | `ALGO_LIVE_SMOKE=1 pytest -k test_the_scrip_master_resolves_a_real_contract` → **1 passed in 7.70s**, 1 August 2026. Real numbers below |
+| **Not claimed:** the market-hours half has not been run | `test_a_real_option_contract_delivers_ticks_on_the_fno_segment` needs a live session — an option that has not traded delivers nothing. Until it runs, the **feed** half of "real contracts work" is asserted, not proven. Resolution itself is now proven against the real broker data |
+
+**What the real master actually returned** (NIFTY, 1 August 2026):
+
+```
+downloaded + parsed   3.92 s, 25.3 MB CSV
+exchange lot size     65
+expiries listed       18   (first: 2026-08-04, 2026-08-11, 2026-08-18, ...)
+nearest expiry        2026-08-04   (chosen by the resolver, unprompted)
+strikes for it        225, range 18500-29700
+resolved CE           security_id 65697   "NIFTY 04 AUG 24100 CALL"   lot 65
+resolved PE           security_id 65698   "NIFTY 04 AUG 24100 PUT"    lot 65
+```
+
+**Two things this run established that the fixture tests could not.**
+
+1. **The configured lot size was wrong, and by 30 %.** `EngineWorkerConfig.lot_size`
+   defaults to **50**; NIFTY's actual exchange lot is **65**. Every position an
+   engine worker sized from configuration was therefore mis-sized, and nothing in
+   the repository could have noticed — the synthetic resolver simply echoed the
+   configured value back. This is precisely the half of limitation 17 that reads
+   as bookkeeping until you see the number.
+
+2. **The strike count independently corroborates Phase 2 Block 2.** That block's
+   one live `/optionchain` call returned **225 strikes** for NIFTY expiry
+   **2026-08-04** (section 1, Block 2 step 4). The instrument master — a different
+   endpoint, a different format, four days later — lists **225 strikes** for the
+   same expiry. Two independent sources agreeing is worth more than either alone,
+   and it is the closest thing to a correctness check the parser can get without
+   market hours.
+
+**A defect in the gate was found by being asked to run this test.** The file's
+module-level `pytestmark` required credentials for *every* test in it, so the
+scrip-master test — whose own docstring said it needed none, because the master is
+a public CSV — could not be run without exporting a token it never uses. Split
+into a shared `ALGO_LIVE_SMOKE=1` gate plus a `needs_credentials` mark applied to
+the seven tests that authenticate. The default run still skips all eight.
+
 #### Phase 3 Part 2b-ii-B-2 gate evidence
 
 **Acceptance gate (Part 2b-ii-B-2) — met in full.**
@@ -2347,8 +2544,26 @@ start/stop/crash/restart tests pass.
     Consequence when it bites: the engine's pending entry never fills, because it
     deliberately waits for a *fresh* tick on the chosen contract rather than using a
     cached price. That is the safe direction — no entry rather than an entry at a
-    stale price — but it is silent today. Worth an alarm alongside 2b-ii-B's
-    entry-block work.
+    stale price — but it is silent today.
+
+    **No longer silent, as of Phase 4 Part 1.** The supervisor now watches how long
+    the oldest unapplied subscription has been waiting
+    (`SharedFeedHub.pending_subscription_age_seconds`) and, past
+    `STUCK_SUBSCRIPTION_SECONDS` (30 s), raises through the same three channels
+    limitation 13 uses — a forced `DEGRADED` heartbeat, a `CRITICAL` row in
+    `errors` with `component='feed'`, and a `subscription_not_applied`
+    notification. Once per run, not once per poll: the condition persists by
+    nature, and a notification every second is noise rather than an alarm.
+
+    **The condition itself is unchanged and this entry stays open.** The hub still
+    applies a pending subscription only at a tick boundary (**D24**), because the
+    alternative is a cross-thread call into the SDK's loop — the hang Phase 3
+    Part 1 exists to prevent. The threshold is generous against the mechanism it
+    watches: the hub applies pending subscriptions on *any* tick, so reaching 30 s
+    means the group has received no tick at all for that long, which is already an
+    incident. It matters more from Part 1 on: with real contracts, an unapplied
+    subscription is the single thing standing between a resolved contract and a
+    fill.
 16. **An engine worker cold-starts its indicators.** Introduced by Part 2b-ii-B-2.
     `TradingEngine` accepts a `warmup_manager`/`warmup_source` pair and a
     `history_provider`, and `engine_worker` injects **none of them**, so `_warm_up()`
@@ -2368,37 +2583,40 @@ start/stop/crash/restart tests pass.
     saying its signals "must not be read as strategy edge". So this cannot silently
     trade a wrongly-seeded indicator; it can only refuse to trade, or trade a
     strategy that declared it did not care. Must be closed before Phase 9.
-17. **The engine trades synthetic contracts, not real ones.** Introduced by
-    Part 2b-i and unchanged by the wiring in Part 2b-ii-B-2, which is why it is
-    recorded here rather than left implicit in "what this part did not deliver".
-    `engine_worker` builds its `OptionSelector` on
-    `SimulatedOptionChainResolver`, so every contract the engine selects has a
-    **manufactured** `security_id` of the form
-    `SIM:<underlying>:<expiry>:<strike>:<CE|PE>` and a `lot_size` taken from
-    configuration rather than from the exchange.
+17. **~~The engine trades synthetic contracts, not real ones.~~ CLOSED**
+    (Phase 4 Part 1, 1 August 2026). The engine now resolves real Dhan contracts
+    through `DhanOptionChainResolver` over the daily instrument master
+    (`common/market_data/scrip_master.py`), so the `security_id`, the strike, the
+    expiry **and the lot size** come from the exchange rather than from
+    configuration. `SimulatedOptionChainResolver` remains and remains the
+    **default**, so every recorded/offline path is unchanged; `contract_resolver:
+    dhan` opts a strategy into real contracts.
 
-    **What that means in practice.** A paper run is internally consistent — the
-    same synthetic id is subscribed, filled, persisted and closed — so every
-    property Phase 3 proves about the engine holds. But those ids correspond to
-    nothing at the broker: a runtime subscription for one can never return real
-    ticks, and the strike/expiry the selector picks is not checked against a
-    tradable contract. **This is the single largest gap between the engine as
-    tested and an engine that could trade**, and it is entirely upstream of the
-    order path, so no amount of execution-side hardening closes it.
+    **The fix this entry originally specified was wrong**, and the correction is
+    recorded rather than quietly applied. It said an `OptionChainResolver` backed
+    by `OptionChainService` — but Dhan's `/v2/optionchain` response is keyed by
+    strike and carries no per-strike `security_id`, so it cannot name a tradable
+    contract. The instrument master can, works outside market hours, and needs no
+    per-trade API call. See **D33**.
 
-    **Why it is still open:** the reference's Dhan resolver was deliberately not
-    ported (see `common/engine/selection.py`) because resolving real contracts
-    needs the scrip master, and this repository already has a live option-chain
-    surface — `common/market_data/option_chain.py`, with its own 3s-per-key
-    throttle and freshness rules, exercised live in Phase 2 Block 2. Wiring the
-    two together is a live-path decision, not an engine-port one.
+    **It was also larger than this entry described.** A real id still could not be
+    subscribed: `DhanMarketFeedAdapter` held one `exchange_segment` for every
+    instrument, and an options runtime needs `IDX_I` for the underlying and
+    `NSE_FNO` for its contracts at the same time. A wrong segment does not raise —
+    it delivers silence — so this is fixed and covered by
+    `tests/unit/test_feed_exchange_segments.py`.
 
-    **When it bites:** the first run against a real feed. Until an
-    `OptionChainResolver` backed by `OptionChainService` exists, an engine worker
-    pointed at live market data would subscribe to ids the broker does not
-    recognise and simply never fill — the safe direction, and silent, which is
-    the same shape as limitation 15. Must be closed before Phase 10, and before
-    any live-feed rehearsal of the engine path.
+    **Proven against the real instrument master on 1 August 2026.** The offline
+    rehearsal was run: NIFTY resolved to real numeric ids (`65697` CE / `65698`
+    PE, "NIFTY 04 AUG 24100"), 225 strikes for expiry 2026-08-04, and — the point
+    of the whole exercise — an exchange lot size of **65** against the **50** the
+    configuration defaulted to. Full numbers in the Part 1 gate evidence
+    (section 4).
+
+    **What is still asserted rather than proven:** that those ids actually stream.
+    `test_a_real_option_contract_delivers_ticks_on_the_fno_segment` needs market
+    hours and has not been run. Resolution is proven; delivery is not.
+
 
 ### Operational risk noted during the audit
 
@@ -2567,27 +2785,84 @@ mtime is unchanged at the recorded baseline.
 Phase 2 is complete, both blocks. **Phase 3 is complete** — all five parts, with its
 acceptance gate met in full. Next is **Phase 4**.
 
-### Phase 4 — candle, indicator and paper-execution foundation — **NOT STARTED**
+### Phase 4 — candle, indicator and paper-execution foundation — **IN PROGRESS**
 
-Scope is the architecture document's; what Phase 3 leaves on its doorstep is listed
-here so it is not rediscovered later:
+Split into **five parts, in strict order**, using the rule Phase 3 used five times:
+separate what is provable offline from what changes the deployed shape, and keep
+independent concerns apart. **Stop for review after each part.**
 
-* **Widen `PaperBroker`.** Phase 3 kept it deliberately minimal, and
-  `InMemoryGateway`'s docstring already names Phase 4 as the owner of bid/ask depth,
-  latency, partial fills and the rejection matrix.
-* **Decide the warm-up source and inject it** (limitation 16). `engine_worker`
-  injects no `warmup_manager`, `warmup_source` or `history_provider`, so an engine
-  worker cold-starts its indicators. Harmless today because the only strategy opts
-  out, and it fails *towards* refusing to trade rather than trading a wrongly-seeded
-  indicator — but it must be closed before Phase 9, and the choice of source is a
-  candle-foundation decision, not a wiring one.
-* **Resolve real contracts** (limitation 17). The engine selects strikes through
-  `SimulatedOptionChainResolver`, so its `security_id`s are manufactured and match
-  nothing at the broker; `common/market_data/option_chain.py` exists with its
-  throttle and freshness rules and is not yet wired to the selector. This blocks any
-  live-feed rehearsal of the engine path, not just Phase 10.
-* **Alarm on limitation 15** — a runtime subscription that never applies currently
-  means a pending entry silently never fills.
+| # | Part | Closes | Gated by | Status |
+|---|---|---|---|---|
+| 1 | Real contract resolution + the live rehearsal | 17; alarms 15 | — | **COMPLETE** (1 Aug 2026) |
+| 2 | Indicator layer (EMA/RSI/VWAP/ATR/ADX) | — | — | Not started |
+| 3 | Candle continuity, session/timezone, wall-clock square-off | 4, 7 | — | Not started |
+| 4 | Warm-up source and injection | 16 | 2, 3 | Not started |
+| 5 | `PaperBroker` realism | 5, D11 | 1 | Not started |
+
+**Why Part 1 came first**, since the ordering was not obvious and the reason
+recorded when this list was first written was the weaker of the two: it is not
+merely that limitation 17 blocked a live rehearsal. It is a **hard precondition
+for Part 5**. The fill model needs bid/ask; indices carry none; the only source of
+real option depth is a Full-mode subscription on a real `NSE_FNO` option
+`security_id`. `paper.py`'s own docstring already said building the model against
+a depth-free tape was the wrong move — Part 1 is what makes a depth-carrying tape
+possible at all.
+
+**Part 2 — the indicator layer.** Port `EMA`, `RSI`, `VWAP`, `ATR` and `ADX` from
+the reference with their regression tests unmodified; they are `StatefulIndicator`
+pairs matching the `SuperTrend` port already in the tree from Part 2a. `VWAP` must
+override `warmup_requirement()` to declare `IndicatorScope.SESSION_LOCAL` — the
+one case the default in `base.py` gets wrong.
+
+`pandas-ta-classic` (0.6.52, already pinned) is the **oracle, not the live path**:
+one adapter providing the vectorised form for warm-up replay and a test-time
+cross-check. The architecture document's bullet says "adapter" and this delivers
+one, but live incremental values stay the reference's proven ones, so the ported
+regression tests hold unweakened. To be recorded as a deviation, with the
+cross-check's tolerance stated and justified (Wilder smoothing and seeding differ)
+rather than an assertion loosened to make it pass.
+
+**Part 3 — continuity and the wall clock.** `CandleAggregator.mark_feed_gap`
+discards a gap-spanning bar today, which is the conservative floor rather than a
+policy (limitation 4). Deliver the policy — including what an indicator does with
+a hole, which Part 2 finally makes answerable — keeping discard as the default and
+marking any repaired bar as repaired. Add the wall-clock square-off net
+(limitation 7), routed through the existing `SquareOffAuthority` seam so there is
+still one owner of the decision.
+
+**Part 4 — the warm-up source** (limitation 16). Port `framework/warmup/manager.py`
+and `source.py` plus `framework/market_data/historical.py`; `requirements.py` is
+already in the tree. **Not** `coordinator.py` — it coordinates across strategies,
+which is Phase 5. Then inject `warmup_manager`/`warmup_source`/`history_provider`
+at `engine_worker`, where `TradingEngine` already accepts them as `object | None`;
+tighten those annotations to real protocols while porting.
+
+**Part 5 — `PaperBroker` realism** (limitation 5, deviation D11). Depth through
+the pipe (Full mode 21 in the adapter, then the gateway protocol, `Signal`, and
+`Quote` construction — four consecutive places depth is dropped today);
+latency-*selected* quotes rather than merely recorded ones; limit orders; partial
+fills, **with** the accumulation fix at `ExecutionRepository.apply_fill`, which
+overwrites `filled_quantity` rather than summing it; the nine rejection rules; and
+a slippage config matching one of the spec's two shapes.
+
+Note for Part 5: `dhan.py`'s comment claiming "Quote/Full add depth" is **wrong**
+and must be fixed with the code. Verified against the pinned SDK — `process_quote`
+(mode 17) returns no depth; only `process_full` (mode 21) does, and `"Full Data"`
+is currently in neither `_TICK_TYPES` nor `_NON_TICK_TYPES`, so such a frame would
+be counted as malformed.
+
+**Struck from Phase 4 scope: "mode-namespaced correlation IDs."** The architecture
+document lists it as a Phase 4 bullet, but it has been delivered since Phase 1 at
+three layers — `common/execution/correlation.py` (`p_`/`l_` prefixes, `MAX_LENGTH`
+25, round-trip parse), `OrderIntent.correlation_namespace`, and a
+`CHECK`-constrained `order_intents.correlation_namespace` column — and is covered
+by `tests/unit/test_correlation_ids.py`. Recorded here so it is not re-planned.
+
+**Constraints, all parts:** paper mode only; `DhanLiveBroker` order placement
+unimplemented and fail-closed (Part 5 widens the *simulator*, never the live
+path); no `MultiLegEngine`/`FixedStrikeEngine`; no real strategies (Phase 9);
+nothing written under `Trading_Automation`.
+
 
 ### Phase 3 — preserve custom engines and policies — **COMPLETE**
 

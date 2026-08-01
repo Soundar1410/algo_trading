@@ -231,14 +231,19 @@ def test_the_exit_was_decided_by_the_real_part_2a_policy(worker_config, database
 
 
 def test_the_contract_was_chosen_at_runtime_and_asked_for_upstream(worker_config):
-    """The engine picks its strike mid-session, so the subscription has to travel."""
+    """The engine picks its strike mid-session, so the subscription has to travel.
+
+    Entries are ``(security_id, segment)`` as of Phase 4 Part 1. A simulated
+    contract has no exchange segment, so ``None`` here is the correct value and
+    not an omission — the assertion below pins that rather than ignoring it.
+    """
     control_queue: queue_module.Queue = queue_module.Queue()
     _run(worker_config, _FULL_TAPE, control_queue=control_queue)
 
     requested = []
     while not control_queue.empty():
         requested.append(control_queue.get_nowait())
-    assert CE_CONTRACT in requested, "the runtime subscription never reached the supervisor"
+    assert (CE_CONTRACT, None) in requested, "the runtime subscription never reached the supervisor"
 
 
 # ------------------------------------------------------------- D20 reporting

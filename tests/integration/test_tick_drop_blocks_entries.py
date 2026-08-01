@@ -76,7 +76,7 @@ class _ScriptedAdapter:
         self.subscribed: list[str] = []
         self.is_running = False
 
-    def subscribe(self, security_ids: Sequence[str]) -> None:
+    def subscribe(self, security_ids: Sequence[str], *, segment: int | None = None) -> None:
         self.subscribed.extend(security_ids)
 
     def request_stop(self) -> None:

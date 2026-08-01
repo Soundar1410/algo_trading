@@ -61,9 +61,11 @@ import queue as queue_module
 import threading
 from collections.abc import Callable
 from importlib import import_module
+from pathlib import Path
 from typing import Any
 
 from common.broker import build_broker
+from common.config.paths import load_paths
 from common.engine.config import EngineConfig, SessionConfig
 from common.engine.engine import TradingEngine
 from common.engine.gateway import LifecycleGateway
@@ -71,7 +73,11 @@ from common.engine.hub_feed import HubTickFeed
 from common.engine.models import AdoptedPosition, OptionContract, OptionType, OrderSide
 from common.engine.positions import PositionManager
 from common.engine.reporting_bindings import HeartbeatEngineReporter, RepositoryReportWriter
-from common.engine.selection import OptionSelector, SimulatedOptionChainResolver
+from common.engine.selection import (
+    DhanOptionChainResolver,
+    OptionSelector,
+    SimulatedOptionChainResolver,
+)
 from common.engine.square_off import PersistedSquareOffAuthority
 from common.engine.state_payload import OPEN_POSITION_KEY, read_payload
 from common.engine.strategy import BaseStrategy
@@ -470,9 +476,13 @@ def _build(
             "here may differ from the hub's, so trading on them is not safe"
         )
 
+    option_selector, option_segment = build_option_selector(config, engine_config)
+
     feed = HubTickFeed(
         tick_queue,
-        request_subscription=_subscription_sender(config, control_queue),
+        request_subscription=_subscription_sender(
+            config, control_queue, option_segment=option_segment
+        ),
         on_square_off=_on_square_off,
         on_tick_dropped=_on_tick_dropped,
         # What makes a SIGTERM land during a silent stretch. Without it the request
@@ -493,11 +503,7 @@ def _build(
     engine = TradingEngine(
         cfg,
         feed=feed,
-        option_selector=OptionSelector(
-            SimulatedOptionChainResolver(config.instrument, lot_size=engine_config.lot_size),
-            strike_step=engine_config.strike_step,
-            expiry=engine_config.expiry,
-        ),
+        option_selector=option_selector,
         strategy=load_strategy(engine_config.strategy_ref, engine_config.strategy_kwargs),
         position_manager=positions,
         underlying_security_id=config.security_id,
@@ -532,7 +538,87 @@ def _build(
     return engine, gateway, feed, positions, recovered
 
 
-def _subscription_sender(config: WorkerConfig, control_queue: Any) -> Callable[[str], None] | None:
+def build_option_selector(
+    config: WorkerConfig, engine_config: EngineWorkerConfig
+) -> tuple[OptionSelector, int | None]:
+    """Build the strike selector, and say which segment its contracts live in.
+
+    Returns ``(selector, option_segment)``. ``option_segment`` is ``None`` for
+    the simulated resolver — a synthetic id has no segment, and the recorded
+    paths that use it must keep behaving exactly as they did.
+
+    ``"dhan"`` closes runbook limitation 17: the resolver reads Dhan's daily
+    instrument master, so the id, the strike, the expiry **and the lot size** all
+    come from the exchange rather than from configuration. The master is loaded
+    once here, at worker start, rather than per entry — resolution during the
+    session must not be able to block on an HTTP call or a rate limit.
+    """
+    if engine_config.contract_resolver == "simulated":
+        return (
+            OptionSelector(
+                SimulatedOptionChainResolver(config.instrument, lot_size=engine_config.lot_size),
+                strike_step=engine_config.strike_step,
+                expiry=engine_config.expiry,
+            ),
+            None,
+        )
+
+    if engine_config.contract_resolver != "dhan":
+        raise ValueError(
+            f"Unknown contract_resolver {engine_config.contract_resolver!r}; "
+            "expected 'simulated' or 'dhan'."
+        )
+
+    # Deferred: the master reaches the network and belongs nowhere near a
+    # simulated run's import path.
+    from common.market_data.scrip_master import (
+        ScripMaster,
+        ScripMasterCache,
+        resolve_index_meta,
+        segment_code,
+    )
+
+    meta = resolve_index_meta(
+        config.instrument,
+        index_security_id=engine_config.index_security_id or None,
+        index_segment=engine_config.index_segment or None,
+        fno_segment=engine_config.fno_segment or None,
+    )
+    cache_dir = (
+        Path(engine_config.scrip_master_cache_dir)
+        if engine_config.scrip_master_cache_dir
+        else load_paths().cache_root
+    )
+    master = ScripMaster(config.instrument, exchange=meta.exchange).load(
+        cache=ScripMasterCache(cache_dir)
+    )
+    resolver = DhanOptionChainResolver(master, expiry=engine_config.expiry)
+    log.info(
+        "resolving real %s contracts: expiry=%s lot_size=%s segment=%s",
+        config.instrument,
+        resolver.expiry,
+        resolver.lot_size,
+        meta.fno_segment,
+    )
+    return (
+        OptionSelector(
+            resolver,
+            strike_step=engine_config.strike_step,
+            # The resolver already fixed the session's expiry, including when
+            # none was configured. Passing it on keeps the selector and the
+            # resolver from disagreeing about which series is being traded.
+            expiry=resolver.expiry,
+        ),
+        segment_code(meta.fno_segment),
+    )
+
+
+def _subscription_sender(
+    config: WorkerConfig,
+    control_queue: Any,
+    *,
+    option_segment: int | None = None,
+) -> Callable[[str], None] | None:
     """Forward the engine's runtime subscriptions upstream, never blocking.
 
     ``None`` when there is no control queue, which makes ``HubTickFeed`` say so
@@ -540,13 +626,24 @@ def _subscription_sender(config: WorkerConfig, control_queue: Any) -> Callable[[
 
     Non-blocking for the same reason the hub's own queues are: this runs on the tick
     callback path, and a blocked send here stalls the engine's whole feed.
+
+    **Where the exchange segment is decided.** The engine's feed contract is
+    ``subscribe(security_id)`` — one string, no segment — and widening it would
+    mean touching :class:`~common.engine.engine.TradingEngine`, whose ported
+    session-gating test pins it attribute by attribute. It does not need
+    widening: this runtime already knows the answer. Everything the engine
+    subscribes at runtime other than the underlying **is** an option contract, so
+    the underlying keeps the hub's default segment and every other id gets
+    ``option_segment``. Deciding it here also keeps the knowledge in the wiring,
+    which is where the rest of the instrument resolution lives.
     """
     if control_queue is None:
         return None
 
     def _send(security_id: str) -> None:
+        segment = None if security_id == config.security_id else option_segment
         try:
-            control_queue.put_nowait(security_id)
+            control_queue.put_nowait((security_id, segment))
         except Exception:  # a full or closed queue must not stop the run
             log.exception(
                 "could not forward a subscription request for %s from %s; ticks for it "

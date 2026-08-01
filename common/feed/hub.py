@@ -61,6 +61,7 @@ aggregates and publishes — anything slower belongs in a worker.
 
 from __future__ import annotations
 
+import time
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -125,7 +126,16 @@ class SharedFeedHub:
         #: Runtime subscription requests awaiting the feed thread. ``deque`` because
         #: ``append``/``popleft`` are atomic under the GIL, so a request can be
         #: enqueued from any thread without a lock on the callback path.
-        self._pending_subscriptions: deque[tuple[str, str]] = deque()
+        #: ``(strategy_id, security_id, segment)``; ``segment`` is ``None`` for
+        #: "the adapter's default", which is what every pre-Phase-4 caller means.
+        self._pending_subscriptions: deque[tuple[str, str, int | None]] = deque()
+        #: Monotonic reading when the pending queue last went from empty to
+        #: non-empty, or ``None`` when it is empty. Read by the supervisor to
+        #: alarm on runbook limitation 15 — a subscription needs a tick to be
+        #: applied, so on a silent feed one can wait for ever and the engine's
+        #: pending entry simply never fills. Monotonic so a clock adjustment
+        #: mid-session cannot invent or erase an age.
+        self._pending_since: float | None = None
         #: strategy_id -> the drop total at which that worker was last notified.
         self._last_drop_notice: dict[str, int] = {}
         self.tick_count = 0
@@ -216,8 +226,15 @@ class SharedFeedHub:
         return discarded
 
     # ------------------------------------------------------ subscription
-    def request_subscription(self, strategy_id: str, security_id: str) -> None:
+    def request_subscription(
+        self, strategy_id: str, security_id: str, *, segment: int | None = None
+    ) -> None:
         """Ask for an instrument to be added mid-session. Safe from **any** thread.
+
+        ``segment`` names the exchange segment the instrument lives in. An
+        options runtime must pass it: the hub's default is the *underlying's*
+        segment (``IDX_I``), and an option contract subscribed there delivers
+        nothing at all rather than erroring. ``None`` keeps the adapter default.
 
         Enqueues and returns. It never calls the adapter, for the same reason
         :meth:`request_stop` never closes the connection: the thread that called
@@ -231,14 +248,32 @@ class SharedFeedHub:
         continuous, so the exposure is a silent feed — which is already an
         incident by itself.
         """
-        self._pending_subscriptions.append((strategy_id, security_id))
+        if self._pending_since is None:
+            self._pending_since = time.monotonic()
+        self._pending_subscriptions.append((strategy_id, security_id, segment))
+
+    def pending_subscription_age_seconds(self) -> float:
+        """How long the oldest unapplied subscription has been waiting.
+
+        ``0.0`` when nothing is pending. Safe from any thread: it reads two
+        values that are only ever written on the feed thread, and a torn read
+        can only make the age briefly wrong, never make a false alarm stick —
+        the caller re-reads on its next poll.
+        """
+        started = self._pending_since
+        if started is None or not self._pending_subscriptions:
+            return 0.0
+        return max(0.0, time.monotonic() - started)
 
     def _apply_pending_subscriptions(self) -> None:
         """Drain the request queue into the adapter. **Feed thread only.**"""
         while True:
             try:
-                strategy_id, security_id = self._pending_subscriptions.popleft()
+                strategy_id, security_id, segment = self._pending_subscriptions.popleft()
             except IndexError:
+                # Drained. Clear the clock so the next request times from itself
+                # rather than from a request that has already been served.
+                self._pending_since = None
                 return
 
             channel = next(
@@ -258,12 +293,13 @@ class SharedFeedHub:
             channel.dynamic_ids.add(security_id)
             # Union semantics in the adapter mean a second worker asking for an
             # instrument the group already holds sends nothing to the broker.
-            self._adapter.subscribe([security_id])
+            self._adapter.subscribe([security_id], segment=segment)
             self.subscriptions_applied += 1
             _log.info(
-                "subscribed at runtime strategy_id=%s security_id=%s",
+                "subscribed at runtime strategy_id=%s security_id=%s segment=%s",
                 strategy_id,
                 security_id,
+                "default" if segment is None else segment,
             )
 
     def drop_subscription(self, strategy_id: str, security_id: str) -> None:

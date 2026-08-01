@@ -68,7 +68,7 @@ class _ScriptedAdapter:
     def subscribed(self) -> frozenset[str]:
         return frozenset(self._security_ids)
 
-    def subscribe(self, security_ids: Sequence[str]) -> None:
+    def subscribe(self, security_ids: Sequence[str], *, segment: int | None = None) -> None:
         self.subscribe_calls.append(list(security_ids))
         self._security_ids.update(str(s) for s in security_ids)
 

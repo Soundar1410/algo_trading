@@ -74,6 +74,9 @@ class RecordedFeedAdapter:
         self._running = False
         #: Highest exchange timestamp seen per instrument, for ordering checks.
         self._last_seen: dict[str, datetime] = {}
+        #: security_id → the segment the caller asked for, when it named one.
+        #: Replay ignores it; tests read it to prove the hub forwarded it.
+        self.requested_segments: dict[str, int] = {}
         self.duplicate_count = 0
         self.out_of_order_count = 0
         self.delivered_count = 0
@@ -86,10 +89,18 @@ class RecordedFeedAdapter:
     def subscribed(self) -> frozenset[str]:
         return frozenset(self._subscribed)
 
-    def subscribe(self, security_ids: Sequence[str]) -> None:
+    def subscribe(self, security_ids: Sequence[str], *, segment: int | None = None) -> None:
         # Union semantics: re-subscribing after a simulated reconnect must not
         # duplicate, which is why this is a set rather than a list.
+        #
+        # ``segment`` is accepted and recorded but does not affect replay: a tape
+        # is already resolved down to security ids. Recording it anyway lets a
+        # test assert that the hub forwarded the right segment without needing a
+        # live adapter to observe it.
         self._subscribed.update(security_ids)
+        if segment is not None:
+            for security_id in security_ids:
+                self.requested_segments[str(security_id)] = segment
 
     def request_stop(self) -> None:
         """Ask the replay to finish. Safe from any thread; see the Protocol.

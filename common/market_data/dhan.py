@@ -207,6 +207,11 @@ class DhanMarketFeedAdapter:
         self._instrument_labels = dict(instrument_labels or {})
         self._feed_mode = feed_mode
         self._security_ids: set[str] = set()
+        #: security_id → exchange segment, for ids that do not live in the
+        #: adapter's default. An options runtime always has some: the underlying
+        #: index sits in ``IDX_I`` (0) and its contracts in ``NSE_FNO`` (2), and
+        #: one adapter carries both at once. Ids absent here use the default.
+        self._segments: dict[str, int] = {}
         self._feed: Any = None
         self._running = False
         #: Ident of the thread currently inside :meth:`start`, i.e. the thread
@@ -233,9 +238,30 @@ class DhanMarketFeedAdapter:
         return self.last_disconnect_code == DISCONNECT_TOKEN_EXPIRED
 
     # ------------------------------------------------------------ subscription
-    def subscribe(self, security_ids: Sequence[str]) -> None:
-        """Union semantics — a resubscribe must not duplicate instruments."""
-        new = {str(s) for s in security_ids} - self._security_ids
+    def subscribe(self, security_ids: Sequence[str], *, segment: int | None = None) -> None:
+        """Union semantics — a resubscribe must not duplicate instruments.
+
+        ``segment`` is remembered per security id, so a later
+        :meth:`resubscribe_all` after a reconnect restores each instrument to the
+        segment it was actually subscribed on. Without that the underlying would
+        come back on the option segment (or vice versa) and the feed would
+        reconnect into silence — a failure that looks exactly like a quiet market.
+        """
+        wanted = {str(s) for s in security_ids}
+        if segment is not None:
+            conflicting = {
+                sid for sid in wanted & self._security_ids if self._segment_for(sid) != segment
+            }
+            if conflicting:
+                raise DhanFeedError(
+                    f"Cannot resubscribe {sorted(conflicting)} to segment {segment}: "
+                    "already subscribed on a different segment. One instrument "
+                    "cannot live in two segments at once."
+                )
+            for sid in wanted:
+                self._segments[sid] = segment
+
+        new = wanted - self._security_ids
         self._security_ids.update(new)
         if self._feed is not None and new:
             self._feed.subscribe_symbols(self._instrument_tuples(new))
@@ -249,8 +275,15 @@ class DhanMarketFeedAdapter:
         if self._feed is not None and self._security_ids:
             self._feed.subscribe_symbols(self._instrument_tuples(self._security_ids))
 
+    def segment_for(self, security_id: str) -> int:
+        """The segment this instrument is subscribed on. Public for assertions."""
+        return self._segment_for(str(security_id))
+
+    def _segment_for(self, security_id: str) -> int:
+        return self._segments.get(security_id, self._exchange_segment)
+
     def _instrument_tuples(self, security_ids: set[str]) -> list[tuple[int, str, int]]:
-        return [(self._exchange_segment, sid, self._feed_mode) for sid in sorted(security_ids)]
+        return [(self._segment_for(sid), sid, self._feed_mode) for sid in sorted(security_ids)]
 
     # ---------------------------------------------------------------- lifecycle
     def start(self, on_tick: TickCallback) -> None:

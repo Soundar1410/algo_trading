@@ -13,18 +13,30 @@ ITM/OTM offsets are sign-sensitive per option type: for a **call**, ITM means a
 :func:`resolve_strike` encodes that once, so strategies never reason about the
 sign themselves — they declare ``moneyness`` and ``steps``.
 
-The **Dhan** resolver is not ported here. Resolving real contracts needs the scrip
-master, and this repository already has a live option-chain surface in
-:mod:`common.market_data.option_chain` with its own throttle and freshness rules
-(Phase 2). Wiring the two together belongs with the live path, not with the engine
-port, so Part 2b-i ships the simulated resolver only.
+Two resolvers ship here. :class:`SimulatedOptionChainResolver` manufactures
+consistent synthetic contracts for offline runs and remains the default.
+:class:`DhanOptionChainResolver` resolves **real** contracts out of Dhan's daily
+instrument master (:mod:`common.market_data.scrip_master`), which is what closed
+runbook limitation 17 in Phase 4 Part 1.
+
+Part 2b-i shipped the simulated resolver alone and recorded that the Dhan one
+"needs the scrip master", pointing at :mod:`common.market_data.option_chain` as
+the surface to wire in. That pointer was wrong and Part 1 corrected it: the
+option-chain response is keyed by strike and carries no per-strike
+``security_id``, so it cannot name a tradable contract at all. The chain service
+keeps its own job — live per-strike quotes and greeks — and is not involved in
+resolution. See :mod:`common.market_data.scrip_master` for the full reasoning.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING
 
 from .models import Moneyness, OptionContract, OptionType
+
+if TYPE_CHECKING:  # annotation only — keeps the engine import graph unchanged
+    from common.market_data.scrip_master import ScripMaster
 
 
 def nearest_atm_strike(spot: float, strike_step: int, offset: int = 0) -> int:
@@ -93,6 +105,69 @@ class SimulatedOptionChainResolver(OptionChainResolver):
             option_type=option_type,
             expiry=exp,
             lot_size=self._lot_size,
+        )
+
+
+class ContractNotListed(KeyError):
+    """No contract exists for the requested strike/expiry.
+
+    A distinct type because the engine must treat this as "do not enter" rather
+    than as a crash: a strategy asking for a strike outside the listed band is a
+    normal market condition near the edges of the chain, not a defect.
+    """
+
+
+class DhanOptionChainResolver(OptionChainResolver):
+    """Resolves real Dhan contracts from the loaded instrument master.
+
+    The expiry is fixed for the session at construction — to the nearest listed
+    expiry unless one is given — so every contract a run selects belongs to the
+    same series even if the run crosses an expiry boundary at midnight. Strike
+    resolution is a dict lookup against the already-loaded master, so entering a
+    position costs **no** API call and cannot be delayed or refused by a rate
+    limit at the worst possible moment.
+    """
+
+    def __init__(self, scrip_master: ScripMaster, *, expiry: str | None = None) -> None:
+        self._master = scrip_master
+        self._expiry = expiry or scrip_master.nearest_expiry()
+        self._log_expiry()
+
+    def _log_expiry(self) -> None:
+        from common.logging import get_logger
+
+        get_logger(__name__).info(
+            "option resolver using %s expiry %s", self._master.underlying, self._expiry
+        )
+
+    @property
+    def expiry(self) -> str:
+        return self._expiry
+
+    @property
+    def lot_size(self) -> int | None:
+        """The exchange's lot size, for callers that must not trust configuration."""
+        return self._master.lot_size
+
+    def resolve(
+        self, strike: int, option_type: OptionType, expiry: str | None = None
+    ) -> OptionContract:
+        exp = expiry or self._expiry
+        row = self._master.get(strike, option_type, exp)
+        if row is None:
+            listed = self._master.strikes_for_expiry(exp)
+            bounds = f"{listed[0]:g}-{listed[-1]:g}" if listed else "none listed"
+            raise ContractNotListed(
+                f"No {self._master.underlying} {option_type.value} contract at strike "
+                f"{strike} for expiry {exp} in the scrip master (listed strikes: {bounds})."
+            )
+        return OptionContract(
+            symbol=row.symbol,
+            security_id=row.security_id,
+            strike=row.strike,
+            option_type=row.option_type,
+            expiry=row.expiry,
+            lot_size=row.lot_size,
         )
 
 
