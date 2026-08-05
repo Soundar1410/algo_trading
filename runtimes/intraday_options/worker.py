@@ -121,6 +121,18 @@ class EngineWorkerConfig:
     max_daily_loss_percent: float | None = None
     regime_enabled: bool = False
     warmup_from_history: bool = True
+    #: ``"none"`` (default, unchanged) or ``"dhan"``. ``"dhan"`` builds a
+    #: ``WarmupManager`` + ``WarmupSource`` (Phase 4 Part 4) so a
+    #: continuity-required strategy's indicators are seeded from real history
+    #: instead of cold-starting — runbook limitation 16. Independent of
+    #: ``contract_resolver``: this fetches the *underlying's* history via
+    #: ``resolve_index_meta``, which needs no scrip master. Left defaulted so
+    #: every existing config keeps today's cold-start behaviour.
+    warmup_source: str = "none"
+    #: How many prior trading sessions to fetch when a strategy's warm-up spec
+    #: needs more bars than one session at this timeframe holds. Passed to
+    #: ``WarmupManager(max_lookback_sessions=...)``.
+    warmup_max_lookback_sessions: int = 3
     parameters: dict[str, Any] = field(default_factory=dict)
     #: The session's opening bound. Its *closing* bounds are derived from
     #: ``WorkerConfig.square_off_policy`` — see

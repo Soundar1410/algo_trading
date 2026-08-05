@@ -7,9 +7,9 @@ the next phase. Updated after every phase.
 
 | | |
 |---|---|
-| **Current phase** | Phase 4 **Parts 1-3 complete**. **Part 3** (candle continuity, session/timezone, wall-clock square-off) found and fixed a **live-blocking defect**: the engine treated every real tick as out-of-session, so on a live feed it would have traded nothing, silently. Awaiting review |
-| **Next phase** | Phase 4 **Part 4** — warm-up source and injection (see section 8) |
-| **Last updated** | 1 August 2026 |
+| **Current phase** | Phase 4 **Parts 1-4 complete**. **Part 4** (warm-up source and injection) ports `WarmupManager`/`WarmupSource`, a new Dhan historical-candle REST client (not the SDK), and wires them into `engine_worker.py` behind an opt-in flag — closing limitation 16. Corrected two real defects found in the reference along the way (a request-format bug that would have made every fetch fail, and an SDK-isolation violation the reference's own design would have committed), plus a same-part amendment (D47) closing a pre-existing Phase 3 gap the end-to-end test surfaced: a continuity-required strategy with no manager used to cold-start and trade with only a `WARNING`; it now refuses construction. Awaiting review |
+| **Next phase** | Phase 4 **Part 5** — `PaperBroker` realism (see section 8) |
+| **Last updated** | 5 August 2026 |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
 | **Live order placement** | **Not implemented.** Fail-closed. Phase 10 only. |
@@ -24,7 +24,7 @@ the next phase. Updated after every phase.
 | 1 | Walking skeleton | **Complete** |
 | 2 | Dhan and shared-feed hardening | **Complete** — Block 1 (offline) + Block 2 (live) |
 | 3 | Preserve custom engines and policies | **Complete.** **Part 1 complete** (live-feed shutdown); **Part 2a complete** (exit registry + SuperTrend port); **Part 2b-i complete** (signal ownership + engine core); **Part 2b-ii-A complete** (the feed seam: tick channel, runtime subscription, `HubTickFeed`); **Part 2b-ii-B-1 complete** (the execution seam: square-off authority, `LifecycleGateway`, entry-block on tick drop); **Part 2b-ii-B-2 complete** (the wiring: worker engine path, supervisor queue delivery, engine restart recovery, D20 reporting bindings). **Phase 3 complete** — its acceptance gate is met in full |
-| 4 | Candle, indicator and paper-execution foundation | **In progress.** **Part 1 complete** (real contract resolution — closes 17, alarms 15). **Part 2 complete** (indicator layer — closes D21). **Part 3 complete** (continuity, timezone, wall-clock square-off — closes 4 and 7, and a live blocker). Parts 4-5 not started: warm-up source; `PaperBroker` realism |
+| 4 | Candle, indicator and paper-execution foundation | **In progress.** **Part 1 complete** (real contract resolution — closes 17, alarms 15). **Part 2 complete** (indicator layer — closes D21). **Part 3 complete** (continuity, timezone, wall-clock square-off — closes 4 and 7, and a live blocker). **Part 4 complete** (warm-up source and injection — closes 16). Part 5 not started: `PaperBroker` realism |
 | 5 | Mixed-mode supervisor and persistence | Not started |
 | 6 | Paper recovery and expiry handling | Not started |
 | 7 | Operations | Not started |
@@ -941,6 +941,260 @@ before any continuity-required strategy runs (see limitation 16). `Database` sti
 opens with thread affinity, so nothing in a worker may touch SQLite off the main
 thread — recorded as **D31** rather than worked around.
 
+### What Phase 4 Part 4 delivered — warm-up source and injection
+
+Closes limitation **16**. Ports the reference's `WarmupManager`/`WarmupSource`,
+builds a Dhan historical-candle fetch this repository did not have, and wires
+both into `engine_worker.py` behind an opt-in config flag so every existing
+configuration keeps today's cold-start behaviour unchanged. Suite 1063 → 1131
+(10 skipped, up from 8 — two new opt-in market-hours smoke tests).
+
+#### Pre-work found two real defects in the reference before anything was ported
+
+Mirroring Part 3's own audit discipline, the reference's design was verified
+against the actual dhanhq 2.2.0 SDK and DhanHQ's own published API
+documentation before being trusted, rather than ported on the strength of its
+docstring:
+
+1. **The reference's `historical.py` imports `dhanhq` directly**
+   (`dhanhq(ctx).intraday_minute_data(...)`), which this repository's
+   test-enforced rule forbids — only `common/market_data/dhan.py` may import
+   the SDK (`tests/unit/test_dhan_adapter.py`). Porting it verbatim would have
+   broken that boundary on day one. Fixed by following this repository's own
+   precedent instead: `common/market_data/dhan_historical.py` speaks Dhan's
+   REST endpoint directly via `httpx`, exactly as `common/authentication/
+   dhan_login.py` already does for auth and for the identical reason — the
+   SDK's own historical-data call has **no retry policy and no rate-limit
+   handling at all** (confirmed by reading the installed SDK source), so there
+   was nothing to gain by coupling to it.
+2. **The reference passes `fromDate`/`toDate` as bare `"YYYY-MM-DD"` strings.**
+   DhanHQ's own documentation for `POST /v2/charts/intraday` (fetched and read
+   directly, not inferred from the reference or the SDK's own docstring, which
+   itself conflicts with the public docs on the lookback window) specifies a
+   full datetime string, e.g. `"2024-09-11 09:30:00"`. A straight port would
+   have sent a request shape the endpoint does not document supporting, for
+   every single fetch. Corrected in `DhanHistoricalDataClient.fetch_intraday`,
+   with a fail-first test targeting exactly this format.
+
+Neither defect was hypothetical or found by inspection — both were verified
+against real sources (the installed SDK package, DhanHQ's published docs)
+before being trusted, the same standard Part 1's scrip-master work and Part
+3's timezone audit already set.
+
+#### What was built
+
+| Piece | Where |
+|---|---|
+| `WarmupSource` — frozen data descriptor (`security_id`, `exchange_segment`, `instrument_type`), `from_underlying`/`from_option` | `common/warmup/source.py` |
+| `WarmupManager`/`WarmupResult` — the fetch+replay engine, gated `SKIPPED_EMPTY`/`SKIPPED_SESSION_LOCAL`/`SKIPPED_VOLUME`/`COLD_START`/`PARTIAL`/`WARMED` | `common/warmup/manager.py` |
+| `parse_intraday_response`, `aggregate_candles`, `_prior_trading_day`, `fetch_warmup_candles_range` | `common/warmup/historical.py` |
+| `DhanHistoricalDataClient` — the REST client; injectable `http_post`, bounded retry/backoff, never imports `dhanhq` | `common/market_data/dhan_historical.py` |
+| `read_secret()` — the `SecretStr`-unwrap helper, promoted out of two independent copies (`scripts/auth_bootstrap.py`, `scripts/capture_live_tape.py`) now that this part's token resolution is a third caller | `common/config/secrets.py` |
+| `build_warmup_manager()`, wired into `_build()` beside `build_option_selector` | `runtimes/intraday_options/engine_worker.py` |
+| `EngineWorkerConfig.warmup_source` (`"none"`/`"dhan"`, default unchanged) and `.warmup_max_lookback_sessions` | `runtimes/intraday_options/worker.py` |
+| `TradingEngine.__init__`'s `warmup_manager`/`warmup_source` params tightened from `object \| None` to `WarmupManager \| None`/`WarmupSource \| None` (`TYPE_CHECKING`-only import — a real one would cycle back through `common.engine.session`); the `# type: ignore[attr-defined]` on the `.warm(...)` call site is gone | `common/engine/engine.py` |
+
+`common/warmup/__init__.py` is **deliberately left unchanged** — see "A design
+decision that reversed itself" below.
+
+#### `aggregate_candles` could not be ported — it had to be rewritten
+
+The reference's `Candle` is a plain **mutable** dataclass; its
+`aggregate_candles` mutates a bucket's `high`/`low`/`close`/`volume` in place.
+This repository's `common.models.Candle` is **frozen**, with a different
+field set (`start_at`/`end_at`, not `start`; requires non-defaulted
+`security_id`/`instrument`). The function was rewritten, not adapted, to
+mirror `common/candles/builder.py`'s own accumulate-then-freeze shape — a
+private mutable per-bucket holder, frozen into a real `Candle` only once its
+interval closes — bucketed through the *same* `floor_to_interval` the live
+engine's own `CandleBuilder` uses. `test_aggregate_candles_matches_
+candlebuilder_bucketing` cross-checks the two independently on an equivalent
+price series, so "identical to the live path" is a checked property rather
+than an inference from both using the same flooring function.
+
+`_prior_trading_day` needed the same kind of adaptation for a different
+reason: the reference calls `session.is_trading_day(date)`; this repository's
+`MarketSession.is_trading_day` takes a `datetime` and already routes through
+Part 3's timezone fix (`local_date_in`, D40). The port builds a
+timezone-aware midnight via the existing `common.utils.timeutils.combine()`
+and calls that public predicate, rather than reimplementing a comparison the
+project already fixed once.
+
+#### A design decision that reversed itself: `common/warmup/__init__.py`
+
+The plan called for re-exporting `WarmupManager`/`WarmupSource` from
+`common/warmup/__init__.py`. Before doing it, the actual risk was tested
+rather than assumed away: `common/engine/engine.py` already does a real
+(non-`TYPE_CHECKING`) `from common.warmup.requirements import
+validate_warmup_config` at module level, which fires *while*
+`common/engine/__init__.py` is still executing its own `from .engine import
+TradingEngine` line — before `.session` is reached. Adding eager `.manager`
+imports to `common/warmup/__init__.py` would make that import trigger
+`common.warmup.manager`, which imports `common.engine.session`, mid-way
+through the partially-initialised `common.engine` package's own `__init__`.
+
+Verified directly in a clean interpreter: it **works today**, because
+`common/engine/__init__.py` happens to import `.config` (which `.session`
+needs) before `.engine`. But that is an accident of import ordering, pinned
+by no test, and silently reversible by a future edit that reorders those
+imports. The alternative has zero risk and matches **100% of the existing
+convention** in this codebase — every current `common.warmup.requirements`
+consumer (`common/indicators/base.py`, `.vwap`, `.supertrend`,
+`common/engine/strategy.py`, `common/engine/engine.py`,
+`strategies/intraday_options/engine_fixture_strategy.py`) already imports
+directly from the submodule, never through the package. So
+`common/warmup/__init__.py` is untouched, and every new caller (including
+this part's own tests) imports `common.warmup.manager`/`.source` directly.
+
+#### Underlying-only, and why `WarmupSource.from_option` has no caller
+
+At the point `_build()` runs, no option contract has been resolved yet — the
+strategy picks its strike on its first signal — and every continuity-required
+indicator in this repository runs on the **underlying's** candles (`_warm_up`'s
+`_sink` feeds `strategy.on_candle` unconditionally off the underlying stream).
+So `build_warmup_manager()` only ever builds `WarmupSource.from_underlying(...)`.
+`from_option` is ported (six lines, and every continuity-required indicator
+here already runs on the underlying regardless) but unreachable until a
+fixed-strike/multi-leg engine exists to call it — recorded as **D43** rather
+than dropped.
+
+**`warmup_source="dhan"` is independent of `contract_resolver`.**
+`resolve_index_meta` needs no scrip master — that is the *option* resolver's
+job (Part 1), not the underlying lookup. A strategy can warm its underlying's
+indicators from real history while still selecting synthetic option contracts,
+or vice versa. `test_warmup_source_dhan_is_independent_of_contract_resolver`
+pins this against a future coupling regression.
+
+#### Finding: a resolved security id could silently diverge from the one the feed actually subscribes
+
+Not anticipated in the plan — found while writing `build_warmup_manager()`,
+by asking "what if these two don't agree?" rather than assuming they always
+do. `WorkerConfig.security_id` (what the live feed subscribes and what the
+engine is told is its underlying) and `resolve_index_meta(config.instrument,
+...).security_id` (what a warm-up fetch would use) are set independently —
+the latter accepts an `index_security_id` override that could go stale
+relative to the former. A REST fetch for the wrong id still **succeeds**, so
+a divergence would silently seed indicators from a different instrument's
+history than the one ticks are actually arriving for. `build_warmup_manager`
+now refuses and cold-starts (logged at `ERROR`) rather than trade on that
+risk — recorded as **D46**, closed by
+`test_a_mismatched_resolved_security_id_refuses_to_warm`.
+
+#### Finding: the pre-existing cold-start fallback only warned — it did not block. Closed as a same-part amendment.
+
+Found while building the end-to-end test, not assumed from the runbook's own
+prior wording. `TradingEngine._warm_up()`'s fallback path — reached whenever
+`warmup_manager`/`warmup_source` are absent, which is every existing
+configuration's default and remains so unless an operator sets
+`warmup_source: dhan` — logs a `WARNING` for a continuity-required strategy
+("signals ... must not be read as strategy edge") but **did not call
+`_block_entries`**. `entry_blocked_by()` is consulted only on the
+`warmup_manager` path. This was pre-existing behaviour from Phase 3 Part
+2b-ii-B-2, not something Part 4's port introduced — but limitation 16's own
+prior wording ("it can only refuse to trade, or trade a strategy that
+declared it did not care") did not name this third case, and read as
+stronger than the code actually was.
+
+**Not left as a documented gap — closed, in this same part.** Once found,
+this was exactly the failure the whole warm-up subsystem exists to prevent
+(the reference's own 2026-07-17 incident), sitting behind the *default*
+configuration rather than an edge case, so it was fixed rather than merely
+recorded: `validate_warmup_config` now refuses construction outright for a
+continuity-required strategy with no `warmup_manager`, not only when
+`warmup_from_history` is explicitly false. See **D47**.
+`test_no_manager_or_source_now_refuses_construction` (renamed from the test
+that first pinned the gap) asserts the refusal. No other test in the tree
+relied on the old fallback for a legitimate reason — confirmed by grepping
+every `continuity_required=True` construction site in the repository, not
+assumed.
+
+#### Deviations recorded
+
+**D43 — `WarmupSource.from_option` is ported but has no caller in this
+repository.** See "Underlying-only" above.
+
+**D44 — the historical-candle fetch speaks Dhan's REST endpoint directly,
+never the SDK.** Same reasoning `dhan_login.py` already gives for auth:
+test-enforced SDK isolation, plus the SDK's own call has no retry or
+rate-limit handling to lose by not coupling to it.
+
+**D45 — `fromDate`/`toDate` are full `"YYYY-MM-DD HH:MM:SS"` datetimes, not
+bare dates.** The reference's own bug, found against DhanHQ's documentation
+and corrected here rather than carried over.
+
+**D46 — `build_warmup_manager` refuses to warm when the resolved underlying's
+security id disagrees with the worker's own.** See the finding above. Not a
+port of anything in the reference — a new safety check this repository's own
+wiring needed and the reference's single-process-per-instrument shape never
+had to consider.
+
+**D47 — `validate_warmup_config` now also refuses construction when no
+`warmup_manager` will be supplied, not only when `warmup_from_history` is
+explicitly false.** A same-part amendment closing a *pre-existing* Phase 3
+gap (see the finding above), not a property of the port itself — recorded
+separately from D43-D46 for that reason.
+
+#### A small, single-process retry — and what it deliberately does not solve
+
+The dhanhq 2.2.0 SDK has zero rate-limiting or retry logic for
+`/charts/intraday`. `DhanHistoricalDataClient` adds a bounded retry (default
+3 attempts, short backoff) around its own fetch call — narrowly scoped to
+*this worker not giving up on one transient error*, not to *coordinating
+across workers*. The reference's actual fix for the equivalent problem
+(`framework/warmup/coordinator.py` — a 2026-07-17 incident where concurrent
+history calls across strategy processes hit Dhan's rate limit and produced
+manufactured SuperTrend flips from truncated warm-up data) is explicitly
+Phase 5 scope (cross-strategy coordination) and stays out of this part. The
+residual is recorded as an open limitation below, not silently declared
+solved by the retry that does exist.
+
+#### Test evidence
+
+| File | Count | What it covers |
+|---|---|---|
+| `tests/unit/test_config_secrets.py` | 5 | `read_secret()` — the promoted helper |
+| `tests/unit/test_warmup_source.py` | 5 | Construction from `IndexMeta`/`OptionContract`, frozen-ness |
+| `tests/unit/test_warmup_manager.py` | 16 | All six `WarmupResult` statuses via a synthetic `fetch_fn`/`sink`; fail-first on the `candle.start`→`.start_at` field fix and on fetch-exception→`COLD_START` never propagating; `_lookback_sessions` scaling; the exact keyword contract `fetch_fn` is called with |
+| `tests/unit/test_warmup_historical.py` | 20 | Response parsing (top-level and `data`-nested, malformed→`ValueError`, bad rows skipped); `aggregate_candles` cross-checked against `CandleBuilder`; `_prior_trading_day` weekend/holiday skipping; `fetch_warmup_candles_range`'s current-bucket exclusion and non-trading-day short-circuit; fail-first on `from_at`/`to_at` reaching the client as full datetimes |
+| `tests/unit/test_dhan_historical_client.py` | 12 | Request shape (fail-first on the datetime format), auth headers, retry-then-succeed with a bounded attempt count and an injected (never-real) sleep, retry exhaustion, 401/403 not retried, no `dhanhq` import anywhere in the module |
+| `tests/unit/test_engine_worker_warmup_wiring.py` | 6 | `"none"` builds nothing and touches no settings; `"dhan"` without credentials cold-starts with a logged reason; `"dhan"` with credentials builds a real manager+source; independence from `contract_resolver`; an unknown value raises; the security-id mismatch guard (D46) |
+| `tests/integration/test_engine_warmup_end_to_end.py` | 4 | **The end-to-end gate.** A real `TradingEngine`, hand-built `WarmupManager`/`WarmupSource`: warm-up candles reach `on_candle` before the first live candle and produce no trade from replay; a fetch failure degrades to `COLD_START` and actually blocks the live entry that would otherwise fire; a successful `WARMED` replay permits entries normally; a continuity-required strategy with no manager at all now refuses construction (`InvalidWarmupConfig`, **D47**) rather than reaching the old WARNING-only fallback |
+| `tests/smoke/test_live_feed_smoke.py` | +2 | Opt-in, market-hours only. The documented response shape holds against a real call; the still-forming-bucket filter holds against a real fetch regardless of what Dhan actually returns for the open period |
+
+Suite **1063 → 1131** (10 skipped, up from 8). Full gate: `pytest` (1131
+passed), `ruff check .` (clean), `mypy` against the project's configured
+package set (`common`, `strategies`, `runtimes`, `dashboards`, `scripts` —
+118 files, clean). Both walking-skeleton gates re-run: every existing
+configuration defaults to `warmup_source="none"`, so behaviour is unchanged.
+
+#### What Part 4 deliberately did NOT deliver
+
+`framework/warmup/coordinator.py` — cross-strategy/cross-process rate-limit
+coordination is Phase 5. The reference's today-only `fetch_warmup_candles`
+convenience wrapper and `fetch_previous_close` — only the multi-session
+`fetch_warmup_candles_range` was ported (see the deviation ledger discussion
+above; the today-only variant cannot supply enough bars early in a session
+and has no production caller in the reference's own factory either).
+`history_provider` stays unwired — the manager+source path fully subsumes it
+whenever both are present, so a second, weaker fetch path was not built just
+to touch a seam already covered better. `EquityScripMaster`-adjacent work,
+`MultiLegEngine`/`FixedStrikeEngine`, real strategies (Phase 9), live order
+placement — all unchanged and out of scope, as in every prior part.
+
+#### What is still asserted rather than proven
+
+The real endpoint's behaviour for a partial/still-forming candle when
+`toDate` is "now" during a live session is **unverified beyond documentation
+and the new opt-in smoke test** — no captured fixture exists anywhere in this
+repository for `/v2/charts/intraday`, unlike the tick payload (Phase 2, both
+source-ratified and live-captured) or the scrip master CSV (Phase 4 Part 1,
+parsed and downloaded for real). The code excludes anything at or after the
+current bucket boundary regardless of what Dhan returns, so correctness does
+not depend on the answer — but the two new smoke tests can only narrow this,
+not settle it, without a market-hours run this session did not make.
+
+---
+
 ### What Phase 4 Part 3 delivered — continuity, the timezone rule, and the wall clock
 
 Closes limitations **4** and **7**, and fixes a **live-blocking defect** the
@@ -1571,6 +1825,11 @@ guard. See deviation D6.
 | **D40** | **Session and square-off predicates refuse a timezone-naive datetime** | They used to accept one and let Python read it as system-local, which is the bug class Part 3 exists to close; reading it as IST instead would hide that a caller lost its timezone upstream. Neither guess is safe, so `common.utils.timeutils.local_time_in` raises `NaiveDatetimeError` naming the argument. This is a behaviour change for any caller that was passing naive datetimes — none in this repository was, and a test now asserts the refusal on every predicate. |
 | **D41** | **The hub discards a gap-spanning bar; the engine's own builder emits and marks it** | Two builders, deliberately two behaviours. `CandleAggregator` fans out to *every* worker, so a stitched bar would corrupt all of them at once, and another bar is always coming — discard is affordable. `CandleBuilder` (**D23**) is one chart in one engine and has no discard path; dropping a bar there would starve an indicator with no signal that it happened, which limitation 14 already calls "worse in kind" than a visible loss. So it emits and sets `Candle.spans_gap`, and the consumer decides. Recorded so the asymmetry reads as a decision rather than an oversight. |
 | **D42** | **A `spans_gap` bar is skipped entirely, so a strategy does not count it** | `BaseStrategy.on_candle` both updates indicators and produces signals, so "do not trade on stitched data" means the bar does not reach the strategy at all — it reaches `on_candle_gap` instead. Consequence worth stating: a strategy counting bars sees one fewer, which is correct (as far as it is concerned the bar did not happen) but is a real behavioural change. Surfaced by `test_premium_candle_state_does_not_leak_across_a_re_entry`, whose tape carries an incidental 20-minute underlying hole; its `enter_on_candle` moved from 3 to 2 and the reason is recorded in the test rather than in a commit message. |
+| **D43** | **`WarmupSource.from_option` is ported but has no caller** | Every continuity-required indicator in this repository runs on the underlying's candles, and no option contract exists yet at the point `build_warmup_manager()` runs (the strategy picks its strike on its first signal). Kept — six lines, reference-faithful — for whichever of `MultiLegEngine`/`FixedStrikeEngine` arrives first, rather than dropped and re-derived later. |
+| **D44** | **The historical-candle fetch speaks Dhan's REST endpoint directly via `httpx`, never the SDK** | The reference calls `dhanhq(ctx).intraday_minute_data(...)` directly, which this repository's test-enforced SDK-isolation rule forbids outside `common/market_data/dhan.py`. `common/market_data/dhan_historical.py` follows `dhan_login.py`'s established precedent instead — the same reasoning applies doubly here, since the installed 2.2.0 SDK's historical-data call has no retry policy or rate-limit handling at all. |
+| **D45** | **`fromDate`/`toDate` are full `"YYYY-MM-DD HH:MM:SS"` datetimes, not bare dates** | The reference passes `current.strftime("%Y-%m-%d")`. DhanHQ's own documentation for `POST /v2/charts/intraday`, fetched and read directly rather than inferred, specifies a full datetime string. A straight port would have sent an undocumented request shape on every fetch. Found and corrected during the port, not carried over; pinned by a fail-first test. |
+| **D46** | **`build_warmup_manager` refuses to warm when the resolved underlying's security id disagrees with the worker's own** | `WorkerConfig.security_id` (what the live feed subscribes) and `resolve_index_meta(...).security_id` (what a warm-up fetch would use) are set independently, and the latter accepts an `index_security_id` override that could go stale. A REST fetch for the wrong id still succeeds, so an unchecked divergence would silently seed indicators from a different instrument's history. Not a port of anything in the reference — this repository's own wiring introduced the risk, so this repository's own wiring closes it. |
+| **D47** | **`validate_warmup_config` now also refuses construction when no `warmup_manager` will be supplied, not only when `warmup_from_history` is explicitly false** | A same-part amendment, distinct from D43-D46 (which are about the port itself) — this closes a **pre-existing Phase 3 Part 2b-ii-B-2 gap**, discovered while building Part 4's own end-to-end test. The function's docstring claimed "the engine's runtime gate fails it closed anyway" for a continuity-required strategy with no manager; that was false — `entry_blocked_by()` is reached only on the `warmup_manager` path, so every existing config (default `warmup_from_history: true`, no manager unless `warmup_source: dhan` is set) sailed through construction and cold-started with only a `WARNING`. `validate_warmup_config(strategy, cfg, warmup_manager=None)` now raises `InvalidWarmupConfig` when a continuity-required strategy has `warmup_from_history` false **or** no manager supplied — the two were independently-reasoned mechanisms with a gap between them, now one check. `warmup_manager` is optional so no pre-Part-4 call site (there was exactly one, and it now passes it) needed to change shape. No test in the tree relied on the old fallback for a legitimate reason — the one that did (`test_no_manager_or_source_reaches_the_pre_existing_fallback_unchanged`) was written in this same part specifically to pin the gap, and is flipped to assert the refusal instead. |
 
 #### D22 in detail: the rebuilt premium-candle mapping
 
@@ -2241,6 +2500,33 @@ the pre-existing `dashboards/app.py` dual-module-name error, unrelated to this p
 | Lint | `ruff check .` | **All checks passed!** |
 | Format | `ruff format --check .` | **173 files already formatted** |
 | Types | `mypy` | **Success: no issues found in 113 source files** |
+
+### Verification results (Phase 4 Part 4, 5 August 2026)
+
+| Check | Command | Result |
+|---|---|---|
+| Tests | `python -m pytest` | **1131 passed, 10 skipped** (was 1063 + 8) |
+| Lint | `ruff check .` | **All checks passed!** |
+| Format | `ruff format --check .` | **191 files already formatted** |
+| Types | `mypy` | **Success: no issues found in 118 source files** |
+| `Trading_Automation` untouched | `find` over the recorded baseline extension set (read-only, absolute path) | Unchanged: **`2026-07-28 10:29:14 .../tests/test_warmup_coordinator.py`**, reproduced against the same command Part 2b-ii-A recorded |
+
+#### Phase 4 Part 4 gate evidence
+
+**Acceptance gate (Part 4) — met, against the task's own stated criteria:**
+
+| Requirement | Evidence |
+|---|---|
+| An engine worker warm-starts a continuity-required strategy from real historical bars and reaches the same indicator state a from-the-open run would | `test_aggregate_candles_matches_candlebuilder_bucketing` proves warm-up and live candles bucket identically (cross-checked, not assumed from shared use of `floor_to_interval`); `test_warmup_replay_seeds_the_strategy_before_the_first_live_candle` proves the replayed candles genuinely reach `on_candle` before the first live one, counted rather than inferred |
+| A fetch failure degrades to a cold start with the existing `WARNING`, never a wrongly-seeded indicator | `test_a_fetch_failure_degrades_to_cold_start_and_blocks_the_first_live_entry` — a real `TradingEngine`, a raising `fetch_fn`, and the live entry that would otherwise fire is refused, not merely a `COLD_START` status computed in isolation |
+| `validate_warmup_config`'s existing refusals still hold | `tests/integration/test_engine_premium_candle_exit.py`'s two pre-existing warm-up tests re-run unchanged and still pass — `test_a_continuity_required_strategy_with_warm_up_disabled_is_rejected`, `test_a_strategy_whose_warmup_spec_raises_is_blocked_from_entering` |
+| No `dhanhq` import outside the adapter, even with a new historical-data module in the tree | `tests/unit/test_dhan_adapter.py` re-run after adding `common/market_data/dhan_historical.py`: still names only `common/market_data/dhan.py` |
+| Every existing configuration's behaviour is unchanged | `EngineWorkerConfig.warmup_source` defaults to `"none"`; both walking-skeleton gates re-run green; `test_warmup_source_none_builds_nothing_and_touches_no_settings` asserts `load_settings` is never even called on the default path |
+| The reference's two real defects are fixed, not carried over | `test_fetch_intraday_builds_the_documented_from_and_to_date_format` (fail-first against the bare-date bug); the SDK-isolation structural check above (fail-first against a direct `dhanhq` import) |
+| Live still fail-closed | `DhanLiveBroker` still absent; nothing in this part touches the broker or order path — the new REST client speaks only to `/v2/charts/intraday`, a read-only endpoint |
+| **Same-part amendment (D47):** a continuity-required strategy with no `warmup_manager` at all must fail at construction, not merely cold-start with a `WARNING` | `test_no_manager_or_source_now_refuses_construction` — raises `InvalidWarmupConfig` naming the missing manager; full suite re-run (`1131 passed, 10 skipped`, unchanged) confirmed no other test in the tree relied on the old fallback |
+| **Not claimed:** the real endpoint's partial-candle behaviour during market hours | No captured fixture exists for this endpoint anywhere in this repository. The two new opt-in smoke tests (`tests/smoke/test_live_feed_smoke.py`) narrow this against a real call but cannot settle it without a market-hours run, which this session did not make |
+| **Not claimed:** cross-worker rate-limit coordination | `DhanHistoricalDataClient`'s retry is single-process, single-call scoped by design (see D44's discussion and the deviation ledger); the coordinator that would solve simultaneous-multi-strategy-startup collisions is explicitly Phase 5 |
 
 ### Verification results (Phase 4 Part 3, 1 August 2026)
 
@@ -2975,25 +3261,47 @@ start/stop/crash/restart tests pass.
     incident. It matters more from Part 1 on: with real contracts, an unapplied
     subscription is the single thing standing between a resolved contract and a
     fill.
-16. **An engine worker cold-starts its indicators.** Introduced by Part 2b-ii-B-2.
-    `TradingEngine` accepts a `warmup_manager`/`warmup_source` pair and a
-    `history_provider`, and `engine_worker` injects **none of them**, so `_warm_up()`
-    takes the cold-start path on every worker start and restart.
+16. **~~An engine worker cold-starts its indicators.~~ CLOSED** (Phase 4 Part 4,
+    5 August 2026). `engine_worker.py` now builds a real `WarmupManager`/
+    `WarmupSource` pair when a strategy opts in via `warmup_source: dhan`; the
+    default (`"none"`) keeps every existing configuration's prior behaviour
+    unchanged.
 
-    **Why it is accepted for now:** the only strategy in the tree is
-    `EngineFixtureStrategy`, whose `warmup_spec()` returns `None` — a deliberate
-    opt-out meaning "cold start is fine" — so nothing today is affected. Wiring a
-    warm-up source would mean choosing one (historical API, recorded tape, or the
-    hub's own bars), which is a Phase 4 decision about the candle foundation rather
-    than a wiring detail of this part.
+    **The claim this entry made before Part 4 was too strong, and building
+    Part 4 found the gap that made it so — closed in the same part, not left
+    corrected-in-wording.** It said a cold start "can only refuse to trade, or
+    trade a strategy that declared it did not care" — true for a
+    `warmup_spec()` that raises, and true for a strategy whose spec is `None`,
+    but **not** true for the third case: a continuity-required strategy with
+    no manager injected (every config's default absent an explicit opt-in)
+    logged a `WARNING` and **traded anyway** on the cold-started indicator.
+    `entry_blocked_by()` was only consulted on the `warmup_manager` path; the
+    fallback (Phase 3 Part 2b-ii-B-2) only logged. Found while building Part
+    4's end-to-end test, not assumed — and once found, fixed rather than
+    merely documented, because it sat behind the *default* configuration and
+    reproduces exactly the failure shape this subsystem exists to prevent
+    (the reference's own 2026-07-17 manufactured-signal incident).
+    `validate_warmup_config(strategy, cfg, warmup_manager)` (**D47**) now
+    refuses construction for a continuity-required strategy whenever
+    `warmup_from_history` is false **or** no manager is supplied — collapsing
+    what were two independently-reasoned mechanisms with a gap between them
+    into one. `test_no_manager_or_source_now_refuses_construction` pins the
+    refusal.
 
-    **When it bites:** the first continuity-required strategy. The engine already
-    fails *towards* safety here — `validate_warmup_config` refuses a config that
-    disables warm-up for such a strategy, a `warmup_spec()` that raises latches
-    entries off, and a cold start on a continuity-required strategy logs a `WARNING`
-    saying its signals "must not be read as strategy edge". So this cannot silently
-    trade a wrongly-seeded indicator; it can only refuse to trade, or trade a
-    strategy that declared it did not care. Must be closed before Phase 9.
+    **Proven end to end** — not just at `WarmupManager`'s own unit level — by
+    `tests/integration/test_engine_warmup_end_to_end.py`: a fetch failure
+    degrading to `COLD_START` actually blocks the live entry that would
+    otherwise fire; a successful `WARMED` replay does not; and a
+    continuity-required strategy with no manager at all now fails at
+    construction rather than reaching a runtime warning.
+
+    **Still open:** the underlying-only scope (no per-option-leg warm-up,
+    D43), the cross-worker rate-limit collision risk (no coordinator — Phase
+    5), and the unverified partial-candle response shape (documentation and
+    an opt-in smoke test only, no captured fixture). None of these three
+    permit a continuity-required strategy to trade on an unwarmed indicator
+    without an explicit `InvalidWarmupConfig` at startup somewhere in the
+    chain — they bound what "warm" can mean, not whether the refusal fires.
 17. **~~The engine trades synthetic contracts, not real ones.~~ CLOSED**
     (Phase 4 Part 1, 1 August 2026). The engine now resolves real Dhan contracts
     through `DhanOptionChainResolver` over the daily instrument master
@@ -3207,7 +3515,7 @@ independent concerns apart. **Stop for review after each part.**
 | 1 | Real contract resolution + the live rehearsal | 17; alarms 15 | — | **COMPLETE** (1 Aug 2026) |
 | 2 | Indicator layer (EMA/RSI/VWAP/ATR/ADX) | D21 | — | **COMPLETE** (1 Aug 2026) |
 | 3 | Candle continuity, session/timezone, wall-clock square-off | 4, 7, a live blocker | — | **COMPLETE** (1 Aug 2026) |
-| 4 | Warm-up source and injection | 16 | 2, 3 | Not started |
+| 4 | Warm-up source and injection | 16 | 2, 3 | **COMPLETE** (5 Aug 2026) |
 | 5 | `PaperBroker` realism | 5, D11 | 1 | Not started |
 
 **Why Part 1 came first**, since the ordering was not obvious and the reason
@@ -3242,12 +3550,26 @@ section 4.
 the live path for the first time — they had no production caller at all — but none
 of it has been exercised against a real socket drop.
 
-**Part 4 — the warm-up source** (limitation 16). Port `framework/warmup/manager.py`
-and `source.py` plus `framework/market_data/historical.py`; `requirements.py` is
-already in the tree. **Not** `coordinator.py` — it coordinates across strategies,
-which is Phase 5. Then inject `warmup_manager`/`warmup_source`/`history_provider`
-at `engine_worker`, where `TradingEngine` already accepts them as `object | None`;
-tighten those annotations to real protocols while porting.
+**Part 4 — the warm-up source — COMPLETE.** `WarmupManager`/`WarmupSource` ported;
+`historical.py` ported with real adaptation (frozen `Candle`, D40-safe trading-day
+walking) rather than verbatim, since a straight port would have broken this
+repository's SDK-isolation boundary and reproduced a real request-format bug —
+both found and fixed before anything was written, not after. `history_provider`
+was deliberately left unwired (the manager path subsumes it), and only the
+multi-session `fetch_warmup_candles_range` was ported, not the reference's
+today-only convenience wrapper. `coordinator.py` stayed out, as planned — it
+coordinates across strategies, which is still Phase 5. `warmup_manager`/
+`warmup_source` are now injected at `engine_worker` behind an opt-in
+`warmup_source: dhan` flag; their `TradingEngine` annotations are tightened from
+`object | None` to real types. **A same-part amendment (D47) also closed a
+pre-existing Phase 3 gap** found while writing the end-to-end test:
+`validate_warmup_config` used to only check the `warmup_from_history` flag, so
+a continuity-required strategy with the flag true (every config's default) but
+no manager supplied sailed past construction and cold-started with only a
+`WARNING` — it now refuses construction outright in that case too. Full
+record: "What Phase 4 Part 4 delivered" (section 1), deviations D43-D47,
+limitation 16 closed (with both the stated residual and this gap corrected
+rather than left overstated), and the Part 4 gate evidence in section 4.
 
 **Part 5 — `PaperBroker` realism** (limitation 5, deviation D11). Depth through
 the pipe (Full mode 21 in the adapter, then the gateway protocol, `Signal`, and

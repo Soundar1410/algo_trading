@@ -60,6 +60,7 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable
 from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
 
 from common.candles.builder import CandleBuilder, to_ohlc
 from common.indicators.base import OHLC
@@ -68,6 +69,15 @@ from common.models import Candle, ExitReason, Tick
 from common.notifications import NotificationEvent, Notifier, NullNotifier, SafeNotifier
 from common.utils.timeutils import now_ist, parse_timeframe_minutes
 from common.warmup.requirements import validate_warmup_config
+
+if TYPE_CHECKING:
+    # Annotation only, per Phase 4 Part 4 -- a real (non-TYPE_CHECKING) import
+    # here would cycle: common.warmup.manager imports common.engine.session,
+    # and this module is what common/engine/__init__.py imports to reach
+    # .session in the first place. The runtime seam stays duck-typed, as it
+    # was before this part -- only the annotation is concrete now.
+    from common.warmup.manager import WarmupManager
+    from common.warmup.source import WarmupSource
 
 from .config import EngineConfig
 from .daily_guard import DailyRiskConfig, DailyRiskGuard
@@ -114,8 +124,8 @@ class TradingEngine:
         history_provider: Callable[[], list[Candle]] | None = None,
         reporter: EngineReporter | None = None,
         report: ReportWriter | None = None,
-        warmup_manager: object | None = None,
-        warmup_source: object | None = None,
+        warmup_manager: WarmupManager | None = None,
+        warmup_source: WarmupSource | None = None,
         square_off_event: threading.Event | None = None,
         square_off_authority: SquareOffAuthority | None = None,
         recover_position: Callable[[], AdoptedPosition | None] | None = None,
@@ -208,9 +218,11 @@ class TradingEngine:
         # day. Independent of the per-position risk manager.
         self._daily_guard = self._build_daily_guard(cfg)
 
-        # Fail fast on a config that disables warm-up for an indicator that cannot
-        # be cold-started (see common.warmup.requirements).
-        validate_warmup_config(strategy, cfg)
+        # Fail fast on a config that would cold-start an indicator that cannot be
+        # cold-started (see common.warmup.requirements) -- checks both the config
+        # flag and, since Phase 4 Part 4, whether a real warm-up manager was
+        # actually supplied.
+        validate_warmup_config(strategy, cfg, warmup_manager)
 
     @staticmethod
     def _build_daily_guard(cfg: EngineConfig) -> DailyRiskGuard | None:
@@ -354,7 +366,7 @@ class TradingEngine:
                 self._regime.observe(ohlc)
                 self.strategy.on_candle(ohlc, candle.start_at)
 
-            result = self._warmup_manager.warm(  # type: ignore[attr-defined]
+            result = self._warmup_manager.warm(
                 _sink,
                 self._warmup_source,
                 spec,

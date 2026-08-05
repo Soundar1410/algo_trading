@@ -479,6 +479,7 @@ def _build(
         )
 
     option_selector, option_segment = build_option_selector(config, engine_config)
+    warmup_manager, warmup_source = build_warmup_manager(config, engine_config)
 
     # Hoisted above the feed so the wall-clock net below and the engine share **one**
     # authority instance. Two would mean two `_load_state()` reads and two
@@ -544,6 +545,8 @@ def _build(
         # wall-clock net consults this same instance rather than a second one.
         square_off_authority=square_off_authority,
         recover_position=_recover,
+        warmup_manager=warmup_manager,
+        warmup_source=warmup_source,
     )
     holder.append(engine)
     return engine, gateway, feed, positions, recovered
@@ -622,6 +625,143 @@ def build_option_selector(
         ),
         segment_code(meta.fno_segment),
     )
+
+
+def build_warmup_manager(
+    config: WorkerConfig, engine_config: EngineWorkerConfig
+) -> tuple[Any, Any]:
+    """Build ``(warmup_manager, warmup_source)``, or ``(None, None)`` when opted
+    out — Phase 4 Part 4, runbook limitation 16.
+
+    Returned as ``Any``, not the concrete types: importing
+    ``common.warmup.manager``/``.source`` at this module's top level would be
+    fine on its own, but the whole point of ``engine_worker.py`` is that
+    nothing forces ``common.engine``'s import cost onto a config that never
+    asked for it — see the module docstring. The concrete types stay behind
+    the same deferred-import discipline ``build_option_selector`` already
+    uses for ``common.market_data.scrip_master``.
+
+    Never raises. Warm-up is a correctness nicety, never a precondition for
+    trading (the same posture ``TradingEngine._warm_up`` already has) — an
+    operator who opts in to ``warmup_source="dhan"`` but has no usable
+    credentials, or whose config can't resolve an underlying, gets a cold
+    start and a logged reason, not a startup failure.
+
+    **Underlying-only.** At this point in ``_build()`` no option contract has
+    been resolved yet — the strategy picks its strike on its first signal —
+    and every continuity-required indicator in this repository runs on the
+    *underlying's* candles (``TradingEngine._warm_up``'s ``_sink`` feeds
+    ``strategy.on_candle`` unconditionally off the underlying stream). So this
+    only ever builds ``WarmupSource.from_underlying(...)``; ``from_option`` is
+    ported (see its own docstring) but unreachable from here.
+
+    **Independent of ``contract_resolver``.** ``resolve_index_meta`` needs no
+    scrip master — it is the *option* resolver that reads the daily
+    instrument master, not the underlying lookup. So ``warmup_source="dhan"``
+    does not require ``contract_resolver="dhan"``; a strategy can warm its
+    underlying's indicators from real history while still selecting synthetic
+    option contracts, or vice versa.
+    """
+    if engine_config.warmup_source == "none":
+        return None, None
+    if engine_config.warmup_source != "dhan":
+        raise ValueError(
+            f"Unknown warmup_source {engine_config.warmup_source!r}; expected 'none' or 'dhan'."
+        )
+
+    # Deferred for the same reason build_option_selector's "dhan" branch defers
+    # its scrip-master imports: none of this belongs on a config that never
+    # asked for it.
+    from common.config import load_settings
+    from common.config.secrets import read_secret
+    from common.market_data.dhan_historical import DhanHistoricalDataClient
+    from common.market_data.scrip_master import resolve_index_meta
+    from common.warmup.historical import fetch_warmup_candles_range
+    from common.warmup.manager import WarmupManager
+    from common.warmup.source import WarmupSource
+
+    meta = resolve_index_meta(
+        config.instrument,
+        index_security_id=engine_config.index_security_id or None,
+        index_segment=engine_config.index_segment or None,
+        fno_segment=engine_config.fno_segment or None,
+    )
+    if meta.security_id != config.security_id:
+        # Not hypothetical: index_security_id is an independent override, and
+        # a stale one would otherwise seed indicators from a different
+        # instrument's history than the one ticks are actually arriving for
+        # -- silently, since a REST fetch for the wrong id still succeeds.
+        log.error(
+            "%s: warmup_source='dhan' but the resolved underlying (%s) does not match "
+            "this worker's security id (%s); refusing to warm from a possibly wrong "
+            "instrument and falling back to a cold start",
+            config.strategy_id,
+            meta.security_id,
+            config.security_id,
+        )
+        return None, None
+
+    settings = load_settings()
+    client_id = read_secret(settings.dhan_client_id)
+    access_token = _resolve_access_token(settings, client_id)
+    if not client_id or not access_token:
+        log.warning(
+            "%s: warmup_source='dhan' but no Dhan client id/access token is available "
+            "(set DHAN_ACCESS_TOKEN, or run scripts/auth_bootstrap.py first); falling "
+            "back to a cold start",
+            config.strategy_id,
+        )
+        return None, None
+
+    client = DhanHistoricalDataClient(client_id, access_token)
+    source = WarmupSource.from_underlying(meta)
+
+    def _fetch(
+        source: Any,
+        *,
+        session: Any,
+        timeframe_minutes: int,
+        lookback_sessions: int,
+        now: Any = None,
+    ) -> Any:
+        return fetch_warmup_candles_range(
+            client,
+            security_id=source.security_id,
+            exchange_segment=source.exchange_segment,
+            instrument_type=source.instrument_type,
+            session=session,
+            timeframe_minutes=timeframe_minutes,
+            lookback_sessions=lookback_sessions,
+            now=now,
+            underlying_label=engine_config.underlying_instrument or config.instrument,
+        )
+
+    manager = WarmupManager(
+        _fetch, max_lookback_sessions=engine_config.warmup_max_lookback_sessions
+    )
+    return manager, source
+
+
+def _resolve_access_token(settings: Any, client_id: str | None) -> str | None:
+    """The same precedence ``scripts/auth_bootstrap.py`` uses: an explicit env
+    override first, then the cache the bootstrap itself writes. Never mints a
+    token -- no PIN/TOTP flow here, since generation is the bootstrap's job
+    alone (spec line 1178: no trading runtime generates its own token).
+    """
+    from common.config.secrets import read_secret
+
+    token = read_secret(settings.dhan_access_token)
+    if token:
+        return token
+    if not client_id:
+        return None
+
+    from common.authentication import TokenCache
+    from common.authentication.bootstrap import TOKEN_CACHE_FILENAME
+
+    paths = load_paths(settings=settings)
+    cached = TokenCache(paths.cache_root / TOKEN_CACHE_FILENAME).load(expected_client_id=client_id)
+    return cached.access_token if cached is not None else None
 
 
 def _wall_clock_square_off(

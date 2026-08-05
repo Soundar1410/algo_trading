@@ -350,6 +350,80 @@ def test_a_real_option_contract_delivers_ticks_on_the_fno_segment(tmp_path: Path
     assert tick.exchange_time <= tick.received_at
 
 
+# --------------------------------------------------- Phase 4 Part 4: warm-up
+@needs_credentials
+def test_the_intraday_endpoint_returns_a_success_shape_during_market_hours(
+    tmp_path: Path,
+) -> None:
+    """**Narrows, but cannot fully resolve, the one thing this port could not
+    verify from source or documentation alone**: whether Dhan's
+    ``/v2/charts/intraday`` returns a partial candle for the still-forming
+    period when ``toDate`` is "now" during a live session. No fixture or
+    captured evidence exists anywhere in this repository for this endpoint's
+    exact response — only DhanHQ's documented shape. This test confirms the
+    documented shape holds against a real call; it does not (and structurally
+    cannot, without a captured tape) settle the partial-candle question on its
+    own — see the next test for what the code does regardless of the answer.
+
+    Read-only: a single ``POST /v2/charts/intraday``. No order-capable
+    endpoint is reachable from here.
+    """
+    from common.market_data.dhan_historical import DhanHistoricalDataClient
+    from common.utils.timeutils import now_ist
+    from common.warmup.historical import parse_intraday_response
+
+    now = now_ist()
+    client = DhanHistoricalDataClient(str(_CLIENT_ID), _token(tmp_path))
+    resp = client.fetch_intraday(
+        security_id=_SECURITY_ID,
+        exchange_segment="IDX_I",
+        instrument_type="INDEX",
+        from_at=now.replace(hour=9, minute=15, second=0, microsecond=0),
+        to_at=now,
+    )
+    assert isinstance(resp, dict) and resp, "empty/non-dict response from a 200"
+    candles = parse_intraday_response(resp, "Asia/Kolkata")
+    assert candles, (
+        "no candles parsed from a real intraday response during market hours; "
+        "check the documented shape still matches what was actually returned"
+    )
+
+
+@needs_credentials
+def test_the_still_forming_bucket_is_excluded_from_a_live_fetch(tmp_path: Path) -> None:
+    """The code's own defence against a partial trailing candle, checked
+    against a real response rather than a synthetic one. Whatever Dhan
+    actually returns for the still-open period, nothing at or after the
+    current timeframe bucket may survive :func:`fetch_warmup_candles_range`'s
+    own filter.
+    """
+    from common.engine.config import SessionConfig
+    from common.engine.session import MarketSession
+    from common.market_data.dhan_historical import DhanHistoricalDataClient
+    from common.utils.timeutils import now_ist
+    from common.warmup.historical import fetch_warmup_candles_range
+
+    now = now_ist()
+    session = MarketSession(SessionConfig())
+    client = DhanHistoricalDataClient(str(_CLIENT_ID), _token(tmp_path))
+    candles = fetch_warmup_candles_range(
+        client,
+        security_id=_SECURITY_ID,
+        exchange_segment="IDX_I",
+        instrument_type="INDEX",
+        session=session,
+        timeframe_minutes=5,
+        lookback_sessions=1,
+        now=now,
+    )
+    assert candles, "no candles returned during market hours; nothing to check the filter against"
+    for candle in candles:
+        assert candle.end_at <= now, (
+            f"candle {candle.start_at}-{candle.end_at} was not excluded even though it "
+            f"had not fully closed by {now} -- the still-forming-bucket filter did not hold"
+        )
+
+
 def _index_last_price(cache_dir: Path, meta) -> float:  # type: ignore[no-untyped-def]
     """The index's LTP, via the same read-only endpoint Phase 2 Block 2 used."""
     import httpx

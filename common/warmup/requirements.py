@@ -67,11 +67,14 @@ class WarmupRequirement:
 
 
 class InvalidWarmupConfig(ValueError):
-    """``warmup_from_history: false`` on a strategy that cannot be cold-started."""
+    """A continuity-required strategy that would run cold, either because
+    ``warmup_from_history`` is false or because no warm-up manager will
+    actually be supplied.
+    """
 
 
-def validate_warmup_config(strategy: Any, cfg: Any) -> None:
-    """Reject a config that disables warm-up for a continuity-required strategy.
+def validate_warmup_config(strategy: Any, cfg: Any, warmup_manager: Any = None) -> None:
+    """Reject a config that would cold-start a continuity-required strategy.
 
     Turning warm-up off for a path-dependent indicator is an invalid
     configuration, not an implicit operator waiver: there is no history at all, so
@@ -79,29 +82,54 @@ def validate_warmup_config(strategy: Any, cfg: Any) -> None:
     manufactured trend with nothing to catch it. Fail at startup, loudly, rather
     than at 09:16 in a log line nobody reads.
 
-    Keyed on the *config flag*, deliberately — not on whether a warm-up manager
-    was actually built. An offline stack legitimately has no manager while the
-    config still asks for warm-up; that is not a config error, and the engine's
-    runtime gate fails it closed anyway. Only an explicit
-    ``warmup_from_history: false`` is a config error.
+    **Widened in Phase 4 Part 4, closing a gap this function's own docstring
+    used to claim was already closed.** It previously read "keyed on the
+    config flag, deliberately — not on whether a warm-up manager was actually
+    built... the engine's runtime gate fails it closed anyway." That second
+    half was wrong: :meth:`~common.engine.engine.TradingEngine._warm_up`'s
+    runtime gate (``entry_blocked_by``) is reached only on the
+    ``warmup_manager`` path. A continuity-required strategy with
+    ``warmup_from_history: true`` (every existing config's default) and no
+    manager supplied — which is every config today, absent an explicit
+    ``warmup_source: dhan`` opt-in — sailed through this check, cold-started,
+    and traded on a possibly manufactured trend with nothing but a ``WARNING``
+    log line. Found while building Part 4's end-to-end warm-up test, not
+    assumed from the prior docstring's claim. Now: **both** an explicit
+    ``warmup_from_history: false`` **and** an unsupplied ``warmup_manager``
+    are config errors for a continuity-required strategy, checked together
+    rather than as two independently-reasoned mechanisms with a gap between
+    them. ``warmup_manager`` is accepted as an optional parameter — not
+    required — so every pre-Part-4 call site (none of which passed it)
+    degrades to the old ``warmup_from_history``-only check rather than
+    breaking.
 
     A future intentional opt-out should be an explicit ``allow_cold_start: true``
     with an audit warning -- not the absence of a flag.
     """
-    if getattr(cfg, "warmup_from_history", False):
-        return
     try:
         spec = strategy.warmup_spec()
     except Exception:  # never let validation itself break startup
         return
     if spec is None or not spec.continuity_required:
         return
+
+    warmup_enabled = bool(getattr(cfg, "warmup_from_history", False))
+    if warmup_enabled and warmup_manager is not None:
+        return  # a real warm-up will actually run before the first live candle
+
+    if not warmup_enabled:
+        reason = "warmup_from_history is set false"
+    else:
+        reason = "warmup_from_history is true but no warmup_manager was supplied"
+
     raise InvalidWarmupConfig(
         f"strategy '{getattr(strategy, 'name', type(strategy).__name__)}' holds a "
         f"continuity-required indicator (e.g. SuperTrend), which cannot be "
         f"cold-started: its trend is path-dependent and a cold seed has no "
         f"guaranteed convergence to the historically continuous state. "
-        f"Set warmup_from_history true on the engine config."
+        f"{reason}, so it would run cold with nothing but a WARNING to catch it. "
+        f"Set warmup_from_history true AND inject a warmup_manager/warmup_source "
+        f"(e.g. warmup_source: dhan) before this strategy may run."
     )
 
 

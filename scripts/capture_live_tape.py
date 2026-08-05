@@ -37,6 +37,7 @@ from typing import Any
 from common.authentication import AuthBootstrap, AuthCredentials, AuthError
 from common.config import load_settings
 from common.config.paths import load_paths
+from common.config.secrets import read_secret as _secret
 from common.logging import get_logger, setup_logging
 
 EXIT_OK = 0
@@ -48,13 +49,6 @@ EXIT_NO_DATA = 4
 _FORBIDDEN_KEYS = ("token", "secret", "pin", "totp", "client", "password", "auth")
 
 _log = get_logger(__name__)
-
-
-def _secret(holder: object) -> str | None:
-    getter = getattr(holder, "get_secret_value", None)
-    if getter is None:
-        return None
-    return str(getter()) or None
 
 
 def _scrub(payload: object) -> object:

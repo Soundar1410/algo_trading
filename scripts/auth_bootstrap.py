@@ -36,6 +36,7 @@ from common.authentication import (
 )
 from common.config import load_settings
 from common.config.paths import load_paths
+from common.config.secrets import read_secret as _secret
 from common.logging import get_logger, setup_logging
 
 EXIT_OK = 0
@@ -44,15 +45,6 @@ EXIT_NO_CREDENTIALS = 2
 EXIT_COOLDOWN = 3
 
 _log = get_logger(__name__)
-
-
-def _secret(holder: object) -> str | None:
-    """Read a SecretStr without letting it reach a log or stdout."""
-    getter = getattr(holder, "get_secret_value", None)
-    if getter is None:
-        return None
-    value = str(getter())
-    return value or None
 
 
 def main(argv: list[str] | None = None) -> int:
