@@ -117,6 +117,27 @@ SEGMENT_CODES: dict[str, int] = {
 }
 
 
+def _tick_size_in_rupees(raw: object) -> float | None:
+    """Convert ``SEM_TICK_SIZE`` from paise to rupees, or ``None`` if unusable.
+
+    See :data:`TICK_SIZE_PAISE_PER_RUPEE` for the evidence that the column is in
+    paise, and for why the result is advisory rather than authoritative. A missing
+    or unparseable value returns ``None`` rather than a default, because "we do
+    not know this instrument's tick" and "its tick is 0.05" must stay
+    distinguishable — the fill model skips its tick rule for the first and
+    enforces it for the second.
+    """
+    if raw is None or isinstance(raw, bool) or not isinstance(raw, str | int | float):
+        return None
+    try:
+        paise = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if paise <= 0:
+        return None
+    return paise / TICK_SIZE_PAISE_PER_RUPEE
+
+
 def segment_code(segment: str) -> int:
     """Map a named feed segment to its numeric code.
 
@@ -160,6 +181,21 @@ def resolve_index_meta(
     )
 
 
+#: What ``SEM_TICK_SIZE`` is denominated in. **Paise, not rupees** — verified
+#: against the live master in Phase 4 Part 5: NIFTY and SENSEX ``OPTIDX`` rows
+#: carry ``5.0000`` for a real ₹0.05 tick, and ``FUTCUR`` USDINR carries
+#: ``0.2500`` for a real ₹0.0025 one.
+#:
+#: **The unit is not uniformly trustworthy outside index options.** In the same
+#: file ``FUTIDX`` NIFTY and NSE ``EQUITY`` RELIANCE both carry ``10.0000``,
+#: neither of which divides to the tick those instruments are commonly quoted in.
+#: So the value is parsed and converted here, and the paper fill model treats it
+#: as *advisory*: the tick it enforces comes from configuration, and a
+#: disagreement is a warning rather than a rejection. Taking the column at face
+#: value as rupees would put NIFTY options on a ₹5 grid and refuse every order.
+TICK_SIZE_PAISE_PER_RUPEE = 100.0
+
+
 @dataclass(frozen=True)
 class OptionRow:
     """One tradable index-option contract as the master describes it."""
@@ -170,6 +206,10 @@ class OptionRow:
     expiry: str  # "YYYY-MM-DD"
     lot_size: int
     symbol: str  # human-readable (SEM_CUSTOM_SYMBOL)
+    #: Minimum price increment **in rupees**, converted from the master's paise.
+    #: ``None`` when the column is absent or unparseable, which the fill model
+    #: treats as "no tick known" and skips the rule rather than guessing.
+    tick_size: float | None = None
 
 
 # --------------------------------------------------------------------- transport
@@ -278,6 +318,10 @@ class ScripMaster:
         meta = INDEX_REGISTRY.get(self._underlying)
         self._exchange = (exchange or (meta.exchange if meta else "NSE")).upper()
         self._by_key: dict[tuple[str, float, OptionType], OptionRow] = {}
+        #: The same rows indexed the way the *broker* asks for them. An order
+        #: carries a ``security_id`` and nothing else, so the strike/expiry key
+        #: cannot answer "what are this instrument's exchange rules?".
+        self._by_security_id: dict[str, OptionRow] = {}
         self._expiries: list[str] = []
         self._lot_size: int | None = None
 
@@ -301,6 +345,7 @@ class ScripMaster:
         clothes.
         """
         self._by_key.clear()
+        self._by_security_id.clear()
         expiries: set[str] = set()
         skipped = 0
 
@@ -337,8 +382,10 @@ class ScripMaster:
                 expiry=expiry,
                 lot_size=lot,
                 symbol=row.get("SEM_CUSTOM_SYMBOL") or symbol,
+                tick_size=_tick_size_in_rupees(row.get("SEM_TICK_SIZE")),
             )
             self._by_key[(expiry, strike, option_row.option_type)] = option_row
+            self._by_security_id[option_row.security_id] = option_row
             expiries.add(expiry)
             self._lot_size = lot
 
@@ -389,8 +436,24 @@ class ScripMaster:
     def get(self, strike: float, option_type: OptionType, expiry: str) -> OptionRow | None:
         return self._by_key.get((expiry, float(strike), option_type))
 
+    def by_security_id(self, security_id: str) -> OptionRow | None:
+        """The contract with this broker id, or ``None`` if the master has none.
+
+        ``None`` is what makes the paper broker's ``INVALID_INSTRUMENT`` rule
+        meaningful: an order for an id the exchange's own daily master does not
+        list is an order that could not have been placed.
+        """
+        return self._by_security_id.get(str(security_id))
+
     def strikes_for_expiry(self, expiry: str) -> list[float]:
         return sorted({key[1] for key in self._by_key if key[0] == expiry})
+
+    def tick_sizes(self) -> frozenset[float]:
+        """Every distinct tick size across the loaded contracts. For assertions
+        and for the startup log — a series whose rows disagree is worth seeing."""
+        return frozenset(
+            row.tick_size for row in self._by_key.values() if row.tick_size is not None
+        )
 
     def atm_band(
         self, spot: float, expiry: str, strike_step: int, half_width: int

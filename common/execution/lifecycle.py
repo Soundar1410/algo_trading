@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from common.broker.base import Broker, BrokerError, Quote
+from common.broker.quotes import QuoteBook
 from common.config.models import ExecutionMode
 from common.logging import get_logger
 from common.models import (
@@ -66,6 +67,7 @@ class OrderLifecycle:
         session_id: int,
         product_type: str = "INTRADAY",
         config_fingerprint: str | None = None,
+        quotes: QuoteBook | None = None,
     ) -> None:
         self._repo = repository
         self._broker = broker
@@ -75,6 +77,12 @@ class OrderLifecycle:
         self._session_id = session_id
         self._product_type = product_type
         self._fingerprint = config_fingerprint
+        #: Optional on purpose (Phase 4 Part 5). With a book, the broker is handed
+        #: a real quote carrying bid/ask and its own timestamp; without one it
+        #: still gets the pre-Part-5 quote synthesised from the signal, which is
+        #: what every offline construction and the fixture worker want. ``None``
+        #: is therefore a supported configuration, not a missing dependency.
+        self._quotes = quotes
 
     def handle_signal(
         self,
@@ -135,11 +143,7 @@ class OrderLifecycle:
         # a recoverable record, keyed by a correlation ID that already exists.
         intent_id = self._repo.reserve_intent(session_id=self._session_id, intent=intent)
 
-        quote = Quote(
-            security_id=signal.security_id,
-            last_price=signal.reference_price,
-            quoted_at=signal.evaluated_at,
-        )
+        quote = self._quote_for(signal)
 
         try:
             order = self._broker.submit(intent, quote)
@@ -201,4 +205,29 @@ class OrderLifecycle:
             correlation_id=correlation_id,
             order=order,
             position=position,
+        )
+
+    def _quote_for(self, signal: Signal) -> Quote:
+        """The quote the broker prices against.
+
+        Prefers the live book, which carries bid/ask and the exchange's own
+        timestamp — the two things a credible fill needs and the signal cannot
+        supply. Falls back to the signal's reference price, which is the whole
+        quote this method used to build unconditionally.
+
+        The fallback is deliberately *silent* rather than an error. It is the
+        correct answer in three real situations: no book was injected at all
+        (every offline test), the book has nothing yet for a contract subscribed
+        moments ago, or a runtime is replaying a tape that carries no depth. The
+        fill records which basis it used in ``Fill.fill_method``, so the
+        distinction is visible per fill rather than assumed per deployment.
+        """
+        if self._quotes is not None:
+            live = self._quotes.latest(signal.security_id)
+            if live is not None:
+                return live
+        return Quote(
+            security_id=signal.security_id,
+            last_price=signal.reference_price,
+            quoted_at=signal.evaluated_at,
         )

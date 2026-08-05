@@ -106,6 +106,66 @@ def test_the_synthesised_fixture_carries_the_sdk_shape_not_a_guess():
     assert "LTQ" in SYNTH_FRAMES["quote"][0], "Quote Data does carry LTQ"
 
 
+#: The five depth levels packed into each synthesised Full frame, as
+#: ``(bid_quantity, ask_quantity, bid_orders, ask_orders, bid_price, ask_price)``.
+#: Keyed by the fixture label they produced.
+_FULL_BOOKS: dict[str, list[tuple[int, int, int, int, float, float]]] = {
+    "full": [
+        (900, 750, 3, 2, 187.40, 187.50),
+        (1200, 1500, 5, 6, 187.35, 187.55),
+        (2100, 1800, 8, 7, 187.30, 187.60),
+        (3000, 2400, 11, 9, 187.25, 187.65),
+        (4500, 3900, 14, 12, 187.20, 187.70),
+    ],
+    "full_bid_only": [(900, 0, 3, 0, 187.40, 0.0)] + [(0, 0, 0, 0, 0.0, 0.0)] * 4,
+    "full_empty_book": [(0, 0, 0, 0, 0.0, 0.0)] * 5,
+}
+
+
+def _sdk_full_frame(levels: list[tuple[int, int, int, int, float, float]]) -> dict[str, Any]:
+    """Pack Dhan's documented 162-byte Full layout and let the **SDK** parse it.
+
+    First byte 8, then ``'<BHBIfHIfIIIIIIffff100s'``: the trailing 100 bytes are
+    five 20-byte depth levels in ``'<IIHHff'``. Nothing here hand-writes the
+    resulting dict — ``process_data`` builds it — so this asserts against the
+    pinned SDK's behaviour rather than against a belief about it.
+    """
+    import struct
+
+    from dhanhq import marketfeed
+
+    depth = b"".join(struct.pack("<IIHHff", *level) for level in levels)
+    assert len(depth) == 100
+    raw = struct.pack(
+        "<BHBIfHIfIIIIIIffff100s",
+        8, 162, 2, 49081, 187.45, 75, 1_754_381_700, 187.42,
+        123456, 4000, 4200, 55000, 56000, 54000,
+        180.0, 179.5, 191.0, 176.0, depth,
+    )  # fmt: skip
+    parser = marketfeed.MarketFeed.__new__(marketfeed.MarketFeed)
+    return marketfeed.MarketFeed.process_data(parser, raw)  # type: ignore[no-any-return]
+
+
+@pytest.mark.parametrize("label", sorted(_FULL_BOOKS))
+def test_the_committed_full_frames_still_match_the_pinned_sdk(label: str):
+    """The fixture cannot drift from the SDK it claims to describe.
+
+    Phase 4 Part 5 added the Full frames, and the whole fill model rests on their
+    shape — string prices, ``"0.00"`` for an empty level, five levels under
+    ``depth``. Regenerating them here means an SDK bump that changes the layout
+    fails *this* test, loudly, instead of leaving a stale JSON blob to disagree
+    with the parser in production.
+    """
+    assert SYNTH_FRAMES[label][0] == _sdk_full_frame(_FULL_BOOKS[label])
+
+
+def test_the_full_frame_prices_are_formatted_strings_not_numbers():
+    top = SYNTH_FRAMES["full"][0]["depth"][0]
+    assert isinstance(top["bid_price"], str) and isinstance(top["ask_price"], str)
+    assert isinstance(top["bid_quantity"], int), "quantities are ints"
+    assert len(SYNTH_FRAMES["full"][0]["depth"]) == 5
+
+
 def test_a_ticker_frame_becomes_a_tick():
     adapter = _adapter()
     tick = adapter.normalise(SYNTH_FRAMES["ticker"][0])
@@ -127,6 +187,100 @@ def test_a_quote_frame_supplies_the_quantity_from_ltq():
     assert tick is not None
     assert tick.last_quantity == 75
     assert adapter.counters.ticks == 1
+
+
+# --------------------------------------------------------------------- depth
+def test_a_quote_frame_carries_no_depth_whatever_the_old_comment_said():
+    """Ratified from SDK source in Part 5. ``dhan.py`` claimed "Quote/Full add
+    depth"; ``process_quote`` returns volume and session OHLC and no book at all,
+    so a Quote-mode subscription would have produced depth-less fills while the
+    config believed otherwise."""
+    quote = SYNTH_FRAMES["quote"][0]
+    assert "depth" not in quote
+    assert "depth" in SYNTH_FRAMES["full"][0], "only Full carries a book"
+
+    tick = _adapter().normalise(quote)
+    assert tick is not None
+    assert tick.bid_price is None and tick.ask_price is None
+
+
+def test_a_full_frame_becomes_a_tick_rather_than_a_silently_dropped_non_tick():
+    """The defect that made mode 21 unusable. ``"Full Data"`` was in neither
+    ``_TICK_TYPES`` nor ``_NON_TICK_TYPES``, so it fell through to the
+    unrecognised-type branch: a **non-tick** count and a *debug* log. A Full-mode
+    feed would have run connected and silent — no candles, no indicators, no
+    orders — with nothing above debug level saying why."""
+    adapter = _adapter()
+    tick = adapter.normalise(SYNTH_FRAMES["full"][0])
+
+    assert tick is not None, "a Full frame must produce a tick"
+    assert adapter.counters.ticks == 1
+    assert adapter.counters.non_tick_frames == 0
+
+
+def test_a_full_frame_carries_the_top_of_book_onto_the_tick():
+    adapter = _adapter()
+    tick = adapter.normalise(SYNTH_FRAMES["full"][0])
+
+    assert tick is not None
+    assert tick.bid_price == pytest.approx(187.40)
+    assert tick.ask_price == pytest.approx(187.50)
+    assert tick.last_quantity == 75
+    assert adapter.counters.ticks_with_depth == 1
+    assert adapter.counters.depth_ratio == 1.0
+
+
+def test_only_the_best_level_is_carried():
+    """Five levels arrive; the fill model prices against the touch. Carrying all
+    five across the IPC queue on every tick would cost pickle size on the hot path
+    for data nothing consumes (spec section 6: no complex exchange simulator)."""
+    top = SYNTH_FRAMES["full"][0]["depth"][0]
+    second = SYNTH_FRAMES["full"][0]["depth"][1]
+    assert float(second["bid_price"]) < float(top["bid_price"])
+
+    tick = _adapter().normalise(SYNTH_FRAMES["full"][0])
+    assert tick is not None and tick.bid_price == pytest.approx(float(top["bid_price"]))
+
+
+def test_a_zero_price_level_means_absence_not_a_bid_of_zero():
+    """The trap in the reference repository's normaliser, which this does not copy.
+
+    An untraded or one-sided strike renders its empty side as ``"0.00"`` rather
+    than omitting it. Read as a number, that makes the quote look two-sided with a
+    bid of zero — and a sell would then price at ``0 - slippage`` and be refused by
+    the simulator, i.e. every exit on a one-sided book would fail.
+    """
+    frame = SYNTH_FRAMES["full_bid_only"][0]
+    assert frame["depth"][0]["ask_price"] == "0.00", "the SDK renders absence as 0.00"
+
+    adapter = _adapter()
+    tick = adapter.normalise(frame)
+
+    assert tick is not None
+    assert tick.bid_price == pytest.approx(187.40)
+    assert tick.ask_price is None, "a 0.00 ask is no ask"
+    assert adapter.counters.ticks_with_depth == 0
+    assert adapter.counters.ticks_one_sided_book == 1
+
+
+def test_an_empty_book_still_produces_a_tradeable_tick():
+    """The price is real even when nothing is resting: the fill model falls back to
+    LTP and records that it did, rather than the tick being dropped."""
+    adapter = _adapter()
+    tick = adapter.normalise(SYNTH_FRAMES["full_empty_book"][0])
+
+    assert tick is not None
+    assert tick.last_price == pytest.approx(187.45)
+    assert tick.bid_price is None and tick.ask_price is None
+    assert adapter.counters.ticks_one_sided_book == 1
+
+
+def test_a_ticker_frame_is_not_counted_as_a_one_sided_book():
+    """Two different problems needing two different responses: an illiquid strike
+    on Full, versus a subscription that carries no book in the first place."""
+    adapter = _adapter()
+    adapter.normalise(SYNTH_FRAMES["ticker"][0])
+    assert adapter.counters.ticks_one_sided_book == 0
 
 
 def test_per_instrument_labels_are_applied():
@@ -316,9 +470,11 @@ def test_replaying_the_whole_synthesised_fixture_produces_only_ticks_and_recogni
         adapter.normalise(frame["payload"])
 
     assert adapter.counters.malformed_payloads == 0
-    assert adapter.counters.ticks == 5
+    assert adapter.counters.ticks == 8  # 4 ticker + 1 quote + 3 full
     assert adapter.counters.non_tick_frames == 3  # prev_close, oi, status
     assert adapter.counters.untraded_frames == 1
+    assert adapter.counters.ticks_with_depth == 1  # only the two-sided Full frame
+    assert adapter.counters.ticks_one_sided_book == 2  # bid-only and empty-book
     assert adapter.counters.exchange_time_fallbacks == 0, (
         "every tick in the fixture carries a reconstructable exchange timestamp"
     )

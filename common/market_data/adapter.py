@@ -45,7 +45,13 @@ TickCallback = Callable[[Tick], None]
 class MarketFeedAdapter(Protocol):
     """One live or recorded source of normalised ticks."""
 
-    def subscribe(self, security_ids: Sequence[str], *, segment: int | None = None) -> None:
+    def subscribe(
+        self,
+        security_ids: Sequence[str],
+        *,
+        segment: int | None = None,
+        mode: int | None = None,
+    ) -> None:
         """Register interest. Called once with the union of worker requirements.
 
         Must be safe to call again after a reconnect without creating duplicate
@@ -59,8 +65,14 @@ class MarketFeedAdapter(Protocol):
         error — it silently delivers nothing, which is why this is part of the
         contract rather than a detail of the Dhan implementation.
 
-        ``None`` means "the adapter's default segment", which keeps every
-        pre-Phase-4 caller correct without change.
+        ``mode`` names the subscription mode, and is per call for the same reason
+        (Phase 4 Part 5). An index has no order book to stream, so it stays on
+        Ticker; an option contract must be on Full, because that is the only mode
+        carrying bid/ask — and the paper fill model's whole claim to realism is
+        that it prices against one. See :data:`common.market_data.dhan.FEED_MODES`.
+
+        ``None`` means "the adapter's default" for either, which keeps every
+        pre-Part-5 caller correct without change.
         """
         ...
 

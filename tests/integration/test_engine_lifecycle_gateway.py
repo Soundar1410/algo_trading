@@ -35,7 +35,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from common.broker import PaperBroker, PaperFillConfig
+from common.broker import PaperBroker, PaperFillConfig, SlippageConfig
 from common.config.models import ExecutionMode
 from common.engine.config import EngineConfig, SessionConfig
 from common.engine.engine import TradingEngine
@@ -56,6 +56,20 @@ CE_CONTRACT = "SIM:NIFTY:WEEKLY:24000:CE"
 RUNTIME_ID = "intraday_options"
 STRATEGY_ID = "engine01"
 TRADING_DATE = "2026-07-16"
+
+
+def _frictionless() -> PaperFillConfig:
+    """A fill model with no friction at all, so these tests assert *plumbing*.
+
+    Both knobs, not just the slippage: Phase 4 Part 5 added the conservative extra
+    tick the spec attaches to the LTP fallback (5.1), and these fixtures supply no
+    order book, so leaving it on would move every fill price here by ₹0.05 for
+    reasons that have nothing to do with what the gateway does. Fill pricing is
+    asserted in ``test_paper_broker_realism.py``.
+    """
+    return PaperFillConfig(
+        slippage=SlippageConfig(market_order_ticks=0), ltp_fallback_extra_ticks=0
+    )
 
 
 def _ts(hour: int, minute: int, second: int = 0, micro: int = 0) -> datetime:
@@ -121,7 +135,7 @@ def lifecycle(repository: ExecutionRepository) -> OrderLifecycle:
     )
     return OrderLifecycle(
         repository=repository,
-        broker=PaperBroker(config=PaperFillConfig(slippage_points=0.0)),
+        broker=PaperBroker(config=_frictionless()),
         runtime_id=RUNTIME_ID,
         strategy_id=STRATEGY_ID,
         execution_mode=ExecutionMode.PAPER,
@@ -385,7 +399,7 @@ def test_a_suppressed_signal_raises_instead_of_fabricating_a_fill(
     )
     lifecycle = OrderLifecycle(
         repository=_SuppressingRepository(repository),  # type: ignore[arg-type]
-        broker=PaperBroker(config=PaperFillConfig(slippage_points=0.0)),
+        broker=PaperBroker(config=_frictionless()),
         runtime_id=RUNTIME_ID,
         strategy_id=STRATEGY_ID,
         execution_mode=ExecutionMode.PAPER,
@@ -439,7 +453,7 @@ def test_a_broker_rejection_raises_rather_than_returning_a_fill(
         process_role="worker",
         pid=4242,
     )
-    broker = PaperBroker(config=PaperFillConfig(slippage_points=0.0))
+    broker = PaperBroker(config=_frictionless())
     lifecycle = OrderLifecycle(
         repository=repository,
         broker=broker,
@@ -473,6 +487,56 @@ def test_a_broker_rejection_raises_rather_than_returning_a_fill(
     assert _rows(repository, "SELECT * FROM orders")[0]["status"] == "REJECTED", (
         "the rejection is still audited, it just is not reported as a fill"
     )
+
+
+def test_a_partial_fill_is_refused_rather_than_reported_as_a_whole_one(
+    repository: ExecutionRepository,
+) -> None:
+    """Phase 4 Part 5, and this branch's absence was silent.
+
+    A partially filled order has fills and an average price, so before Part 5 it
+    passed every check ``_require_a_fill`` made and ``PositionManager`` went on to
+    record an ``OpenPosition`` sized at the lots it *asked* for. The engine's book
+    would have believed in exposure the broker never gave it.
+
+    Refusing is the only correct answer available: the ported ``FillOutcome``
+    carries a price and charges and no quantity, so there is no way to say "you
+    got 25 of the 75" without widening the Phase 3 port. The position stays as the
+    database has it, which is the state restart recovery adopts.
+    """
+    session = repository.open_session(
+        runtime_id=RUNTIME_ID,
+        strategy_id=STRATEGY_ID,
+        execution_mode=ExecutionMode.PAPER,
+        process_role="worker",
+        pid=4242,
+    )
+    broker = PaperBroker(
+        config=_frictionless(),
+        fill_quantity_policy=lambda intent, quote: (intent.quantity // 3,),
+    )
+    gateway = LifecycleGateway(
+        OrderLifecycle(
+            repository=repository,
+            broker=broker,
+            runtime_id=RUNTIME_ID,
+            strategy_id=STRATEGY_ID,
+            execution_mode=ExecutionMode.PAPER,
+            session_id=session.id,
+        ),
+        strategy_id=STRATEGY_ID,
+        execution_mode=ExecutionMode.PAPER,
+        trading_date=TRADING_DATE,
+    )
+
+    with pytest.raises(GatewayExecutionError, match="cannot represent a partial fill"):
+        gateway.buy(_contract(), 1, ref_price=100.0, ts=_ts(9, 30))
+
+    order = _rows(repository, "SELECT * FROM orders")[0]
+    assert order["status"] == "PARTIALLY_FILLED", (
+        "the partial is still audited in full; it is only not reported as a fill"
+    )
+    assert order["filled_quantity"] == LOT_SIZE // 3
 
 
 def test_the_failure_reaches_the_engine_rather_than_being_swallowed(

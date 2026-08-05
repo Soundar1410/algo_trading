@@ -26,7 +26,8 @@ from common.config.models import ExecutionMode, ResolvedConfig, effective_live_g
 from common.logging import get_logger
 
 from .base import Broker
-from .paper import PaperBroker
+from .paper import InstrumentRulesLookup, PaperBroker
+from .quotes import QuoteBook
 
 _log = get_logger(__name__)
 
@@ -41,6 +42,8 @@ def build_broker(
     preflight_passed: bool = False,
     paper_execution: dict[str, Any] | None = None,
     cost_rates: dict[str, Any] | None = None,
+    quotes: QuoteBook | None = None,
+    instrument_rules: InstrumentRulesLookup | None = None,
 ) -> Broker:
     """Return the broker for one strategy, or refuse to build one.
 
@@ -48,6 +51,15 @@ def build_broker(
         cfg: the strategy's fully resolved configuration.
         preflight_passed: result of live preflight. Defaults False so a caller
             that forgets to run it gets a refusal rather than a live broker.
+        quotes: recent quotes per instrument, for the paper fill model's latency
+            selection and its resting limit orders (Phase 4 Part 5). Optional: a
+            broker without one prices every fill at the submission quote and says
+            so on each fill, rather than failing.
+        instrument_rules: lot size, tick size and any quantity ceiling per
+            ``security_id``, for the simulator's instrument and quantity rejection
+            rules. Optional, and ``None`` leaves those rules inactive: a runtime
+            with no instrument master (every simulated-contract run) must not have
+            correct orders refused against a lot size nobody knows.
 
     Raises:
         LiveExecutionBlocked: if the strategy is live-mode. Always, in Phase 1 —
@@ -63,6 +75,8 @@ def build_broker(
         return PaperBroker.from_config(
             paper_execution=paper_execution,
             cost_rates=cost_rates,
+            quotes=quotes,
+            instrument_rules=instrument_rules,
         )
 
     decision = effective_live_gate(cfg, preflight_passed=preflight_passed)

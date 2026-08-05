@@ -126,9 +126,9 @@ class SharedFeedHub:
         #: Runtime subscription requests awaiting the feed thread. ``deque`` because
         #: ``append``/``popleft`` are atomic under the GIL, so a request can be
         #: enqueued from any thread without a lock on the callback path.
-        #: ``(strategy_id, security_id, segment)``; ``segment`` is ``None`` for
-        #: "the adapter's default", which is what every pre-Phase-4 caller means.
-        self._pending_subscriptions: deque[tuple[str, str, int | None]] = deque()
+        #: ``(strategy_id, security_id, segment, mode)``; either may be ``None``
+        #: for "the adapter's default", which is what every pre-Part-5 caller means.
+        self._pending_subscriptions: deque[tuple[str, str, int | None, int | None]] = deque()
         #: Monotonic reading when the pending queue last went from empty to
         #: non-empty, or ``None`` when it is empty. Read by the supervisor to
         #: alarm on runbook limitation 15 — a subscription needs a tick to be
@@ -227,7 +227,12 @@ class SharedFeedHub:
 
     # ------------------------------------------------------ subscription
     def request_subscription(
-        self, strategy_id: str, security_id: str, *, segment: int | None = None
+        self,
+        strategy_id: str,
+        security_id: str,
+        *,
+        segment: int | None = None,
+        mode: int | None = None,
     ) -> None:
         """Ask for an instrument to be added mid-session. Safe from **any** thread.
 
@@ -235,6 +240,11 @@ class SharedFeedHub:
         options runtime must pass it: the hub's default is the *underlying's*
         segment (``IDX_I``), and an option contract subscribed there delivers
         nothing at all rather than erroring. ``None`` keeps the adapter default.
+
+        ``mode`` names the subscription mode, and an options runtime must pass
+        that too: the hub's default is the underlying's Ticker mode, which carries
+        no order book, so a contract subscribed there streams prices the paper fill
+        model then has to price off last price instead of bid/ask.
 
         Enqueues and returns. It never calls the adapter, for the same reason
         :meth:`request_stop` never closes the connection: the thread that called
@@ -250,7 +260,7 @@ class SharedFeedHub:
         """
         if self._pending_since is None:
             self._pending_since = time.monotonic()
-        self._pending_subscriptions.append((strategy_id, security_id, segment))
+        self._pending_subscriptions.append((strategy_id, security_id, segment, mode))
 
     def pending_subscription_age_seconds(self) -> float:
         """How long the oldest unapplied subscription has been waiting.
@@ -269,7 +279,12 @@ class SharedFeedHub:
         """Drain the request queue into the adapter. **Feed thread only.**"""
         while True:
             try:
-                strategy_id, security_id, segment = self._pending_subscriptions.popleft()
+                (
+                    strategy_id,
+                    security_id,
+                    segment,
+                    mode,
+                ) = self._pending_subscriptions.popleft()
             except IndexError:
                 # Drained. Clear the clock so the next request times from itself
                 # rather than from a request that has already been served.
@@ -293,13 +308,14 @@ class SharedFeedHub:
             channel.dynamic_ids.add(security_id)
             # Union semantics in the adapter mean a second worker asking for an
             # instrument the group already holds sends nothing to the broker.
-            self._adapter.subscribe([security_id], segment=segment)
+            self._adapter.subscribe([security_id], segment=segment, mode=mode)
             self.subscriptions_applied += 1
             _log.info(
-                "subscribed at runtime strategy_id=%s security_id=%s segment=%s",
+                "subscribed at runtime strategy_id=%s security_id=%s segment=%s mode=%s",
                 strategy_id,
                 security_id,
                 "default" if segment is None else segment,
+                "default" if mode is None else mode,
             )
 
     def drop_subscription(self, strategy_id: str, security_id: str) -> None:

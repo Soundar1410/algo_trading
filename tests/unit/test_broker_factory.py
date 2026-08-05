@@ -130,7 +130,18 @@ def test_every_single_gate_alone_is_enough_to_block(kwargs: dict[str, bool]):
 def test_paper_broker_receives_its_configuration():
     broker = build_broker(
         _config(mode=ExecutionMode.PAPER),
-        paper_execution={"slippage_points": 1.25},
+        paper_execution={"slippage": {"options": {"mode": "ticks", "market_order_ticks": 2}}},
     )
     assert isinstance(broker, PaperBroker)
-    assert broker.config.slippage_points == 1.25
+    assert broker.config.slippage.market_order_ticks == 2
+
+
+def test_paper_broker_receives_the_quote_book():
+    """Without it the fill model has no post-latency quote to select and no way to
+    settle a resting order, so it must not be silently droppable."""
+    from common.broker import QuoteBook
+
+    quotes = QuoteBook()
+    broker = build_broker(_config(mode=ExecutionMode.PAPER), quotes=quotes)
+    assert isinstance(broker, PaperBroker)
+    assert broker.quotes is quotes

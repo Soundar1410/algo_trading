@@ -37,6 +37,38 @@ Phase 1 wrote this defensively and got three things wrong, all corrected here:
    first byte. Both failed the old ``isinstance(payload, dict)`` guard and
    inflated ``malformed_payloads``, making a genuine shape problem
    indistinguishable from ordinary traffic.
+
+Depth: **ratified** (Phase 4 Part 5)
+------------------------------------
+Only ``process_full`` (request code 21, first byte 8) carries a book. Verified
+against the pinned SDK: ``process_quote`` (code 17) returns LTQ, volume, buy/sell
+quantity totals and session OHLC and **no depth at all**, and ``MarketFeed``
+refuses any v2 mode outside ``{15, 17, 21}``, so the 20-level depth code 19 is not
+available to us. Full Data is:
+
+.. code-block:: python
+
+    {"type": "Full Data", ..., "LTP": "1234.55", "LTQ": int, "LTT": "09:15:03",
+     "depth": [{"bid_quantity": int, "ask_quantity": int, "bid_orders": int,
+                "ask_orders": int, "bid_price": "1234.50", "ask_price": "1234.60"},
+               ...5 levels...]}
+
+Two properties of that structure decide how it is read here:
+
+1. **Prices are formatted strings**, built by ``"{:.2f}".format(...)`` exactly as
+   ``LTP`` is, so they are coerced rather than assumed numeric.
+2. **A level with no order carries ``"0.00"``**, not a missing key. Zero is
+   therefore *absence*, and :func:`_price_or_none` maps it to ``None``. Reading it
+   as a real price would make :attr:`~common.broker.base.Quote.has_depth` true with
+   a bid of zero, and a sell would then price at ``0 - slippage`` — i.e. every exit
+   on a one-sided book refused by the simulator. The reference repository's
+   normaliser does exactly that; it is not copied.
+
+Adding ``"Full Data"`` to :data:`_TICK_TYPES` is what makes mode 21 usable at all.
+Without it the frame falls through to the unrecognised-type branch, which counts a
+*non-tick* and logs at **debug** — so a Full-mode feed would run connected and
+silent, producing no candles, no indicators and no orders, with nothing above debug
+level to say why.
 """
 
 from __future__ import annotations
@@ -55,14 +87,36 @@ from .adapter import TickCallback
 
 _log = get_logger(__name__)
 
-#: Subscription mode. Ticker gives last price and time, which is all a candle
-#: needs. Quote/Full add depth and volume and belong to the Phase 4 fill model.
+#: Subscription modes, as the v2 protocol numbers them. Ticker gives last price
+#: and time, which is all a candle needs. Quote adds traded quantity, volume and
+#: session OHLC — **not** depth, despite what this comment claimed before Phase 4
+#: Part 5. Only Full carries a bid/ask book, which is what the paper fill model
+#: prices against. ``MarketFeed`` rejects any other value on v2.
 TICKER_MODE = 15
 QUOTE_MODE = 17
+FULL_MODE = 21
+
+#: Every mode the SDK accepts on v2. Checked here so an unusable mode fails at
+#: subscription rather than inside the SDK's batching, where the message names no
+#: instrument.
+FEED_MODES = frozenset({TICKER_MODE, QUOTE_MODE, FULL_MODE})
+
+
+def _is_feed_mode(value: object) -> bool:
+    """True only for an exact ``int`` naming a v2 mode.
+
+    Exact on purpose. ``21.0 in FEED_MODES`` is ``True`` and the SDK's own
+    batching would then key a ``defaultdict`` by a float, which happens to work
+    and would leave a wrongly-typed value travelling to the socket — the sort of
+    thing that survives until the day it does not. ``bool`` is excluded for the
+    usual reason: ``True`` is ``1``, and no mode is 1.
+    """
+    return type(value) is int and value in FEED_MODES
+
 
 #: ``type`` values that carry a tradeable price. Everything else is a legitimate
 #: non-tick frame, not a parse failure.
-_TICK_TYPES = frozenset({"Ticker Data", "Quote Data"})
+_TICK_TYPES = frozenset({"Ticker Data", "Quote Data", "Full Data"})
 
 #: ``type`` values we recognise and intentionally ignore.
 _NON_TICK_TYPES = frozenset({"Previous Close", "OI Data", "Market Depth"})
@@ -112,6 +166,14 @@ class FeedCounters:
     #: the open, especially for far-out-of-the-money strikes; a count that stays
     #: high all session means we are subscribed to something illiquid.
     untraded_frames: int = 0
+    #: Ticks carrying a two-sided book, i.e. the ones the fill model can price
+    #: against bid/ask instead of falling back to last price.
+    ticks_with_depth: int = 0
+    #: Ticks from a Full-mode frame whose top of book had one side or neither.
+    #: Ordinary for an illiquid strike and *not* an error, but a rate that stays
+    #: high means paper fills are being priced off LTP while the config believes
+    #: they are being priced off the book.
+    ticks_one_sided_book: int = 0
     disconnects: int = 0
     disconnect_codes: dict[int, int] = field(default_factory=dict)
 
@@ -119,6 +181,11 @@ class FeedCounters:
     def fallback_ratio(self) -> float:
         """Share of ticks whose exchange timestamp could not be reconstructed."""
         return self.exchange_time_fallbacks / self.ticks if self.ticks else 0.0
+
+    @property
+    def depth_ratio(self) -> float:
+        """Share of ticks that carried a two-sided book."""
+        return self.ticks_with_depth / self.ticks if self.ticks else 0.0
 
 
 def reconstruct_exchange_time(
@@ -205,6 +272,11 @@ class DhanMarketFeedAdapter:
         self._exchange_segment = exchange_segment
         self._instrument_label = instrument_label
         self._instrument_labels = dict(instrument_labels or {})
+        if not _is_feed_mode(feed_mode):
+            raise DhanFeedError(
+                f"Unsupported feed mode {feed_mode!r}. The v2 protocol accepts only "
+                f"{sorted(FEED_MODES)} (ticker/quote/full)."
+            )
         self._feed_mode = feed_mode
         self._security_ids: set[str] = set()
         #: security_id → exchange segment, for ids that do not live in the
@@ -212,6 +284,13 @@ class DhanMarketFeedAdapter:
         #: index sits in ``IDX_I`` (0) and its contracts in ``NSE_FNO`` (2), and
         #: one adapter carries both at once. Ids absent here use the default.
         self._segments: dict[str, int] = {}
+        #: security_id → subscription mode, for the same reason and with the same
+        #: shape as ``_segments``. An options runtime wants two at once: the
+        #: underlying index on Ticker, because an index has no order book to
+        #: stream, and its contracts on Full, because that is the only mode that
+        #: carries one. ``MarketFeed.validate_and_process_tuples`` already batches
+        #: a mixed instrument list by mode, so both travel on one socket.
+        self._modes: dict[str, int] = {}
         self._feed: Any = None
         self._running = False
         #: Ident of the thread currently inside :meth:`start`, i.e. the thread
@@ -238,14 +317,23 @@ class DhanMarketFeedAdapter:
         return self.last_disconnect_code == DISCONNECT_TOKEN_EXPIRED
 
     # ------------------------------------------------------------ subscription
-    def subscribe(self, security_ids: Sequence[str], *, segment: int | None = None) -> None:
+    def subscribe(
+        self,
+        security_ids: Sequence[str],
+        *,
+        segment: int | None = None,
+        mode: int | None = None,
+    ) -> None:
         """Union semantics — a resubscribe must not duplicate instruments.
 
-        ``segment`` is remembered per security id, so a later
+        ``segment`` and ``mode`` are both remembered per security id, so a later
         :meth:`resubscribe_all` after a reconnect restores each instrument to the
-        segment it was actually subscribed on. Without that the underlying would
-        come back on the option segment (or vice versa) and the feed would
-        reconnect into silence — a failure that looks exactly like a quiet market.
+        segment *and* mode it was actually subscribed on. Without the segment the
+        underlying would come back on the option segment (or vice versa) and the
+        feed would reconnect into silence — a failure that looks exactly like a
+        quiet market. Without the mode a reconnect would silently demote the option
+        contracts to Ticker, and the fill model would start pricing off last price
+        while still reporting itself as depth-driven.
         """
         wanted = {str(s) for s in security_ids}
         if segment is not None:
@@ -260,6 +348,18 @@ class DhanMarketFeedAdapter:
                 )
             for sid in wanted:
                 self._segments[sid] = segment
+
+        if mode is not None:
+            if not _is_feed_mode(mode):
+                raise DhanFeedError(
+                    f"Unsupported feed mode {mode!r}. The v2 protocol accepts only "
+                    f"{sorted(FEED_MODES)} (ticker/quote/full)."
+                )
+            # Unlike a segment, a mode change on an already-subscribed instrument
+            # is legitimate — the SDK simply sends another subscription frame — so
+            # this overwrites rather than refusing.
+            for sid in wanted:
+                self._modes[sid] = mode
 
         new = wanted - self._security_ids
         self._security_ids.update(new)
@@ -279,11 +379,18 @@ class DhanMarketFeedAdapter:
         """The segment this instrument is subscribed on. Public for assertions."""
         return self._segment_for(str(security_id))
 
+    def mode_for(self, security_id: str) -> int:
+        """The mode this instrument is subscribed in. Public for assertions."""
+        return self._mode_for(str(security_id))
+
     def _segment_for(self, security_id: str) -> int:
         return self._segments.get(security_id, self._exchange_segment)
 
+    def _mode_for(self, security_id: str) -> int:
+        return self._modes.get(security_id, self._feed_mode)
+
     def _instrument_tuples(self, security_ids: set[str]) -> list[tuple[int, str, int]]:
-        return [(self._segment_for(sid), sid, self._feed_mode) for sid in sorted(security_ids)]
+        return [(self._segment_for(sid), sid, self._mode_for(sid)) for sid in sorted(security_ids)]
 
     # ---------------------------------------------------------------- lifecycle
     def start(self, on_tick: TickCallback) -> None:
@@ -480,7 +587,16 @@ class DhanMarketFeedAdapter:
             self.counters.exchange_time_fallbacks += 1
             exchange_time = received
 
+        bid, ask = _top_of_book(payload)
         self.counters.ticks += 1
+        if bid is not None and ask is not None:
+            self.counters.ticks_with_depth += 1
+        elif "depth" in payload:
+            # A Full-mode frame arrived but the top of book was one-sided or empty.
+            # Counted separately from "this mode carries no depth at all", because
+            # the two need different responses: this one is an illiquid strike, the
+            # other is a misconfigured subscription.
+            self.counters.ticks_one_sided_book += 1
         return Tick(
             security_id=security_id,
             instrument=self._instrument_labels.get(security_id, self._instrument_label),
@@ -488,6 +604,8 @@ class DhanMarketFeedAdapter:
             exchange_time=exchange_time,
             received_at=received,
             last_quantity=_as_int(payload.get("LTQ")),
+            bid_price=bid,
+            ask_price=ask,
         )
 
 
@@ -504,6 +622,42 @@ def _is_never_traded(raw: object) -> bool:
     if isinstance(raw, int | float):
         return raw <= 0
     return str(raw).strip() == NEVER_TRADED_LTT
+
+
+def _top_of_book(payload: dict[str, Any]) -> tuple[float | None, float | None]:
+    """Best bid and ask from a Full-mode frame, or ``(None, None)``.
+
+    The SDK renders every depth price through ``"{:.2f}".format(...)``, so these
+    are strings, and a level with no resting order renders as ``"0.00"`` rather
+    than being omitted. **Zero therefore means absence**, which is why this goes
+    through :func:`_price_or_none` rather than ``float()``: a bid of ``0.0`` would
+    make the quote look two-sided to the fill model, and a sell would then be
+    priced at ``0 - slippage`` and refused. Each side is resolved independently,
+    so a book with only an ask still yields that ask.
+
+    Ticker and Quote frames have no ``depth`` key at all and fall out here with
+    both sides ``None``, which is the same answer they gave before Part 5.
+    """
+    depth = payload.get("depth")
+    if not isinstance(depth, list) or not depth:
+        return None, None
+    top = depth[0]
+    if not isinstance(top, dict):
+        return None, None
+    return _price_or_none(top.get("bid_price")), _price_or_none(top.get("ask_price"))
+
+
+def _price_or_none(value: object) -> float | None:
+    """Coerce a depth price, mapping absent/zero/negative/unparseable to ``None``."""
+    if value is None or isinstance(value, bool):
+        return None
+    if not isinstance(value, int | float | str):
+        return None
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    return price if price > 0 else None
 
 
 def _as_int(value: object) -> int:

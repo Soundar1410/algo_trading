@@ -66,9 +66,11 @@ from pathlib import Path
 from typing import Any
 
 from common.broker import build_broker
+from common.broker.quotes import QuoteBook
 from common.config.paths import load_paths
 from common.engine.config import EngineConfig, SessionConfig
 from common.engine.engine import TradingEngine
+from common.engine.feed import SubscriptionMode
 from common.engine.gateway import LifecycleGateway
 from common.engine.hub_feed import HubTickFeed
 from common.engine.models import AdoptedPosition, OptionContract, OptionType, OrderSide
@@ -418,12 +420,35 @@ def _build(
     control_queue: Any,
 ) -> tuple[TradingEngine, LifecycleGateway, HubTickFeed, PositionManager, _Recovered]:
     """Assemble the engine and everything behind it."""
+    option_selector, option_segment = build_option_selector(config, engine_config)
+    # Full (21) is the only mode carrying a bid/ask book, and the paper fill model
+    # prices against it (Phase 4 Part 5). Derived from ``option_segment`` rather
+    # than configured beside it, because the two answer the same question: a
+    # synthetic contract has neither a real exchange segment nor a real book, so
+    # the recorded paths keep the hub's Ticker default and behave as they did.
+    option_mode = None if option_segment is None else int(SubscriptionMode.FULL)
+
+    # One book, two readers (Phase 4 Part 5): the lifecycle takes the *current*
+    # quote from it to price a fill against a real bid/ask, and the paper broker
+    # takes a *range* of recent quotes from it to select one at the simulated
+    # latency deadline and to settle resting limit orders. It is filled by the
+    # feed observer registered below, on the same thread that then reads it.
+    quotes = QuoteBook()
+
+    # The lot size and tick size the broker's rejection rules check against come
+    # from the exchange's own daily master when there is one. ``None`` for the
+    # simulated resolver, which leaves those rules inactive — inventing a lot size
+    # to validate synthetic contracts against would reject correct orders.
+    instrument_rules = getattr(option_selector.resolver, "instrument_rules", None)
+
     # The live gate stays where Phase 1 put it (deviation D5/D19): the factory
     # refuses live, and the engine's arrival does not get its own opinion about it.
     broker = build_broker(
         resolved_config_stub(config),
         paper_execution=config.paper_execution,
         cost_rates=config.cost_rates,
+        quotes=quotes,
+        instrument_rules=instrument_rules,
     )
     lifecycle = OrderLifecycle(
         repository=repository,
@@ -433,6 +458,7 @@ def _build(
         execution_mode=config.execution_mode,
         session_id=session_id,
         config_fingerprint=config.config_fingerprint,
+        quotes=quotes,
     )
     gateway = LifecycleGateway(
         lifecycle,
@@ -478,7 +504,6 @@ def _build(
             "here may differ from the hub's, so trading on them is not safe"
         )
 
-    option_selector, option_segment = build_option_selector(config, engine_config)
     warmup_manager, warmup_source = build_warmup_manager(config, engine_config)
 
     # Hoisted above the feed so the wall-clock net below and the engine share **one**
@@ -497,7 +522,7 @@ def _build(
     feed = HubTickFeed(
         tick_queue,
         request_subscription=_subscription_sender(
-            config, control_queue, option_segment=option_segment
+            config, control_queue, option_segment=option_segment, option_mode=option_mode
         ),
         on_square_off=_on_square_off,
         on_tick_dropped=_on_tick_dropped,
@@ -511,6 +536,10 @@ def _build(
         poll_seconds=engine_config.feed_poll_seconds,
         idle_timeout_seconds=config.idle_timeout_seconds,
     )
+    # Ahead of the engine's own handler, which the feed contract guarantees: the
+    # engine's reaction to a tick may be to place an order priced off exactly that
+    # tick's quote, so the book must already hold it by then.
+    feed.add_tick_observer(quotes.record)
 
     recovered = _Recovered()
 
@@ -838,6 +867,7 @@ def _subscription_sender(
     control_queue: Any,
     *,
     option_segment: int | None = None,
+    option_mode: int | None = None,
 ) -> Callable[[str], None] | None:
     """Forward the engine's runtime subscriptions upstream, never blocking.
 
@@ -847,23 +877,32 @@ def _subscription_sender(
     Non-blocking for the same reason the hub's own queues are: this runs on the tick
     callback path, and a blocked send here stalls the engine's whole feed.
 
-    **Where the exchange segment is decided.** The engine's feed contract is
-    ``subscribe(security_id)`` — one string, no segment — and widening it would
-    mean touching :class:`~common.engine.engine.TradingEngine`, whose ported
-    session-gating test pins it attribute by attribute. It does not need
-    widening: this runtime already knows the answer. Everything the engine
-    subscribes at runtime other than the underlying **is** an option contract, so
-    the underlying keeps the hub's default segment and every other id gets
-    ``option_segment``. Deciding it here also keeps the knowledge in the wiring,
-    which is where the rest of the instrument resolution lives.
+    **Where the exchange segment and the subscription mode are decided.** The
+    engine's feed contract is ``subscribe(security_id)`` — one string, no segment
+    and no mode — and widening it would mean touching
+    :class:`~common.engine.engine.TradingEngine`, whose ported session-gating test
+    pins it attribute by attribute. It does not need widening: this runtime already
+    knows the answer. Everything the engine subscribes at runtime other than the
+    underlying **is** an option contract, so the underlying keeps the hub's
+    defaults and every other id gets ``option_segment`` and ``option_mode``.
+    Deciding it here also keeps the knowledge in the wiring, which is where the
+    rest of the instrument resolution lives.
+
+    The mode split is not cosmetic. An index carries no order book at all, so
+    putting the underlying on Full would gain nothing and cost a wider frame per
+    tick; an option contract on Ticker carries no book either, and the paper fill
+    model would then price every fill off last price while its configuration said
+    it was pricing off bid/ask.
     """
     if control_queue is None:
         return None
 
     def _send(security_id: str) -> None:
-        segment = None if security_id == config.security_id else option_segment
+        is_underlying = security_id == config.security_id
+        segment = None if is_underlying else option_segment
+        mode = None if is_underlying else option_mode
         try:
-            control_queue.put_nowait((security_id, segment))
+            control_queue.put_nowait((security_id, segment, mode))
         except Exception:  # a full or closed queue must not stop the run
             log.exception(
                 "could not forward a subscription request for %s from %s; ticks for it "

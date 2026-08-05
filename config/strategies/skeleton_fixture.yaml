@@ -32,6 +32,22 @@ parameters:
   candle_interval_seconds: 60
 
   paper_execution:
-    slippage_points: 0.05
+    # The spec's section 6 shape. `slippage_points: 0.05` is still accepted and
+    # means the same thing here — one NSE index-option tick is ₹0.05 — but ticks
+    # are what the spec names for options, and a whole number of them keeps a
+    # simulated fill on the tick grid by construction.
+    slippage:
+      options:
+        mode: ticks
+        market_order_ticks: 1
     submission_latency_ms: 250
+    tick_size: 0.05
     allow_ltp_fallback: true
+    # Spec 5.1 permits the last-price fallback only with a conservative extra
+    # cost. A price taken from the last trade rather than a resting order is a
+    # worse estimate of what we would have paid, so it must cost more.
+    ltp_fallback_extra_ticks: 1
+    # Explicitly off. This fixture replays a recorded tape whose timestamps are
+    # historic, so a freshness check against the wall clock would refuse every
+    # order. A live-feed configuration should set this (e.g. 2000).
+    max_quote_age_ms: null

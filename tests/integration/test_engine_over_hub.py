@@ -138,7 +138,13 @@ class _PacedAdapter:
     def subscribed(self) -> frozenset[str]:
         return frozenset(self._subscribed)
 
-    def subscribe(self, security_ids: Sequence[str], *, segment: int | None = None) -> None:
+    def subscribe(
+        self,
+        security_ids: Sequence[str],
+        *,
+        segment: int | None = None,
+        mode: int | None = None,
+    ) -> None:
         self._subscribed.update(security_ids)
 
     def request_stop(self) -> None:

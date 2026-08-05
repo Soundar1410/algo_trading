@@ -169,17 +169,34 @@ def test_the_option_carries_the_segment_and_the_underlying_does_not(tmp_path: Pa
     send("13")  # the underlying
     send("8103")  # the option the engine chose
 
-    assert control.get_nowait() == ("13", None)
-    assert control.get_nowait() == ("8103", NSE_FNO)
+    assert control.get_nowait() == ("13", None, None)
+    assert control.get_nowait() == ("8103", NSE_FNO, None)
 
 
-def test_a_simulated_run_sends_no_segment_at_all(tmp_path: Path):
+def test_the_option_carries_the_full_mode_and_the_underlying_does_not(tmp_path: Path):
+    """Phase 4 Part 5. An index has no order book in any mode, so putting the
+    underlying on Full buys a wider frame per tick and nothing else; an option left
+    on Ticker carries no book either, and the paper fill model would price every
+    fill off last price while its config said bid/ask."""
     config = _worker_config(tmp_path)
     control: queue_module.Queue = queue_module.Queue()
-    send = _subscription_sender(config, control, option_segment=None)
+    send = _subscription_sender(config, control, option_segment=NSE_FNO, option_mode=21)
+    assert send is not None
+
+    send("13")
+    send("8103")
+
+    assert control.get_nowait() == ("13", None, None)
+    assert control.get_nowait() == ("8103", NSE_FNO, 21)
+
+
+def test_a_simulated_run_sends_no_segment_or_mode_at_all(tmp_path: Path):
+    config = _worker_config(tmp_path)
+    control: queue_module.Queue = queue_module.Queue()
+    send = _subscription_sender(config, control, option_segment=None, option_mode=None)
     assert send is not None
     send("SIM:NIFTY:WEEKLY:24000:CE")
-    assert control.get_nowait() == ("SIM:NIFTY:WEEKLY:24000:CE", None)
+    assert control.get_nowait() == ("SIM:NIFTY:WEEKLY:24000:CE", None, None)
 
 
 def test_no_control_queue_still_means_no_sender(tmp_path: Path):
@@ -198,15 +215,22 @@ def test_a_full_control_queue_does_not_stop_the_run(tmp_path: Path):
 
 
 # ------------------------------------------------------ supervisor wire format
-def test_the_supervisor_reads_the_new_tuple_shape():
-    assert _parse_subscription_request(("8103", NSE_FNO)) == ("8103", NSE_FNO)
-    assert _parse_subscription_request(("8103", None)) == ("8103", None)
+def test_the_supervisor_reads_the_segment_and_mode_tuple():
+    assert _parse_subscription_request(("8103", NSE_FNO, 21)) == ("8103", NSE_FNO, 21)
+    assert _parse_subscription_request(("8103", None, None)) == ("8103", None, None)
+
+
+def test_the_supervisor_still_reads_the_two_element_shape():
+    """A worker that started before the Part 5 upgrade can still have entries on
+    the queue, so the segment-only shape is accepted rather than migrated."""
+    assert _parse_subscription_request(("8103", NSE_FNO)) == ("8103", NSE_FNO, None)
+    assert _parse_subscription_request(("8103", None)) == ("8103", None, None)
 
 
 def test_the_supervisor_still_reads_a_bare_id():
     """The recorded paths and any pre-Phase-4 sender put a plain string on the
     queue. Dropping that shape would break them silently."""
-    assert _parse_subscription_request("8103") == ("8103", None)
+    assert _parse_subscription_request("8103") == ("8103", None, None)
 
 
 @pytest.mark.parametrize(
@@ -222,6 +246,9 @@ def test_the_supervisor_still_reads_a_bare_id():
         ("", 2),
         (2, "8103"),  # the right pieces in the wrong order
         ["8103", 2],
+        ("8103", 2, "full"),  # the name, not the code
+        ("8103", 2, True),  # a bool is an int, and would subscribe in mode 1
+        ("8103", 2, 21, 0),  # one element too many
     ],
 )
 def test_a_malformed_request_is_dropped_rather_than_crashing_the_group(malformed):

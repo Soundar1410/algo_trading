@@ -350,6 +350,90 @@ def test_a_real_option_contract_delivers_ticks_on_the_fno_segment(tmp_path: Path
     assert tick.exchange_time <= tick.received_at
 
 
+# ------------------------------------------------------ Phase 4 Part 5: depth
+@needs_credentials
+def test_a_real_option_in_full_mode_delivers_a_two_sided_book(tmp_path: Path):
+    """**The Part 5 gate item, and the one that must be run live.**
+
+    Everything else about the fill model is provable offline against a Full frame
+    packed from Dhan's documented layout and parsed by the SDK's own
+    ``process_full``. What that cannot establish is that a *real* ``NSE_FNO``
+    option, subscribed in mode 21 against the real socket, actually delivers a
+    two-sided book — which is the single fact the whole of Part 5 rests on, and
+    the reason Part 1 was a hard precondition for it.
+
+    It also pins the mode split that makes the subscription work at all: the
+    index stays on Ticker (an index has no order book in any mode) while its
+    contract goes on Full, both on one adapter and one socket.
+
+    Read-only: it subscribes and listens. No order, no order-capable endpoint.
+    Needs market hours; a far wing that has not traded delivers nothing, which is
+    correct behaviour rather than a defect — hence the ATM strike below.
+    """
+    from common.market_data.dhan import FULL_MODE, TICKER_MODE, DhanMarketFeedAdapter
+    from common.market_data.scrip_master import (
+        ScripMaster,
+        ScripMasterCache,
+        resolve_index_meta,
+        segment_code,
+    )
+    from common.models import OptionType
+
+    meta = resolve_index_meta("NIFTY")
+    master = ScripMaster("NIFTY").load(cache=ScripMasterCache(tmp_path))
+    expiry = master.nearest_expiry()
+    spot = _index_last_price(tmp_path, meta)
+    atm = min(master.strikes_for_expiry(expiry), key=lambda strike: abs(strike - spot))
+    contract = master.get(atm, OptionType.CE, expiry)
+    assert contract is not None
+
+    adapter = DhanMarketFeedAdapter(
+        client_id=str(_CLIENT_ID),
+        access_token=_token(tmp_path),
+        exchange_segment=segment_code(meta.segment),
+    )
+    adapter.subscribe([meta.security_id])
+    adapter.subscribe(
+        [contract.security_id],
+        segment=segment_code(meta.fno_segment),
+        mode=FULL_MODE,
+    )
+    assert adapter.mode_for(meta.security_id) == TICKER_MODE
+    assert adapter.mode_for(contract.security_id) == FULL_MODE
+
+    with_book: list[Tick] = []
+    done = threading.Event()
+
+    def _on_tick(tick: Tick) -> None:
+        if tick.security_id != contract.security_id:
+            return
+        if tick.bid_price is not None and tick.ask_price is not None:
+            with_book.append(tick)
+            done.set()
+            adapter.request_stop()
+
+    thread = threading.Thread(target=adapter.start, args=(_on_tick,), daemon=True)
+    thread.start()
+    arrived = done.wait(timeout=_TIMEOUT_SECONDS)
+    adapter.request_stop()
+    thread.join(timeout=_TIMEOUT_SECONDS)
+
+    assert arrived, (
+        f"no two-sided book for {contract.symbol} (id {contract.security_id}) within "
+        f"{_TIMEOUT_SECONDS:.0f}s. ticks={adapter.counters.ticks} "
+        f"with_depth={adapter.counters.ticks_with_depth} "
+        f"one_sided={adapter.counters.ticks_one_sided_book} "
+        f"non_tick={adapter.counters.non_tick_frames}. A non_tick count rising with "
+        "no ticks would mean 'Full Data' is not being recognised at all."
+    )
+    tick = with_book[0]
+    assert tick.bid_price is not None and tick.ask_price is not None
+    assert 0 < tick.bid_price <= tick.ask_price, "a crossed or zero book is not a book"
+    assert tick.exchange_time <= tick.received_at
+    assert adapter.counters.malformed_payloads == 0
+    assert adapter.counters.ticks_with_depth > 0
+
+
 # --------------------------------------------------- Phase 4 Part 4: warm-up
 @needs_credentials
 def test_the_intraday_endpoint_returns_a_success_shape_during_market_hours(

@@ -77,6 +77,10 @@ class RecordedFeedAdapter:
         #: security_id → the segment the caller asked for, when it named one.
         #: Replay ignores it; tests read it to prove the hub forwarded it.
         self.requested_segments: dict[str, int] = {}
+        #: security_id → the subscription mode the caller asked for. Same purpose
+        #: and same non-effect on replay: a tape already carries whatever depth it
+        #: carries, so the mode is recorded to be asserted on, not acted upon.
+        self.requested_modes: dict[str, int] = {}
         self.duplicate_count = 0
         self.out_of_order_count = 0
         self.delivered_count = 0
@@ -89,18 +93,27 @@ class RecordedFeedAdapter:
     def subscribed(self) -> frozenset[str]:
         return frozenset(self._subscribed)
 
-    def subscribe(self, security_ids: Sequence[str], *, segment: int | None = None) -> None:
+    def subscribe(
+        self,
+        security_ids: Sequence[str],
+        *,
+        segment: int | None = None,
+        mode: int | None = None,
+    ) -> None:
         # Union semantics: re-subscribing after a simulated reconnect must not
         # duplicate, which is why this is a set rather than a list.
         #
-        # ``segment`` is accepted and recorded but does not affect replay: a tape
-        # is already resolved down to security ids. Recording it anyway lets a
-        # test assert that the hub forwarded the right segment without needing a
-        # live adapter to observe it.
+        # ``segment`` and ``mode`` are accepted and recorded but do not affect
+        # replay: a tape is already resolved down to security ids and already
+        # carries whatever depth it carries. Recording them anyway lets a test
+        # assert that the hub forwarded the right values without needing a live
+        # adapter to observe it.
         self._subscribed.update(security_ids)
-        if segment is not None:
-            for security_id in security_ids:
+        for security_id in security_ids:
+            if segment is not None:
                 self.requested_segments[str(security_id)] = segment
+            if mode is not None:
+                self.requested_modes[str(security_id)] = mode
 
     def request_stop(self) -> None:
         """Ask the replay to finish. Safe from any thread; see the Protocol.

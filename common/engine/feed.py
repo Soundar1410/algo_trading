@@ -80,12 +80,31 @@ class MarketDataFeed(ABC):
     def __init__(self) -> None:
         self._on_tick: TickHandler | None = None
         self._on_status: StatusHandler | None = None
+        self._observers: list[TickHandler] = []
         self._subscribed: set[str] = set()
         self._running = False
 
     def on_tick(self, handler: TickHandler) -> None:
         """Register the callback invoked for every received tick."""
         self._on_tick = handler
+
+    def add_tick_observer(self, observer: TickHandler) -> None:
+        """Register something that *watches* ticks without consuming them.
+
+        Phase 4 Part 5, for :class:`~common.broker.quotes.QuoteBook`. Distinct from
+        :meth:`on_tick`, which has exactly one owner — ``TradingEngine.run`` sets
+        it to ``self.on_tick``, so a worker that wrapped the handler afterwards
+        would simply be overwritten. Observers are additive, run **before** the
+        handler, and cannot replace it.
+
+        Ordering is the point: the quote book must already hold this tick by the
+        time the engine reacts to it, because the engine's reaction may be to
+        place an order that prices itself off exactly that quote.
+
+        An observer runs on the feed callback thread and inherits that contract in
+        full: it must return quickly and must not touch the connection.
+        """
+        self._observers.append(observer)
 
     def on_status(self, handler: StatusHandler) -> None:
         """Register an optional lifecycle callback; existing consumers ignore it."""
@@ -107,6 +126,8 @@ class MarketDataFeed(ABC):
         return frozenset(self._subscribed)
 
     def _emit(self, tick: Tick) -> None:
+        for observer in self._observers:
+            observer(tick)
         if self._on_tick is not None:
             self._on_tick(tick)
 

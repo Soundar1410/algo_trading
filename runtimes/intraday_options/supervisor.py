@@ -104,32 +104,44 @@ SUPERVISOR_ROLE = "supervisor"
 STUCK_SUBSCRIPTION_SECONDS = 30.0
 
 
-def _parse_subscription_request(request: object) -> tuple[str, int | None] | None:
-    """Normalise one control-queue entry into ``(security_id, segment)``.
+def _parse_subscription_request(request: object) -> tuple[str, int | None, int | None] | None:
+    """Normalise one control-queue entry into ``(security_id, segment, mode)``.
 
-    Two shapes are accepted, and both are real:
+    Three shapes are accepted, and all three are real:
 
-    * ``"49081"`` — a bare id, meaning "the hub's default segment". This is what
-      every pre-Phase-4 sender put on the queue, and the recorded-tape paths
-      still do.
+    * ``"49081"`` — a bare id, meaning "the hub's defaults". This is what every
+      pre-Phase-4 sender put on the queue, and the recorded-tape paths still do.
     * ``("49081", 2)`` — an id and the numeric exchange segment it lives in.
       Phase 4 Part 1 added this so an option contract chosen mid-session is
       subscribed on ``NSE_FNO`` rather than on the underlying's ``IDX_I``, where
       it would be accepted and then deliver nothing.
+    * ``("49081", 2, 21)`` — the same plus the subscription mode. Part 5 added
+      this so the contract arrives in Full mode, the only one carrying a bid/ask
+      book; on Ticker it streams prices the fill model can price only off LTP.
+
+    The two-element shape is still accepted rather than migrated, because the
+    queue can hold entries written by a worker that started before an upgrade.
 
     Returns ``None`` for anything else, so the caller can log and drop it. The
     child that sent a malformed entry is the one with the problem; taking the
     whole group down with it would be the worse outcome.
     """
     if isinstance(request, str):
-        return (request, None) if request else None
-    if isinstance(request, tuple) and len(request) == 2:
-        security_id, segment = request
+        return (request, None, None) if request else None
+    if isinstance(request, tuple) and len(request) in (2, 3):
+        security_id = request[0]
         if not isinstance(security_id, str) or not security_id:
             return None
-        if segment is None or (isinstance(segment, int) and not isinstance(segment, bool)):
-            return security_id, segment
+        segment = request[1]
+        mode = request[2] if len(request) == 3 else None
+        if _optional_code(segment) and _optional_code(mode):
+            return security_id, segment, mode
     return None
+
+
+def _optional_code(value: object) -> bool:
+    """True when ``value`` is ``None`` or a plain int (``bool`` is not an int here)."""
+    return value is None or (isinstance(value, int) and not isinstance(value, bool))
 
 
 @dataclass
@@ -540,8 +552,8 @@ class IntradayOptionsSupervisor:
                         request,
                     )
                     continue
-                security_id, segment = parsed
-                self._hub.request_subscription(strategy_id, security_id, segment=segment)
+                security_id, segment, mode = parsed
+                self._hub.request_subscription(strategy_id, security_id, segment=segment, mode=mode)
 
     def _beat_running(self, heartbeat: HeartbeatWriter) -> None:
         """One rate-limited liveness beat, carrying the group's queue picture."""

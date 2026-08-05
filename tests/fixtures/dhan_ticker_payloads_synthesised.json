@@ -1,6 +1,6 @@
 {
   "source": "synthesised",
-  "note": "SYNTHESISED, not captured -- produced in Block 1 by packing Dhan's documented binary layouts and running them through the installed dhanhq marketfeed.process_data(), so the shape is the SDK's own rather than hand-written. Deliberately kept alongside dhan_ticker_payloads_real.json (Block 2's real capture): this file exists solely to exercise every normalisation branch (Quote/OI/Previous-Close/status/untraded-instrument frames) that a real single-instrument ticker-mode capture cannot naturally produce. Do not delete when a new real tape is captured. Contains no credentials or account data.",
+  "note": "SYNTHESISED, not captured -- produced by packing Dhan's documented binary layouts and running them through the installed dhanhq marketfeed.process_data(), so the shape is the SDK's own rather than hand-written. Deliberately kept alongside dhan_ticker_payloads_real.json (Block 2's real capture): this file exists solely to exercise every normalisation branch (Quote/Full/OI/Previous-Close/status/untraded-instrument frames, and a Full frame whose book is one-sided or empty) that a real single-instrument ticker-mode capture cannot naturally produce. The Full frames were added in Phase 4 Part 5; test_dhan_adapter.py regenerates them from the installed SDK on every run and asserts they still match, so this file cannot drift from the SDK it describes. Do not delete when a new real tape is captured. Contains no credentials or account data.",
   "sdk_version": "2.2.0",
   "frames": [
     {
@@ -94,6 +94,198 @@
     {
       "label": "status",
       "payload": "Markets Open"
+    },
+    {
+      "label": "full",
+      "payload": {
+        "type": "Full Data",
+        "exchange_segment": 2,
+        "security_id": 49081,
+        "LTP": "187.45",
+        "LTQ": 75,
+        "LTT": "08:15:00",
+        "avg_price": "187.42",
+        "volume": 123456,
+        "total_sell_quantity": 4000,
+        "total_buy_quantity": 4200,
+        "OI": 55000,
+        "oi_day_high": 56000,
+        "oi_day_low": 54000,
+        "open": "180.00",
+        "close": "179.50",
+        "high": "191.00",
+        "low": "176.00",
+        "depth": [
+          {
+            "bid_quantity": 900,
+            "ask_quantity": 750,
+            "bid_orders": 3,
+            "ask_orders": 2,
+            "bid_price": "187.40",
+            "ask_price": "187.50"
+          },
+          {
+            "bid_quantity": 1200,
+            "ask_quantity": 1500,
+            "bid_orders": 5,
+            "ask_orders": 6,
+            "bid_price": "187.35",
+            "ask_price": "187.55"
+          },
+          {
+            "bid_quantity": 2100,
+            "ask_quantity": 1800,
+            "bid_orders": 8,
+            "ask_orders": 7,
+            "bid_price": "187.30",
+            "ask_price": "187.60"
+          },
+          {
+            "bid_quantity": 3000,
+            "ask_quantity": 2400,
+            "bid_orders": 11,
+            "ask_orders": 9,
+            "bid_price": "187.25",
+            "ask_price": "187.65"
+          },
+          {
+            "bid_quantity": 4500,
+            "ask_quantity": 3900,
+            "bid_orders": 14,
+            "ask_orders": 12,
+            "bid_price": "187.20",
+            "ask_price": "187.70"
+          }
+        ]
+      }
+    },
+    {
+      "label": "full_bid_only",
+      "payload": {
+        "type": "Full Data",
+        "exchange_segment": 2,
+        "security_id": 49081,
+        "LTP": "187.45",
+        "LTQ": 75,
+        "LTT": "08:15:00",
+        "avg_price": "187.42",
+        "volume": 123456,
+        "total_sell_quantity": 4000,
+        "total_buy_quantity": 4200,
+        "OI": 55000,
+        "oi_day_high": 56000,
+        "oi_day_low": 54000,
+        "open": "180.00",
+        "close": "179.50",
+        "high": "191.00",
+        "low": "176.00",
+        "depth": [
+          {
+            "bid_quantity": 900,
+            "ask_quantity": 0,
+            "bid_orders": 3,
+            "ask_orders": 0,
+            "bid_price": "187.40",
+            "ask_price": "0.00"
+          },
+          {
+            "bid_quantity": 0,
+            "ask_quantity": 0,
+            "bid_orders": 0,
+            "ask_orders": 0,
+            "bid_price": "0.00",
+            "ask_price": "0.00"
+          },
+          {
+            "bid_quantity": 0,
+            "ask_quantity": 0,
+            "bid_orders": 0,
+            "ask_orders": 0,
+            "bid_price": "0.00",
+            "ask_price": "0.00"
+          },
+          {
+            "bid_quantity": 0,
+            "ask_quantity": 0,
+            "bid_orders": 0,
+            "ask_orders": 0,
+            "bid_price": "0.00",
+            "ask_price": "0.00"
+          },
+          {
+            "bid_quantity": 0,
+            "ask_quantity": 0,
+            "bid_orders": 0,
+            "ask_orders": 0,
+            "bid_price": "0.00",
+            "ask_price": "0.00"
+          }
+        ]
+      }
+    },
+    {
+      "label": "full_empty_book",
+      "payload": {
+        "type": "Full Data",
+        "exchange_segment": 2,
+        "security_id": 49081,
+        "LTP": "187.45",
+        "LTQ": 75,
+        "LTT": "08:15:00",
+        "avg_price": "187.42",
+        "volume": 123456,
+        "total_sell_quantity": 4000,
+        "total_buy_quantity": 4200,
+        "OI": 55000,
+        "oi_day_high": 56000,
+        "oi_day_low": 54000,
+        "open": "180.00",
+        "close": "179.50",
+        "high": "191.00",
+        "low": "176.00",
+        "depth": [
+          {
+            "bid_quantity": 0,
+            "ask_quantity": 0,
+            "bid_orders": 0,
+            "ask_orders": 0,
+            "bid_price": "0.00",
+            "ask_price": "0.00"
+          },
+          {
+            "bid_quantity": 0,
+            "ask_quantity": 0,
+            "bid_orders": 0,
+            "ask_orders": 0,
+            "bid_price": "0.00",
+            "ask_price": "0.00"
+          },
+          {
+            "bid_quantity": 0,
+            "ask_quantity": 0,
+            "bid_orders": 0,
+            "ask_orders": 0,
+            "bid_price": "0.00",
+            "ask_price": "0.00"
+          },
+          {
+            "bid_quantity": 0,
+            "ask_quantity": 0,
+            "bid_orders": 0,
+            "ask_orders": 0,
+            "bid_price": "0.00",
+            "ask_price": "0.00"
+          },
+          {
+            "bid_quantity": 0,
+            "ask_quantity": 0,
+            "bid_orders": 0,
+            "ask_orders": 0,
+            "bid_price": "0.00",
+            "ask_price": "0.00"
+          }
+        ]
+      }
     }
   ]
 }

@@ -208,6 +208,20 @@ class Fill:
     latency_ms: int | None = None
     fill_method: str | None = None
     charges: float = 0.0
+    #: Whether the simulated latency actually selected a later quote, or the fill
+    #: fell back to the submission quote (Phase 4 Part 5, deviation D48). Recorded
+    #: per fill rather than asserted per configuration, because on a live feed the
+    #: post-latency quote does not exist yet at submission time. ``None`` for any
+    #: fill that did not come from the simulator.
+    latency_applied: bool | None = None
+    #: The submission-time quote the fill was priced against — spec section 6's
+    #: "record the submission-time quote". ``None`` on either side means the book
+    #: had no resting order there, which is why the fill fell back to last price.
+    quote_bid: float | None = None
+    quote_ask: float | None = None
+    #: How old that quote was when the fill was priced. ``None`` when the quote's
+    #: exchange timestamp is ahead of our clock, which is ordinary on a replay.
+    quote_age_ms: float | None = None
 
     def __post_init__(self) -> None:
         if self.quantity <= 0:

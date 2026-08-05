@@ -48,6 +48,12 @@ EXIT_NO_DATA = 4
 #: Keys that must never appear in a committed fixture.
 _FORBIDDEN_KEYS = ("token", "secret", "pin", "totp", "client", "password", "auth")
 
+#: Subscription modes by name. The numbers are the v2 protocol's own; they are
+#: repeated rather than imported because ``common.market_data.dhan`` is imported
+#: lazily below, after credentials are resolved, and a module-level import here
+#: would undo that. A unit test pins them equal to the adapter's constants.
+_MODES = {"ticker": 15, "quote": 17, "full": 21}
+
 _log = get_logger(__name__)
 
 
@@ -79,6 +85,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--segment", type=int, default=0, help="Exchange segment (0=IDX, 2=NSE_FNO)."
+    )
+    parser.add_argument(
+        "--mode",
+        choices=sorted(_MODES),
+        default="ticker",
+        help=(
+            "Subscription mode. 'full' is the only one carrying a bid/ask book, so "
+            "it is what a depth-bearing capture needs — and it only yields one on a "
+            "real NSE_FNO option (--segment 2), because an index has no order book."
+        ),
     )
     parser.add_argument("--label", default="NIFTY", help="Instrument label for the ticks.")
     parser.add_argument("--max-frames", type=int, default=200, help="Stop after this many frames.")
@@ -135,6 +151,7 @@ def main(argv: list[str] | None = None) -> int:
         access_token=token,
         exchange_segment=args.segment,
         instrument_label=args.label,
+        feed_mode=_MODES[args.mode],
     )
     adapter.subscribe(security_ids)
 
@@ -228,6 +245,8 @@ def main(argv: list[str] | None = None) -> int:
         "exchange_time_fallbacks": adapter.counters.exchange_time_fallbacks,
         "untraded_frames": adapter.counters.untraded_frames,
         "empty_frames": adapter.counters.empty_frames,
+        "ticks_with_depth": adapter.counters.ticks_with_depth,
+        "ticks_one_sided_book": adapter.counters.ticks_one_sided_book,
     }
     document: dict[str, Any] = {
         "source": "captured",
@@ -240,6 +259,7 @@ def main(argv: list[str] | None = None) -> int:
         "captured_at": datetime.now(UTC).isoformat(),
         "instruments": security_ids,
         "segment": args.segment,
+        "mode": args.mode,
         "counters": counters,
         "frames": frames,
     }
@@ -268,6 +288,12 @@ def main(argv: list[str] | None = None) -> int:
         print(
             "  WARNING: some ticks fell back to receipt time. The LTT format may "
             "have changed — reconstruct_exchange_time needs review."
+        )
+    if args.mode == "full" and not adapter.counters.ticks_with_depth:
+        print(
+            "  WARNING: a full-mode capture produced no two-sided book at all. Either "
+            "the instrument is illiquid, or it is not an option (an index carries no "
+            "book in any mode) — check --segment 2 and a real NSE_FNO security id."
         )
     return EXIT_OK
 

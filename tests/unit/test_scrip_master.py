@@ -376,3 +376,112 @@ def _all_rows(master: ScripMaster) -> list[OptionRow]:
                 if row is not None:
                     rows.append(row)
     return rows
+
+
+# ------------------------------------------------------------------ tick size
+#: A master carrying `SEM_TICK_SIZE`, in the units Dhan actually publishes.
+#: Assembled here rather than as a fixture file so the paise values sit next to
+#: the rupee assertions that depend on them.
+_TICK_HEADER = (
+    "SEM_SMST_SECURITY_ID,SEM_INSTRUMENT_NAME,SEM_TRADING_SYMBOL,SEM_CUSTOM_SYMBOL,"
+    "SEM_EXPIRY_DATE,SEM_STRIKE_PRICE,SEM_OPTION_TYPE,SEM_LOT_UNITS,SEM_TICK_SIZE,"
+    "SEM_EXM_EXCH_ID,SEM_SEGMENT"
+)
+
+#: ``(security_id, strike, option_type, raw SEM_TICK_SIZE)``. 5.0000 is what the
+#: live master carries for a NIFTY option whose real tick is ₹0.05 — the paise
+#: unit this file exists to pin. The empty and "rubbish" values are the two ways
+#: the column can fail to say anything.
+_TICK_ROWS = [
+    ("9001", 24100, "CE", "5.0000"),
+    ("9002", 24100, "PE", "5.0000"),
+    ("9003", 24200, "CE", ""),
+    ("9004", 24200, "PE", "rubbish"),
+]
+
+_WITH_TICKS = "\n".join(
+    [
+        _TICK_HEADER,
+        *(
+            f"{sid},OPTIDX,NIFTY-Jul2026-{strike}-{kind},"
+            f"NIFTY 28 JUL {strike} {kind},2026-07-28 00:00:00,"
+            f"{strike},{kind},75,{tick},NSE,D"
+            for sid, strike, kind, tick in _TICK_ROWS
+        ),
+        "",
+    ]
+)
+
+
+def _ticked() -> ScripMaster:
+    return ScripMaster("NIFTY").load_from_text(_WITH_TICKS)
+
+
+def test_the_tick_size_is_converted_from_paise_to_rupees():
+    """The finding that shaped the whole tick rule (Phase 4 Part 5).
+
+    Verified against the live master: NIFTY and SENSEX ``OPTIDX`` rows carry
+    ``5.0000`` where the real tick is ₹0.05, and ``FUTCUR`` USDINR carries
+    ``0.2500`` for a real ₹0.0025. Read at face value as rupees, NIFTY options
+    would sit on a ₹5 grid and every order would be refused as off-tick.
+    """
+    row = _ticked().get(24100.0, OptionType.CE, "2026-07-28")
+    assert row is not None
+    assert row.tick_size == pytest.approx(0.05)
+
+
+@pytest.mark.parametrize("strike", [24200.0])
+def test_a_missing_or_unparseable_tick_size_is_none_not_a_default(strike: float):
+    """Not knowing an instrument's tick and knowing it is 0.05 must stay
+    distinguishable: the fill model skips its tick rule for the first and enforces
+    it for the second."""
+    master = _ticked()
+    assert master.get(strike, OptionType.CE, "2026-07-28").tick_size is None  # type: ignore[union-attr]
+    assert master.get(strike, OptionType.PE, "2026-07-28").tick_size is None  # type: ignore[union-attr]
+
+
+def test_a_master_without_the_column_at_all_still_loads():
+    """The column is absent from both committed fixtures, and from any master
+    Dhan might trim — that must not be a load failure."""
+    for row in _all_rows(_multi()):
+        assert row.tick_size is None
+
+
+def test_contracts_are_indexed_by_security_id_for_the_broker():
+    """An order carries a ``security_id`` and nothing else, so the strike/expiry
+    key cannot answer "what are this instrument's exchange rules?"."""
+    master = _ticked()
+    row = master.by_security_id("9001")
+    assert row is not None and row.strike == 24100.0 and row.option_type is OptionType.CE
+    assert master.by_security_id("does-not-exist") is None
+
+
+def test_the_security_id_index_is_cleared_on_reload():
+    master = _ticked()
+    assert master.by_security_id("9001") is not None
+    master.load_from_text(MULTI.read_text())
+    assert master.by_security_id("9001") is None, "a reload must not keep stale ids"
+
+
+def test_the_resolver_hands_the_broker_the_exchange_rules():
+    """The whole contract between the scrip master and the paper broker is a
+    ``Callable[[str], InstrumentRules | None]`` — the broker must not know what a
+    scrip master is."""
+    resolver = DhanOptionChainResolver(_ticked(), expiry="2026-07-28")
+    rules = resolver.instrument_rules("9001")
+    assert rules is not None
+    assert rules.lot_size == 75
+    assert rules.tick_size == pytest.approx(0.05)
+
+
+def test_an_unlisted_security_id_has_no_rules_which_is_what_refuses_it():
+    """``None`` is what makes the broker's INVALID_INSTRUMENT rule mean something:
+    an order for an id the exchange's own daily master does not list is an order
+    that could not have been placed."""
+    resolver = DhanOptionChainResolver(_ticked(), expiry="2026-07-28")
+    assert resolver.instrument_rules("99999") is None
+
+
+def test_the_distinct_tick_sizes_are_reportable():
+    assert _ticked().tick_sizes() == frozenset({0.05})
+    assert _multi().tick_sizes() == frozenset()

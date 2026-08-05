@@ -266,6 +266,23 @@ class LifecycleGateway:
             problem = f"the order is {order.status.value} with no fill recorded"
         elif order.average_fill_price is None:
             problem = "the order reports fills but no average fill price"
+        elif order.status is OrderStatus.PARTIALLY_FILLED:
+            # Phase 4 Part 5. This branch used to be absent, and its absence was
+            # silent: a partially filled order has fills and an average price, so
+            # it passed every check above and PositionManager went on to record an
+            # OpenPosition sized at the *requested* lots. The engine's book would
+            # then have believed in exposure the broker never gave it.
+            #
+            # Refusing is the only available correct answer here, because the
+            # ported FillOutcome carries a price and charges and no quantity — so
+            # there is no way to tell PositionManager "you got 25 of the 75 you
+            # asked for" without widening the Phase 3 port and its regression
+            # tests. Loud, and it leaves the position exactly as the database has
+            # it, which is the state restart recovery knows how to adopt.
+            problem = (
+                f"the order filled {order.filled_quantity} of the requested quantity and "
+                "the position manager cannot represent a partial fill"
+            )
         if problem is None:
             return
 

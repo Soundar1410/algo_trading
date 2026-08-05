@@ -406,14 +406,32 @@ class ExecutionRepository:
                     fill.filled_at.isoformat(),
                 ),
             )
+            # Accumulate, never overwrite. Until Phase 4 Part 5 this wrote
+            # ``fill.quantity`` and ``fill.price`` directly, so an order with two
+            # fills reported the *last* one's quantity and price as though they
+            # were the order's. Invisible while nothing produced two fills, and
+            # wrong the moment the partial-fill model does. The running totals are
+            # read back from the ``fills`` rows — inside this transaction, and
+            # after this fill's own INSERT — so they cannot disagree with them.
+            totals = conn.execute(
+                """
+                SELECT COALESCE(SUM(quantity), 0)              AS filled,
+                       COALESCE(SUM(price * quantity), 0.0)    AS notional
+                FROM fills WHERE order_id = ?
+                """,
+                (order_id,),
+            ).fetchone()
+            filled_quantity = int(totals["filled"])
+            average_price = float(totals["notional"]) / filled_quantity if filled_quantity else None
             conn.execute(
                 """
                 UPDATE orders
                 SET status = ?, filled_quantity = ?, average_fill_price = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (order_status.value, fill.quantity, fill.price, _now(), order_id),
+                (order_status.value, filled_quantity, average_price, _now(), order_id),
             )
+            self._record_fill_quote(conn, order_id=order_id, fill=fill)
             position = self._upsert_position(
                 conn,
                 runtime_id=runtime_id,
@@ -435,6 +453,40 @@ class ExecutionRepository:
                 realised_delta=position.realised_pnl,
             )
             return position
+
+    @staticmethod
+    def _record_fill_quote(conn: sqlite3.Connection, *, order_id: int, fill: Fill) -> None:
+        """Record the submission-time quote this fill was priced against.
+
+        Spec section 6's record list asks for the submission-time quote alongside
+        the slippage and latency the ``fills`` row already carries. It lives in a
+        side table rather than in new ``fills`` columns because the migration
+        runner requires every statement to be replay-safe and SQLite's
+        ``ALTER TABLE ... ADD COLUMN`` is not — it errors on the second run.
+
+        Writes nothing when the broker recorded no quote detail, so a live adapter
+        that cannot supply one leaves no misleading all-``NULL`` row behind.
+        """
+        if fill.quote_bid is None and fill.quote_ask is None and fill.latency_applied is None:
+            return
+        conn.execute(
+            """
+            INSERT INTO paper_fill_quotes
+                (order_id, broker_fill_id, quote_bid, quote_ask, quote_age_ms,
+                 latency_applied, fill_method)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (order_id, broker_fill_id) DO NOTHING
+            """,
+            (
+                order_id,
+                fill.broker_fill_id,
+                fill.quote_bid,
+                fill.quote_ask,
+                fill.quote_age_ms,
+                None if fill.latency_applied is None else int(fill.latency_applied),
+                fill.fill_method,
+            ),
+        )
 
     def _upsert_position(
         self,

@@ -7,8 +7,8 @@ the next phase. Updated after every phase.
 
 | | |
 |---|---|
-| **Current phase** | Phase 4 **Parts 1-4 complete**. **Part 4** (warm-up source and injection) ports `WarmupManager`/`WarmupSource`, a new Dhan historical-candle REST client (not the SDK), and wires them into `engine_worker.py` behind an opt-in flag — closing limitation 16. Corrected two real defects found in the reference along the way (a request-format bug that would have made every fetch fail, and an SDK-isolation violation the reference's own design would have committed), plus a same-part amendment (D47) closing a pre-existing Phase 3 gap the end-to-end test surfaced: a continuity-required strategy with no manager used to cold-start and trade with only a `WARNING`; it now refuses construction. Awaiting review |
-| **Next phase** | Phase 4 **Part 5** — `PaperBroker` realism (see section 8) |
+| **Current phase** | Phase 4 **Parts 1-4 complete; Part 5 code complete**. **Part 5** (`PaperBroker` realism) closes limitation 5 and deviation D11: depth reaches the fill through a shared `QuoteBook`, a buy takes the ask and a sell the bid, the price is rounded adversely onto the tick grid, limit orders rest and settle from later quotes, partial fills accumulate correctly, and the spec's nine rejection rules are implemented behind a code enum. The pre-work audit corrected two wrong notes in this document and found four things that changed the work — including that Dhan publishes `SEM_TICK_SIZE` in **paise**, so a model trusting the column would have put NIFTY options on a ₹5 grid. New deviations **D48-D53** state what is *not* claimed. Awaiting review |
+| **Next phase** | **Run the outstanding Part 5 gate item** — the opt-in Full-mode depth capture against a real `NSE_FNO` option, which needs market hours (09:15–15:30 IST); command in [Commands](#5-commands). Then Phase 5 |
 | **Last updated** | 5 August 2026 |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
@@ -24,7 +24,7 @@ the next phase. Updated after every phase.
 | 1 | Walking skeleton | **Complete** |
 | 2 | Dhan and shared-feed hardening | **Complete** — Block 1 (offline) + Block 2 (live) |
 | 3 | Preserve custom engines and policies | **Complete.** **Part 1 complete** (live-feed shutdown); **Part 2a complete** (exit registry + SuperTrend port); **Part 2b-i complete** (signal ownership + engine core); **Part 2b-ii-A complete** (the feed seam: tick channel, runtime subscription, `HubTickFeed`); **Part 2b-ii-B-1 complete** (the execution seam: square-off authority, `LifecycleGateway`, entry-block on tick drop); **Part 2b-ii-B-2 complete** (the wiring: worker engine path, supervisor queue delivery, engine restart recovery, D20 reporting bindings). **Phase 3 complete** — its acceptance gate is met in full |
-| 4 | Candle, indicator and paper-execution foundation | **In progress.** **Part 1 complete** (real contract resolution — closes 17, alarms 15). **Part 2 complete** (indicator layer — closes D21). **Part 3 complete** (continuity, timezone, wall-clock square-off — closes 4 and 7, and a live blocker). **Part 4 complete** (warm-up source and injection — closes 16). Part 5 not started: `PaperBroker` realism |
+| 4 | Candle, indicator and paper-execution foundation | **In progress.** **Part 1 complete** (real contract resolution — closes 17, alarms 15). **Part 2 complete** (indicator layer — closes D21). **Part 3 complete** (continuity, timezone, wall-clock square-off — closes 4 and 7, and a live blocker). **Part 4 complete** (warm-up source and injection — closes 16). **Part 5 code complete** (`PaperBroker` realism — closes 5 and D11), **pending one live gate item**: the opt-in Full-mode depth capture against a real `NSE_FNO` option has not been run |
 | 5 | Mixed-mode supervisor and persistence | Not started |
 | 6 | Paper recovery and expiry handling | Not started |
 | 7 | Operations | Not started |
@@ -941,6 +941,202 @@ before any continuity-required strategy runs (see limitation 16). `Database` sti
 opens with thread affinity, so nothing in a worker may touch SQLite off the main
 thread — recorded as **D31** rather than worked around.
 
+### What Phase 4 Part 5 delivered — `PaperBroker` realism
+
+Closes limitation **5** and deviation **D11**. Depth now reaches the fill, the
+fill is priced against the touch and put on the tick grid, limit orders rest and
+settle from later quotes, partial fills are modelled and accumulate correctly, and
+the spec's nine rejection rules are implemented behind a code enum.
+
+**The one-line summary of what changed:** run the same engine over the same tape
+and every fill used to come back `ltp_fallback`, priced off the signal's own
+reference price. A round trip on an unchanged book therefore cost exactly zero.
+It now pays the spread, twice, and says which side of the book it took.
+
+#### Pre-work found four things that changed the work
+
+The audit was run against the pinned SDK's source, the live Dhan scrip master and
+the current tree — the same method Parts 3 and 4 used, and it paid the same way.
+
+1. **This runbook's own Part 5 note was wrong about the failure mode, and the real
+   one is worse.** The note said a `"Full Data"` frame "would be counted as
+   malformed". It would not: `normalise` tests `_NON_TICK_TYPES` first, then falls
+   through to the unrecognised-type branch, which increments **`non_tick_frames`**
+   and logs at **debug**. Switching the feed to mode 21 without fixing
+   normalisation would have given a connected socket, a debug line nobody reads,
+   and **zero ticks** — no candles, no indicators, no orders. A malformed count
+   would at least have been visible.
+
+2. **Dhan publishes `SEM_TICK_SIZE` in paise, and its unit is not uniform.** There
+   was no tick size anywhere in this repository, so the spec's "invalid tick-size
+   price" rule had nothing to check against. The live master
+   (`images.dhan.co/api-data/api-scrip-master.csv`, 202 948 rows) carries
+   `5.0000` on NIFTY and SENSEX `OPTIDX` rows whose real tick is ₹0.05, and
+   `0.2500` on `FUTCUR` USDINR whose real tick is ₹0.0025 — paise. But `FUTIDX`
+   NIFTY and NSE `EQUITY` RELIANCE both carry `10.0000`, neither of which divides
+   to the tick those instruments are commonly quoted in. Taken at face value as
+   rupees, NIFTY options would sit on a ₹5 grid and every order would be refused.
+   Hence **D50**: the master's value is advisory, the enforced tick is
+   configuration, and no tick means the rule is skipped rather than guessed.
+
+3. **Depth prices are formatted strings, and `"0.00"` means absence.**
+   `process_full` renders every level through `"{:.2f}".format(...)`, and a level
+   with no resting order renders as `"0.00"` rather than being omitted. The
+   reference repository's normaliser
+   (`Trading_Automation/.../framework/market_data/websocket.py`) does
+   `number(top.get("bid_price"))` with **no zero guard**. Ported as written, a
+   quote would look two-sided with a bid of zero, and a sell would price at
+   `0 - slippage` and hit the simulator's own non-positive-price rejection — i.e.
+   every exit on a one-sided book refused. `_price_or_none` maps zero and negative
+   to `None`. The same reference function also stamps receipt time as the tick
+   timestamp, which is the exact defect Part 3 fixed; neither was copied.
+
+4. **The reference has no fill model to port.** Its `PaperBroker` fills at
+   `ref_price ± slippage_points` with no depth, no latency, no limit orders, no
+   partial fills and no rejection rules — strictly weaker than what was already
+   here. CLAUDE.md's "port their regression tests BEFORE changing internals" has
+   nothing to bind to for this part. **Part 5 is original work, and its evidence
+   standard is new tests rather than a port diff.**
+
+Two structural blockers the plan had not identified were also found: `FillOutcome`
+carries no quantity while `LifecycleGateway` *accepted* a `PARTIALLY_FILLED` order
+(**D51**), and the migration runner's replay-safety rule forbids
+`ALTER TABLE … ADD COLUMN`, so the submission-time quote needed a side table.
+
+#### Depth through the pipe
+
+Depth was dropped at four consecutive places. `Tick` already had `bid_price` and
+`ask_price` fields; nothing ever filled them.
+
+* `common/market_data/dhan.py` — `FULL_MODE = 21`, `"Full Data"` added to
+  `_TICK_TYPES` (finding 1), `_top_of_book` with the zero guard (finding 3), and a
+  **per-security mode map** mirroring the existing per-security segment map. The
+  underlying stays on Ticker because an index has no order book in any mode; its
+  contracts go on Full. `MarketFeed.validate_and_process_tuples` already batches a
+  mixed instrument list by mode, so both travel on one socket. The wrong comment
+  claiming "Quote/Full add depth" is corrected: `process_quote` returns volume and
+  session OHLC and no book at all.
+* `MarketFeedAdapter.subscribe` gains `mode=`, documented like `segment=` and for
+  the same reason; `ReconnectingFeed`, `SharedFeedHub` and the worker's control
+  queue forward it. The queue's tuple is now `(security_id, segment, mode)`, and
+  the two-element and bare-string shapes are still accepted rather than migrated,
+  because a worker that started before the upgrade can still have entries on it.
+* `scripts/capture_live_tape.py` gains `--mode {ticker,quote,full}`, still
+  read-only, and warns when a full-mode capture yields no two-sided book at all.
+
+**The last two places were closed with one object rather than four widened
+signatures.** The plan proposed adding bid/ask to `ExecutionGateway`'s verbs and
+then to `Signal`; that means editing `PositionManager`, a Phase 3 port, for no
+gain — because two consumers want the same data and neither is on that path.
+`common/broker/quotes.py::QuoteBook` is a bounded per-instrument ring of recent
+quotes: `OrderLifecycle` reads `latest()` to build a real depth-carrying `Quote`
+instead of one synthesised from `signal.reference_price`, and `PaperBroker` reads
+`after()` for latency selection and limit settlement. It is filled by
+`MarketDataFeed.add_tick_observer`, which runs **before** the engine's own handler
+— the engine's reaction to a tick may be to place an order priced off exactly that
+tick's quote. `Signal.reference_price` is untouched, so `Fill.slippage_amount`
+stays auditable against what the strategy actually saw.
+
+#### The fill model
+
+* **Market orders** take the ask (buy) or bid (sell), move adversely by configured
+  slippage, and round **away** from the trader onto the tick grid. Rounding follows
+  the same rule as slippage for the same reason: a simulator that can round in your
+  favour flatters a losing strategy.
+* **The LTP fallback** now applies all four of the spec's conditions rather than
+  one. The missing one was the "conservative additional slippage rule"
+  (`ltp_fallback_extra_ticks`, default one tick): before this, a fill priced off a
+  last *trade* cost exactly as much as one priced off a resting order, so the
+  simulator was quietly indifferent to whether an instrument had a book at all.
+* **Limit orders** rest in a working book and settle from `on_quote()` when an
+  eligible price arrives *after* submission. They fill **at the limit, never at a
+  better available price**: real price improvement depends on queue position, which
+  a top-of-book simulator cannot know, and assuming it would hand every resting
+  order a free edge. Nothing in the engine issues one — `OrderLifecycle` builds
+  every intent as `MARKET` — and `LifecycleGateway` refuses a fill-less order, so
+  the model cannot leak a phantom position. It exists because spec 5.3/5.4 ask for
+  the model and its test hooks. **`PaperBroker.on_quote` therefore has no
+  production caller**: the working book is always empty in a real run, so nothing
+  drives settlement, and wiring a pump for an empty book would be ceremony. The
+  first consumer that issues a limit order wires it, in one line, beside the
+  `QuoteBook` observer that already exists.
+* **Partial fills** come from a deterministic `fill_quantity_policy` hook. The
+  default still fills the whole quantity in one, so no existing run moves.
+* **Slippage** takes the spec's section 6 shape (`slippage: {options: {mode:
+  ticks, market_order_ticks: 1}}`). `slippage_points` is still accepted as an alias
+  — `from_mapping` refuses unknown keys, so dropping it would turn every
+  pre-Part-5 strategy file into a startup failure — and one tick on an index option
+  is ₹0.05, exactly the old default, so reshaping the config moved no fill price.
+
+#### The nine rejection rules
+
+`PaperRejectionCode` is a `StrEnum` and the code is prefixed onto the message, so
+`orders.rejection_reason` carries it without a schema change. Every dependency the
+rules need is **injected and optional**, which is the only safe default: a broker
+that refused everything it could not verify would refuse every order in a runtime
+with no scrip master — every offline test and every simulated-contract run.
+`INVALID_INSTRUMENT` and `INVALID_QUANTITY` are wired to the real master through
+`DhanOptionChainResolver.instrument_rules`; `RISK_BLOCKED` and `MARKET_CLOSED`
+have no producer yet (**D52**).
+
+#### Persistence
+
+* **`ExecutionRepository.apply_fill` accumulated nothing.** It wrote
+  `fill.quantity` and `fill.price` straight onto the `orders` row, so an order with
+  two fills reported the **last** one's values as the order's own. Invisible for
+  three phases because nothing produced two fills. It now reads the running total
+  and the quantity-weighted average back from the `fills` rows, inside the same
+  transaction and after this fill's own insert, so the two cannot disagree.
+* **Migration `0003_paper_fill_realism.sql`** adds `paper_fill_quotes`, one row per
+  fill, closing spec section 6's "record the submission-time quote". A side table
+  rather than new `fills` columns because SQLite has no `ADD COLUMN IF NOT EXISTS`
+  and the runner requires replay-safe statements (**D6**). Nothing is written when
+  the broker supplied no quote detail, so a future live adapter leaves no
+  misleading row of NULLs.
+
+#### Test evidence
+
+Suite **1131 → 1242** (11 skipped, up from 10 — one new opt-in market-hours smoke
+test). `ruff` and `mypy` clean across 112 source files.
+
+| File | What it establishes |
+|---|---|
+| `tests/unit/test_paper_broker_realism.py` (new, 42) | The whole model: ask/bid selection, a round trip paying the spread, adverse tick rounding in both directions, the LTP fallback costing more than the touch, latency selection and its fallback counter, resting limit orders that refuse price improvement, partial-fill accumulation, and one test per rejection code |
+| `tests/unit/test_quote_book.py` (new, 12) | `after()` returns the **oldest** quote past the deadline, not the best — the difference between a latency model and lookahead |
+| `tests/integration/test_depth_to_fill.py` (new, 6) | The end-to-end statement: a depth-carrying tape through the real engine, gateway, lifecycle and broker yields `fill_method == "bid_ask"`, the entry takes the ask and the exit the bid, and the round trip's cost equals the spread. The same tape without a book still trades and reports `ltp_fallback` |
+| `tests/unit/test_dhan_adapter.py` (+11) | A synthesised 162-byte Full frame driven through the SDK's own `process_full`, two-sided / bid-only / empty books, the `"0.00" → None` guard, and proof that a `"Full Data"` frame now produces a tick rather than a silent non-tick. **The committed frames are regenerated from the installed SDK on every run and asserted equal**, so the fixture cannot drift from the parser it describes |
+| `tests/unit/test_feed_exchange_segments.py` (+8) | Mixed-mode subscription (index on 15, contract on 21) surviving a reconnect, refusal of any mode the v2 protocol does not accept, and that the engine's `SubscriptionMode`, the adapter's constants and the capture script's table all agree |
+| `tests/unit/test_scrip_master.py` (+8) | The paise→rupee conversion, missing/unparseable ticks yielding `None` rather than a default, and the `security_id` index the broker's rules lookup needs |
+| `tests/integration/test_execution_persistence.py` (+7) | Two fills accumulating into one `orders` row, the quantity-weighted average, the `PARTIALLY_FILLED` status, and the submission-time quote landing in `paper_fill_quotes` |
+| `tests/unit/test_migrations.py` (+1, 3 updated) | `0003` applies once, replays cleanly, and upgrades a 0001-only database — and that `fills` was **not** widened in place |
+| `tests/integration/test_engine_lifecycle_gateway.py` (+1) | A partial fill raising rather than being reported as whole, with the partial still fully audited |
+| `tests/smoke/test_live_feed_smoke.py` (+1, opt-in) | **The outstanding gate item.** A real `NSE_FNO` option in Full mode delivering a two-sided book |
+
+**Tests whose expectations moved, and why each is correct.** Three legs of the
+suite now price differently, and none of it is a weakened assertion:
+`test_execution_persistence`'s round-trip P&L drops by one tick per leg because the
+LTP fallback finally costs the conservative extra the spec requires;
+`test_paper_broker`'s slippage tests moved to the section 6 config shape with the
+same numbers; and `test_engine_lifecycle_gateway` gained a `_frictionless()` helper
+that turns *both* slippage knobs off, because those tests assert plumbing and
+should not move when pricing changes.
+
+#### What is asserted rather than proven
+
+**The live Full-mode capture has not been run.** `tests/smoke/test_live_feed_smoke.py::
+test_a_real_option_in_full_mode_delivers_a_two_sided_book` is written and opt-in,
+and it is the one gate item that must be run against the real socket during market
+hours (09:15–15:30 IST). Until it passes, the claim "a real `NSE_FNO` option in
+mode 21 delivers a two-sided book" rests on the SDK's source and on a Full frame
+packed from Dhan's documented layout and parsed by the SDK's own `process_full` —
+which is strong evidence about *shape* and no evidence at all about what the
+exchange actually sends. Part 5 is not complete until that capture lands.
+
+Separately, **D48 is a real residual, not a formality**: on a live feed a market
+order still fills at its submission quote, because the post-latency quote does not
+exist when `submit()` is called. `Fill.latency_applied` and
+`PaperBroker.latency_not_applied` make that a number rather than a paragraph.
+
 ### What Phase 4 Part 4 delivered — warm-up source and injection
 
 Closes limitation **16**. Ports the reference's `WarmupManager`/`WarmupSource`,
@@ -1792,7 +1988,7 @@ guard. See deviation D6.
 | **D8** | `effective_live_gate()` exists in Phase 0 with no consumer | It can only return *blocked* in this phase (`preflight_passed` defaults False and no preflight exists). Included now because a config model that accepts `mode: live` without a fail-closed evaluator beside it is a footgun. |
 | **D9** | Feed hub fans out **completed candles, not ticks** | Spec section 6 (and core principle 6) describe distributing *normalised ticks* to workers. Aggregating once, centrally, guarantees every worker sees byte-identical bars and makes "prevent duplicate candle publication" structural rather than conventional. Cost: a worker cannot pick its own timeframe off the raw stream; it aggregates further from completed bars. A tick channel can be added in Phase 2 without reshaping the queues. |
 | **D10** | **No engine port in Phase 1** | The slice runs on a minimal `Strategy` protocol with a deterministic fixture implementation, shaped like `TradingEngine`'s signal interface but not derived from it. Porting the real engines is Phase 3, and doing it early would have meant porting them against a skeleton with no exit policies to receive them. |
-| **D11** | `PaperBroker` is **deliberately minimal here** | Bid/ask depth, latency-selected quotes, limit orders, partial fills and the full nine-rule rejection matrix are Phase 4. Phase 1 implements a fill at the submission-time quote plus adverse slippage, a recorded latency value, and exactly one rejection rule (duplicate correlation ID) — that one because it is a correctness property of idempotent submission, not a realism feature. |
+| **D11** | ~~`PaperBroker` is **deliberately minimal here**~~ **CLOSED (Phase 4 Part 5)** | Phase 1 implemented a fill at the submission-time quote plus adverse slippage, a *recorded* latency value, and exactly one rejection rule (duplicate correlation ID) — that one because it is a correctness property of idempotent submission, not a realism feature. Part 5 delivered the rest: bid/ask depth through the pipe, latency-selected quotes, resting limit orders, partial fills and all nine rejection rules. Read **D48**, **D51** and **D53** for what is *not* claimed — this deviation is closed, not perfected. |
 | **D12** | **`dhanhq` pin moved to `2.2.0`**, superseding `CLAUDE.md`'s "default to the stable 2.1.0" | Superseded by the compatibility spike that same rule mandated, which is the documented mechanism for changing it. `2.1.0` is **yanked** on PyPI (publisher reason: "Breaking changes"), its `subscribe_symbols`/`unsubscribe_symbols` read `ws.closed` which no longer exists on `websockets>=14` (so resubscription — a Phase 2 deliverable — raises `AttributeError`), and its `disconnect()` never closes the socket. The tick/quote payload builders are byte-identical across the two versions, so normalisation is unaffected. Full evidence in section 4. |
 | **D13** | **`LTT` is reconstructed, not parsed** | Dhan's SDK renders the exchange timestamp as `strftime('%H:%M:%S')` against UTC, discarding the date, so no timestamp parser can consume it directly. The date is recovered by choosing whichever of yesterday/today/tomorrow places the wall clock closest to receipt — correct for any true latency under twelve hours. Recorded as a deviation because it is inference rather than transmitted data. Mitigated by counting every fallback, so a format change becomes visible instead of silent. |
 | **D14** | **Authentication uses `httpx` directly, not the SDK's `DhanLogin`** | `dhanhq` 2.2.0 ships a `DhanLogin` class hitting the same endpoint, but importing it into `common/authentication/` would break the one-file SDK-isolation rule that a test enforces. Its version also has no retry policy, no rate-limit detection, and swallows every failure into a bare `Exception` — so coupling to it would cost exactly the fail-fast behaviour that protects the account from repeated rejected logins. |
@@ -1830,6 +2026,13 @@ guard. See deviation D6.
 | **D45** | **`fromDate`/`toDate` are full `"YYYY-MM-DD HH:MM:SS"` datetimes, not bare dates** | The reference passes `current.strftime("%Y-%m-%d")`. DhanHQ's own documentation for `POST /v2/charts/intraday`, fetched and read directly rather than inferred, specifies a full datetime string. A straight port would have sent an undocumented request shape on every fetch. Found and corrected during the port, not carried over; pinned by a fail-first test. |
 | **D46** | **`build_warmup_manager` refuses to warm when the resolved underlying's security id disagrees with the worker's own** | `WorkerConfig.security_id` (what the live feed subscribes) and `resolve_index_meta(...).security_id` (what a warm-up fetch would use) are set independently, and the latter accepts an `index_security_id` override that could go stale. A REST fetch for the wrong id still succeeds, so an unchecked divergence would silently seed indicators from a different instrument's history. Not a port of anything in the reference — this repository's own wiring introduced the risk, so this repository's own wiring closes it. |
 | **D47** | **`validate_warmup_config` now also refuses construction when no `warmup_manager` will be supplied, not only when `warmup_from_history` is explicitly false** | A same-part amendment, distinct from D43-D46 (which are about the port itself) — this closes a **pre-existing Phase 3 Part 2b-ii-B-2 gap**, discovered while building Part 4's own end-to-end test. The function's docstring claimed "the engine's runtime gate fails it closed anyway" for a continuity-required strategy with no manager; that was false — `entry_blocked_by()` is reached only on the `warmup_manager` path, so every existing config (default `warmup_from_history: true`, no manager unless `warmup_source: dhan` is set) sailed through construction and cold-started with only a `WARNING`. `validate_warmup_config(strategy, cfg, warmup_manager=None)` now raises `InvalidWarmupConfig` when a continuity-required strategy has `warmup_from_history` false **or** no manager supplied — the two were independently-reasoned mechanisms with a gap between them, now one check. `warmup_manager` is optional so no pre-Part-4 call site (there was exactly one, and it now passes it) needed to change shape. No test in the tree relied on the old fallback for a legitimate reason — the one that did (`test_no_manager_or_source_reaches_the_pre_existing_fallback_unchanged`) was written in this same part specifically to pin the gap, and is flipped to assert the refusal instead. |
+
+| **D48** | **Simulated latency *selects* a quote; it does not wait for one** | Spec 5.2 asks the simulator to price against "the quote available after the simulated latency". At the moment `PaperBroker.submit()` is called on a live feed, that quote **does not exist yet** — the deadline is 250 ms in the future. The alternatives were to block the feed callback thread, or to make everything from `PositionManager` down asynchronous, which is a redesign of the Phase 3 execution port rather than a widening of the simulator. So a market order asks `QuoteBook.after()` for the first quote at or past its deadline, uses it when one exists, and otherwise fills at the submission quote. **Every fill records which happened** in `Fill.latency_applied`, and the broker counts the fallbacks in `latency_not_applied`, so this is a per-fill observation rather than a claim the configuration makes. On a live feed a market order is nearly always the fallback case; on a replayed tape, and for every resting limit order, it is not. |
+| **D49** | **`modification_latency_ms` / `cancellation_latency_ms` are not implemented** | Spec 5.2 lists all three latencies. There are no modify or cancel verbs on `Broker` — they arrive with their first consumer, as `broker/base.py` has said since Phase 1 — so accepting configuration for them would be a setting that describes behaviour the system does not have. `submission_latency_ms` is implemented; the other two arrive with the verbs. |
+| **D50** | **The enforced tick size comes from configuration, not from `SEM_TICK_SIZE`** | The column is parsed, converted paise→rupees and carried on `OptionRow.tick_size`, but the fill model enforces `paper_execution.tick_size` and treats the exchange's value as advisory. Verified against the live master: NIFTY and SENSEX `OPTIDX` rows carry `5.0000` for a real ₹0.05 tick and `FUTCUR` USDINR carries `0.2500` for ₹0.0025 — paise — but in the same file `FUTIDX` NIFTY and NSE `EQUITY` RELIANCE both carry `10.0000`, neither of which divides to the tick those instruments are commonly quoted in. The unit is therefore not uniformly trustworthy outside index options, and reading it at face value as rupees would put NIFTY options on a ₹5 grid and refuse every order. With no tick known from either source the rule is **skipped**, not guessed at. |
+| **D51** | **A partial fill is refused at the gateway rather than propagated into the engine's book** | `FillOutcome` carries a price and charges and no quantity, so there is no way to tell `PositionManager` "you got 25 of the 75 you asked for" without widening the Phase 3 port and its ported regression tests. `LifecycleGateway._require_a_fill` therefore raises on `PARTIALLY_FILLED`. **The branch's previous absence was silent**: a partial has fills and an average price, so it passed every check and the engine recorded a full-size `OpenPosition` for exposure the broker never gave it. The partial is still persisted in full — `orders.filled_quantity` is now a running total — it is simply not reported as a fill. |
+| **D52** | **`MARKET_CLOSED` and `RISK_BLOCKED` have no producer yet** | Both rules are implemented and tested. `RISK_BLOCKED` fires on `OrderIntent.risk_decision`, which `OrderLifecycle` currently hardcodes to `ALLOWED` — a real risk gate is Phase 5/6. `MARKET_CLOSED` needs an injected session predicate and is **off by default**, which is a hazard-driven decision rather than an omission: the engine already gates *entries* on the session, while an exit or a square-off legitimately fires at or after the square-off time, so a broker enforcing this by default would refuse exactly the orders that must never be refused. |
+| **D53** | **`max_quote_age_ms` defaults to off** | The staleness rule compares the quote's exchange timestamp against the wall clock, which is meaningful live and meaningless on a replayed tape — where every timestamp is historical and *every* order would be refused. Tape replay is this repository's default execution path, and a setting that breaks every replay is one that gets switched off everywhere and then protects nothing. **A live-feed configuration must set it** (e.g. `2000`). |
 
 #### D22 in detail: the rebuilt premium-candle mapping
 
@@ -1943,7 +2146,10 @@ common/feed/
 
 common/broker/
   base.py          Broker Protocol + Quote
-  paper.py         PaperBroker — adverse slippage, idempotent on correlation ID
+  paper.py         PaperBroker — bid/ask fills, latency-selected quotes, resting
+                   limit orders, partial fills, nine rejection rules (Part 5)
+  quotes.py        QuoteBook — recent quotes per instrument; read by the fill
+                   model for its latency deadline and by the lifecycle for depth
   costs.py         ChargesCalculator — config-driven rates
   factory.py       build_broker() — consults the live gate, REFUSES live
 
@@ -3005,6 +3211,26 @@ ALGO_LIVE_SMOKE=1 ALGO_SMOKE_EXPIRY=YYYY-MM-DD \
   .venv/bin/python -m pytest tests/smoke -v
 ```
 
+**The Phase 4 Part 5 gate item — outstanding.** Depth is only real on a Full-mode
+subscription to a real `NSE_FNO` option, so it can only be confirmed with the
+socket, during market hours (09:15–15:30 IST):
+
+```bash
+# The gate assertion: a real option in mode 21 delivers a two-sided book.
+ALGO_LIVE_SMOKE=1 .venv/bin/python -m pytest tests/smoke \
+  -k full_mode_delivers_a_two_sided_book -v
+
+# Optional, to keep the frames for later inspection. --segment 2 and a real
+# NSE_FNO security id are both required: an index carries no book in any mode.
+.venv/bin/python -m scripts.capture_live_tape \
+  --mode full --segment 2 --security-id <NSE_FNO id> --seconds 30 \
+  --out tests/fixtures/dhan_full_payloads_real.json
+```
+
+Read the printed `ticks_with_depth` and `ticks_one_sided_book` counters. Zero
+ticks with a rising `non_tick_frames` would mean `"Full Data"` is not being
+recognised at all — the failure mode described under Part 5's finding 1.
+
 **Recovery.** A worker recovers automatically on restart: it acquires its lock,
 runs integrity checks, closes the previous incomplete session, adopts any open
 paper position and resumes. There is no manual recovery command, by design — an
@@ -3088,8 +3314,26 @@ start/stop/crash/restart tests pass.
    because they are exponentially forgetting and self-correct. See
    `common.indicators.reset_session_local`.
 
-5. **The paper fill model is minimal** (deviation D11). Paper P&L from Phase 1 is
-   not yet a credible estimate of live P&L — it has no bid/ask spread cost.
+5. **~~The paper fill model is minimal.~~ CLOSED** (Phase 4 Part 5, deviation D11
+   closed with it). It had no bid/ask spread cost, which is the specific reason
+   Phase 1 paper P&L was not a credible estimate of live P&L: a round trip on an
+   unchanged book cost exactly zero, so every strategy was flattered by the full
+   width of the book, twice per trade. Depth now reaches the fill through
+   `QuoteBook`, a buy takes the ask and a sell the bid, the price is rounded
+   adversely onto the tick grid, and the last-price fallback costs the conservative
+   extra the spec always attached to it. Limit orders, partial fills and the nine
+   rejection rules arrived with it.
+
+   **Three residuals, each recorded as a deviation rather than folded away.**
+   Simulated latency *selects* a quote rather than waiting for one, so on a live
+   feed a market order still fills at its submission quote — per-fill observable
+   via `Fill.latency_applied` (**D48**). A partial fill is refused at the gateway
+   rather than sized into the engine's book (**D51**). And `max_quote_age_ms`
+   defaults to off, so a live configuration must set it (**D53**).
+
+   **One gate item is outstanding**: the opt-in Full-mode capture against a real
+   `NSE_FNO` option has not been run. See "What is asserted rather than proven"
+   under Part 5.
 6. **Migration atomicity is by replay, not transactions** (deviation D6).
 7. **~~Square-off is driven by the candle clock, not a wall clock.~~ CLOSED**
    (Phase 4 Part 3). The candle clock is still the primary trigger and still the
@@ -3506,6 +3750,12 @@ acceptance gate met in full. Next is **Phase 4**.
 
 ### Phase 4 — candle, indicator and paper-execution foundation — **IN PROGRESS**
 
+**All five parts are code complete. One item stands between Phase 4 and done:**
+the opt-in Full-mode depth capture against a real `NSE_FNO` option, which needs the
+socket and market hours (09:15–15:30 IST). The command is in section 5. Until it
+passes, Part 5's central claim — that a real option in mode 21 delivers a
+two-sided book — is inferred from the SDK's source rather than observed.
+
 Split into **five parts, in strict order**, using the rule Phase 3 used five times:
 separate what is provable offline from what changes the deployed shape, and keep
 independent concerns apart. **Stop for review after each part.**
@@ -3516,7 +3766,7 @@ independent concerns apart. **Stop for review after each part.**
 | 2 | Indicator layer (EMA/RSI/VWAP/ATR/ADX) | D21 | — | **COMPLETE** (1 Aug 2026) |
 | 3 | Candle continuity, session/timezone, wall-clock square-off | 4, 7, a live blocker | — | **COMPLETE** (1 Aug 2026) |
 | 4 | Warm-up source and injection | 16 | 2, 3 | **COMPLETE** (5 Aug 2026) |
-| 5 | `PaperBroker` realism | 5, D11 | 1 | Not started |
+| 5 | `PaperBroker` realism | 5, D11 | 1 | **CODE COMPLETE** (5 Aug 2026) — one live gate item outstanding |
 
 **Why Part 1 came first**, since the ordering was not obvious and the reason
 recorded when this list was first written was the weaker of the two: it is not
@@ -3525,7 +3775,10 @@ for Part 5**. The fill model needs bid/ask; indices carry none; the only source 
 real option depth is a Full-mode subscription on a real `NSE_FNO` option
 `security_id`. `paper.py`'s own docstring already said building the model against
 a depth-free tape was the wrong move — Part 1 is what makes a depth-carrying tape
-possible at all.
+possible at all. **Part 5 bore that out**: the mode split it needed (index on
+Ticker, contract on Full, one socket) is a direct extension of the segment split
+Part 1 added, and reuses its per-security map, its `subscribe` keyword and its
+control-queue tuple.
 
 **Part 2 — the indicator layer — COMPLETE.** All five ported, `ConfirmedCrossover`
 with them, `AdxAtrClassifier` registered (D21 closed), and the `pandas-ta-classic`
@@ -3571,19 +3824,39 @@ record: "What Phase 4 Part 4 delivered" (section 1), deviations D43-D47,
 limitation 16 closed (with both the stated residual and this gap corrected
 rather than left overstated), and the Part 4 gate evidence in section 4.
 
-**Part 5 — `PaperBroker` realism** (limitation 5, deviation D11). Depth through
-the pipe (Full mode 21 in the adapter, then the gateway protocol, `Signal`, and
-`Quote` construction — four consecutive places depth is dropped today);
-latency-*selected* quotes rather than merely recorded ones; limit orders; partial
-fills, **with** the accumulation fix at `ExecutionRepository.apply_fill`, which
-overwrites `filled_quantity` rather than summing it; the nine rejection rules; and
-a slippage config matching one of the spec's two shapes.
+**Part 5 — `PaperBroker` realism — CODE COMPLETE**, with one live gate item
+outstanding. Limitations 5 and D11 closed; new deviations **D48-D53**. Full
+record: "What Phase 4 Part 5 delivered" (section 1).
 
-Note for Part 5: `dhan.py`'s comment claiming "Quote/Full add depth" is **wrong**
-and must be fixed with the code. Verified against the pinned SDK — `process_quote`
-(mode 17) returns no depth; only `process_full` (mode 21) does, and `"Full Data"`
-is currently in neither `_TICK_TYPES` nor `_NON_TICK_TYPES`, so such a frame would
-be counted as malformed.
+**Two notes written here while planning turned out to be wrong, and are corrected
+rather than deleted, because both were load-bearing:**
+
+* `"Full Data"` in neither `_TICK_TYPES` nor `_NON_TICK_TYPES` would **not** have
+  been "counted as malformed". `normalise` falls through to the unrecognised-type
+  branch: `non_tick_frames` and a **debug** log. The real failure was a connected,
+  silent feed producing zero ticks — worse, because a malformed count is at least
+  visible.
+* The plan's four-places-to-widen list (adapter, gateway protocol, `Signal`,
+  `Quote`) was right about where depth dies and wrong about the fix. Widening
+  `ExecutionGateway` and `Signal` means editing `PositionManager`, a Phase 3 port,
+  for no gain; one shared `QuoteBook` serves both the lifecycle's quote and the
+  broker's latency buffer, and the port is untouched.
+* The plan also proposed adding `bid_quantity`/`ask_quantity` to `Quote`. **Dropped
+  deliberately.** Nothing would consume them: slippage is not quantity-aware (spec
+  section 6 defers that explicitly) and partial fills come from a policy hook
+  rather than from depth. `Tick` carries no depth quantities either, so populating
+  them would mean widening the IPC payload on every tick for a field with no
+  reader — the same "declarations that lie about being supported" that
+  `broker/base.py` has refused since Phase 1.
+
+The comment claiming "Quote/Full add depth" *was* wrong as recorded, and is fixed
+with the code: `process_quote` (mode 17) returns volume and session OHLC and no
+book; only `process_full` (mode 21) carries one.
+
+**Read "What is asserted rather than proven" before treating this part as done.**
+Every offline claim is tested; the claim that a real `NSE_FNO` option in mode 21
+delivers a two-sided book is not yet, because that needs the socket and market
+hours.
 
 **Struck from Phase 4 scope: "mode-namespaced correlation IDs."** The architecture
 document lists it as a Phase 4 bullet, but it has been delivered since Phase 1 at

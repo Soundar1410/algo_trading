@@ -279,9 +279,10 @@ def test_shipped_migrations_start_at_the_walking_skeleton():
     from common.persistence.migrations import VERSIONS_DIR
 
     shipped = discover_migrations(VERSIONS_DIR)
-    assert [m.version for m in shipped] == ["0001", "0002"]
+    assert [m.version for m in shipped] == ["0001", "0002", "0003"]
     assert shipped[0].name == "walking_skeleton"
     assert shipped[1].name == "feed_and_auth_health"
+    assert shipped[2].name == "paper_fill_realism"
 
 
 def test_shipped_migrations_apply_to_a_fresh_database(tmp_path: Path):
@@ -291,16 +292,16 @@ def test_shipped_migrations_apply_to_a_fresh_database(tmp_path: Path):
     database = Database(tmp_path / "operational" / "intraday_options.db")
     applied = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
 
-    assert [m.version for m in applied] == ["0001", "0002"]
+    assert [m.version for m in applied] == ["0001", "0002", "0003"]
     assert database.integrity_check() == []
     assert database.foreign_key_check() == []
 
 
-def test_0002_upgrades_a_database_created_by_0001_alone(tmp_path: Path):
+def test_later_migrations_upgrade_a_database_created_by_0001_alone(tmp_path: Path):
     """The real upgrade path: an existing paper database must not need rebuilding.
 
-    Applying 0001 by itself, then the full set, proves 0002 is purely additive
-    rather than only working on a database built from scratch.
+    Applying 0001 by itself, then the full set, proves the later migrations are
+    purely additive rather than only working on a database built from scratch.
     """
     from common.persistence.migrations import VERSIONS_DIR, discover_migrations
 
@@ -314,7 +315,7 @@ def test_0002_upgrades_a_database_created_by_0001_alone(tmp_path: Path):
     database = Database(tmp_path / "operational" / "intraday_options.db")
     MigrationRunner(database, versions_dir=only_0001).run_pending()
 
-    # Put a row in a 0001 table, so a destructive 0002 would be detectable.
+    # Put a row in a 0001 table, so a destructive later migration is detectable.
     with database.transaction() as conn:
         conn.execute(
             "INSERT INTO runtime_sessions (runtime_id, execution_mode, process_role, "
@@ -324,16 +325,38 @@ def test_0002_upgrades_a_database_created_by_0001_alone(tmp_path: Path):
 
     applied = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
 
-    assert [m.version for m in applied] == ["0002"]
+    assert [m.version for m in applied] == ["0002", "0003"]
     with database.connect() as conn:
         survivors = conn.execute("SELECT COUNT(*) FROM runtime_sessions").fetchone()[0]
         tables = {
             row["name"]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
-    assert survivors == 1, "0002 must not disturb existing rows"
+    assert survivors == 1, "a later migration must not disturb existing rows"
     assert {"auth_events", "feed_events", "option_chain_snapshots"} <= tables
+    assert "paper_fill_quotes" in tables
     assert database.integrity_check() == []
+
+
+def test_0003_records_the_quote_in_a_side_table_not_new_fills_columns(tmp_path: Path):
+    """Phase 4 Part 5, and the reason is the runner's own rule.
+
+    SQLite has no ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS``, and every
+    migration here must be a no-op on replay because ``executescript()`` commits
+    implicitly and cannot be undone (deviation D6). Widening ``fills`` would
+    therefore fail on the second run — which is the whole safety mechanism.
+    """
+    from common.persistence.migrations import VERSIONS_DIR
+
+    database = Database(tmp_path / "operational" / "intraday_options.db")
+    MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
+
+    with database.connect() as conn:
+        fills = {row["name"] for row in conn.execute("PRAGMA table_info(fills)")}
+        quotes = {row["name"] for row in conn.execute("PRAGMA table_info(paper_fill_quotes)")}
+
+    assert "quote_bid" not in fills, "fills must not have been widened in place"
+    assert {"quote_bid", "quote_ask", "quote_age_ms", "latency_applied"} <= quotes
 
 
 def test_no_phase_two_table_can_store_a_secret(tmp_path: Path):

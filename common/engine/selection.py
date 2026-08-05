@@ -33,6 +33,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
+from common.broker.paper import InstrumentRules
+
 from .models import Moneyness, OptionContract, OptionType
 
 if TYPE_CHECKING:  # annotation only — keeps the engine import graph unchanged
@@ -149,6 +151,25 @@ class DhanOptionChainResolver(OptionChainResolver):
         """The exchange's lot size, for callers that must not trust configuration."""
         return self._master.lot_size
 
+    def instrument_rules(self, security_id: str) -> InstrumentRules | None:
+        """This instrument's exchange rules, or ``None`` if it is not listed.
+
+        The lookup the paper broker's rejection rules take (Phase 4 Part 5). It
+        lives here rather than in the broker because the broker must not know what
+        a scrip master is — a ``Callable[[str], InstrumentRules | None]`` is the
+        whole of the contract between them.
+
+        ``tick_size`` comes from the exchange's own ``SEM_TICK_SIZE``, converted
+        from paise. The fill model treats it as advisory and warns on
+        disagreement rather than enforcing it, because that column's unit is not
+        uniform across instrument types — see
+        :data:`~common.market_data.scrip_master.TICK_SIZE_PAISE_PER_RUPEE`.
+        """
+        row = self._master.by_security_id(security_id)
+        if row is None:
+            return None
+        return InstrumentRules(lot_size=row.lot_size, tick_size=row.tick_size)
+
     def resolve(
         self, strike: int, option_type: OptionType, expiry: str | None = None
     ) -> OptionContract:
@@ -193,6 +214,16 @@ class OptionSelector:
         self._default_moneyness = default_moneyness
         self._default_steps = default_steps
         self._expiry = expiry
+
+    @property
+    def resolver(self) -> OptionChainResolver:
+        """The chain resolver behind this selector.
+
+        Public because the wiring needs to ask a *real* resolver for the exchange
+        rules the paper broker validates against, and reaching into ``_resolver``
+        from the runtime would be the same access with less honesty about it.
+        """
+        return self._resolver
 
     def select(
         self,

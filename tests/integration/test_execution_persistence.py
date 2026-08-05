@@ -8,10 +8,10 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from common.broker import PaperBroker, PaperFillConfig
+from common.broker import PaperBroker, PaperFillConfig, QuoteBook, SlippageConfig
 from common.config.models import ExecutionMode
 from common.execution import ExecutionRepository, OrderLifecycle
-from common.models import Candle, Fill, OrderStatus, PositionStatus, Side, Signal
+from common.models import Candle, Fill, OrderStatus, PositionStatus, Side, Signal, Tick
 from common.persistence import Database, MigrationRunner
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -69,14 +69,20 @@ def _signal(side: Side = Side.BUY, minute: int = 15, close: float = 100.5) -> Si
     )
 
 
-def _lifecycle(repository: ExecutionRepository, session, broker=None) -> OrderLifecycle:
+def _lifecycle(
+    repository: ExecutionRepository, session, broker=None, quotes=None
+) -> OrderLifecycle:
     return OrderLifecycle(
         repository=repository,
-        broker=broker or PaperBroker(config=PaperFillConfig(slippage_points=0.5)),
+        broker=broker
+        or PaperBroker(
+            config=PaperFillConfig(slippage=SlippageConfig(mode="points", market_order_points=0.5))
+        ),
         runtime_id="intraday_options",
         strategy_id="st01",
         execution_mode=ExecutionMode.PAPER,
         session_id=session.id,
+        quotes=quotes,
     )
 
 
@@ -256,8 +262,184 @@ def test_an_opposing_fill_closes_the_position_and_realises_pnl(repository, sessi
     assert result.position is not None
     assert result.position.quantity == 0
     assert result.position.status is PositionStatus.CLOSED
-    # Bought at 100.0+0.5 slippage, sold at 110.0-0.5.
-    assert result.position.realised_pnl == pytest.approx(50 * (109.5 - 100.5))
+    # No quote book is injected here, so the lifecycle synthesises a quote from
+    # the signal's reference price alone and the fill model has no book to price
+    # against. Each leg therefore pays the 0.5 configured slippage **and** the
+    # conservative one-tick extra that Phase 4 Part 5 attaches to the LTP fallback
+    # (spec 5.1) — buy at 100.55, sell at 109.45. Phase 1 charged only the 0.5,
+    # which is precisely the understatement limitation 5 described.
+    assert result.position.realised_pnl == pytest.approx(50 * (109.45 - 100.55))
+
+
+# ---------------------------------------- accumulation across several fills
+def _order_row(repository: ExecutionRepository):
+    return (
+        repository.database.connect()
+        .execute("SELECT filled_quantity, average_fill_price, status FROM orders")
+        .fetchone()
+    )
+
+
+def test_two_fills_on_one_order_accumulate_rather_than_overwrite(repository, session):
+    """The defect Phase 4 Part 5 found and fixed.
+
+    ``apply_fill`` used to write ``fill.quantity`` and ``fill.price`` straight onto
+    the ``orders`` row, so an order with two fills reported the **last** fill's
+    quantity and price as though they were the order's own. It was invisible for
+    three phases only because nothing produced two fills; the partial-fill model
+    does, so it would have shipped a row saying 25 of 75 filled at the second
+    price.
+    """
+    broker = PaperBroker(
+        config=PaperFillConfig(slippage=SlippageConfig(market_order_ticks=0)),
+        fill_quantity_policy=lambda intent, quote: (30, 20),
+    )
+    result = _lifecycle(repository, session, broker=broker).handle_signal(
+        _signal(), trading_date=TRADING_DATE
+    )
+
+    assert result.order is not None and len(result.order.fills) == 2
+    row = _order_row(repository)
+    assert row["filled_quantity"] == 50, "the running total, not the last fill's 20"
+    assert row["status"] == OrderStatus.FILLED.value
+    assert result.position is not None and result.position.quantity == 50
+
+
+def test_the_persisted_average_is_quantity_weighted(repository, session):
+    """Two fills at different prices, and the row must not report either one."""
+    result = _lifecycle(repository, session).handle_signal(_signal(), trading_date=TRADING_DATE)
+    assert result.correlation_id is not None
+    order_id = int(repository.database.connect().execute("SELECT id FROM orders").fetchone()["id"])
+
+    repository.apply_fill(
+        order_id=order_id,
+        runtime_id="intraday_options",
+        fill=Fill(
+            correlation_id=result.correlation_id,
+            broker_fill_id="manual-second-fill",
+            strategy_id="st01",
+            execution_mode=ExecutionMode.PAPER,
+            quantity=50,
+            price=200.55,
+            filled_at=datetime.now(UTC),
+        ),
+        order_status=OrderStatus.FILLED,
+        instrument="NIFTY",
+        security_id="99926000",
+        side=Side.BUY,
+        trading_date=TRADING_DATE,
+    )
+
+    first_price = result.order.fills[0].price if result.order else 0.0
+    row = _order_row(repository)
+    assert row["filled_quantity"] == 100
+    # The mean of the two, not the second alone and not the first alone.
+    assert row["average_fill_price"] == pytest.approx((first_price + 200.55) / 2)
+    assert row["average_fill_price"] != pytest.approx(200.55)
+
+
+def test_a_partially_filled_order_is_persisted_as_partially_filled(repository, session):
+    broker = PaperBroker(
+        config=PaperFillConfig(slippage=SlippageConfig(market_order_ticks=0)),
+        fill_quantity_policy=lambda intent, quote: (20,),
+    )
+    _lifecycle(repository, session, broker=broker).handle_signal(
+        _signal(), trading_date=TRADING_DATE
+    )
+
+    row = _order_row(repository)
+    assert row["status"] == OrderStatus.PARTIALLY_FILLED.value
+    assert row["filled_quantity"] == 20
+
+
+# --------------------------------------------- the quote behind the fill
+def test_the_lifecycle_prices_against_the_live_book_when_one_is_available(repository, session):
+    """The four-place gap Part 5 closed, seen from the far end: before it, the
+    lifecycle built its quote from ``signal.reference_price`` alone and every fill
+    was an LTP fallback no matter what the feed carried."""
+    quotes = QuoteBook()
+    quotes.record(
+        Tick(
+            security_id="99926000",
+            instrument="NIFTY",
+            last_price=100.5,
+            exchange_time=datetime(2026, 7, 30, 9, 16, tzinfo=UTC),
+            received_at=datetime(2026, 7, 30, 9, 16, tzinfo=UTC),
+            bid_price=100.40,
+            ask_price=100.60,
+        )
+    )
+    broker = PaperBroker(config=PaperFillConfig(slippage=SlippageConfig(market_order_ticks=0)))
+    result = _lifecycle(repository, session, broker=broker, quotes=quotes).handle_signal(
+        _signal(), trading_date=TRADING_DATE
+    )
+
+    assert result.order is not None
+    fill = result.order.fills[0]
+    assert fill.fill_method == "bid_ask"
+    assert result.order.average_fill_price == 100.60, "the ask, not the reference price"
+
+
+def test_the_submission_time_quote_is_persisted_beside_the_fill(repository, session):
+    """Spec section 6's record list. ``fills`` could not be widened — the runner
+    needs replay-safe statements — so it lands in ``paper_fill_quotes``."""
+    quotes = QuoteBook()
+    quotes.record(
+        Tick(
+            security_id="99926000",
+            instrument="NIFTY",
+            last_price=100.5,
+            exchange_time=datetime(2026, 7, 30, 9, 16, tzinfo=UTC),
+            received_at=datetime(2026, 7, 30, 9, 16, tzinfo=UTC),
+            bid_price=100.40,
+            ask_price=100.60,
+        )
+    )
+    _lifecycle(repository, session, quotes=quotes).handle_signal(
+        _signal(), trading_date=TRADING_DATE
+    )
+
+    row = (
+        repository.database.connect()
+        .execute("SELECT quote_bid, quote_ask, latency_applied, fill_method FROM paper_fill_quotes")
+        .fetchone()
+    )
+    assert (row["quote_bid"], row["quote_ask"]) == (100.40, 100.60)
+    assert row["fill_method"] == "bid_ask"
+    assert row["latency_applied"] == 0, "no post-deadline quote existed — deviation D48"
+
+
+def test_a_live_style_fill_with_no_quote_detail_leaves_no_misleading_row(repository, session):
+    """A future live adapter that cannot report the book must not write a row of
+    NULLs that reads like "we looked and there was nothing there"."""
+    result = _lifecycle(repository, session).handle_signal(_signal(), trading_date=TRADING_DATE)
+    order_id = int(repository.database.connect().execute("SELECT id FROM orders").fetchone()["id"])
+    repository.apply_fill(
+        order_id=order_id,
+        runtime_id="intraday_options",
+        fill=Fill(
+            correlation_id=result.correlation_id or "",
+            broker_fill_id="live-style-fill",
+            strategy_id="st01",
+            execution_mode=ExecutionMode.PAPER,
+            quantity=50,
+            price=100.5,
+            filled_at=datetime.now(UTC),
+        ),
+        order_status=OrderStatus.FILLED,
+        instrument="NIFTY",
+        security_id="99926000",
+        side=Side.BUY,
+        trading_date=TRADING_DATE,
+    )
+
+    ids = [
+        row["broker_fill_id"]
+        for row in repository.database.connect().execute(
+            "SELECT broker_fill_id FROM paper_fill_quotes"
+        )
+    ]
+    assert "live-style-fill" not in ids
 
 
 def test_a_rejected_order_is_recorded_without_a_position(repository, session):
