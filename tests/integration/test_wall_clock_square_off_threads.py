@@ -55,6 +55,26 @@ IDLE_TIMEOUT = 30.0
 #: a long one only makes the suite slow.
 SHORT_IDLE = 2.0
 
+#: The largest ``square_off_in`` any test below adds to ``anchor``. The ``anchor``
+#: fixture skips when this offset would carry ``square_off_at`` past midnight —
+#: **widen this constant (not the fixture) if a future test needs a bigger one.**
+#: Found by exactly this failing: a hardcoded five-minute guard let
+#: ``test_a_square_off_still_in_the_future_leaves_the_position_open``'s two-hour
+#: offset wrap unnoticed for the two hours before that window opened, producing a
+#: ``SquareOffPolicy`` construction error — "square_off_at must not precede
+#: entry_cutoff" — that has nothing to do with the property under test and that
+#: only appears after ~22:00 IST, so it survives a whole day of development runs.
+#:
+#: **A symmetric, narrower gap exists at the other end and is deliberately left
+#: unguarded.** ``_config`` also computes ``entry_cutoff`` as
+#: ``anchor - timedelta(minutes=1)``, so a run started in the first minute after
+#: midnight wraps *that* back to 23:59 the previous day and hits the identical
+#: construction error from the other direction. One-in-1440 versus this one's
+#: one-in-12, so it was judged not worth a second constant — but if it is ever
+#: worth closing, the fix is the same shape: skip ``anchor`` when it falls inside
+#: that one-minute window after midnight, the same way this guard skips it before.
+MAX_SQUARE_OFF_OFFSET = timedelta(hours=2)
+
 
 def _last_weekday(moment: datetime) -> datetime:
     """``moment`` itself on a weekday, else the same clock time on the last one."""
@@ -173,10 +193,27 @@ def _run(config: WorkerConfig, ticks):
 
 @pytest.fixture
 def anchor() -> datetime:
-    """One clock reading per test, so the tape and the policy cannot disagree."""
+    """One clock reading per test, so the tape and the policy cannot disagree.
+
+    Skipped whenever ``anchor + MAX_SQUARE_OFF_OFFSET`` would fall on the next
+    day: ``_config`` builds ``square_off_at`` as ``(anchor + square_off_in).time()``,
+    which drops the date, so a wrap turns "square-off two hours from now" into a
+    *time of day* hours **earlier** than ``entry_cutoff`` — and
+    ``SquareOffPolicy.__post_init__`` refuses to construct rather than silently
+    misordering the two. That refusal is correct and has nothing to do with
+    wall-clock square-off; skipping here is what keeps this suite from failing on
+    a clock artifact for two hours out of every twenty-four.
+
+    See :data:`MAX_SQUARE_OFF_OFFSET` for what to widen if a test ever needs a
+    bigger offset, and for the narrower, deliberately-unguarded gap at the other
+    end of the day.
+    """
     now = now_ist().replace(microsecond=0)
-    if now.hour == 23 and now.minute >= 55:
-        pytest.skip("within minutes of IST midnight; the relative timeline would wrap")
+    time_of_day = timedelta(hours=now.hour, minutes=now.minute, seconds=now.second)
+    if timedelta(hours=24) - time_of_day <= MAX_SQUARE_OFF_OFFSET:
+        pytest.skip(
+            f"within {MAX_SQUARE_OFF_OFFSET} of IST midnight; the relative timeline would wrap"
+        )
     return now
 
 
