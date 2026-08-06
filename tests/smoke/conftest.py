@@ -37,9 +37,7 @@ _REAL_LIVE_SMOKE_ENV = {
 
 
 @pytest.fixture(autouse=True)
-def _restore_live_smoke_credentials(
-    isolated_env: None, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def _restore_live_smoke_credentials(isolated_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
     """Undo ``isolated_env``'s clearing, but only for an opted-in live run."""
     if _REAL_LIVE_SMOKE_ENV.get("ALGO_LIVE_SMOKE") != "1":
         return

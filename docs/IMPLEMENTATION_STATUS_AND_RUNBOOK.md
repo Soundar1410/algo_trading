@@ -9,7 +9,7 @@ the next phase. Updated after every phase.
 |---|---|
 | **Current phase** | Phase 4 **Parts 1-4 complete; Part 5 code complete**. **Part 5** (`PaperBroker` realism) closes limitation 5 and deviation D11: depth reaches the fill through a shared `QuoteBook`, a buy takes the ask and a sell the bid, the price is rounded adversely onto the tick grid, limit orders rest and settle from later quotes, partial fills accumulate correctly, and the spec's nine rejection rules are implemented behind a code enum. The pre-work audit corrected two wrong notes in this document and found four things that changed the work — including that Dhan publishes `SEM_TICK_SIZE` in **paise**, so a model trusting the column would have put NIFTY options on a ₹5 grid. New deviations **D48-D53** state what is *not* claimed. Awaiting review |
 | **Next phase** | **Run the outstanding Part 5 gate item** — the opt-in Full-mode depth capture against a real `NSE_FNO` option, which needs market hours (09:15–15:30 IST); command in [Commands](#5-commands). Then Phase 5 |
-| **Last updated** | 6 August 2026 — operational-safety incident recorded, see [Known limitations](#6-known-limitations) 18 |
+| **Last updated** | 6 August 2026 — limitation 18 fixed and closed; limitation 19 (new) recorded, see [Known limitations](#6-known-limitations) |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
 | **Live order placement** | **Not implemented.** Fail-closed. Phase 10 only. |
@@ -3580,17 +3580,97 @@ start/stop/crash/restart tests pass.
     `test_a_real_option_contract_delivers_ticks_on_the_fno_segment` needs market
     hours and has not been run. Resolution is proven; delivery is not.
 
-18. **Generating a fresh Dhan access token for the shared client ID invalidates
-    whichever token was previously active — for both systems.** Confirmed live on
-    6 August 2026: a fresh login from this repo's smoke-test bootstrap killed this
-    repo's own just-minted token **and** `Trading_Automation`'s already-active one
-    in the same stroke. Full incident writeup, sequence and the required fix are
+18. **~~Generating a fresh Dhan access token for the shared client ID invalidates
+    whichever token was previously active — for both systems.~~ FIXED** (6 August
+    2026, same day as the incident). Full incident writeup and sequence remain
     under [Operational risk noted during the audit](#operational-risk-noted-during-the-audit),
-    "Incident, 6 August 2026". **Not yet fixed** —
-    `tests/smoke/test_live_feed_smoke.py`'s module-scoped `_bootstrap()` still
-    mints a fresh login on every run rather than defaulting to the cached token.
-    No positions were affected this time only because both systems are
-    paper-only. **Must be verified fixed before Phase 10.**
+    "Incident, 6 August 2026" — that record is kept as-is, since it is what
+    happened. The fix: `ALGO_LIVE_SMOKE=1` (run the live smoke tests) and
+    `ALGO_SMOKE_ALLOW_FRESH_LOGIN=1` (permit minting a new token) are now two
+    separate gates. `tests/smoke/test_live_feed_smoke.py`'s `_bootstrap()`
+    defaults to this repo's real `data/cache/token_cache.json` and never puts
+    `DHAN_PIN`/`DHAN_TOTP_SECRET` into `AuthCredentials` unless
+    `allow_fresh_login=True` is passed explicitly — so `AuthCredentials.can_generate`
+    stays False by default and `AuthBootstrap` never builds a login object,
+    regardless of what is exported. A test without a usable cached or
+    environment token now fails closed with `MissingCredentialsError` rather
+    than minting one. Exactly one test
+    (`test_the_token_cache_is_written_atomically_and_privately`) still needs a
+    real generation to verify the cache-write path itself; it is gated behind a
+    new `needs_fresh_login` marker and isolated to its own `tmp_path`, never
+    touching the real cache file. **Verified by a mocked dry run** (fabricated
+    client id, `DhanTotpLogin.generate` monkeypatched to raise if called, no
+    network reachable): default-with-no-cache fails closed without attempting a
+    login; default-with-a-cached-token reuses it without attempting a login;
+    `allow_fresh_login=True` does reach the login call, proving the opt-in path
+    is real. Full suite unchanged at 1242 passed, 11 skipped, both before and
+    after. Not yet re-run against a live account under the new gates.
+
+19. **`dhanClientId` sent as an HTTP header instead of a JSON-body field, on
+    every POST call this repo makes with a hand-rolled `httpx` request.** Found
+    while investigating limitation 18, not yet fixed.
+
+    **The bug.** `tests/smoke/test_live_feed_smoke.py`'s `_index_last_price`
+    (backs the ATM-strike lookup in two live rehearsal tests) and
+    `test_the_option_chain_throttle_holds_against_the_real_endpoint`'s `fetch()`
+    both send `headers={"access-token": token, "dhanClientId": client_id}` to a
+    `POST` endpoint (`/v2/marketfeed/ltp`, `/v2/optionchain`) and never put
+    `dhanClientId` in the JSON body at all. The installed `dhanhq==2.2.0` SDK's
+    own `dhan_http.py` shows the real contract for a POST:
+    `header = {"access-token": ..., "client-id": ..., ...}` (`client-id`, not
+    `dhanClientId`), and separately, unconditionally,
+    `payload["dhanClientId"] = self.client_id` injected into the JSON body
+    itself before every POST is sent (`_send_request`, `dhan_http.py:53-56`).
+    Both call sites here are missing the body field, and neither sends
+    `client-id` as a header.
+
+    **Not confined to the smoke-test helpers — the same pattern is in
+    production code.** `common/market_data/dhan_historical.py`, the module that
+    performs the real `POST /v2/charts/intraday` warm-up-candle fetch for Phase
+    4 Part 4, builds its request the identical way:
+    `headers = {"access-token": ..., "dhanClientId": ...}`, payload never
+    touched. This is not a test-only bug if the same defect applies there too.
+    That endpoint has itself never been exercised against a real live call —
+    its own module docstring and `test_the_intraday_endpoint_returns_a_success_shape_during_market_hours`'s
+    docstring both say so — so this may already be a live defect in a shipped
+    production code path that simply has not been observed yet, only because
+    nothing has forced it to run.
+
+    **Contrast, and why the theory holds together.** The one call proven to
+    work live is `GET /v2/profile` (`common/authentication/dhan_login.py`'s
+    `validate_token`), which also sends `dhanClientId` as a header — but it is
+    a bodyless GET, so there is no payload for the SDK's contract to require
+    the field in. That is consistent with the theory that this only bites
+    POST/JSON-body calls, which is every endpoint listed above except
+    `/profile`.
+
+    **Not proven live in isolation, and here is why honestly.** An attempt to
+    correct just the header name (`client-id` instead of `dhanClientId`) was
+    made live during the limitation-18 incident and still returned 401 — but by
+    that point the token itself had already been invalidated by the same
+    incident, so that attempt cannot distinguish "still wrong" from "token is
+    dead" and is not evidence either way. The stronger evidence is earlier in
+    the same incident: the *first* `_index_last_price` failure happened using a
+    token minted moments earlier in the very same call (via the then-unfixed
+    fresh-login-every-run behaviour) — a token that had every reason to be
+    good — and it still came back 401 "Client ID or Token invalid". That is
+    consistent with a request that never told Dhan which client it was.
+
+    **Could this be silently causing failures? Yes, plausibly, on every future
+    attempt, independent of token validity** — a structural request-shape bug
+    fails the same way whether the token is perfect or dead, which is exactly
+    what makes it easy to misdiagnose as a token/auth problem (as very nearly
+    happened here) rather than a malformed request.
+
+    **Worth checking before the next live rehearsal? Yes** — specifically
+    before trusting either: (a) the option-chain smoke test or the ATM-strike
+    lookup that gates the Part 1 and Part 5 live rehearsal tests, or (b) Part
+    4's warm-up feature, which reads real pre-market history through the same
+    pattern in production code. A cheap, safe check that spends no additional
+    token generation and risks no further invalidation: reuse the existing
+    valid cached token, add the `client-id` header, inject `dhanClientId` into
+    the POST body to match the SDK's own contract, and retry — read-only calls
+    only, as every call in this file already is. **Not yet fixed.**
 
 
 ### Operational risk noted during the audit

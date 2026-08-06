@@ -16,6 +16,25 @@ a test that fails at 21:00 for correct reasons trains people to ignore failures.
 Phase 2 change: the token now comes from the authentication bootstrap rather than
 a hand-pasted ``DHAN_ACCESS_TOKEN``. That variable still works as an override, so
 either path can be exercised.
+
+**Fixing known limitation 18** (see the runbook): every test here used to build
+its own ``AuthBootstrap`` against a throwaway ``tmp_path``, which meant that with
+``DHAN_PIN``/``DHAN_TOTP_SECRET`` exported it *always* attempted a fresh TOTP
+login -- even when this repo already held a perfectly good cached token.
+Confirmed live on 6 August 2026: that fresh login minted a new access token for
+a Dhan client ID shared with ``Trading_Automation``, which silently invalidated
+that system's already-active session. ``ALGO_LIVE_SMOKE=1`` was never meant to
+also mean "mint a new token" -- those are now two separate decisions:
+
+* By default, every test in this file reuses this repo's own token cache
+  (``data/cache/token_cache.json``, via the same :class:`TokenCache` a real
+  runtime reads) or an exported ``DHAN_ACCESS_TOKEN``. If neither is usable, a
+  test fails closed with ``MissingCredentialsError`` rather than logging
+  anyone out.
+* A fresh TOTP login is only attempted when ``ALGO_SMOKE_ALLOW_FRESH_LOGIN=1``
+  is *also* exported, on top of ``DHAN_PIN``/``DHAN_TOTP_SECRET``. Exactly one
+  test needs this: the one that verifies the cache-writing code path itself,
+  which cannot be exercised without a real generation.
 """
 
 from __future__ import annotations
@@ -30,11 +49,42 @@ from common.models import Tick
 
 _ENABLED = os.environ.get("ALGO_LIVE_SMOKE") == "1"
 _CLIENT_ID = os.environ.get("DHAN_CLIENT_ID")
+
+#: The **separate** gate for minting a fresh Dhan login. Deliberately distinct
+#: from ALGO_LIVE_SMOKE=1: conflating "run the live smoke tests" with "mint a
+#: new token" is exactly what caused the incident behind known limitation 18 --
+#: a run of this file generated a new access token for a Dhan client ID shared
+#: with Trading_Automation, which silently invalidated that system's
+#: already-active session. Only one test in this file needs to set this.
+_ALLOW_FRESH_LOGIN = os.environ.get("ALGO_SMOKE_ALLOW_FRESH_LOGIN") == "1"
+
+
+def _cached_token_is_usable() -> bool:
+    """True if this repo's own token cache already holds a usable token.
+
+    Checked at collection time, before any fixture runs and before any test
+    body executes, using the same :class:`TokenCache` a real runtime reads --
+    not a fresh ``AuthBootstrap``. This never touches the network and never
+    mints anything; it only decides whether the module's skip gate reflects
+    what is already true on disk.
+    """
+    from common.authentication import TokenCache
+    from common.authentication.bootstrap import TOKEN_CACHE_FILENAME
+    from common.config.paths import load_paths
+
+    cache = TokenCache(load_paths().cache_root / TOKEN_CACHE_FILENAME)
+    stored = cache.load(expected_client_id=_CLIENT_ID)
+    return stored is not None and stored.is_usable()
+
+
 _CAN_AUTHENTICATE = bool(
     _CLIENT_ID
     and (
         os.environ.get("DHAN_ACCESS_TOKEN")
-        or (os.environ.get("DHAN_PIN") and os.environ.get("DHAN_TOTP_SECRET"))
+        or _cached_token_is_usable()
+        or (
+            _ALLOW_FRESH_LOGIN and os.environ.get("DHAN_PIN") and os.environ.get("DHAN_TOTP_SECRET")
+        )
     )
 )
 
@@ -54,9 +104,18 @@ pytestmark = pytest.mark.skipif(
 needs_credentials = pytest.mark.skipif(
     not _CAN_AUTHENTICATE,
     reason=(
-        "Needs DHAN_CLIENT_ID plus either DHAN_ACCESS_TOKEN or "
-        "DHAN_PIN + DHAN_TOTP_SECRET, exported into the environment."
+        "Needs DHAN_CLIENT_ID plus a usable token: DHAN_ACCESS_TOKEN, an "
+        "already-cached token in data/cache/token_cache.json, or "
+        "ALGO_SMOKE_ALLOW_FRESH_LOGIN=1 plus DHAN_PIN + DHAN_TOTP_SECRET."
     ),
+)
+
+#: The narrower gate for the one test that must mint a fresh login to do its
+#: job -- it verifies the cache-writing code path itself. Every other test in
+#: this file is content to reuse whatever token is already available.
+needs_fresh_login = pytest.mark.skipif(
+    not (_ALLOW_FRESH_LOGIN and os.environ.get("DHAN_PIN") and os.environ.get("DHAN_TOTP_SECRET")),
+    reason="Needs ALGO_SMOKE_ALLOW_FRESH_LOGIN=1 plus DHAN_PIN + DHAN_TOTP_SECRET.",
 )
 
 #: NIFTY 50 index on the IDX segment.
@@ -65,30 +124,56 @@ _SEGMENT = int(os.environ.get("ALGO_SMOKE_SEGMENT", "0"))
 _TIMEOUT_SECONDS = 30.0
 
 
-def _bootstrap(cache_dir: Path):  # type: ignore[no-untyped-def]
+def _default_cache_dir() -> Path:
+    """This repo's own token cache directory -- the same one a real runtime
+    reads and writes, so a test run here sees whatever a pre-market
+    ``scripts.auth_bootstrap`` already minted today."""
+    from common.config.paths import load_paths
+
+    return load_paths().cache_root
+
+
+def _bootstrap(*, cache_dir: Path | None = None, allow_fresh_login: bool = _ALLOW_FRESH_LOGIN):  # type: ignore[no-untyped-def]
+    """Build the bootstrap. Defaults to reuse-only.
+
+    A fresh login is only ever possible when ``allow_fresh_login`` is
+    explicitly True (by default, whatever ``ALGO_SMOKE_ALLOW_FRESH_LOGIN``
+    says) -- not merely because ``DHAN_PIN``/``DHAN_TOTP_SECRET`` are present.
+    Omitting the pin/totp from ``AuthCredentials`` entirely when fresh login is
+    not allowed is what makes this safe: it leaves
+    ``AuthCredentials.can_generate`` False, so ``AuthBootstrap`` never builds a
+    login object at all -- there is no path to a network call to forget to
+    take.
+    """
     from common.authentication import AuthBootstrap, AuthCredentials
 
     return AuthBootstrap(
         AuthCredentials(
             client_id=str(_CLIENT_ID),
-            pin=os.environ.get("DHAN_PIN"),
-            totp_secret=os.environ.get("DHAN_TOTP_SECRET"),
+            pin=os.environ.get("DHAN_PIN") if allow_fresh_login else None,
+            totp_secret=os.environ.get("DHAN_TOTP_SECRET") if allow_fresh_login else None,
             access_token=os.environ.get("DHAN_ACCESS_TOKEN"),
         ),
-        cache_dir=cache_dir,
+        cache_dir=cache_dir if cache_dir is not None else _default_cache_dir(),
     )
 
 
-def _token(cache_dir: Path) -> str:
-    """Obtain a token the way a real runtime does."""
-    token, _outcome = _bootstrap(cache_dir).get_token()
+def _token(cache_dir: Path | None = None) -> str:
+    """Obtain a token the way a real runtime does: reuse first, and never mint
+    one unless explicitly told to."""
+    token, _outcome = _bootstrap(cache_dir=cache_dir).get_token()
     return token
 
 
 @needs_credentials
-def test_the_bootstrap_obtains_a_token_and_dhan_accepts_it(tmp_path: Path):
-    """Auth plus the spec's safe read request. Places no order."""
-    bootstrap = _bootstrap(tmp_path)
+def test_the_bootstrap_obtains_a_token_and_dhan_accepts_it():
+    """Auth plus the spec's safe read request. Places no order.
+
+    Reuse-only by default (see the module docstring): this proves the *reuse*
+    path works end to end, which is the path every other test in this file
+    also takes.
+    """
+    bootstrap = _bootstrap()
     token, outcome = bootstrap.get_token()
 
     assert token
@@ -96,15 +181,18 @@ def test_the_bootstrap_obtains_a_token_and_dhan_accepts_it(tmp_path: Path):
     assert bootstrap.validate(token) is True, "Dhan rejected the token via GET /v2/profile"
 
 
-@needs_credentials
+@needs_fresh_login
 def test_the_token_cache_is_written_atomically_and_privately(tmp_path: Path):
-    """Ratifies the cache against a real token rather than a synthetic one."""
+    """Ratifies the cache against a real, freshly-generated token.
+
+    The one test in this file that must mint a login rather than reuse one --
+    the whole point is to observe the write happen. Isolated to its own
+    ``tmp_path`` rather than this repo's real cache dir, so it never touches
+    (or races) ``data/cache/token_cache.json``.
+    """
     import stat
 
-    if not (os.environ.get("DHAN_PIN") and os.environ.get("DHAN_TOTP_SECRET")):
-        pytest.skip("token generation requires DHAN_PIN and DHAN_TOTP_SECRET")
-
-    bootstrap = _bootstrap(tmp_path)
+    bootstrap = _bootstrap(cache_dir=tmp_path, allow_fresh_login=True)
     bootstrap.get_token()
 
     assert bootstrap.cache.path.exists()
@@ -114,13 +202,13 @@ def test_the_token_cache_is_written_atomically_and_privately(tmp_path: Path):
 
 
 @needs_credentials
-def test_one_live_tick_reaches_the_hub(tmp_path: Path):
+def test_one_live_tick_reaches_the_hub():
     """Read-only: subscribe, receive one tick, disconnect. No order is placed."""
     from common.market_data.dhan import DhanMarketFeedAdapter
 
     adapter = DhanMarketFeedAdapter(
         client_id=str(_CLIENT_ID),
-        access_token=_token(tmp_path),
+        access_token=_token(),
         exchange_segment=_SEGMENT,
         instrument_label="NIFTY",
     )
@@ -155,7 +243,7 @@ def test_one_live_tick_reaches_the_hub(tmp_path: Path):
 
 
 @needs_credentials
-def test_the_live_payload_matches_the_ratified_shape(tmp_path: Path):
+def test_the_live_payload_matches_the_ratified_shape():
     """The Block 2 ratification assertion.
 
     Phase 1 shipped normalisation written against an *unobserved* payload. This
@@ -167,7 +255,7 @@ def test_the_live_payload_matches_the_ratified_shape(tmp_path: Path):
 
     adapter = DhanMarketFeedAdapter(
         client_id=str(_CLIENT_ID),
-        access_token=_token(tmp_path),
+        access_token=_token(),
         exchange_segment=_SEGMENT,
         instrument_label="NIFTY",
     )
@@ -201,7 +289,7 @@ def test_the_live_payload_matches_the_ratified_shape(tmp_path: Path):
 
 
 @needs_credentials
-def test_the_option_chain_throttle_holds_against_the_real_endpoint(tmp_path: Path):
+def test_the_option_chain_throttle_holds_against_the_real_endpoint():
     """One read-only /optionchain call through the service. Places no order."""
     import httpx
 
@@ -211,7 +299,7 @@ def test_the_option_chain_throttle_holds_against_the_real_endpoint(tmp_path: Pat
     if not expiry:
         pytest.skip("set ALGO_SMOKE_EXPIRY=YYYY-MM-DD to exercise the option chain")
 
-    token = _token(tmp_path)
+    token = _token()
     client_id = str(_CLIENT_ID)
 
     def fetch(security_id: int, segment: str, chain_expiry: str) -> dict[str, object]:
@@ -308,14 +396,14 @@ def test_a_real_option_contract_delivers_ticks_on_the_fno_segment(tmp_path: Path
     # Pick the strike nearest the index's own last price, so the contract is one
     # that is actually trading rather than a far wing that may be untouched.
     strikes = master.strikes_for_expiry(expiry)
-    spot = _index_last_price(tmp_path, meta)
+    spot = _index_last_price(meta)
     atm = min(strikes, key=lambda strike: abs(strike - spot))
     contract = master.get(atm, OptionType.CE, expiry)
     assert contract is not None
 
     adapter = DhanMarketFeedAdapter(
         client_id=str(_CLIENT_ID),
-        access_token=_token(tmp_path),
+        access_token=_token(),
         exchange_segment=segment_code(meta.segment),  # the underlying's segment
     )
     adapter.subscribe([meta.security_id])
@@ -382,14 +470,14 @@ def test_a_real_option_in_full_mode_delivers_a_two_sided_book(tmp_path: Path):
     meta = resolve_index_meta("NIFTY")
     master = ScripMaster("NIFTY").load(cache=ScripMasterCache(tmp_path))
     expiry = master.nearest_expiry()
-    spot = _index_last_price(tmp_path, meta)
+    spot = _index_last_price(meta)
     atm = min(master.strikes_for_expiry(expiry), key=lambda strike: abs(strike - spot))
     contract = master.get(atm, OptionType.CE, expiry)
     assert contract is not None
 
     adapter = DhanMarketFeedAdapter(
         client_id=str(_CLIENT_ID),
-        access_token=_token(tmp_path),
+        access_token=_token(),
         exchange_segment=segment_code(meta.segment),
     )
     adapter.subscribe([meta.security_id])
@@ -436,9 +524,7 @@ def test_a_real_option_in_full_mode_delivers_a_two_sided_book(tmp_path: Path):
 
 # --------------------------------------------------- Phase 4 Part 4: warm-up
 @needs_credentials
-def test_the_intraday_endpoint_returns_a_success_shape_during_market_hours(
-    tmp_path: Path,
-) -> None:
+def test_the_intraday_endpoint_returns_a_success_shape_during_market_hours() -> None:
     """**Narrows, but cannot fully resolve, the one thing this port could not
     verify from source or documentation alone**: whether Dhan's
     ``/v2/charts/intraday`` returns a partial candle for the still-forming
@@ -457,7 +543,7 @@ def test_the_intraday_endpoint_returns_a_success_shape_during_market_hours(
     from common.warmup.historical import parse_intraday_response
 
     now = now_ist()
-    client = DhanHistoricalDataClient(str(_CLIENT_ID), _token(tmp_path))
+    client = DhanHistoricalDataClient(str(_CLIENT_ID), _token())
     resp = client.fetch_intraday(
         security_id=_SECURITY_ID,
         exchange_segment="IDX_I",
@@ -474,7 +560,7 @@ def test_the_intraday_endpoint_returns_a_success_shape_during_market_hours(
 
 
 @needs_credentials
-def test_the_still_forming_bucket_is_excluded_from_a_live_fetch(tmp_path: Path) -> None:
+def test_the_still_forming_bucket_is_excluded_from_a_live_fetch() -> None:
     """The code's own defence against a partial trailing candle, checked
     against a real response rather than a synthetic one. Whatever Dhan
     actually returns for the still-open period, nothing at or after the
@@ -489,7 +575,7 @@ def test_the_still_forming_bucket_is_excluded_from_a_live_fetch(tmp_path: Path) 
 
     now = now_ist()
     session = MarketSession(SessionConfig())
-    client = DhanHistoricalDataClient(str(_CLIENT_ID), _token(tmp_path))
+    client = DhanHistoricalDataClient(str(_CLIENT_ID), _token())
     candles = fetch_warmup_candles_range(
         client,
         security_id=_SECURITY_ID,
@@ -508,13 +594,13 @@ def test_the_still_forming_bucket_is_excluded_from_a_live_fetch(tmp_path: Path) 
         )
 
 
-def _index_last_price(cache_dir: Path, meta) -> float:  # type: ignore[no-untyped-def]
+def _index_last_price(meta) -> float:  # type: ignore[no-untyped-def]
     """The index's LTP, via the same read-only endpoint Phase 2 Block 2 used."""
     import httpx
 
     response = httpx.post(
         "https://api.dhan.co/v2/marketfeed/ltp",
-        headers={"access-token": _token(cache_dir), "dhanClientId": str(_CLIENT_ID)},
+        headers={"access-token": _token(), "dhanClientId": str(_CLIENT_ID)},
         json={meta.segment: [int(meta.security_id)]},
         timeout=15.0,
     )
