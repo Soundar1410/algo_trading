@@ -9,7 +9,7 @@ the next phase. Updated after every phase.
 |---|---|
 | **Current phase** | Phase 4 **Parts 1-4 complete; Part 5 code complete**. **Part 5** (`PaperBroker` realism) closes limitation 5 and deviation D11: depth reaches the fill through a shared `QuoteBook`, a buy takes the ask and a sell the bid, the price is rounded adversely onto the tick grid, limit orders rest and settle from later quotes, partial fills accumulate correctly, and the spec's nine rejection rules are implemented behind a code enum. The pre-work audit corrected two wrong notes in this document and found four things that changed the work — including that Dhan publishes `SEM_TICK_SIZE` in **paise**, so a model trusting the column would have put NIFTY options on a ₹5 grid. New deviations **D48-D53** state what is *not* claimed. Awaiting review |
 | **Next phase** | **Run the outstanding Part 5 gate item** — the opt-in Full-mode depth capture against a real `NSE_FNO` option, which needs market hours (09:15–15:30 IST); command in [Commands](#5-commands). Then Phase 5 |
-| **Last updated** | 5 August 2026 |
+| **Last updated** | 6 August 2026 — operational-safety incident recorded, see [Known limitations](#6-known-limitations) 18 |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
 | **Live order placement** | **Not implemented.** Fail-closed. Phase 10 only. |
@@ -3580,6 +3580,18 @@ start/stop/crash/restart tests pass.
     `test_a_real_option_contract_delivers_ticks_on_the_fno_segment` needs market
     hours and has not been run. Resolution is proven; delivery is not.
 
+18. **Generating a fresh Dhan access token for the shared client ID invalidates
+    whichever token was previously active — for both systems.** Confirmed live on
+    6 August 2026: a fresh login from this repo's smoke-test bootstrap killed this
+    repo's own just-minted token **and** `Trading_Automation`'s already-active one
+    in the same stroke. Full incident writeup, sequence and the required fix are
+    under [Operational risk noted during the audit](#operational-risk-noted-during-the-audit),
+    "Incident, 6 August 2026". **Not yet fixed** —
+    `tests/smoke/test_live_feed_smoke.py`'s module-scoped `_bootstrap()` still
+    mints a fresh login on every run rather than defaulting to the cached token.
+    No positions were affected this time only because both systems are
+    paper-only. **Must be verified fixed before Phase 10.**
+
 
 ### Operational risk noted during the audit
 
@@ -3662,12 +3674,78 @@ bootstrap, the two will contend for that budget — and our token cache and refr
 lock are local to this repository, so they cannot coordinate with it. Do not run
 both bootstraps in the same window.
 
+#### Incident, 6 August 2026: a fresh login from this repo invalidated `Trading_Automation`'s live token
+
+The concern above understated the risk. It framed the shared client ID as a
+**rate-limit contention** problem — two systems competing for one budget of
+roughly one token generation per two minutes. Today's attempt to run the Part 5
+Full-mode gate item (`tests/smoke/test_live_feed_smoke.py`) showed it is worse
+than that: **generating a new access token for the shared client ID invalidates
+whichever token was previously active, immediately, for both systems.** This is
+not contention over a budget: it is one system's login silently logging the
+other one out.
+
+Sequence, reconstructed from the session:
+
+1. `scripts.auth_bootstrap` was run in this repo — a fresh token was minted and
+   validated OK against `GET /v2/profile`.
+2. Minutes later, `tests/smoke/test_live_feed_smoke.py::
+   test_a_real_option_in_full_mode_delivers_a_two_sided_book` was run with
+   `ALGO_LIVE_SMOKE=1`. Its `_bootstrap()` helper builds a fresh
+   `AuthBootstrap` against a throwaway `tmp_path` cache directory on every
+   invocation — it has no notion of "a good token already exists", so with
+   `DHAN_PIN`/`DHAN_TOTP_SECRET` exported it always attempts its own login
+   rather than reusing this repo's already-valid cache.
+3. That second login minted a new token for the same client ID.
+4. Both this repo's just-minted token from step 1 **and**
+   `Trading_Automation/common/access_token.json` (created earlier that morning,
+   expiry the next day, actively in use by its running `start_trading.py`, two
+   Streamlit dashboards and the weekly-strategies scheduler) were confirmed
+   dead immediately after — both returned `DH-906 Invalid Token` against a
+   direct, read-only `GET /v2/profile` check.
+5. After the invalidation was discovered, a subsequent attempt exported
+   `DHAN_ACCESS_TOKEN` only, with `DHAN_PIN`/`DHAN_TOTP_SECRET` unset. With no
+   PIN/TOTP available, `AuthCredentials.can_generate` is `False`, so
+   `_bootstrap()` cannot fall back to a fresh login even from a throwaway cache
+   directory — it is limited to the token handed to it. That attempt did not
+   trigger a second fresh login. **The safe path already exists today, without
+   the code fix**: export a known-good `DHAN_ACCESS_TOKEN` and omit
+   `DHAN_PIN`/`DHAN_TOTP_SECRET` for any run against a shared client ID, and no
+   login call — fresh or otherwise — is possible.
+
+**Confirmed today: no positions were affected.** Both systems are paper-only
+right now, so a dead auth token meant a broken read, not a stuck live order or
+an unmanaged position. **This will matter once either system holds real
+capital** — an invalidated token on a live system means it cannot manage or
+exit an open position until it notices and re-authenticates, and there is no
+guarantee it notices promptly.
+
+**Action required before Phase 10 (live trading) is ever enabled — tracked here
+as a checklist item, not yet done:**
+
+- `test_live_feed_smoke.py`'s module-scoped fresh-login pattern must default to
+  **reusing a cached token** (this repo's own `data/cache/token_cache.json`, if
+  valid) rather than minting a fresh one on every run. A fresh-login code path
+  may still exist for the cases that genuinely need one, but it must be gated
+  behind an explicit opt-in separate from `ALGO_LIVE_SMOKE=1` — the two are
+  currently the same gate, which is how this ran unnoticed.
+- This must be **verified fixed**, not just noted, before Phase 10. A live
+  system silently logging out another live system's session is not acceptable
+  once either is trading real capital.
+
 ---
 
 ## 7. Safety confirmations
 
 Re-confirmed for **Phase 2 Block 1**, with the code and tests that back each
 claim. Every statement below was re-run this phase, not carried forward.
+
+**Outstanding Phase 10 precondition, not yet satisfied:** known limitation 18 —
+a fresh Dhan login from this repo invalidates `Trading_Automation`'s live token
+and vice versa, confirmed live on 6 August 2026. Harmless today because both
+systems are paper-only; must be fixed and reverified before Phase 10 gates open
+for real capital. See known limitation 18 and the incident writeup under
+[Operational risk noted during the audit](#operational-risk-noted-during-the-audit).
 
 **Re-confirmed again for Phase 3 Part 1** (30 July 2026), against the full suite:
 546 passed, 6 skipped. Part 1 touched the feed's *shutdown* path only. It added no
