@@ -202,6 +202,11 @@ class PersistedSquareOffAuthority:
         self._save(SquareOffState.COMPLETED, last_candle_end_at=ts.isoformat())
 
     def _save(self, state: SquareOffState, *, last_candle_end_at: str | None = None) -> None:
+        # Phase 6 Part 3: every persisted write from this authority is an
+        # "attempt" in spec section 10's sense -- a normal day makes exactly
+        # two (IN_PROGRESS then COMPLETED), and a crash-forced retry (see
+        # _load_state's IN_PROGRESS-degrades-to-PENDING handling above) raises
+        # the count further, which is the observable evidence a retry happened.
         self._repo.save_strategy_state(
             runtime_id=self._runtime_id,
             strategy_id=self._strategy_id,
@@ -210,5 +215,6 @@ class PersistedSquareOffAuthority:
             square_off_state=state.value,
             entries_blocked=True,
             last_candle_end_at=last_candle_end_at,
+            increment_square_off_attempts=True,
         )
         self.writes += 1

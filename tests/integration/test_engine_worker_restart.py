@@ -649,6 +649,211 @@ def _payload_for(database_path: Path, strategy_id: str) -> dict:
     )
 
 
+# --------------------------------------------------------- Phase 6 Part 3: MFE/MAE
+#: Opens and walks the premium up in two candles without ever triggering
+#: momentum_close (each closes higher than the one before), leaving a peak of
+#: 3250 (150 - 100 = 50 * LOT_SIZE) — same structure as _LOSS_TAPE, direction
+#: reversed, and stopping short of any exit.
+_MFE_RUN1_TAPE = [
+    _tick(UNDERLYING, 24000.0, _ts(9, 16)),
+    _tick(UNDERLYING, 24010.0, _ts(9, 21)),  # closes candle 1 -> ENTER
+    _tick(CE_CONTRACT, 100.0, _ts(9, 21, 30)),  # fills the pending entry
+    _tick(CE_CONTRACT, 130.0, _ts(9, 23)),
+    _tick(CE_CONTRACT, 140.0, _ts(9, 26)),  # closes 09:20-09:25 @130 -- no previous, no exit
+    _tick(CE_CONTRACT, 150.0, _ts(9, 28)),
+    _tick(CE_CONTRACT, 155.0, _ts(9, 31)),  # closes 09:25-09:30 @150 -- 150>130, no exit; peak=3250
+]
+
+#: A restart, then a fresh premium candle (no previous, no exit) followed by
+#: one that closes lower, firing momentum_close -- at a price (90) far below
+#: the restored peak, so the peak survives only if it was actually restored.
+_MFE_RUN2_TAPE = [
+    _tick(CE_CONTRACT, 120.0, _ts(9, 41)),
+    _tick(CE_CONTRACT, 125.0, _ts(9, 46)),  # closes @120 -- first post-restart candle, no exit
+    _tick(CE_CONTRACT, 90.0, _ts(9, 48)),
+    _tick(CE_CONTRACT, 85.0, _ts(9, 51)),  # closes @90 -- 90<120 -> EXIT
+]
+
+
+def test_mfe_survives_a_restart_rather_than_resetting_to_the_first_post_restart_tick(
+    worker_config, database_path
+):
+    """Fails without Part 3's seeding: an unrestored position's peak starts at
+    0.0, so the first post-restart profitable tick would read as a *new* peak
+    instead of falling short of the real one.
+
+    Compares before/after rather than a hand-computed literal: ``update_price``
+    runs on every tick (not just candle closes), so the exact peak depends on
+    PaperBroker's entry slippage too. The property under test — a restart must
+    not lose it — doesn't need the exact number, only that run 2's ticks (all
+    below run 1's peak) leave it unchanged.
+    """
+    first = _run(worker_config, _MFE_RUN1_TAPE)
+    assert first.exit_code == 0, first.error
+    assert first.trades_closed == 0, "the tape must stop short of firing, or this proves nothing"
+    restored_peak = _open_positions(database_path)[0].highest_favourable
+    assert restored_peak is not None and restored_peak > 0, "the tape must build a real peak"
+
+    second = _run(worker_config, _MFE_RUN2_TAPE)
+
+    assert second.exit_code == 0, second.error
+    assert second.recovered_position is True
+    assert second.trades_closed == 1
+
+    closed = Database(database_path).connect().execute("SELECT * FROM positions").fetchone()
+    # Every run 2 tick (120, 125, 90, 85) is below the peak reached in run 1
+    # (which topped out at 155), so a correctly-restored peak must be
+    # unchanged -- not reset to 0 and rebuilt from run 2's own smaller ticks.
+    assert closed["highest_favourable"] == pytest.approx(restored_peak)
+
+
+# --------------------------------------------- Phase 6 Part 3: state version
+def test_an_unrecognised_state_version_blocks_position_recovery(worker_config, database_path):
+    """Mirrors ``test_a_stale_contract_record_for_another_instrument_is_refused``:
+    an unreadable/unrecognised payload must fail closed for position recovery,
+    with the same CRITICAL-row treatment every other recovery failure gets."""
+    first = _run(worker_config, _FIRST_TAPE)
+    assert first.exit_code == 0, first.error
+
+    repository = _repository(database_path)
+    with repository.database.transaction() as conn:
+        conn.execute(
+            "UPDATE strategy_state SET state_version = 99 WHERE strategy_id = ?",
+            (STRATEGY_ID,),
+        )
+
+    second = _run(worker_config, _SECOND_TAPE)
+
+    assert second.exit_code == 0, "a recoverable inconsistency must not crash the worker"
+    assert second.recovered_position is False
+    assert _intents(database_path, "BUY") == 1, "it entered again despite the open position"
+
+    error = (
+        Database(database_path)
+        .connect()
+        .execute("SELECT severity, component, message FROM errors ORDER BY id DESC LIMIT 1")
+        .fetchone()
+    )
+    assert error["severity"] == "CRITICAL"
+    assert error["component"] == "engine.recovery"
+    assert "state_version" in error["message"]
+
+
+def test_a_bad_state_version_blocks_position_recovery_before_exit_state_is_ever_read(
+    trailing_worker_config, database_path
+):
+    """A finding from building this test, corrected here rather than left
+    asserting what the plan originally claimed.
+
+    The plan's draft expected exit-state recovery's fail-open path (D60) to be
+    independently reachable through the *same* state_version corruption that
+    fails position recovery closed. It is not, and cannot be, in this
+    architecture: ``state_version`` gates the whole ``strategy_state`` row, not
+    a key within it, and ``recover_exit_state`` is only ever called from
+    *inside* ``_adopt_recovered_position`` — after ``recover_position`` has
+    already succeeded. A version bad enough to block one blocks both, and
+    position recovery, which runs first, always intercepts it — exit-state
+    recovery's own fail-open wrapper never gets a chance to see this particular
+    failure. (It remains real and reachable for the failures Part 2's own test
+    already covers — a foreign ``security_id``, or no snapshot at all — which
+    do not depend on ``state_version``.)
+    """
+    _run(trailing_worker_config, _TRAILING_RUN1_TAPE)
+    repository = _repository(database_path)
+    with repository.database.transaction() as conn:
+        conn.execute(
+            "UPDATE strategy_state SET state_version = 99 WHERE strategy_id = ?",
+            (TRAILING_STRATEGY_ID,),
+        )
+
+    second = _run(trailing_worker_config, _TRAILING_RUN2_TAPE)
+
+    assert second.exit_code == 0, second.error
+    assert second.recovered_position is False, "position recovery fails closed first"
+    assert second.trades_closed == 0
+    error = (
+        Database(database_path)
+        .connect()
+        .execute(
+            "SELECT severity, component FROM errors WHERE strategy_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (TRAILING_STRATEGY_ID,),
+        )
+        .fetchone()
+    )
+    assert error["severity"] == "CRITICAL"
+    assert error["component"] == "engine.recovery"
+
+
+# --------------------------------------------- Phase 6 Part 3: candle idempotency
+#: Two premium candles, so the guard's target (the first) and its control (the
+#: second, which must still process) are distinguishable. Reuses the trailing
+#: fixture's peak from _TRAILING_RUN1_TAPE.
+_WATERMARK_RUN2_TAPE = [
+    _tick(CE_CONTRACT, 120.0, _ts(9, 41)),
+    _tick(CE_CONTRACT, 125.0, _ts(9, 46)),  # closes @120, ts 09:46 -- this one gets skipped
+    _tick(CE_CONTRACT, 90.0, _ts(9, 48)),
+    _tick(CE_CONTRACT, 85.0, _ts(9, 51)),  # closes @90, ts 09:51 -- past the watermark, must fire
+]
+
+
+def test_a_restored_watermark_blocks_reprocessing_the_same_candle(
+    trailing_worker_config, database_path
+):
+    """The property the plan's own bullet names: a replayed candle already
+    reflected in last_candle_end_at must not double-count. Simulated by
+    hand-setting the watermark to the first of run 2's two candle boundaries
+    before running it, so only that one is skipped."""
+    _run(trailing_worker_config, _TRAILING_RUN1_TAPE)
+    repository = _repository(database_path)
+    with repository.database.transaction() as conn:
+        conn.execute(
+            "UPDATE strategy_state SET last_candle_end_at = ? WHERE strategy_id = ?",
+            (_ts(9, 46).isoformat(), TRAILING_STRATEGY_ID),
+        )
+
+    second = _run(trailing_worker_config, _WATERMARK_RUN2_TAPE)
+
+    assert second.exit_code == 0, second.error
+    assert second.recovered_position is True
+    # The skipped candle (@120, ts 09:46) never reaches the exit engine -- but
+    # the *next* candle (@90, ts 09:51, past the watermark) still processes
+    # normally and fires against the restored trailing peak from run 1.
+    assert second.trades_closed == 1
+
+
+def test_without_a_restored_watermark_both_candles_process_normally(
+    trailing_worker_config, database_path
+):
+    """Control for the test above: the same two-candle tape, no watermark set,
+    must behave exactly as Part 2 already proved -- proving the skip above is
+    the watermark's doing, not something already true of this tape."""
+    _run(trailing_worker_config, _TRAILING_RUN1_TAPE)
+
+    second = _run(trailing_worker_config, _WATERMARK_RUN2_TAPE)
+
+    assert second.exit_code == 0, second.error
+    assert second.trades_closed == 1
+
+
+def test_a_flat_restart_does_not_carry_the_candle_guard_over(worker_config, database_path):
+    """Control proving the guard is position-gated: a strategy-day with nothing
+    adopted (the position already closed in run 1) must not have any watermark
+    applied in run 2, even if strategy_state.last_candle_end_at holds a stale
+    value from run 1's own bookkeeping."""
+    first = _run(worker_config, _FIRST_TAPE)
+    assert first.exit_code == 0
+
+    second = _run(worker_config, _SECOND_TAPE)  # adopts and closes within run 2
+    assert second.trades_closed == 1
+
+    # Nothing was adopted this time (already flat) -- a fresh entry attempt
+    # must not be silently skipped by a leftover watermark.
+    third = _run(worker_config, _ENTRY_ATTEMPT_TAPE)
+    assert third.exit_code == 0
+    assert third.orders_placed == 1, "a flat restart must not inherit a stale candle watermark"
+
+
 def test_stop_and_target_stay_null_under_todays_risk_manager(worker_config, database_path):
     """Phase 6 Part 2's negative control on the widened stop/target plumbing.
 

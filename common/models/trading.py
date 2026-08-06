@@ -121,6 +121,18 @@ class PositionStatus(StrEnum):
     CLOSED = "CLOSED"
 
 
+#: The shape ``strategy_state.payload`` (and, by extension, everything this
+#: build writes into ``strategy_state.state_version``) is written against.
+#: Phase 6 Part 3. Lives here rather than in ``common.engine.state_payload``
+#: (the natural-looking home, next to the key constants) because
+#: ``common.execution.repository`` — the write side — must not import from
+#: ``common.engine`` at runtime; Parts 1-2 kept that direction
+#: ``TYPE_CHECKING``-only deliberately. Both packages already depend on this
+#: leaf module, so it is the one place this constant can live without adding
+#: a new coupling in either direction.
+CURRENT_STATE_VERSION = 1
+
+
 class RiskDecision(StrEnum):
     ALLOWED = "ALLOWED"
     BLOCKED = "BLOCKED"

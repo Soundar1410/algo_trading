@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from .market import Candle, Tick
 from .trading import (
+    CURRENT_STATE_VERSION,
     ExitReason,
     Fill,
     OptionType,
@@ -20,6 +21,7 @@ from .trading import (
 )
 
 __all__ = [
+    "CURRENT_STATE_VERSION",
     "Candle",
     "ExitReason",
     "Fill",

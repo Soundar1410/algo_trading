@@ -24,10 +24,12 @@ from common.config.models import ExecutionMode
 from common.engine.state_payload import (
     DAY_SUMMARY_KEY,
     OPEN_POSITION_KEY,
+    UnsupportedStateVersion,
     merge_payload,
     read_payload,
 )
 from common.execution import ExecutionRepository
+from common.models import CURRENT_STATE_VERSION
 from common.persistence import Database, MigrationRunner
 
 RUNTIME_ID = "intraday_options"
@@ -216,3 +218,66 @@ def test_the_payload_does_not_leak_across_strategies(repository):
         repository, strategy_id="someone_else", execution_mode=MODE, trading_date=TRADING_DATE
     )
     assert other == {}
+
+
+# ------------------------------------------------ Phase 6 Part 3: state version
+def test_a_fresh_row_carries_the_current_version_and_reads_fine(repository):
+    """The write side stamps it explicitly (see repository tests); this pins
+    that the read side then agrees with what was just written."""
+    _merge(repository, {OPEN_POSITION_KEY: _CONTRACT})
+    row = repository.load_strategy_state(
+        strategy_id=STRATEGY_ID, execution_mode=MODE, trading_date=TRADING_DATE
+    )
+    assert row is not None
+    assert row["state_version"] == CURRENT_STATE_VERSION
+    assert read_payload(
+        repository, strategy_id=STRATEGY_ID, execution_mode=MODE, trading_date=TRADING_DATE
+    )[OPEN_POSITION_KEY] == _CONTRACT
+
+
+def test_an_unrecognised_state_version_raises_rather_than_being_read(repository):
+    """The one deliberate narrowing of 'never raises on bad data' (module
+    docstring): a version mismatch means this build has no guarantee it can
+    read the payload's shape correctly, unlike a payload that merely fails to
+    decode -- see test_unusable_stored_data_reads_as_empty_rather_than_raising
+    for the contrast this is deliberately different from."""
+    _merge(repository, {OPEN_POSITION_KEY: _CONTRACT})
+    with repository.database.transaction() as conn:
+        conn.execute(
+            "UPDATE strategy_state SET state_version = ? WHERE strategy_id = ?",
+            (CURRENT_STATE_VERSION + 1, STRATEGY_ID),
+        )
+
+    with pytest.raises(UnsupportedStateVersion, match="state_version"):
+        read_payload(
+            repository, strategy_id=STRATEGY_ID, execution_mode=MODE, trading_date=TRADING_DATE
+        )
+
+
+def test_an_older_state_version_also_raises_not_just_a_newer_one(repository):
+    """'A version it does not understand' (spec wording) -- every version but
+    the current one, not only ones ahead of it."""
+    _merge(repository, {OPEN_POSITION_KEY: _CONTRACT})
+    with repository.database.transaction() as conn:
+        conn.execute(
+            "UPDATE strategy_state SET state_version = 0 WHERE strategy_id = ?",
+            (STRATEGY_ID,),
+        )
+
+    with pytest.raises(UnsupportedStateVersion):
+        read_payload(
+            repository, strategy_id=STRATEGY_ID, execution_mode=MODE, trading_date=TRADING_DATE
+        )
+
+
+def test_merge_payload_also_propagates_the_version_raise(repository):
+    """merge_payload reads before it writes -- the raise must surface through it too."""
+    _merge(repository, {OPEN_POSITION_KEY: _CONTRACT})
+    with repository.database.transaction() as conn:
+        conn.execute(
+            "UPDATE strategy_state SET state_version = ? WHERE strategy_id = ?",
+            (CURRENT_STATE_VERSION + 1, STRATEGY_ID),
+        )
+
+    with pytest.raises(UnsupportedStateVersion):
+        _merge(repository, {DAY_SUMMARY_KEY: {"trade_count": 1}})

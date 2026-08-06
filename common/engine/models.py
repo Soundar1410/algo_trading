@@ -184,6 +184,22 @@ class AdoptedPosition:
     #: Last traded premium, if the caller knows one. ``None`` leaves the position
     #: marked at its entry price until the first tick arrives.
     last_price: float | None = None
+    #: The excursion this position saw before the restart, from
+    #: ``positions.highest_favourable``/``.lowest_favourable`` (Phase 6 Part 3).
+    #: Default ``0.0`` matches a fresh ``OpenPosition``'s own starting value, so
+    #: a position with nothing persisted yet (an older row, or one closed before
+    #: Part 3 shipped) restarts exactly as it did before this part existed.
+    max_favorable_pnl: float = 0.0
+    max_adverse_pnl: float = 0.0
+    #: The last candle this strategy-day fully processed before the restart
+    #: (``strategy_state.last_candle_end_at``), Phase 6 Part 3. ``None`` means
+    #: nothing was recorded (an older row, or no candle has closed yet) — the
+    #: engine then guards against nothing, exactly as before this part existed.
+    #: Position-scoped rather than a day-level provider deliberately: it is
+    #: only ever restored when a position was actually adopted, matching the
+    #: write side's own "only while a position is open" gate (see
+    #: ``TradingEngine._persist_exit_state``).
+    last_candle_end_at: datetime | None = None
 
 
 @dataclass

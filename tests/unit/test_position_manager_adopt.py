@@ -107,16 +107,43 @@ def test_the_adopted_position_carries_the_lots_it_was_given_not_the_managers():
     assert position.quantity == 2 * LOT_SIZE
 
 
-def test_excursion_restarts_at_zero_rather_than_being_invented():
-    """MFE/MAE before the restart are recorded nowhere.
-
-    Zero is visibly a floor; a fabricated figure would look like an observation.
+def test_excursion_defaults_to_zero_when_nothing_was_persisted():
+    """Phase 6 Part 3: MFE/MAE *are* now recordable (``update_position_marks``,
+    seeded here via the ``max_favorable_pnl``/``max_adverse_pnl`` kwargs below) —
+    zero is the default for a row nothing has touched yet (an older position, or
+    one that closed before its first per-candle checkpoint), not a permanent "we
+    never know this" floor the way it was before this part existed.
     """
     manager = PositionManager(_ExplodingGateway(), lots=1)
     position = manager.adopt(_contract(), OrderSide.BUY, 1, 100.0, ENTRY_TIME)
 
     assert position.max_favorable_pnl == 0.0
     assert position.max_adverse_pnl == 0.0
+
+
+def test_a_restored_excursion_is_the_baseline_the_first_tick_compares_against():
+    """The property Phase 6 Part 3 exists for: a restart must not forget an
+    excursion already observed. Fails without seeding — a fresh position starts
+    both at 0.0, so a mark below the restored MFE would incorrectly look new."""
+    manager = PositionManager(_ExplodingGateway(), lots=1)
+    position = manager.adopt(
+        _contract(),
+        OrderSide.BUY,
+        1,
+        100.0,
+        ENTRY_TIME,
+        max_favorable_pnl=650.0,
+        max_adverse_pnl=-130.0,
+    )
+    assert position.max_favorable_pnl == 650.0
+    assert position.max_adverse_pnl == -130.0
+
+    # A real tick arrives after the restart, at a price *less* favourable than
+    # the peak but still profitable — the restored peak must survive it.
+    position.update_price(105.0)  # pnl = 5 * LOT_SIZE = 325, below the restored 650
+
+    assert position.max_favorable_pnl == 650.0, "the restored peak must not be overwritten"
+    assert position.max_adverse_pnl == -130.0
 
 
 def test_a_known_last_price_is_marked_immediately():

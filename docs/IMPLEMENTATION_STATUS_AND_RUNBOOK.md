@@ -7,9 +7,9 @@ the next phase. Updated after every phase.
 
 | | |
 |---|---|
-| **Current phase** | **Phase 6 Part 2 complete** — position-management state snapshot/restore. Pre-work found the plan's own bullet ("add `snapshot()`/`restore()` to `BaseExit`/`RiskManager`, populate `positions.stop_price`/`target_price`") understated four real gaps: (1) `RiskManager.new_position()` had no entry-price parameter, so no manager could ever compute an absolute stop/target — resolved by widening the interface (put to the user directly as the one genuine either-way fork; decided: widen now, not defer); (2) nothing exposed a strategy's private exit engine to the engine layer — `BaseStrategy` gained `exit_state_snapshot()`/`restore_exit_state()`, no-op defaults; (3) no per-candle persistence hook existed at all on the engine path — a new injected `persist_exit_state` callback, called after every candle a position is open for, is genuinely new database-write behaviour, called out explicitly rather than folded into "reuse `merge_payload`"; (4) `EngineFixtureStrategy` could only drive `MomentumCloseExit`'s own convenience method, not the generic `BaseExit.should_exit()` contract `TrailingExit`/`HighestCloseExit`/`ConsecutiveReversalExit` implement — widened with a default-preserving `exit_engine_name` kwarg. Exit-state recovery is deliberately **fail-open** (log and continue with fresh/reset state), unlike position and daily-risk recovery's fail-closed: a wrong or missing snapshot degrades exit timing quality, never safety — the same philosophy `PositionManager.adopt` already documents for MFE/MAE restarting at zero. The stop/target widening — `RiskManager.new_position(entry_price=...)`, `ExecutionGateway`/`InMemoryGateway`/`PositionManager.open()` all threading `stop_price`/`target_price` through to `LifecycleGateway` — carries an executable negative-control test: under today's `FixtureRiskManager` (which reports neither), a real entry through the full `run_worker` path still leaves both columns NULL, so the day Phase 9 adds a manager that overrides them, that test starts failing rather than silently inheriting a stale claim. |
-| **Next phase** | Phase 6 Part 3 (the remaining §7 "restore at minimum" gaps — MFE/MAE, square-off attempts, state-version validation, last-candle idempotency) |
-| **Last updated** | 6 August 2026 — Phase 6 Part 2 complete, see [Known limitations](#6-known-limitations) |
+| **Current phase** | **Phase 6 Part 3 complete** — the remaining §7 "restore at minimum" gaps. Pre-work found the same pattern as Parts 1-2: each item named a destination but not a write *path*. MFE/MAE gained a genuinely new write path — `ExecutionRepository.update_position_marks`, outside the fill path entirely — reusing Part 2's per-candle-while-open checkpoint rather than adding a new one; seeded on adopt via two new `AdoptedPosition` fields, applied before any mark so a restored baseline (not zero) is what the first post-restart tick compares against. Square-off attempts needed `save_strategy_state` widened with an accumulate-in-SQL counter (the same pattern D58 established for `daily_realised_pnl`) and a semantic decision (every persisted write counts, not just retries) made explicit rather than left implicit. State-version validation needed three sub-decisions the plan's one-liner didn't make: where `CURRENT_STATE_VERSION` lives (`common/models/trading.py`, a genuine leaf both `common.execution` and `common.engine` already depend on, keeping the write side out of the `common.engine`-import direction Parts 1-2 were careful to avoid); that `save_strategy_state` must stamp it explicitly rather than rely on the schema default; and that `recover_position`'s own `read_payload` call — unwrapped until now — needed its own try/except to preserve the `CRITICAL`-row precedent every other position-recovery failure gets. Last-candle idempotency was put to the user directly (the one genuine either-way fork): write `last_candle_end_at` unconditionally on every candle (matching the spec's literal day-level framing) or gate it on "position open" like Part 2, avoiding new write-frequency on top of limitation 24's already-unmeasured contention question — decided: gate it, recording the flat-day residual as a new limitation rather than leaving it implicit. **One planned test was found architecturally impossible while building it, not before**: state-version corruption cannot reach exit-state recovery's fail-open path independently of position recovery's fail-closed one, because both read the same row's same column and position recovery always runs first — corrected in the test file and here, not left asserting what the plan draft claimed. |
+| **Next phase** | Phase 6 Part 4 (`force_square_off_before_expiry`, and the settlement gate) |
+| **Last updated** | 6 August 2026 — Phase 6 Part 3 complete, see [Known limitations](#6-known-limitations) |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
 | **Live order placement** | **Not implemented.** Fail-closed. Phase 10 only. |
@@ -26,7 +26,7 @@ the next phase. Updated after every phase.
 | 3 | Preserve custom engines and policies | **Complete.** **Part 1 complete** (live-feed shutdown); **Part 2a complete** (exit registry + SuperTrend port); **Part 2b-i complete** (signal ownership + engine core); **Part 2b-ii-A complete** (the feed seam: tick channel, runtime subscription, `HubTickFeed`); **Part 2b-ii-B-1 complete** (the execution seam: square-off authority, `LifecycleGateway`, entry-block on tick drop); **Part 2b-ii-B-2 complete** (the wiring: worker engine path, supervisor queue delivery, engine restart recovery, D20 reporting bindings). **Phase 3 complete** — its acceptance gate is met in full |
 | 4 | Candle, indicator and paper-execution foundation | **Complete.** **Part 1 complete** (real contract resolution — closes 17, alarms 15). **Part 2 complete** (indicator layer — closes D21). **Part 3 complete** (continuity, timezone, wall-clock square-off — closes 4 and 7, and a live blocker). **Part 4 complete** (warm-up source and injection — closes 16). **Part 5 complete** (`PaperBroker` realism — closes 5 and D11; the live Full-mode gate item ran 6 August 2026 and passed, closing known limitation 20 along the way). **Phase 4 complete** — all five parts done, its one live gate item proven rather than asserted |
 | 5 | Mixed-mode supervisor and persistence | **Complete** |
-| 6 | Paper recovery and expiry handling | **In progress.** **Part 1 complete** (daily risk state across a restart — closes the risk-limit-bypass gap in bullet 1, and finds/fixes **D58**/limitation 22 along the way). **Part 2 complete** (position-management state snapshot/restore — exit-policy state via `BaseExit`/`RiskManager`/`BaseStrategy` snapshot hooks, and stop/target persistence through a widened `RiskManager`/`ExecutionGateway`, fail-open on a bad snapshot, negative-control-tested) |
+| 6 | Paper recovery and expiry handling | **In progress.** **Part 1 complete** (daily risk state across a restart — closes the risk-limit-bypass gap in bullet 1, and finds/fixes **D58**/limitation 22 along the way). **Part 2 complete** (position-management state snapshot/restore — exit-policy state via `BaseExit`/`RiskManager`/`BaseStrategy` snapshot hooks, and stop/target persistence through a widened `RiskManager`/`ExecutionGateway`, fail-open on a bad snapshot, negative-control-tested). **Part 3 complete** (MFE/MAE, square-off attempts, state-version validation and position-gated last-candle idempotency — the rest of §7's "restore at minimum" list) |
 | 7 | Operations | Not started |
 | 8 | LaunchAgent validation | Not started |
 | 9 | Real strategies | Not started |
@@ -2200,6 +2200,10 @@ guard. See deviation D6.
 | **D59** | **`ExecutionGateway`'s "deliberately narrow, two verbs" Protocol was widened — the first change to it since Phase 3 Part 2b-i** | Phase 6 Part 2 needed a risk manager's reported `stop_price`/`target_price` to reach `positions.stop_price`/`.target_price`, and there was no possible producer for either at any depth: `RiskManager.new_position(self, lots: int = 1) -> None` received no entry price, so no manager — not even a hypothetical Phase 9 one built against the pre-Part-2 interface — could ever compute an absolute price level. Put to the user directly as the one genuine either-way fork in the part (widen now vs. add only inert no-op properties and defer the plumbing to Phase 9); decided: widen now. `RiskManager.new_position` gained an optional `entry_price` kwarg; `RiskManager` gained no-op `stop_price`/`target_price` properties; `ExecutionGateway.buy`/`.sell`, `InMemoryGateway.buy`/`.sell`, `LifecycleGateway.buy`/`.sell`/`._execute` and `PositionManager.open()` each gained optional `stop_price`/`target_price` kwargs (default `None`), threaded to `OrderLifecycle.handle_signal`, which already accepted them (the Phase 1 fixture worker's own existing precedent). Every addition is optional with a `None` default and no existing call site needed to change to keep behaving exactly as before — `tests/integration/test_engine_lifecycle_gateway.py` and the `PositionManager`/`InMemoryGateway` regression suites pass unmodified. `TradingEngine._open()` was reordered to arm the risk manager *before* `positions.open()` (previously the other way around) so a manager's computed levels are known before the entry fill — safe because neither call consulted the other under the old order either. |
 | **D60** | **Exit-state restart recovery is fail-*open*, the only recovery mechanism in Phase 6 that is** | Position recovery (`recover_position`) and daily-risk recovery (`recover_daily_risk`, Part 1) both fail closed — block entries, write a `CRITICAL` error — because both guard against *double exposure* or *trading past a limit*. A missing, foreign, or unusable exit-state snapshot (a trailing peak, a reversal streak) carries no such risk: it only degrades **exit timing quality** on an *already-adopted* position (a trailing stop re-arms from the current price instead of its true peak), never safety. `TradingEngine._restore_exit_state` therefore logs and continues with the strategy's already-`reset()` (empty) state on any failure — no entry block, no `errors` row — exactly the philosophy `PositionManager.adopt` already documents for MFE/MAE restarting at zero ("zero is visibly the floor rather than plausibly the truth"). `test_a_stale_exit_state_snapshot_for_another_contract_is_ignored` proves both halves: the position still adopts cleanly, and no `component='engine.recovery'` error row is written for this case — asserting its *absence* is what would catch a future change that quietly promoted this to fail-closed without updating this record. |
 | **D61** | **A new per-candle database write exists on the engine path — there was none before, and its multi-worker contention cost is unmeasured** | `strategy_state.payload` was previously touched only on a *fill* (`LifecycleGateway._record_contract`, via `apply_fill`), never once per candle. Exit-policy state changes on every candle a position is open for (a trailing peak can advance, or a reversal streak extend, without producing an exit signal that candle), so persisting only at entry/exit fills would leave the *mid-position* value — exactly what a crash-and-restart needs — permanently stale; proving the part's own test scenario is structurally impossible without a new per-candle write. `TradingEngine._persist_exit_state`, called from `_on_candle_close` and `_check_premium_candle_exit`, gated on a *completed* candle (`CandleBuilder.add()` returning non-`None`), so this fires once per `cfg.timeframe` per open position — not once per tick — and each write is one `merge_payload` call (a SELECT + UPSERT on `strategy_state`), the same shape every existing write to that row already uses. Both call sites are guarded by "only when a position is open," and skipped on a candle that itself triggers a close, since `_close()` persists (clears) the key once the position it belonged to is actually gone. **What is not verified**: candle boundaries are wall-clock aligned, so multiple strategies in one runtime group sharing a timeframe tend to complete candles in the same second — a synchronised write burst against the shared group database, not uniformly-distributed load, and structurally different from most existing `strategy_state` writes because this one fires unconditionally on *every* candle for *every* open position rather than only on the writes those already produce. `journal_mode=WAL` / `busy_timeout=5000ms` (`common/persistence/database.py`) already governs every write across every worker in a group and is untouched by this change, but no test or benchmark exercises this specific burst pattern against it — nothing in the suite measures write latency or lock-wait time under concurrent multi-worker load at all, for this write or any other. Bounded by the same conservative default (5 s busy-timeout) as every write already ships with; not yet shown to be *comfortable* at a realistic group size. Revisit before Phase 7 operations work or before a group grows past a handful of concurrently-timeframed strategies, whichever comes first. |
+| **D62** | **`CURRENT_STATE_VERSION` lives in `common/models/trading.py`, not next to the key constants it governs** | Phase 6 Part 3 needed one literal both the write side (`common.execution.repository.save_strategy_state`) and the read side (`common.engine.state_payload.read_payload`) agree on. The natural-looking home — `common/engine/state_payload.py`, beside `OPEN_POSITION_KEY`/`EXIT_STATE_KEY` — would have made `common.execution` import from `common.engine` at runtime, the exact direction Parts 1-2 kept `TYPE_CHECKING`-only on purpose (`gateway.py`, `square_off.py`). `common/models/trading.py` is a genuine leaf both packages already depend on, so it adds no new coupling in either direction. `save_strategy_state` now stamps it explicitly on every write rather than relying on the schema's `DEFAULT 1` — the two happened to agree because nothing had ever bumped it, and relying on that agreement implicitly would let a future migration that changes the default silently disagree with what this code believes it wrote. |
+| **D63** | **`square_off_attempts` accumulates via the same "add a delta in SQL" pattern D58 fixed `daily_realised_pnl` onto, and every persisted write counts, not only retries** | `save_strategy_state` had no `square_off_attempts` parameter at all before Phase 6 Part 3, and the SQL never referenced the column. Two semantic readings were possible: increment only on a *fresh* attempt (the `due()` → `IN_PROGRESS` transition specifically, which `PersistedSquareOffAuthority._load_state` already treats as "a new attempt started" when it inherits a stalled `IN_PROGRESS`), or increment on every `_save()` call (both the `IN_PROGRESS` and `COMPLETED` writes). Decided: every call, matching the plan's literal wording ("increment... in `_save`") and staying simplest — a monotonic count of persisted state transitions for the day, always >= 2 on a day that reaches `COMPLETED`, higher only when a crash forced a retry. `increment_square_off_attempts: bool = False`, written as `square_off_attempts = square_off_attempts + ?` — race-free without a read first, the same reasoning D58 already established for the sibling column. |
+| **D64** | **`recover_position` gained its own try/except around `read_payload`, to preserve the `CRITICAL`-row precedent a bare propagation would have broken** | `read_payload`'s "never raises on bad data" rule is narrowed for exactly one case (Phase 6 Part 3): a `state_version` this build does not recognise raises `UnsupportedStateVersion` rather than being silently misread, because unlike a payload that merely fails to decode, a version mismatch means the payload might be a shape this build cannot safely interpret. Checked directly rather than assumed: `recover_position` called `read_payload` unwrapped, so a raise would have propagated past `_record_recovery_failure`'s `CRITICAL`-row write, reaching only `TradingEngine`'s generic except-block — which blocks entries but writes no error row, breaking the same precedent every other position-recovery failure (`OPEN_POSITION_KEY` missing, an unusable contract record, a stale `security_id`) already gets. `recover_position` now wraps the call, mirroring the try/except already around the `OptionContract(...)` construction two lines below it. `recover_exit_state` needed no equivalent change — its call site is already inside `TradingEngine._restore_exit_state`'s existing fail-open wrapper (D60), so it inherits the right severity for any exception type without a special case — see **D65** for why that path is, in practice, never actually reached by a `state_version` failure specifically. |
+| **D65** | **Position-gated `last_candle_end_at`, decided directly with the user — the one genuine either-way fork in Part 3 — and a planned test corrected mid-build once its premise proved architecturally unreachable** | Nothing wrote `last_candle_end_at` on the engine path before this part. Two options: write it unconditionally on every candle (matching §7's literal day-level framing, independent of position state) or gate it on "position open" like Part 2's `_persist_exit_state`, reusing that checkpoint rather than adding a new always-on one. The first adds new write frequency on top of limitation 24's already-unmeasured contention question; the second does not. Decided with the user: gate it. Idempotent replay is guaranteed exactly when it matters most (indicator and MFE/MAE double-counting risk during active management); a flat day's candles are not idempotently resumable — recorded as limitation 25, not left implicit. Separately, the Part 3 plan draft claimed exit-state recovery's fail-open path (D60) would be independently provable through the same `state_version` corruption that fails position recovery closed. Building the test found this is architecturally impossible: `state_version` gates the whole `strategy_state` row, not a key within it, and `recover_exit_state` is only ever called from inside `_adopt_recovered_position` — *after* `recover_position` has already succeeded. A version bad enough to block one blocks both, and position recovery, which runs first, always intercepts it first. The test was rewritten to assert what is actually true (both fail together, position recovery's fail-closed path wins) rather than left asserting the original, unreachable claim. D60's fail-open mechanism remains real and independently provable for the failures Part 2's own test already covers (a foreign `security_id`, or no snapshot at all) — those do not depend on `state_version` and are unaffected by this finding. |
 
 #### D22 in detail: the rebuilt premium-candle mapping
 
@@ -4071,6 +4075,29 @@ start/stop/crash/restart tests pass.
     quietly stand in for having measured it. Revisit before Phase 7
     operations work, or before any runtime group grows past a handful of
     concurrently-timeframed strategies, whichever comes first.
+25. **Candle-idempotency protection (`last_candle_end_at`) only applies
+    while a position is open — a flat day's candles are not idempotently
+    resumable.** Phase 6 Part 3, **D65**, decided directly with the user:
+    gating the watermark write on "position open" (reusing Part 2's
+    checkpoint) rather than writing it unconditionally on every candle
+    avoids adding new write frequency on top of limitation 24's already-
+    unmeasured contention question. The cost is real: a worker that
+    crashes and restarts on a day with no open position (before its first
+    entry, or after a clean close) has no watermark at all, so a replayed
+    tape's underlying candles are reprocessed from scratch — indicator
+    state (a session-cumulative one, in particular) could double-count on
+    a genuine replay of that portion of the day.
+    `test_a_flat_restart_does_not_carry_the_candle_guard_over` proves the
+    current behaviour (a fresh entry is not silently skipped) but does not
+    close this gap. Not believed to matter for live operation — a live
+    feed does not re-deliver ticks already received, so genuine
+    reprocessing only arises from an offline/recorded-tape replay — but
+    worth closing before this repository's own recorded-tape tooling
+    (`scripts/capture_live_tape.py` and any future replay-based testing)
+    is used to validate a day that both starts flat and later opens a
+    position. Closes if a future part decides the write-frequency cost
+    (limitation 24) is acceptable and lifts the "position open" gate, or a
+    cheaper day-level heartbeat write is found.
 
 
 ### Operational risk noted during the audit
@@ -4306,11 +4333,10 @@ mtime is unchanged at the recorded baseline.
 Phase 2 is complete, both blocks. **Phase 3 is complete** — all five parts, with its
 acceptance gate met in full. **Phase 4 is complete** — all five parts, its one live
 gate item run and passed. **Phase 5 is complete** — see below. **Phase 6 is in
-progress: Parts 1-2 complete**, see below. Next is **Phase 6 Part 3** (the
-remaining §7 "restore at minimum" gaps — MFE/MAE, square-off attempts,
-state-version validation, last-candle idempotency).
+progress: Parts 1-3 complete**, see below. Next is **Phase 6 Part 4**
+(`force_square_off_before_expiry`, and the settlement gate).
 
-### Phase 6 — paper recovery and expiry handling — **Part 2 of 5 complete**
+### Phase 6 — paper recovery and expiry handling — **Part 3 of 5 complete**
 
 A pre-work audit (spec's Phase 6 bullets read directly from
 `ALGO_TRADING_FORWARD_TESTING_ARCHITECTURE_FINAL.md:2905-2910`, checked against
@@ -4418,6 +4444,74 @@ quality, never safety, unlike position or daily-risk recovery. See **D60**.
 | `stop_price`/`target_price` reach `positions` through the full path | **Done** — plumbing only; every value is `None` under today's `FixtureRiskManager` |
 | Negative control: `stop_price`/`target_price` stay NULL under today's config | **Done** — will fail the day a real risk manager reports either, by design |
 | `RiskManager.snapshot()`/`restore()` (internal state, distinct from stop/target) | **Done** — mechanism proven by a local stateful test double, not `FixtureRiskManager` |
+
+**Part 3 — the remaining §7 "restore at minimum" gaps.** Same pattern as Parts
+1-2: each item named a destination but not a write *path*, and three of the
+five needed a real path invented, not just wired. See **D62-D65** for the
+mechanisms.
+
+1. **MFE/MAE had no write path at all**, at any point in a position's life —
+   `highest_favourable`/`lowest_favourable` were read by `_row_to_position`
+   and set by nothing, ever, including at close. A new
+   `ExecutionRepository.update_position_marks` (direct `UPDATE`, outside the
+   fill path — `_upsert_position` only runs on a fill) is called from the
+   **same** per-candle-while-open checkpoint Part 2's `_persist_exit_state`
+   already established, not a new one. Seeded on adopt via two new
+   `AdoptedPosition` fields, applied to the constructed `OpenPosition` before
+   any mark so a restored baseline (not zero) is what the first post-restart
+   tick compares against — the `PositionManager.adopt` docstring's
+   pre-Part-3 "MFE/MAE deliberately restart at zero" is corrected in the same
+   change.
+2. **Re-entry count — unchanged from Part 1's own reasoning.** Still
+   deliberately unwritten; nothing found on review changes it.
+3. **Square-off attempts needed `save_strategy_state` widened** —
+   `square_off_attempts` was not a parameter and the SQL never referenced the
+   column. `increment_square_off_attempts: bool = False`, accumulated in SQL
+   (the same pattern D58 fixed `daily_realised_pnl` onto), incremented on
+   *every* `PersistedSquareOffAuthority._save()` call — a normal day reaches
+   exactly 2, a crash-forced retry reaches higher. See **D63**.
+4. **State schema version validation needed three sub-decisions the plan's
+   one-liner didn't make**: where `CURRENT_STATE_VERSION` lives (`common/
+   models/trading.py`, keeping `common.execution` out of the `common.engine`
+   runtime-import direction Parts 1-2 protected — **D62**); that
+   `save_strategy_state` must stamp it explicitly, not rely on the schema
+   default (**D62**); and that `recover_position`'s own unwrapped
+   `read_payload` call needed a try/except to keep the `CRITICAL`-row
+   precedent every other position-recovery failure gets (**D64**).
+   `read_payload` now raises `UnsupportedStateVersion` on any
+   `state_version != CURRENT_STATE_VERSION` — the one deliberate narrowing
+   of its "never raises on bad data" rule.
+5. **Last-candle idempotency, put to the user directly — the one genuine
+   either-way fork in the part.** Write `last_candle_end_at` unconditionally
+   on every candle (the spec's literal day-level framing) or gate it on
+   "position open" like Part 2, avoiding new write frequency on top of
+   limitation 24's already-unmeasured contention question. Decided: gate it.
+   The residual — a flat day's candles are not idempotently resumable — is
+   recorded as **limitation 25**, not left implicit. See **D65**.
+
+**A planned test was found architecturally impossible while building it, not
+before, and corrected rather than forced.** The draft expected exit-state
+recovery's fail-open path (D60) to be independently provable through the same
+`state_version` corruption that fails position recovery closed. It cannot be:
+`state_version` gates the whole `strategy_state` row, not a key within it, and
+`recover_exit_state` is only ever called from inside `_adopt_recovered_position`
+— after `recover_position` has already succeeded. A version bad enough to
+block one blocks both, and position recovery, which runs first, always
+intercepts it. The test now asserts what is actually true (both fail
+together); D60's fail-open mechanism remains real and provable for the
+failures Part 2's own test already covers (a foreign `security_id`, or no
+snapshot at all), which do not depend on `state_version`. See **D65**.
+
+| Property | Status |
+|---|---|
+| MFE/MAE survives a restart rather than resetting to the first post-restart tick | **Done** — fail-first proven through `run_worker` |
+| `PositionManager.adopt`'s "MFE/MAE restart at zero" docstring | **Corrected** — was permanent policy, is now the pre-Part-3/no-data default |
+| Square-off attempts persist and accumulate | **Done** — a normal day reaches 2, a forced retry reaches more, unit-proven on `PersistedSquareOffAuthority` directly |
+| An unrecognised `state_version` blocks position recovery | **Done** — `CRITICAL` `engine.recovery` row, same as every other recovery failure |
+| The same corruption reaching exit-state recovery | **Architecturally unreachable when a position is open** — position recovery always intercepts it first; test corrected to assert this |
+| A restored candle watermark blocks reprocessing | **Done, position-gated** — fail-first proven, with a same-tape no-watermark control |
+| A flat restart does not inherit a stale watermark | **Done** — proven directly |
+| Idempotent replay on a flat (no position) day | **Not covered** — limitation 25 |
 
 ### Phase 5 — mixed-mode supervisor and persistence — **COMPLETE**
 

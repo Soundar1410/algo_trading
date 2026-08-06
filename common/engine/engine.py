@@ -131,7 +131,8 @@ class TradingEngine:
         recover_position: Callable[[], AdoptedPosition | None] | None = None,
         recover_daily_risk: Callable[[], DailyRiskRecovery | None] | None = None,
         recover_exit_state: Callable[[], dict[str, Any] | None] | None = None,
-        persist_exit_state: Callable[[dict[str, Any] | None], None] | None = None,
+        persist_exit_state: Callable[[dict[str, Any] | None, str | None], None] | None = None,
+        persist_position_marks: Callable[[float, float], None] | None = None,
         clock: Callable[[], datetime] = now_ist,
     ) -> None:
         self.cfg = cfg
@@ -179,8 +180,24 @@ class TradingEngine:
         # a position is open for. Both None (offline/tests, and every run with no
         # persistence layer) => the strategy's own reset() state is all there is,
         # exactly as before Phase 6 Part 2. See _restore_exit_state, _persist_exit_state.
+        # The callable's second argument (Phase 6 Part 3) is the candle boundary
+        # just processed, written in the *same* call as the exit-state payload
+        # rather than a second transaction at the same checkpoint — see
+        # _persist_exit_state.
         self._recover_exit_state = recover_exit_state
         self._persist_exit_state_cb = persist_exit_state
+        # Optional callable this engine calls with the open position's current
+        # (max_favorable_pnl, max_adverse_pnl) at the same checkpoint as the
+        # exit-state write, Phase 6 Part 3. None => marks are not persisted
+        # incrementally (offline/tests) — a restart then restores them at
+        # whatever the positions row's own fill-time value was (0.0, if never
+        # touched), exactly as before this part existed. See _persist_position_marks.
+        self._persist_position_marks_cb = persist_position_marks
+        # The last candle this strategy-day fully processed before a restart,
+        # restored (only when a position was actually adopted) from
+        # AdoptedPosition.last_candle_end_at -- Phase 6 Part 3. None => no
+        # candle is skipped, exactly as before this part existed.
+        self._last_processed_candle_end: datetime | None = None
         interval = parse_timeframe_minutes(cfg.timeframe)
         self.candles = CandleBuilder(
             interval,
@@ -483,6 +500,10 @@ class TradingEngine:
         # A new day is the ONLY thing that clears a warm-up block; _warm_up() runs
         # straight after this and may set it again.
         self._entry_blocked = None
+        # State must never leak between days (spec section 12) -- cleared
+        # unconditionally here, before _adopt_recovered_position() below might
+        # set it from a genuinely-adopted position's own last_candle_end_at.
+        self._last_processed_candle_end = None
         if self._daily_guard is not None:
             self._daily_guard.reset()
             self._restore_daily_risk()
@@ -584,6 +605,8 @@ class TradingEngine:
             recovered.entry_time,
             entry_charges=recovered.entry_charges,
             last_price=recovered.last_price,
+            max_favorable_pnl=recovered.max_favorable_pnl,
+            max_adverse_pnl=recovered.max_adverse_pnl,
         )
         self.feed.subscribe(recovered.contract.security_id)
         self.strategy.risk_manager.new_position(recovered.lots, entry_price=recovered.entry_price)
@@ -596,6 +619,10 @@ class TradingEngine:
             self._last_option_tick_ts = recovered.entry_time
             self._premium_gap_logged = False
         self._restore_exit_state(recovered.contract.security_id)
+        # Phase 6 Part 3. Only set when a position was actually adopted, matching
+        # the write side's own "only while a position is open" gate -- a day with
+        # nothing to adopt guards against nothing, exactly as before this part.
+        self._last_processed_candle_end = recovered.last_candle_end_at
         log.info(
             "adopted %s %s x%d @ %.2f from a previous run; no order placed",
             recovered.side.value,
@@ -659,7 +686,7 @@ class TradingEngine:
                 self.label,
             )
 
-    def _persist_exit_state(self) -> None:
+    def _persist_exit_state(self, candle_end_at: datetime | None = None) -> None:
         """Write the strategy's current exit-policy state, or clear it once flat.
 
         Phase 6 Part 2. Called after every candle (underlying and premium) that
@@ -669,6 +696,15 @@ class TradingEngine:
         ``LifecycleGateway._record_contract``'s clear-on-close for
         ``OPEN_POSITION_KEY``). A no-op if no callback was injected — every
         offline/test construction, unchanged from before this part.
+
+        ``candle_end_at`` (Phase 6 Part 3, optional) is the candle boundary just
+        processed, written in the **same** call as the exit-state payload — the
+        callback threads it straight to ``merge_payload``'s own
+        ``last_candle_end_at`` parameter, so this stays one write per checkpoint
+        rather than two. ``None`` from the close-time caller: closing does not
+        represent a new candle boundary being processed in the sense this guards,
+        and once flat there is nothing left for the guard to protect anyway (see
+        ``_on_candle_close``'s and ``_check_premium_candle_exit``'s guards).
 
         A failure to write is logged, not raised, for the same reason
         ``_record_contract`` gives for the same choice: this is an observability
@@ -687,13 +723,65 @@ class TradingEngine:
             }
         )
         try:
-            self._persist_exit_state_cb(payload)
+            self._persist_exit_state_cb(
+                payload, None if candle_end_at is None else candle_end_at.isoformat()
+            )
         except Exception:
             log.exception(
                 "%s: could not persist exit-policy state; a restart may re-arm "
                 "this position's exit rules from scratch",
                 self.label,
             )
+
+    def _persist_position_marks(self) -> None:
+        """Write the open position's running MFE/MAE excursion. Phase 6 Part 3.
+
+        Same checkpoint as :meth:`_persist_exit_state`, and for the same
+        reason: a mid-position crash must not lose an excursion already
+        observed in memory. No-op if no callback was injected, or nothing is
+        open — unlike exit-state there is nothing to *clear* on close, since
+        ``highest_favourable``/``lowest_favourable`` are plain columns on the
+        position's own (now ``CLOSED``) row, not a cross-contract-leakable
+        blob key, and the final values are exactly the audit trail a closed
+        trade's MFE/MAE should carry.
+        """
+        if self._persist_position_marks_cb is None:
+            return
+        pos = self._current_position()
+        if pos is None:
+            return
+        try:
+            self._persist_position_marks_cb(pos.max_favorable_pnl, pos.max_adverse_pnl)
+        except Exception:
+            log.exception(
+                "%s: could not persist position marks; a restart may lose the "
+                "excursion already observed",
+                self.label,
+            )
+
+    def _persist_open_position_checkpoint(self, candle_end_at: datetime) -> None:
+        """Everything that must survive a restart while a position is open.
+
+        Phase 6 Part 3, extending Part 2's single exit-state write into the one
+        shared per-candle checkpoint all three quantities (exit state, MFE/MAE,
+        last-processed-candle) now use. No new call sites and no new write
+        frequency beyond what limitation 24 already scopes — same reasoning as
+        the choice to gate ``last_candle_end_at`` on "position open" rather than
+        write it unconditionally.
+
+        **Guarded here, once, on "is anything open" — not by each caller.**
+        ``_on_candle_close``'s "no signal"/"same leg" branches reach this call
+        whether or not a position exists (idle days included), and without this
+        guard a flat day would still write a clearing exit-state payload and
+        advance the watermark on every candle — exactly the unconditional
+        per-candle write the position-gated design was chosen specifically to
+        avoid. Close-time clearing is unaffected: ``_close()`` calls
+        :meth:`_persist_exit_state` directly, not through here.
+        """
+        if not self.positions.has_position():
+            return
+        self._persist_exit_state(candle_end_at)
+        self._persist_position_marks()
 
     def _end_day(self) -> None:
         summary_trades = self.positions.trades
@@ -816,6 +904,23 @@ class TradingEngine:
         completed = self._option_candles.add(tick.last_price, tick.exchange_time)
         if completed is None:
             return None
+        if (
+            self._last_processed_candle_end is not None
+            and tick.exchange_time <= self._last_processed_candle_end
+        ):
+            # Phase 6 Part 3: a replay landing on (or before) a candle this
+            # strategy-day already fully processed before a restart. Refused
+            # outright — not even consulting the strategy — so a
+            # session-cumulative indicator (or the exit-policy state below)
+            # cannot double-count what it already saw.
+            log.info(
+                "%s: skipping an already-processed premium candle at %s (restored "
+                "watermark %s)",
+                self.label,
+                tick.exchange_time.isoformat(),
+                self._last_processed_candle_end.isoformat(),
+            )
+            return None
         strat_signal = self.strategy.on_option_candle(to_ohlc(completed), tick.exchange_time)
         if strat_signal is not None and strat_signal.action is SignalAction.EXIT:
             # No persist call here: the caller closes the position on this
@@ -824,8 +929,9 @@ class TradingEngine:
             # overwritten a moment later.
             return strat_signal.exit_reason or ExitReason.STRATEGY_EXIT
         # Still open: this candle may have advanced exit-policy state (a peak, a
-        # streak) without firing — persist it so a restart resumes from it.
-        self._persist_exit_state()
+        # streak) or the MFE/MAE excursion without firing — persist both, and
+        # this candle as the new watermark, so a restart resumes from all three.
+        self._persist_open_position_checkpoint(tick.exchange_time)
         return None
 
     def _on_option_tick(self, tick: Tick) -> None:
@@ -870,6 +976,18 @@ class TradingEngine:
 
     # ----------------------------------------------------------- candle/signal
     def _on_candle_close(self, candle: OHLC, ts: datetime) -> None:
+        if self._last_processed_candle_end is not None and ts <= self._last_processed_candle_end:
+            # Phase 6 Part 3: a replay landing on (or before) a candle this
+            # strategy-day already fully processed before a restart. Refused
+            # outright, before the regime tagger or the strategy see it, so a
+            # session-cumulative indicator cannot double-count what it already saw.
+            log.info(
+                "%s: skipping an already-processed candle at %s (restored watermark %s)",
+                self.label,
+                ts.isoformat(),
+                self._last_processed_candle_end.isoformat(),
+            )
+            return
         # Update the regime classifier with the just-closed underlying candle
         # before consulting the strategy, so an entry this candle is tagged with
         # the regime as of now. Purely observational — no effect on the signal.
@@ -899,8 +1017,9 @@ class TradingEngine:
         if strat_signal is None:
             # No actionable signal, but the strategy's own on_candle() may still
             # have advanced its exit-policy state (e.g. a trailing peak driven off
-            # the underlying) without producing one — persist it either way.
-            self._persist_exit_state()
+            # the underlying) or the MFE/MAE excursion without producing one —
+            # persist both, and this candle as the new watermark, either way.
+            self._persist_open_position_checkpoint(ts)
             return
         log.info(
             "SIGNAL %s bar=%s evaluated_at=%s | %s",
@@ -931,7 +1050,7 @@ class TradingEngine:
             and pos.contract.option_type == strat_signal.option_type
             and pos.side == strat_signal.side
         ):
-            self._persist_exit_state()
+            self._persist_open_position_checkpoint(ts)
             return
 
         # Different/opposite leg open -> exit it first (_close() persists/clears).

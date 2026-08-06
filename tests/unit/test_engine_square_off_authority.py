@@ -319,6 +319,36 @@ def test_an_unreadable_stored_state_fails_towards_squaring_off(
     assert _authority(repository).due(_at(15, 25)) is True
 
 
+def test_a_normal_day_records_exactly_two_attempts(repository: ExecutionRepository) -> None:
+    """Phase 6 Part 3, spec section 10's 'persist square-off attempts'. Every
+    persisted write from this authority counts -- a normal day makes exactly two
+    (the IN_PROGRESS write from due(), then COMPLETED from completed())."""
+    authority = _authority(repository)
+    authority.due(_at(15, 15))
+    authority.completed(_at(15, 15))
+    assert _stored(repository)["square_off_attempts"] == 2
+
+
+def test_a_crash_forced_retry_records_more_attempts_than_a_normal_day(
+    repository: ExecutionRepository,
+) -> None:
+    """The count is the observable evidence a retry happened. Scenario: the
+    first process's due() writes IN_PROGRESS (attempt 1) and crashes before
+    completed(); the restarted process inherits the stalled IN_PROGRESS,
+    retries (test_an_inherited_in_progress_attempt_is_retried_and_reported
+    already proves the retry itself), and its own due()+completed() add two
+    more."""
+    first = _authority(repository)
+    first.due(_at(15, 15))  # crashes here, before completed()
+
+    restarted = _authority(repository)
+    assert restarted.due(_at(15, 16)) is True  # the retry the stalled IN_PROGRESS forces
+    restarted.completed(_at(15, 16))
+
+    assert _stored(repository)["square_off_attempts"] == 3
+    assert _stored(repository)["square_off_attempts"] > 2
+
+
 def test_another_strategys_state_is_not_consulted(repository: ExecutionRepository) -> None:
     repository.save_strategy_state(
         runtime_id=RUNTIME_ID,

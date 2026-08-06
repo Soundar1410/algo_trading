@@ -271,6 +271,8 @@ class PositionManager:
         *,
         entry_charges: float = 0.0,
         last_price: float | None = None,
+        max_favorable_pnl: float = 0.0,
+        max_adverse_pnl: float = 0.0,
     ) -> OpenPosition:
         """Take ownership of a position this process did not open.
 
@@ -285,10 +287,15 @@ class PositionManager:
         resulting :class:`Trade` nets correctly on close rather than under-reporting
         the round trip's cost by one leg.
 
-        MFE/MAE deliberately restart at zero. The excursion this position saw before
-        the restart is not recorded anywhere, and seeding a fabricated figure would
-        put a number that was never observed into the day's report; zero is visibly
-        the floor rather than plausibly the truth.
+        ``max_favorable_pnl``/``max_adverse_pnl`` restore the excursion a previous
+        process observed (Phase 6 Part 3 — ``positions.highest_favourable``/
+        ``.lowest_favourable``, kept current by
+        :class:`~common.engine.engine.TradingEngine`'s per-candle persistence, the
+        same checkpoint Part 2's exit-state snapshot already uses). Set on the
+        constructed position **before** any ``last_price`` mark below, so a restored
+        baseline — not zero — is what the first excursion comparison runs against;
+        this was the gap Part 1's original design left, at a time before Part 2 had
+        established a checkpoint to keep them current from.
         """
         position_id = contract.security_id
         if position_id in self._positions:
@@ -301,6 +308,8 @@ class PositionManager:
             entry_price=entry_price,
             entry_time=entry_time,
         )
+        position.max_favorable_pnl = max_favorable_pnl
+        position.max_adverse_pnl = max_adverse_pnl
         if last_price is not None:
             position.update_price(last_price)
         self._positions[position_id] = position

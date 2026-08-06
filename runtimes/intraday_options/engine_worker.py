@@ -86,6 +86,7 @@ from common.engine.square_off import PersistedSquareOffAuthority, SquareOffAutho
 from common.engine.state_payload import (
     EXIT_STATE_KEY,
     OPEN_POSITION_KEY,
+    UnsupportedStateVersion,
     merge_payload,
     read_payload,
 )
@@ -176,12 +177,23 @@ def recover_position(
         return None
     position = positions[0]
 
-    payload = read_payload(
-        repository,
-        strategy_id=config.strategy_id,
-        execution_mode=config.execution_mode,
-        trading_date=config.trading_date,
-    )
+    try:
+        payload = read_payload(
+            repository,
+            strategy_id=config.strategy_id,
+            execution_mode=config.execution_mode,
+            trading_date=config.trading_date,
+        )
+    except UnsupportedStateVersion as exc:
+        # Phase 6 Part 3. read_payload narrows its own "never raises on bad
+        # data" rule specifically for this — an unreadable strategy_state.payload
+        # is cosmetic, but a state_version this build does not understand risks
+        # confidently misreading a foreign shape, which is worse than the loud
+        # refusal here. Same CRITICAL-row treatment as every other recovery
+        # failure in this function, so a dashboard query for
+        # component='engine.recovery' catches this one too.
+        _record_recovery_failure(config, repository, str(exc))
+        raise RuntimeError(str(exc)) from exc
     record = payload.get(OPEN_POSITION_KEY)
     if not isinstance(record, dict):
         _record_recovery_failure(
@@ -250,6 +262,28 @@ def recover_position(
         position.average_price,
         position.opened_at.isoformat(),
     )
+
+    # Phase 6 Part 3. A separate, cheap read rather than widening read_payload's
+    # return shape -- this is a column on the same row, not part of the payload
+    # JSON it decodes. None (no row, empty column, or an unparsable one) leaves
+    # the engine's idempotency guard unarmed, exactly as before this part existed.
+    last_candle_end_at: datetime | None = None
+    state_row = repository.load_strategy_state(
+        strategy_id=config.strategy_id,
+        execution_mode=config.execution_mode,
+        trading_date=config.trading_date,
+    )
+    if state_row is not None and state_row["last_candle_end_at"]:
+        try:
+            last_candle_end_at = datetime.fromisoformat(state_row["last_candle_end_at"])
+        except ValueError:
+            log.warning(
+                "unreadable strategy_state.last_candle_end_at %r for %s; the restart "
+                "candle-idempotency guard will not be armed",
+                state_row["last_candle_end_at"],
+                config.strategy_id,
+            )
+
     return AdoptedPosition(
         contract=contract,
         side=side,
@@ -257,6 +291,15 @@ def recover_position(
         entry_price=position.average_price,
         entry_time=position.opened_at,
         entry_charges=position.charges,
+        # Phase 6 Part 3. NULL only for a row Part 3's per-candle persistence
+        # never touched (pre-Part-3, or a position that closed before its
+        # first candle checkpoint) — 0.0 matches a fresh OpenPosition's own
+        # starting value in that case.
+        max_favorable_pnl=(
+            0.0 if position.highest_favourable is None else position.highest_favourable
+        ),
+        max_adverse_pnl=0.0 if position.lowest_favourable is None else position.lowest_favourable,
+        last_candle_end_at=last_candle_end_at,
     )
 
 
@@ -661,7 +704,7 @@ def _build(
     def _recover_exit_state() -> dict[str, Any] | None:
         return recover_exit_state(config, repository)
 
-    def _persist_exit_state(data: dict[str, Any] | None) -> None:
+    def _persist_exit_state(data: dict[str, Any] | None, last_candle_end_at: str | None) -> None:
         merge_payload(
             repository,
             {EXIT_STATE_KEY: data},
@@ -669,6 +712,23 @@ def _build(
             strategy_id=config.strategy_id,
             execution_mode=config.execution_mode,
             trading_date=config.trading_date,
+            last_candle_end_at=last_candle_end_at,
+        )
+
+    def _persist_position_marks(highest_favourable: float, lowest_favourable: float) -> None:
+        # positions (the same PositionManager instance the engine drives) is
+        # already in scope here -- the engine only calls this while it holds
+        # exactly one open position, so this is the one it means.
+        current = positions.positions
+        if not current:  # pragma: no cover - guarded by the engine's own check
+            return
+        repository.update_position_marks(
+            strategy_id=config.strategy_id,
+            execution_mode=config.execution_mode,
+            trading_date=config.trading_date,
+            security_id=current[0].contract.security_id,
+            highest_favourable=highest_favourable,
+            lowest_favourable=lowest_favourable,
         )
 
     engine = TradingEngine(
@@ -700,6 +760,7 @@ def _build(
         recover_daily_risk=_recover_daily_risk,
         recover_exit_state=_recover_exit_state,
         persist_exit_state=_persist_exit_state,
+        persist_position_marks=_persist_position_marks,
         warmup_manager=warmup_manager,
         warmup_source=warmup_source,
     )

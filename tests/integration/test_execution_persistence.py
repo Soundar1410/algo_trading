@@ -590,6 +590,122 @@ def test_square_off_state_survives_a_reload(repository):
     assert state["entries_blocked"] == 1
 
 
+# --------------------------------------------------- Phase 6 Part 3
+def test_state_version_is_stamped_explicitly_not_left_to_the_column_default(repository):
+    """Written every call, not relied on implicitly from the schema's own
+    ``DEFAULT 1`` — a future migration changing that default must not silently
+    disagree with what this code believes it wrote."""
+    from common.models import CURRENT_STATE_VERSION
+
+    repository.save_strategy_state(
+        runtime_id="intraday_options",
+        strategy_id="st01",
+        execution_mode=ExecutionMode.PAPER,
+        trading_date=TRADING_DATE,
+        square_off_state="PENDING",
+    )
+    state = repository.load_strategy_state(
+        strategy_id="st01", execution_mode=ExecutionMode.PAPER, trading_date=TRADING_DATE
+    )
+    assert state is not None
+    assert state["state_version"] == CURRENT_STATE_VERSION
+
+
+def test_square_off_attempts_accumulate_rather_than_reset(repository):
+    """The same 'add a delta in SQL' pattern the daily_realised_pnl fix (Part 1,
+    D58) established -- race-free without a read first."""
+    repository.save_strategy_state(
+        runtime_id="intraday_options",
+        strategy_id="st01",
+        execution_mode=ExecutionMode.PAPER,
+        trading_date=TRADING_DATE,
+        square_off_state="IN_PROGRESS",
+        increment_square_off_attempts=True,
+    )
+    repository.save_strategy_state(
+        runtime_id="intraday_options",
+        strategy_id="st01",
+        execution_mode=ExecutionMode.PAPER,
+        trading_date=TRADING_DATE,
+        square_off_state="COMPLETED",
+        increment_square_off_attempts=True,
+    )
+    state = repository.load_strategy_state(
+        strategy_id="st01", execution_mode=ExecutionMode.PAPER, trading_date=TRADING_DATE
+    )
+    assert state is not None
+    assert state["square_off_attempts"] == 2
+
+
+def test_a_write_that_does_not_increment_attempts_leaves_the_count_unchanged(repository):
+    repository.save_strategy_state(
+        runtime_id="intraday_options",
+        strategy_id="st01",
+        execution_mode=ExecutionMode.PAPER,
+        trading_date=TRADING_DATE,
+        square_off_state="IN_PROGRESS",
+        increment_square_off_attempts=True,
+    )
+    repository.save_strategy_state(
+        runtime_id="intraday_options",
+        strategy_id="st01",
+        execution_mode=ExecutionMode.PAPER,
+        trading_date=TRADING_DATE,
+        last_candle_end_at="2026-07-29T09:20:00+05:30",
+    )
+    state = repository.load_strategy_state(
+        strategy_id="st01", execution_mode=ExecutionMode.PAPER, trading_date=TRADING_DATE
+    )
+    assert state is not None
+    assert state["square_off_attempts"] == 1
+
+
+def test_update_position_marks_writes_the_excursion(repository, session):
+    _lifecycle(repository, session).handle_signal(_signal(), trading_date=TRADING_DATE)
+
+    repository.update_position_marks(
+        strategy_id="st01",
+        execution_mode=ExecutionMode.PAPER,
+        trading_date=TRADING_DATE,
+        security_id="99926000",
+        highest_favourable=650.0,
+        lowest_favourable=-130.0,
+    )
+
+    row = (
+        repository.database.connect()
+        .execute("SELECT highest_favourable, lowest_favourable FROM positions")
+        .fetchone()
+    )
+    assert row["highest_favourable"] == 650.0
+    assert row["lowest_favourable"] == -130.0
+
+
+def test_update_position_marks_is_a_no_op_for_a_closed_position(repository, session):
+    """Outside the fill path deliberately -- must not resurrect or misdirect a
+    write against a position that is no longer open."""
+    lifecycle = _lifecycle(repository, session)
+    lifecycle.handle_signal(_signal(Side.BUY, minute=15), trading_date=TRADING_DATE)
+    lifecycle.handle_signal(_signal(Side.SELL, minute=16), trading_date=TRADING_DATE)
+
+    repository.update_position_marks(
+        strategy_id="st01",
+        execution_mode=ExecutionMode.PAPER,
+        trading_date=TRADING_DATE,
+        security_id="99926000",
+        highest_favourable=999.0,
+        lowest_favourable=-999.0,
+    )
+
+    row = (
+        repository.database.connect()
+        .execute("SELECT highest_favourable, lowest_favourable FROM positions")
+        .fetchone()
+    )
+    assert row["highest_favourable"] is None
+    assert row["lowest_favourable"] is None
+
+
 # ------------------------------------------------------- notifications
 def test_notifications_are_persisted(repository):
     repository.record_notification(

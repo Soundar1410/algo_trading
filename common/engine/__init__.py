@@ -55,6 +55,7 @@ from .state_payload import (
     DAY_SUMMARY_KEY,
     EXIT_STATE_KEY,
     OPEN_POSITION_KEY,
+    UnsupportedStateVersion,
     merge_payload,
     read_payload,
 )
@@ -107,6 +108,7 @@ __all__ = [
     "StrategySignal",
     "Trade",
     "TradingEngine",
+    "UnsupportedStateVersion",
     "available_strategies",
     "build_regime_tagger",
     "get_strategy",

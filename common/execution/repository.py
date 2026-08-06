@@ -27,6 +27,7 @@ from datetime import UTC, datetime
 
 from common.config.models import ExecutionMode
 from common.models import (
+    CURRENT_STATE_VERSION,
     Candle,
     Fill,
     Order,
@@ -762,19 +763,40 @@ class ExecutionRepository:
         square_off_state: str | None = None,
         entries_blocked: bool | None = None,
         payload: dict[str, object] | None = None,
+        increment_square_off_attempts: bool = False,
     ) -> None:
+        """Upsert this strategy-day's row.
+
+        ``state_version`` is stamped to :data:`common.models.CURRENT_STATE_VERSION`
+        on **every** write, never left to the column's schema default (Phase 6
+        Part 3). Relying on the default happened to be correct only because
+        nothing had ever bumped it; a future migration that changes the default
+        would then silently disagree with what this code believes it wrote.
+
+        ``increment_square_off_attempts`` accumulates rather than overwrites —
+        the same "add a delta in SQL" pattern the ``daily_realised_pnl`` fix
+        (Part 1, D58) established — so this is race-free without a read first.
+        ``PersistedSquareOffAuthority._save`` passes ``True`` on every call it
+        makes (both the ``IN_PROGRESS`` and ``COMPLETED`` writes), so a normal
+        day's attempts count is always >= 2 and a crash-forced retry raises it
+        further — closing spec section 10's "persist square-off attempts".
+        """
         with self._db.transaction() as conn:
             conn.execute(
                 """
                 INSERT INTO strategy_state
                     (runtime_id, strategy_id, execution_mode, trading_date, last_candle_end_at,
-                     square_off_state, entries_blocked, payload, updated_at)
-                VALUES (?, ?, ?, ?, ?, COALESCE(?, 'PENDING'), COALESCE(?, 0), ?, ?)
+                     square_off_state, entries_blocked, payload, state_version,
+                     square_off_attempts, updated_at)
+                VALUES (?, ?, ?, ?, ?, COALESCE(?, 'PENDING'), COALESCE(?, 0), ?, ?, ?, ?)
                 ON CONFLICT (strategy_id, execution_mode, trading_date) DO UPDATE SET
                     last_candle_end_at = COALESCE(excluded.last_candle_end_at, last_candle_end_at),
                     square_off_state = COALESCE(?, square_off_state),
                     entries_blocked = COALESCE(?, entries_blocked),
                     payload = COALESCE(excluded.payload, payload),
+                    state_version = excluded.state_version,
+                    square_off_attempts = strategy_state.square_off_attempts
+                                           + excluded.square_off_attempts,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -786,9 +808,52 @@ class ExecutionRepository:
                     square_off_state,
                     None if entries_blocked is None else int(entries_blocked),
                     json.dumps(payload) if payload is not None else None,
+                    CURRENT_STATE_VERSION,
+                    int(increment_square_off_attempts),
                     _now(),
                     square_off_state,
                     None if entries_blocked is None else int(entries_blocked),
+                ),
+            )
+
+    def update_position_marks(
+        self,
+        *,
+        strategy_id: str,
+        execution_mode: ExecutionMode,
+        trading_date: str,
+        security_id: str,
+        highest_favourable: float,
+        lowest_favourable: float,
+    ) -> None:
+        """Persist the running MFE/MAE excursion for an open position.
+
+        Phase 6 Part 3. Deliberately **outside** the fill path — ``_upsert_position``
+        only ever runs from :meth:`apply_fill`, and MFE/MAE change on every tick
+        while a position is open, not just at entry/exit. Called from the same
+        per-candle-while-open checkpoint :class:`~common.engine.engine.TradingEngine`
+        already uses for ``_persist_exit_state`` (Part 2), not a new one — so this
+        adds no write frequency beyond what limitation 24 already scopes.
+
+        A no-op (0 rows affected) if the position is not OPEN or does not exist —
+        callers only invoke this while they hold an open position in memory, so
+        that should never happen, but the write itself makes no assumption about it.
+        """
+        with self._db.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE positions
+                SET highest_favourable = ?, lowest_favourable = ?
+                WHERE strategy_id = ? AND execution_mode = ? AND trading_date = ?
+                  AND security_id = ? AND status = 'OPEN'
+                """,
+                (
+                    highest_favourable,
+                    lowest_favourable,
+                    strategy_id,
+                    execution_mode.value,
+                    trading_date,
+                    security_id,
                 ),
             )
 
