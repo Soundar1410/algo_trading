@@ -62,14 +62,34 @@ class ExecutionGateway(Protocol):
 
     Two verbs, matching the reference's broker contract, because the manager's
     body is a port and a wider interface here would mean editing it.
+
+    ``stop_price``/``target_price`` (Phase 6 Part 2, optional, default ``None``)
+    are the one addition since the port: observability only, threaded through to
+    ``positions.stop_price``/``.target_price`` where a gateway persists. Neither
+    verb's own decision logic consults them — a call that doesn't pass them
+    behaves exactly as before.
     """
 
     def buy(
-        self, contract: OptionContract, lots: int, *, ref_price: float, ts: datetime
+        self,
+        contract: OptionContract,
+        lots: int,
+        *,
+        ref_price: float,
+        ts: datetime,
+        stop_price: float | None = None,
+        target_price: float | None = None,
     ) -> FillOutcome: ...
 
     def sell(
-        self, contract: OptionContract, lots: int, *, ref_price: float, ts: datetime
+        self,
+        contract: OptionContract,
+        lots: int,
+        *,
+        ref_price: float,
+        ts: datetime,
+        stop_price: float | None = None,
+        target_price: float | None = None,
     ) -> FillOutcome: ...
 
 
@@ -96,13 +116,29 @@ class InMemoryGateway:
         self._charges = ChargesCalculator(rates)
 
     def buy(
-        self, contract: OptionContract, lots: int, *, ref_price: float, ts: datetime
+        self,
+        contract: OptionContract,
+        lots: int,
+        *,
+        ref_price: float,
+        ts: datetime,
+        stop_price: float | None = None,
+        target_price: float | None = None,
     ) -> FillOutcome:
         # Adverse by construction: a buy fills above the reference price.
+        # stop_price/target_price: nowhere to persist them offline; accepted only
+        # to satisfy ExecutionGateway.
         return self._fill(Side.BUY, ref_price + self._slippage, lots * contract.lot_size)
 
     def sell(
-        self, contract: OptionContract, lots: int, *, ref_price: float, ts: datetime
+        self,
+        contract: OptionContract,
+        lots: int,
+        *,
+        ref_price: float,
+        ts: datetime,
+        stop_price: float | None = None,
+        target_price: float | None = None,
     ) -> FillOutcome:
         # Never below zero: a deep slippage setting must not mint a negative price.
         return self._fill(Side.SELL, max(ref_price - self._slippage, 0.0), lots * contract.lot_size)
@@ -167,21 +203,41 @@ class PositionManager:
         *,
         regime: str | None = None,
         regime_features: str = "{}",
+        stop_price: float | None = None,
+        target_price: float | None = None,
     ) -> OpenPosition:
         """Open a position: BUY to go long the option, SELL to write it.
 
         ``regime`` (optional) is the market regime detected at entry;
         ``regime_features`` its raw diagnostic values (JSON). Both are stashed and
         attached to the resulting :class:`Trade` on close.
+
+        ``stop_price``/``target_price`` (Phase 6 Part 2, optional) are passed
+        straight to the gateway for persistence — observability only, this class
+        does not read them back for any decision.
         """
         position_id = contract.security_id
         if position_id in self._positions:
             raise RuntimeError(f"Cannot open: a position is already open for {contract.symbol}.")
 
         if side is OrderSide.BUY:
-            result = self._gateway.buy(contract, self._lots, ref_price=ref_price, ts=ts)
+            result = self._gateway.buy(
+                contract,
+                self._lots,
+                ref_price=ref_price,
+                ts=ts,
+                stop_price=stop_price,
+                target_price=target_price,
+            )
         else:
-            result = self._gateway.sell(contract, self._lots, ref_price=ref_price, ts=ts)
+            result = self._gateway.sell(
+                contract,
+                self._lots,
+                ref_price=ref_price,
+                ts=ts,
+                stop_price=stop_price,
+                target_price=target_price,
+            )
 
         position = OpenPosition(
             contract=contract,

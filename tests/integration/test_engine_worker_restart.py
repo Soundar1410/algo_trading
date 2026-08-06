@@ -484,3 +484,185 @@ def test_daily_risk_recovery_failure_blocks_entries_without_crashing(
     assert error["severity"] == "CRITICAL"
     assert error["component"] == "engine.recovery"
     assert "daily risk" in error["message"]
+
+
+# ------------------------------------------- Phase 6 Part 2: exit-policy state
+#
+# A trailing stop's peak, restored through the real worker path — the property
+# the plan named directly: "a trailing stop that had locked a peak before the
+# restart still exits on the same retracement after it."
+
+TRAILING_STRATEGY_ID = "engine_trailing"
+
+
+@pytest.fixture
+def trailing_worker_config(runtime_dirs: dict[str, Path], database_path: Path) -> WorkerConfig:
+    return WorkerConfig(
+        runtime_id=RUNTIME_ID,
+        strategy_id=TRAILING_STRATEGY_ID,
+        security_id=UNDERLYING,
+        instrument="NIFTY",
+        database_path=database_path,
+        lock_dir=runtime_dirs["lock_dir"],
+        pid_dir=runtime_dirs["pid_dir"],
+        log_dir=runtime_dirs["log_dir"],
+        trading_date=TRADING_DATE,
+        execution_mode=ExecutionMode.PAPER,
+        idle_timeout_seconds=0.5,
+        square_off_policy=SquareOffPolicy(),
+        engine=EngineWorkerConfig(
+            strategy_ref=ENGINE_STRATEGY,
+            strategy_kwargs={
+                "enter_on_candle": 1,
+                "premium_exit": True,
+                "exit_engine_name": "trailing",
+                "exit_engine_params": {"trail_points": 15},
+            },
+            timeframe="5m",
+            lot_size=LOT_SIZE,
+            strike_step=50,
+            feed_poll_seconds=0.05,
+        ),
+    )
+
+
+#: Opens, then walks the premium up to a peak of 40 (100 -> 140) and stops —
+#: not enough retracement yet to fire (trail_points=15). The peak this leaves
+#: behind is exactly what the restart must not lose.
+_TRAILING_RUN1_TAPE = [
+    _tick(UNDERLYING, 24000.0, _ts(9, 16)),
+    _tick(UNDERLYING, 24010.0, _ts(9, 21)),  # closes candle 1 -> ENTER
+    _tick(CE_CONTRACT, 100.0, _ts(9, 21, 30)),  # fills the pending entry
+    _tick(CE_CONTRACT, 140.0, _ts(9, 23)),  # within the 09:20-09:25 bucket
+    _tick(CE_CONTRACT, 145.0, _ts(9, 26)),  # closes 09:20-09:25 at 140 -> peak=40
+]
+
+#: A restart, then straight to a retracement that only fires if the 40 peak
+#: survived: 140 -> 120 gives back 20 >= 15. A fresh (unrestored) trailing
+#: engine would instead read 120 as a brand-new peak and never fire.
+_TRAILING_RUN2_TAPE = [
+    _tick(CE_CONTRACT, 120.0, _ts(9, 41)),  # 09:40-09:45 bucket opens
+    _tick(CE_CONTRACT, 125.0, _ts(9, 46)),  # closes it at 120 -> retrace 40-20=20 >= 15
+]
+
+
+def test_a_trailing_stops_peak_survives_a_restart_and_still_exits(
+    trailing_worker_config, database_path
+):
+    first = _run(trailing_worker_config, _TRAILING_RUN1_TAPE)
+    assert first.exit_code == 0, first.error
+    assert first.trades_closed == 0, "the tape must stop short of firing, or this proves nothing"
+    assert (
+        _open_positions_for(database_path, TRAILING_STRATEGY_ID)[0].status is PositionStatus.OPEN
+    )
+
+    second = _run(trailing_worker_config, _TRAILING_RUN2_TAPE)
+
+    assert second.exit_code == 0, second.error
+    assert second.recovered_position is True
+    assert second.trades_closed == 1, "the restored peak must be what this retracement exits on"
+
+
+def test_a_fresh_leg_after_a_gap_reads_a_new_peak_not_the_restored_one(
+    trailing_worker_config, database_path
+):
+    """Control for the test above: prove the tape genuinely depends on restore()
+    rather than firing on its own merits regardless of the prior peak.
+
+    Same run-two tape, but the exit-state key is cleared before it runs — the
+    same premium walk (120 -> close 120, no second data point yet) must NOT
+    exit, because with no restored peak there is nothing to retrace *from* on
+    the very first candle it sees.
+    """
+    _run(trailing_worker_config, _TRAILING_RUN1_TAPE)
+    repository = _repository(database_path)
+    payload = _payload_for(database_path, TRAILING_STRATEGY_ID)
+    del payload["exit_state"]
+    with repository.database.transaction() as conn:
+        import json
+
+        conn.execute(
+            "UPDATE strategy_state SET payload = ? WHERE strategy_id = ?",
+            (json.dumps(payload), TRAILING_STRATEGY_ID),
+        )
+
+    second = _run(trailing_worker_config, _TRAILING_RUN2_TAPE)
+
+    assert second.exit_code == 0, second.error
+    assert second.recovered_position is True
+    assert second.trades_closed == 0, "with no restored peak, this retracement must not fire"
+
+
+def test_a_stale_exit_state_snapshot_for_another_contract_is_ignored(
+    trailing_worker_config, database_path
+):
+    """Mirrors ``test_a_stale_contract_record_for_another_instrument_is_refused``
+    for the exit-state key: unlike position/daily-risk recovery, the refusal
+    must not block anything — only degrade this run's exit timing back to a
+    fresh peak."""
+    _run(trailing_worker_config, _TRAILING_RUN1_TAPE)
+    repository = _repository(database_path)
+    payload = _payload_for(database_path, TRAILING_STRATEGY_ID)
+    payload["exit_state"]["security_id"] = "SIM:NIFTY:WEEKLY:24500:PE"
+    with repository.database.transaction() as conn:
+        import json
+
+        conn.execute(
+            "UPDATE strategy_state SET payload = ? WHERE strategy_id = ?",
+            (json.dumps(payload), TRAILING_STRATEGY_ID),
+        )
+
+    second = _run(trailing_worker_config, _TRAILING_RUN2_TAPE)
+
+    assert second.exit_code == 0, second.error
+    assert second.recovered_position is True, "the position itself must still adopt cleanly"
+    assert second.trades_closed == 0, "a snapshot naming a different contract must be ignored"
+    # No error row for this: a stale exit-state snapshot degrades timing, not
+    # safety, so it must never be reported the way position/daily-risk failures
+    # are — that would be a false CRITICAL for something that isn't one.
+    error = (
+        Database(database_path)
+        .connect()
+        .execute(
+            "SELECT COUNT(*) FROM errors WHERE strategy_id = ? AND component = 'engine.recovery'",
+            (TRAILING_STRATEGY_ID,),
+        )
+        .fetchone()[0]
+    )
+    assert error == 0
+
+
+def _open_positions_for(database_path: Path, strategy_id: str):
+    return _repository(database_path).open_positions(
+        strategy_id=strategy_id,
+        execution_mode=ExecutionMode.PAPER,
+        trading_date=TRADING_DATE,
+    )
+
+
+def _payload_for(database_path: Path, strategy_id: str) -> dict:
+    return read_payload(
+        _repository(database_path),
+        strategy_id=strategy_id,
+        execution_mode=ExecutionMode.PAPER,
+        trading_date=TRADING_DATE,
+    )
+
+
+def test_stop_and_target_stay_null_under_todays_risk_manager(worker_config, database_path):
+    """Phase 6 Part 2's negative control on the widened stop/target plumbing.
+
+    ``FixtureRiskManager`` — the only risk manager this repository can run
+    today — reports neither, so the columns the engine now threads all the way
+    through ``PositionManager.open()`` -> ``LifecycleGateway`` -> ``apply_fill``
+    must still land NULL. The day Phase 9 adds a manager that overrides
+    ``stop_price``/``target_price``, this test starts seeing a real number and
+    fails — forcing that change to be confronted here rather than inherited
+    silently.
+    """
+    first = _run(worker_config, _FIRST_TAPE)
+    assert first.exit_code == 0, first.error
+
+    position = _open_positions(database_path)[0]
+    assert position.stop_price is None
+    assert position.target_price is None

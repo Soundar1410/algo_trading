@@ -83,7 +83,12 @@ from common.engine.selection import (
     SimulatedOptionChainResolver,
 )
 from common.engine.square_off import PersistedSquareOffAuthority, SquareOffAuthority
-from common.engine.state_payload import OPEN_POSITION_KEY, read_payload
+from common.engine.state_payload import (
+    EXIT_STATE_KEY,
+    OPEN_POSITION_KEY,
+    merge_payload,
+    read_payload,
+)
 from common.engine.strategy import BaseStrategy
 from common.execution import ExecutionRepository, OrderLifecycle
 from common.feed.queues import TickDropNotice
@@ -349,6 +354,31 @@ def _record_daily_risk_recovery_failure(
         component="engine.recovery",
         message=message,
     )
+
+
+def recover_exit_state(
+    config: WorkerConfig,
+    repository: ExecutionRepository,
+) -> dict[str, Any] | None:
+    """The previous process's exit-policy snapshot for the open position, or ``None``.
+
+    Phase 6 Part 2. Read straight off ``strategy_state.payload[EXIT_STATE_KEY]`` —
+    no consistency check against the ``positions`` row here, because
+    ``TradingEngine._restore_exit_state`` already does the one that matters (the
+    snapshot's own ``security_id`` against the position actually adopted), and
+    doing it twice would just be two copies of the same comparison. Never raises:
+    an unreadable snapshot degrades exit timing quality, not safety — see
+    ``_restore_exit_state``'s docstring for why that makes fail-open correct here,
+    unlike :func:`recover_position` / :func:`recover_daily_risk`.
+    """
+    payload = read_payload(
+        repository,
+        strategy_id=config.strategy_id,
+        execution_mode=config.execution_mode,
+        trading_date=config.trading_date,
+    )
+    snapshot = payload.get(EXIT_STATE_KEY)
+    return snapshot if isinstance(snapshot, dict) else None
 
 
 # ------------------------------------------------------------------- the run
@@ -628,6 +658,19 @@ def _build(
     def _recover_daily_risk() -> DailyRiskRecovery | None:
         return recover_daily_risk(config, repository)
 
+    def _recover_exit_state() -> dict[str, Any] | None:
+        return recover_exit_state(config, repository)
+
+    def _persist_exit_state(data: dict[str, Any] | None) -> None:
+        merge_payload(
+            repository,
+            {EXIT_STATE_KEY: data},
+            runtime_id=config.runtime_id,
+            strategy_id=config.strategy_id,
+            execution_mode=config.execution_mode,
+            trading_date=config.trading_date,
+        )
+
     engine = TradingEngine(
         cfg,
         feed=feed,
@@ -655,6 +698,8 @@ def _build(
         square_off_authority=square_off_authority,
         recover_position=_recover,
         recover_daily_risk=_recover_daily_risk,
+        recover_exit_state=_recover_exit_state,
+        persist_exit_state=_persist_exit_state,
         warmup_manager=warmup_manager,
         warmup_source=warmup_source,
     )

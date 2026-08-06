@@ -85,11 +85,26 @@ class RiskManager(ABC):
         * :meth:`reset` clears all state (no open position; called at the start of
           each trading day).
         * :meth:`new_position` arms the manager for a freshly opened position
-          (``lots`` scales per-lot thresholds).
+          (``lots`` scales per-lot thresholds; ``entry_price``, optional, is what
+          a manager needs to ever compute an *absolute* stop/target price level —
+          see :attr:`stop_price`).
         * :meth:`on_pnl` is fed the latest unrealised P&L (rupees) on every tick
           and returns an :class:`~common.models.ExitReason` if the position should
           be closed now, else ``None``.
         * :attr:`state` exposes the current risk picture for logging.
+        * :attr:`stop_price` / :attr:`target_price` — Phase 6 Part 2. Absolute
+          price levels, for observability only: the engine persists whatever
+          these report onto the ``positions`` row, but consults neither for its
+          own trading decisions (those still go through :meth:`on_pnl`). Default
+          ``None`` — a manager that tracks P&L thresholds rather than price
+          levels (every manager in this repository today) has nothing honest to
+          report here, and ``None`` is exactly that: not "zero", not a guess.
+        * :meth:`snapshot` / :meth:`restore` — Phase 6 Part 2. The pair
+          :class:`~common.exit.base.BaseExit` carries one layer over, for any
+          *internal* state a manager holds that must survive a restart (distinct
+          from stop/target above, which is a computed report, not stored state).
+          Default no-op, for the same reason :meth:`reset`'s default is a no-op:
+          a manager with nothing to preserve has nothing to override.
     """
 
     name: str = "base"
@@ -101,7 +116,7 @@ class RiskManager(ABC):
     def reset(self) -> None: ...
 
     @abstractmethod
-    def new_position(self, lots: int = 1) -> None: ...
+    def new_position(self, lots: int = 1, *, entry_price: float | None = None) -> None: ...
 
     @abstractmethod
     def on_pnl(self, pnl: float) -> ExitReason | None: ...
@@ -109,3 +124,29 @@ class RiskManager(ABC):
     @property
     @abstractmethod
     def state(self) -> Any: ...
+
+    @property
+    def stop_price(self) -> float | None:
+        """Absolute stop-loss price level, if this manager tracks one. See the class docstring."""
+        return None
+
+    @property
+    def target_price(self) -> float | None:
+        """Absolute profit-target price level, if this manager tracks one.
+
+        See the class docstring.
+        """
+        return None
+
+    def snapshot(self) -> dict[str, Any]:
+        """Internal state to restore after a restart. Default no-op (``{}``)."""
+        return {}
+
+    def restore(self, data: dict[str, Any]) -> None:  # noqa: B027 - see snapshot
+        """Reapply a previous :meth:`snapshot`. Default no-op.
+
+        Must never raise — same reasoning as
+        :meth:`common.exit.base.BaseExit.restore`: a wrong or missing risk-manager
+        snapshot degrades trade management quality, not safety, so the correct
+        default is to continue rather than block.
+        """

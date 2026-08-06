@@ -45,6 +45,7 @@ from common.engine.models import (
 from common.engine.risk import RiskManager
 from common.engine.strategy import BaseStrategy
 from common.exit import get_exit_engine
+from common.exit.base import BaseExit
 from common.exit.momentum_close import MomentumCloseExit
 from common.indicators.base import OHLC
 from common.models import ExitReason, Tick
@@ -66,13 +67,18 @@ class FixtureRiskManager(RiskManager):
         self.stop_loss_rupees = stop_loss_rupees
         self.armed_lots = 0
         self.resets = 0
+        #: Kept for inspection only — this manager reports no stop_price/
+        #: target_price (a rupee P&L stop is not a price level), so nothing
+        #: downstream reads it. See RiskManager.stop_price's docstring.
+        self.armed_entry_price: float | None = None
 
     def reset(self) -> None:
         self.armed_lots = 0
         self.resets += 1
 
-    def new_position(self, lots: int = 1) -> None:
+    def new_position(self, lots: int = 1, *, entry_price: float | None = None) -> None:
         self.armed_lots = lots
+        self.armed_entry_price = entry_price
 
     def on_pnl(self, pnl: float) -> ExitReason | None:
         if self.stop_loss_rupees is None:
@@ -97,6 +103,18 @@ class EngineFixtureStrategy(BaseStrategy):
         stop_loss_rupees: arms :class:`FixtureRiskManager`; ``None`` disables it.
         continuity_required: declare a path-dependent warm-up need, so the
             fail-closed gate can be exercised.
+        exit_engine_name: the registered premium-candle exit engine to drive.
+            Default ``"momentum_close"`` (unchanged behaviour, via its own
+            ``should_exit_closes`` convenience method). Phase 6 Part 2: any of
+            ``"trailing"`` / ``"highest_close"`` / ``"consecutive_reversal"`` — the
+            three engines with restart-recoverable state — drives the generic
+            :meth:`~common.exit.base.BaseExit.should_exit` contract instead, so
+            their snapshot/restore round trip can be exercised through a real
+            worker run rather than only at the unit level.
+        exit_engine_params: parameters for ``exit_engine_name``. ``momentum_close``
+            keeps its ``{"price_stream": "premium"}`` default when this is empty;
+            every other engine gets exactly what is passed (empty means its own
+            registered defaults).
     """
 
     name = "engine_fixture"
@@ -112,6 +130,8 @@ class EngineFixtureStrategy(BaseStrategy):
         lots: int = 1,
         continuity_required: bool = False,
         warmup_spec_raises: bool = False,
+        exit_engine_name: str = "momentum_close",
+        exit_engine_params: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(cfg=None)
         # A sequence rather than a single index so a test can drive a genuine
@@ -132,18 +152,24 @@ class EngineFixtureStrategy(BaseStrategy):
         self._warmup_spec_raises = warmup_spec_raises
         self._risk = FixtureRiskManager(stop_loss_rupees)
 
-        # The real Part 2a policy, in premium mode — not a reimplementation.
-        # Resolved through the registry rather than constructed directly, so this
-        # also exercises the name->class wiring; the isinstance check is what makes
-        # that lookup type-safe, and it would catch a registry that silently
-        # started handing back a different class under the same name.
-        policy = get_exit_engine("momentum_close", {"price_stream": "premium"})
-        if not isinstance(policy, MomentumCloseExit):  # pragma: no cover - registry guard
+        # The real Part 2a/Part 6-2 policy — not a reimplementation. Resolved
+        # through the registry rather than constructed directly, so this also
+        # exercises the name->class wiring; the isinstance check (momentum_close
+        # only, where the specialised should_exit_closes() convenience method is
+        # actually called) is what makes that lookup type-safe, and it would catch
+        # a registry that silently started handing back a different class under
+        # the same name.
+        self._exit_engine_name = exit_engine_name
+        default_params = {"price_stream": "premium"} if exit_engine_name == "momentum_close" else {}
+        policy = get_exit_engine(exit_engine_name, {**default_params, **(exit_engine_params or {})})
+        if exit_engine_name == "momentum_close" and not isinstance(
+            policy, MomentumCloseExit
+        ):  # pragma: no cover - registry guard
             raise TypeError(
                 f"the 'momentum_close' registry entry resolved to {type(policy).__name__}, "
                 "which does not expose should_exit_closes()"
             )
-        self._exit_engine: MomentumCloseExit = policy
+        self._exit_engine: BaseExit = policy
 
         # Observable state the tests assert on.
         self.candles_seen = 0
@@ -202,15 +228,47 @@ class EngineFixtureStrategy(BaseStrategy):
         self.premium_closes.append(candle.close)
         previous = self._previous_premium_close
         self._previous_premium_close = candle.close
-        # The real registered policy decides, on the traded option's own bars.
-        if self._exit_engine.should_exit_closes(candle.close, previous, side=self.side):
+
+        if self._exit_engine_name == "momentum_close":
+            # Unchanged from before Phase 6 Part 2: the specialised convenience
+            # method, and the specific ExitReason existing tests pin.
+            assert isinstance(self._exit_engine, MomentumCloseExit)
+            if self._exit_engine.should_exit_closes(candle.close, previous, side=self.side):
+                return StrategySignal(
+                    action=SignalAction.EXIT,
+                    timestamp=timestamp,
+                    exit_reason=ExitReason.MOMENTUM_LOW,
+                    reason="fixture premium-candle exit",
+                )
+            return None
+
+        # A generic BaseExit — trailing/highest_close/consecutive_reversal, Phase
+        # 6 Part 2. None of the three consume candle_history, indicators or
+        # strategy_config (verified against their should_exit bodies), so the
+        # placeholders below are honest rather than a shortcut dropping behaviour
+        # a real caller would need. last_position comes from on_position_tick,
+        # which the engine calls on every option tick — always populated by the
+        # time a premium candle involving that contract can have completed.
+        if self.last_position is None:
+            return None
+        fired = self._exit_engine.should_exit(
+            self.last_position, candle, [], {}, None, timestamp=timestamp
+        )
+        if fired:
             return StrategySignal(
                 action=SignalAction.EXIT,
                 timestamp=timestamp,
-                exit_reason=ExitReason.MOMENTUM_LOW,
-                reason="fixture premium-candle exit",
+                exit_reason=self._exit_engine.exit_reason,
+                reason=f"fixture premium-candle exit ({self._exit_engine.label})",
             )
         return None
+
+    # --------------------------------------------- Phase 6 Part 2: restart state
+    def exit_state_snapshot(self) -> dict[str, Any]:
+        return self._exit_engine.snapshot()
+
+    def restore_exit_state(self, data: dict[str, Any]) -> None:
+        self._exit_engine.restore(data)
 
     def on_option_candle_gap(self) -> None:
         """Forget the previous premium close so a streak re-primes on fresh bars.

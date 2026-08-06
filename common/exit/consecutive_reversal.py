@@ -37,6 +37,19 @@ class ConsecutiveReversalExit(BaseExit):
         self._streak = 0
         self._prev_close = None
 
+    def snapshot(self) -> dict[str, Any]:
+        if self._streak == 0 and self._prev_close is None:
+            return {}
+        return {"streak": self._streak, "prev_close": self._prev_close}
+
+    def restore(self, data: dict[str, Any]) -> None:
+        streak = data.get("streak")
+        if isinstance(streak, int):
+            self._streak = streak
+        prev_close = data.get("prev_close")
+        if isinstance(prev_close, int | float):
+            self._prev_close = float(prev_close)
+
     def should_exit(
         self,
         position: Any,

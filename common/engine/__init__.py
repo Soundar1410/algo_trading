@@ -53,6 +53,7 @@ from .square_off import (
 )
 from .state_payload import (
     DAY_SUMMARY_KEY,
+    EXIT_STATE_KEY,
     OPEN_POSITION_KEY,
     merge_payload,
     read_payload,
@@ -61,6 +62,7 @@ from .strategy import BaseStrategy, available_strategies, get_strategy, register
 
 __all__ = [
     "DAY_SUMMARY_KEY",
+    "EXIT_STATE_KEY",
     "OPEN_POSITION_KEY",
     "AdoptedPosition",
     "BaseStrategy",

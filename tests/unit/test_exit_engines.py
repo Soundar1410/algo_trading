@@ -422,3 +422,125 @@ def test_composite_no_fire_when_conditions_absent():
 def test_unknown_engine_raises():
     with pytest.raises(KeyError):
         get_exit_engine("does_not_exist")
+
+
+# --------------------------------------- Phase 6 Part 2: snapshot/restore
+def test_stateless_engine_snapshot_is_empty_by_default():
+    """momentum_close (and every other stateless engine) inherits the no-op pair."""
+    e = get_exit_engine("momentum_close")
+    assert e.snapshot() == {}
+    e.restore({"anything": "at all"})  # must not raise
+
+
+def test_trailing_snapshot_is_empty_before_the_trail_arms():
+    e = get_exit_engine("trailing", {"trail_points": 15})
+    e.reset()
+    e.should_exit(_pos(OptionType.CE, entry=180, last=180), _c(1), [], {}, None)  # peak still 0
+    assert e.snapshot() == {}
+
+
+def test_trailing_snapshot_and_restore_round_trip():
+    """The property the plan's own test scenario names: a peak survives the
+    restart and the *same* retracement that would have exited before it still
+    exits after."""
+    e = get_exit_engine("trailing", {"trail_points": 15})
+    e.reset()
+    e.should_exit(_pos(OptionType.CE, entry=180, last=220), _c(1), [], {}, None)  # peak 40
+    snapshot = e.snapshot()
+    assert snapshot == {"peak_profit": 40.0}
+
+    # A brand-new instance -- the "restarted process" -- restores it.
+    restarted = get_exit_engine("trailing", {"trail_points": 15})
+    restarted.reset()
+    restarted.restore(snapshot)
+
+    # Fails without restore(): a fresh instance's peak is 0, so this same
+    # retracement (40 -> 20, giving back 20 >= 15) would read as "no peak yet"
+    # and never fire.
+    pos = _pos(OptionType.CE, entry=180, last=200)
+    assert restarted.should_exit(pos, _c(1), [], {}, None) is True
+
+
+def test_highest_close_snapshot_and_restore_round_trip():
+    e = get_exit_engine("highest_close", {"trail_points": 20})
+    e.reset()
+    e.should_exit(_pos(OptionType.CE), _c(130), [], {}, None)  # peak 130
+    snapshot = e.snapshot()
+    assert snapshot == {"extreme": 130.0, "activated": False}
+
+    restarted = get_exit_engine("highest_close", {"trail_points": 20})
+    restarted.reset()
+    restarted.restore(snapshot)
+
+    # 130 -> 109 gives back 21 >= 20. A fresh instance would read 109 as a new
+    # peak (nothing to retrace from) and never fire.
+    assert restarted.should_exit(_pos(OptionType.CE), _c(109), [], {}, None) is True
+
+
+def test_consecutive_reversal_snapshot_and_restore_round_trip():
+    e = get_exit_engine("consecutive_reversal", {"reverse_candles": 2})
+    e.reset()
+    e.should_exit(_pos(OptionType.CE), _c(100), [], {}, None)  # seed
+    e.should_exit(_pos(OptionType.CE), _c(99), [], {}, None)  # streak 1
+    snapshot = e.snapshot()
+    assert snapshot == {"streak": 1, "prev_close": 99.0}
+
+    restarted = get_exit_engine("consecutive_reversal", {"reverse_candles": 2})
+    restarted.reset()
+    restarted.restore(snapshot)
+
+    # One more adverse close should complete the streak at 2 and fire. A fresh
+    # instance (streak 0, no prev_close) would only re-seed on this candle.
+    assert restarted.should_exit(_pos(OptionType.CE), _c(98), [], {}, None) is True
+
+
+@pytest.mark.parametrize(
+    "name,params",
+    [
+        ("trailing", {}),
+        ("highest_close", {}),
+        ("consecutive_reversal", {}),
+    ],
+)
+def test_restore_with_foreign_or_empty_data_does_not_raise(name, params):
+    """A snapshot from an older build, or none at all, must never crash restore()."""
+    e = get_exit_engine(name, params)
+    e.restore({})
+    e.restore({"unexpected_key": "foreign value", "peak_profit": "not-a-number"})
+
+
+def test_composite_snapshot_keys_by_label_and_skips_stateless_children():
+    comp = build_exit_engine(
+        _exit_cfg(
+            mode="MOMENTUM_CLOSE",
+            momentum_close={"enabled": True},
+            trailing={"enabled": True, "trail_points": 15},
+        )
+    )
+    comp.should_exit(
+        _pos(OptionType.CE, entry=180, last=220), _c(101), [_c(100)], {}, None
+    )  # trailing peak 40; momentum_close is stateless
+
+    snapshot = comp.snapshot()
+
+    assert snapshot == {"TRAILING": {"peak_profit": 40.0}}
+
+
+def test_composite_restore_applies_matching_labels():
+    comp = build_exit_engine(
+        _exit_cfg(mode="MOMENTUM_CLOSE", trailing={"enabled": True, "trail_points": 15})
+    )
+    comp.restore({"TRAILING": {"peak_profit": 40.0}})
+
+    trailing = next(e for e in comp.engines if e.label == "TRAILING")
+    assert trailing.snapshot() == {"peak_profit": 40.0}
+
+
+def test_composite_restore_skips_unknown_labels_without_raising():
+    comp = build_exit_engine(
+        _exit_cfg(mode="MOMENTUM_CLOSE", trailing={"enabled": True, "trail_points": 15})
+    )
+    comp.restore({"HIGHEST_CLOSE": {"extreme": 999.0}})  # not configured today
+
+    trailing = next(e for e in comp.engines if e.label == "TRAILING")
+    assert trailing.snapshot() == {}  # untouched — nothing was applied to it

@@ -74,6 +74,17 @@ class HighestCloseExit(BaseExit):
         self._extreme = None
         self._activated = False
 
+    def snapshot(self) -> dict[str, Any]:
+        if self._extreme is None:
+            return {}
+        return {"extreme": self._extreme, "activated": self._activated}
+
+    def restore(self, data: dict[str, Any]) -> None:
+        extreme = data.get("extreme")
+        if isinstance(extreme, int | float):
+            self._extreme = float(extreme)
+            self._activated = bool(data.get("activated", False))
+
     def _is_long(self, position: Any) -> bool:
         if self.basis == "side":
             return position.side is OrderSide.BUY

@@ -107,14 +107,44 @@ class LifecycleGateway:
 
     # -------------------------------------------------------------- the verbs
     def buy(
-        self, contract: OptionContract, lots: int, *, ref_price: float, ts: datetime
+        self,
+        contract: OptionContract,
+        lots: int,
+        *,
+        ref_price: float,
+        ts: datetime,
+        stop_price: float | None = None,
+        target_price: float | None = None,
     ) -> FillOutcome:
-        return self._execute(OrderSide.BUY, contract, lots, ref_price=ref_price, ts=ts)
+        return self._execute(
+            OrderSide.BUY,
+            contract,
+            lots,
+            ref_price=ref_price,
+            ts=ts,
+            stop_price=stop_price,
+            target_price=target_price,
+        )
 
     def sell(
-        self, contract: OptionContract, lots: int, *, ref_price: float, ts: datetime
+        self,
+        contract: OptionContract,
+        lots: int,
+        *,
+        ref_price: float,
+        ts: datetime,
+        stop_price: float | None = None,
+        target_price: float | None = None,
     ) -> FillOutcome:
-        return self._execute(OrderSide.SELL, contract, lots, ref_price=ref_price, ts=ts)
+        return self._execute(
+            OrderSide.SELL,
+            contract,
+            lots,
+            ref_price=ref_price,
+            ts=ts,
+            stop_price=stop_price,
+            target_price=target_price,
+        )
 
     # ------------------------------------------------------------- the plumbing
     def _execute(
@@ -125,6 +155,8 @@ class LifecycleGateway:
         *,
         ref_price: float,
         ts: datetime,
+        stop_price: float | None = None,
+        target_price: float | None = None,
     ) -> FillOutcome:
         quantity = lots * contract.lot_size
         start_at, end_at = self._window(contract.symbol, ts)
@@ -154,7 +186,12 @@ class LifecycleGateway:
             reason=f"engine {side.value} {lots} lot(s) of {contract.symbol}",
         )
 
-        result = self._lifecycle.handle_signal(signal, trading_date=self._trading_date)
+        result = self._lifecycle.handle_signal(
+            signal,
+            trading_date=self._trading_date,
+            stop_price=stop_price,
+            target_price=target_price,
+        )
         self._require_a_fill(result, side, contract)
         self.executions += 1
         self._record_contract(contract, lots, side, result)

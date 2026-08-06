@@ -57,6 +57,15 @@ OPEN_POSITION_KEY = "open_position"
 #: that class for why.
 DAY_SUMMARY_KEY = "day_summary"
 
+#: The open position's exit-policy state (a trailing peak, a reversal streak),
+#: written after every candle close while a position is open and cleared on
+#: close — Phase 6 Part 2. Shape: ``{"security_id": <open contract's>, "state":
+#: <the strategy's own exit_state_snapshot()>}``. The ``security_id`` wrapper
+#: reuses exactly the mismatch check ``OPEN_POSITION_KEY`` already needs (a
+#: snapshot from a different contract must be refused), rather than inventing a
+#: second comparison for this key.
+EXIT_STATE_KEY = "exit_state"
+
 
 def read_payload(
     repository: ExecutionRepository,

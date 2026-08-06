@@ -103,6 +103,28 @@ class BaseStrategy(ABC):
         cooldown). Default: no-op."""
         return None
 
+    def exit_state_snapshot(self) -> dict[str, Any]:
+        """Restart-recoverable exit-policy state, for :class:`~common.engine.engine.
+        TradingEngine` to persist. Phase 6 Part 2.
+
+        Default ``{}`` (no-op) — the engine has no other way to reach whatever
+        exit engine(s) a strategy holds privately (:attr:`risk_manager` is the
+        only strategy-internal object the engine already reaches, and that is a
+        different concern — see :class:`~common.engine.risk.RiskManager`). A
+        strategy that owns a stateful exit engine overrides this to delegate to
+        its own :meth:`~common.exit.base.BaseExit.snapshot`; one that doesn't
+        inherits the no-op and pays nothing."""
+        return {}
+
+    def restore_exit_state(self, data: dict[str, Any]) -> None:
+        """Reapply a previous :meth:`exit_state_snapshot`. Default no-op.
+
+        Must never raise — a missing or foreign snapshot degrades exit timing
+        quality (a trailing stop re-arms from the current price instead of its
+        true peak), never safety, so the correct default is to continue with
+        already-:meth:`reset` state rather than block."""
+        return None
+
     @property
     def needs_option_candles(self) -> bool:
         """Opt into :class:`~common.engine.engine.TradingEngine` building a

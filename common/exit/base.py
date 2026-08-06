@@ -94,6 +94,28 @@ class BaseExit(ABC):
         an empty override — and, worse, would change the ported contract.
         """
 
+    def snapshot(self) -> dict[str, Any]:
+        """The per-position state :meth:`reset` would clear, for restart recovery.
+
+        Phase 6 Part 2. Default no-op (``{}``), exactly like :meth:`reset`'s
+        default and for the same reason: most registered engines are stateless
+        and have nothing to snapshot. An empty return is the caller's signal that
+        there is nothing worth persisting for this engine — see
+        :class:`~common.exit.composite.CompositeExit`, which skips it.
+        """
+        return {}
+
+    def restore(self, data: dict[str, Any]) -> None:  # noqa: B027 - see snapshot
+        """Reapply a previous :meth:`snapshot`. Default no-op.
+
+        Must never raise on foreign or malformed data — the caller (restart
+        recovery) treats an unreadable snapshot as "nothing to restore", not as a
+        reason to fail closed. Unlike position or daily-risk recovery, a wrong or
+        missing exit-state snapshot only degrades **exit timing quality** (a
+        trailing stop re-arms from the current price instead of its true peak),
+        never safety, so the correct default is to continue rather than block.
+        """
+
     @abstractmethod
     def should_exit(
         self,

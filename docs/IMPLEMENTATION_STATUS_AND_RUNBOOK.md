@@ -7,9 +7,9 @@ the next phase. Updated after every phase.
 
 | | |
 |---|---|
-| **Current phase** | **Phase 6 Part 1 complete** — daily risk state across a restart. A pre-work audit (spec's Phase 6 bullets read directly, checked against the codebase before any implementation) found the phase does **not** follow Phase 5's "mostly wiring" pattern: roughly 60% of bullet 1 (restore positions and strategy/risk state) was already built and tested through Phase 3-5, but the single highest-value gap — `DailyRiskGuard.reset()` zeroing realised P&L and trade count on every restart, including after a loss the day's cap should already have stopped — was a genuine risk-limit bypass with no producer or reader anywhere. Part 1 closes it: `DailyRiskGuard.restore()` seeds the guard from what a previous process already booked, running the same evaluation the live path uses so an already-past-cap restart halts immediately at the *remaining* headroom rather than a fresh full cap; `TradingEngine` gains an injected `recover_daily_risk` provider (mirrors `recover_position`'s shape and its fail-closed behaviour on a raising provider); `engine_worker.recover_daily_risk` supplies it from `strategy_state.daily_realised_pnl` (already written, never read before now) and a `positions.status='CLOSED'` count (queried, not a new stored counter). Building the column's first reader found it was silently wrong for any strategy trading more than one contract per day — **D58**, **limitation 22**, fixed in the same part with fail-first evidence. Deliberately *not* done in Part 1, each for a stated reason: `re_entry_count` stays unwritten rather than counted-but-unenforced (redundant with the now-restored `max_trades` counter, and the persuasive-half-built-state risk named in the plan's standing rule); MFE/MAE, square-off attempts, state-version validation and last-candle idempotency are Part 3. New deviation **D58**, new limitations **22** (found and fixed same part) and **23**. |
-| **Next phase** | Phase 6 Part 2 (position-management state snapshot/restore — exit-policy state and stop/target persistence) |
-| **Last updated** | 6 August 2026 — Phase 6 Part 1 complete, see [Known limitations](#6-known-limitations) |
+| **Current phase** | **Phase 6 Part 2 complete** — position-management state snapshot/restore. Pre-work found the plan's own bullet ("add `snapshot()`/`restore()` to `BaseExit`/`RiskManager`, populate `positions.stop_price`/`target_price`") understated four real gaps: (1) `RiskManager.new_position()` had no entry-price parameter, so no manager could ever compute an absolute stop/target — resolved by widening the interface (put to the user directly as the one genuine either-way fork; decided: widen now, not defer); (2) nothing exposed a strategy's private exit engine to the engine layer — `BaseStrategy` gained `exit_state_snapshot()`/`restore_exit_state()`, no-op defaults; (3) no per-candle persistence hook existed at all on the engine path — a new injected `persist_exit_state` callback, called after every candle a position is open for, is genuinely new database-write behaviour, called out explicitly rather than folded into "reuse `merge_payload`"; (4) `EngineFixtureStrategy` could only drive `MomentumCloseExit`'s own convenience method, not the generic `BaseExit.should_exit()` contract `TrailingExit`/`HighestCloseExit`/`ConsecutiveReversalExit` implement — widened with a default-preserving `exit_engine_name` kwarg. Exit-state recovery is deliberately **fail-open** (log and continue with fresh/reset state), unlike position and daily-risk recovery's fail-closed: a wrong or missing snapshot degrades exit timing quality, never safety — the same philosophy `PositionManager.adopt` already documents for MFE/MAE restarting at zero. The stop/target widening — `RiskManager.new_position(entry_price=...)`, `ExecutionGateway`/`InMemoryGateway`/`PositionManager.open()` all threading `stop_price`/`target_price` through to `LifecycleGateway` — carries an executable negative-control test: under today's `FixtureRiskManager` (which reports neither), a real entry through the full `run_worker` path still leaves both columns NULL, so the day Phase 9 adds a manager that overrides them, that test starts failing rather than silently inheriting a stale claim. |
+| **Next phase** | Phase 6 Part 3 (the remaining §7 "restore at minimum" gaps — MFE/MAE, square-off attempts, state-version validation, last-candle idempotency) |
+| **Last updated** | 6 August 2026 — Phase 6 Part 2 complete, see [Known limitations](#6-known-limitations) |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
 | **Live order placement** | **Not implemented.** Fail-closed. Phase 10 only. |
@@ -26,7 +26,7 @@ the next phase. Updated after every phase.
 | 3 | Preserve custom engines and policies | **Complete.** **Part 1 complete** (live-feed shutdown); **Part 2a complete** (exit registry + SuperTrend port); **Part 2b-i complete** (signal ownership + engine core); **Part 2b-ii-A complete** (the feed seam: tick channel, runtime subscription, `HubTickFeed`); **Part 2b-ii-B-1 complete** (the execution seam: square-off authority, `LifecycleGateway`, entry-block on tick drop); **Part 2b-ii-B-2 complete** (the wiring: worker engine path, supervisor queue delivery, engine restart recovery, D20 reporting bindings). **Phase 3 complete** — its acceptance gate is met in full |
 | 4 | Candle, indicator and paper-execution foundation | **Complete.** **Part 1 complete** (real contract resolution — closes 17, alarms 15). **Part 2 complete** (indicator layer — closes D21). **Part 3 complete** (continuity, timezone, wall-clock square-off — closes 4 and 7, and a live blocker). **Part 4 complete** (warm-up source and injection — closes 16). **Part 5 complete** (`PaperBroker` realism — closes 5 and D11; the live Full-mode gate item ran 6 August 2026 and passed, closing known limitation 20 along the way). **Phase 4 complete** — all five parts done, its one live gate item proven rather than asserted |
 | 5 | Mixed-mode supervisor and persistence | **Complete** |
-| 6 | Paper recovery and expiry handling | **In progress.** **Part 1 complete** (daily risk state across a restart — closes the risk-limit-bypass gap in bullet 1, and finds/fixes **D58**/limitation 22 along the way) |
+| 6 | Paper recovery and expiry handling | **In progress.** **Part 1 complete** (daily risk state across a restart — closes the risk-limit-bypass gap in bullet 1, and finds/fixes **D58**/limitation 22 along the way). **Part 2 complete** (position-management state snapshot/restore — exit-policy state via `BaseExit`/`RiskManager`/`BaseStrategy` snapshot hooks, and stop/target persistence through a widened `RiskManager`/`ExecutionGateway`, fail-open on a bad snapshot, negative-control-tested) |
 | 7 | Operations | Not started |
 | 8 | LaunchAgent validation | Not started |
 | 9 | Real strategies | Not started |
@@ -2197,6 +2197,9 @@ guard. See deviation D6.
 | **D56** | **Positional-options rollout is split: inert scaffolding shipped now, the working supervisor/worker/persistence layer genuinely deferred to Phase 6/9 — corrected from an earlier draft that deferred all of it** | Spec bullet 6 reads "add positional options and intraday stocks one at a time; keep positional stocks a placeholder" — naming three things and treating them differently. An earlier version of this deviation read "no strategy exists yet" as sufficient reason to defer everything, which was too broad: the bullet singling out "positional stocks" as *the* placeholder only makes sense if "no consumer yet" wasn't meant to excuse the other two equally, and **D34** — written back in the reference audit — already said "Intraday stocks are Phase 5", i.e. this project's own earlier documentation expected incremental movement here. Corrected split: (1) `config/runtimes/positional_options.yaml` (`enabled: false`) and `runtimes/positional_options/__init__.py` are real, loadable, and shipped — matching the exact precedent `intraday_options.yaml` set in Phase 1, and completely inert since nothing scans `config/runtimes/*.yaml` on its own. (2) The supervisor/worker/config-adapter layer stays deferred, and this part **is** a genuine structural blocker, not merely "no consumer": `positions`/`strategy_state`/`order_intents` all key their UNIQUE identity on `trading_date` (migration `0001`), which fragments a position held across sessions into unrelated rows, and `SquareOffPolicy` is same-day wall-clock exit with no multi-day concept — both are Phase 6's explicit job ("restore open paper positions... by strategy and mode", not by date; `force_square_off_before_expiry`; settlement simulation). Building it now would mean either reusing same-day-shaped persistence incorrectly or inventing Phase 6's answer out of order. `intraday_stocks` gets no placeholder at all — D34's "needs a real consumer" reasoning for its scanner-driven universe is unchanged and still applies there. |
 | **D57** | **`discover_enabled_strategies` has no way to scope strategy files to one runtime** | Recorded as its own deviation, separate from D56, because it is a gap in the *mechanism* rather than a deferred *feature*: `StrategyConfig` carries no `runtime_id`, and neither does the spec's own "required resolved strategy fields" list (section 9), so a strategy's runtime membership is established only by filename convention (spec's own example: `io_supertrend_fast_v1`). `discover_enabled_strategies(config_root, runtime_id)` therefore resolves *every* enabled file under `config/strategies/` against whichever `runtime_id` it is called with — correct today because `intraday_options` is the only caller, unsafe the day a second runtime's supervisor calls it against the same directory. See limitation 21. |
 | **D58** | **`_touch_strategy_state` accumulated the wrong thing — fixed while building its first reader** | Phase 6 Part 1 needed `strategy_state.daily_realised_pnl` to mean "today's total realised P&L" in order to restore `DailyRiskGuard` across a restart, and found that it did not: the UPSERT wrote `daily_realised_pnl = excluded.daily_realised_pnl` (overwrite, not accumulate) while its caller passed *the position's own* cumulative `realised_pnl` under the parameter name `realised_delta`. A strategy that closes one contract and opens a **different** one the same day (a different `security_id`, hence a different `positions` row) silently lost the first contract's booked P&L from this column the moment the second contract's first fill landed. Exactly the shape of the `orders.filled_quantity`/`average_fill_price` bug Phase 4 Part 5 already found and fixed on the sibling column (`test_two_fills_on_one_order_accumulate_rather_than_overwrite`) — missed here because nothing had read `daily_realised_pnl` back until now. `ExecutionRepository._upsert_position` now returns the true per-call delta (this fill's own contribution, computed from the position's realised P&L *before* the update, not its new cumulative total), and `_touch_strategy_state`'s SQL adds it to the stored value rather than replacing it. `test_daily_realised_pnl_accumulates_across_contracts_not_just_the_last_one` (`tests/integration/test_execution_persistence.py`) pins it — demonstrated failing against the pre-fix code first, since the single-contract-per-day shape every other test in the file uses cannot distinguish "accumulate" from "overwrite" (there is only ever one value to keep). See limitation 22. |
+| **D59** | **`ExecutionGateway`'s "deliberately narrow, two verbs" Protocol was widened — the first change to it since Phase 3 Part 2b-i** | Phase 6 Part 2 needed a risk manager's reported `stop_price`/`target_price` to reach `positions.stop_price`/`.target_price`, and there was no possible producer for either at any depth: `RiskManager.new_position(self, lots: int = 1) -> None` received no entry price, so no manager — not even a hypothetical Phase 9 one built against the pre-Part-2 interface — could ever compute an absolute price level. Put to the user directly as the one genuine either-way fork in the part (widen now vs. add only inert no-op properties and defer the plumbing to Phase 9); decided: widen now. `RiskManager.new_position` gained an optional `entry_price` kwarg; `RiskManager` gained no-op `stop_price`/`target_price` properties; `ExecutionGateway.buy`/`.sell`, `InMemoryGateway.buy`/`.sell`, `LifecycleGateway.buy`/`.sell`/`._execute` and `PositionManager.open()` each gained optional `stop_price`/`target_price` kwargs (default `None`), threaded to `OrderLifecycle.handle_signal`, which already accepted them (the Phase 1 fixture worker's own existing precedent). Every addition is optional with a `None` default and no existing call site needed to change to keep behaving exactly as before — `tests/integration/test_engine_lifecycle_gateway.py` and the `PositionManager`/`InMemoryGateway` regression suites pass unmodified. `TradingEngine._open()` was reordered to arm the risk manager *before* `positions.open()` (previously the other way around) so a manager's computed levels are known before the entry fill — safe because neither call consulted the other under the old order either. |
+| **D60** | **Exit-state restart recovery is fail-*open*, the only recovery mechanism in Phase 6 that is** | Position recovery (`recover_position`) and daily-risk recovery (`recover_daily_risk`, Part 1) both fail closed — block entries, write a `CRITICAL` error — because both guard against *double exposure* or *trading past a limit*. A missing, foreign, or unusable exit-state snapshot (a trailing peak, a reversal streak) carries no such risk: it only degrades **exit timing quality** on an *already-adopted* position (a trailing stop re-arms from the current price instead of its true peak), never safety. `TradingEngine._restore_exit_state` therefore logs and continues with the strategy's already-`reset()` (empty) state on any failure — no entry block, no `errors` row — exactly the philosophy `PositionManager.adopt` already documents for MFE/MAE restarting at zero ("zero is visibly the floor rather than plausibly the truth"). `test_a_stale_exit_state_snapshot_for_another_contract_is_ignored` proves both halves: the position still adopts cleanly, and no `component='engine.recovery'` error row is written for this case — asserting its *absence* is what would catch a future change that quietly promoted this to fail-closed without updating this record. |
+| **D61** | **A new per-candle database write exists on the engine path — there was none before, and its multi-worker contention cost is unmeasured** | `strategy_state.payload` was previously touched only on a *fill* (`LifecycleGateway._record_contract`, via `apply_fill`), never once per candle. Exit-policy state changes on every candle a position is open for (a trailing peak can advance, or a reversal streak extend, without producing an exit signal that candle), so persisting only at entry/exit fills would leave the *mid-position* value — exactly what a crash-and-restart needs — permanently stale; proving the part's own test scenario is structurally impossible without a new per-candle write. `TradingEngine._persist_exit_state`, called from `_on_candle_close` and `_check_premium_candle_exit`, gated on a *completed* candle (`CandleBuilder.add()` returning non-`None`), so this fires once per `cfg.timeframe` per open position — not once per tick — and each write is one `merge_payload` call (a SELECT + UPSERT on `strategy_state`), the same shape every existing write to that row already uses. Both call sites are guarded by "only when a position is open," and skipped on a candle that itself triggers a close, since `_close()` persists (clears) the key once the position it belonged to is actually gone. **What is not verified**: candle boundaries are wall-clock aligned, so multiple strategies in one runtime group sharing a timeframe tend to complete candles in the same second — a synchronised write burst against the shared group database, not uniformly-distributed load, and structurally different from most existing `strategy_state` writes because this one fires unconditionally on *every* candle for *every* open position rather than only on the writes those already produce. `journal_mode=WAL` / `busy_timeout=5000ms` (`common/persistence/database.py`) already governs every write across every worker in a group and is untouched by this change, but no test or benchmark exercises this specific burst pattern against it — nothing in the suite measures write latency or lock-wait time under concurrent multi-worker load at all, for this write or any other. Bounded by the same conservative default (5 s busy-timeout) as every write already ships with; not yet shown to be *comfortable* at a realistic group size. Revisit before Phase 7 operations work or before a group grows past a handful of concurrently-timeframed strategies, whichever comes first. |
 
 #### D22 in detail: the rebuilt premium-candle mapping
 
@@ -4047,6 +4050,27 @@ start/stop/crash/restart tests pass.
     since no worker configuration can reach them end to end to prove it
     there). Closes when a real strategy's configuration needs one of the
     other three limits — most likely Phase 9.
+24. **The Phase 6 Part 2 per-candle exit-state write's multi-worker
+    contention cost is unmeasured.** `TradingEngine._persist_exit_state`
+    (see **D61**) writes to the shared group `strategy_state` row once per
+    completed candle per open position — not once per tick, and the same
+    write shape every other `strategy_state` write already uses, so it is
+    not a new *kind* of load. What is genuinely new and unverified: candle
+    boundaries are wall-clock aligned, so multiple strategies in one group
+    sharing a timeframe tend to complete candles in the same second — a
+    synchronised write burst against one SQLite file, not
+    uniformly-distributed load. `journal_mode=WAL` /
+    `busy_timeout=5000ms` (`common/persistence/database.py`) already
+    governs every write across every worker in a group, unchanged by this
+    part, but **no test or benchmark in this repository measures write
+    latency or lock-wait time under concurrent multi-worker load at all** —
+    for this write or any other that already existed. Found while answering
+    a direct question about it, not during Part 2's own build — worth
+    recording precisely because it would have been easy to let the
+    deviation entry's mention of "a real, measurable behaviour change"
+    quietly stand in for having measured it. Revisit before Phase 7
+    operations work, or before any runtime group grows past a handful of
+    concurrently-timeframed strategies, whichever comes first.
 
 
 ### Operational risk noted during the audit
@@ -4282,10 +4306,11 @@ mtime is unchanged at the recorded baseline.
 Phase 2 is complete, both blocks. **Phase 3 is complete** — all five parts, with its
 acceptance gate met in full. **Phase 4 is complete** — all five parts, its one live
 gate item run and passed. **Phase 5 is complete** — see below. **Phase 6 is in
-progress: Part 1 complete**, see below. Next is **Phase 6 Part 2** (position-
-management state snapshot/restore).
+progress: Parts 1-2 complete**, see below. Next is **Phase 6 Part 3** (the
+remaining §7 "restore at minimum" gaps — MFE/MAE, square-off attempts,
+state-version validation, last-candle idempotency).
 
-### Phase 6 — paper recovery and expiry handling — **Part 1 of 5 complete**
+### Phase 6 — paper recovery and expiry handling — **Part 2 of 5 complete**
 
 A pre-work audit (spec's Phase 6 bullets read directly from
 `ALGO_TRADING_FORWARD_TESTING_ARCHITECTURE_FINAL.md:2905-2910`, checked against
@@ -4339,7 +4364,7 @@ each case:
 - MFE/MAE, square-off attempts, state-version validation and last-processed-
   candle idempotency (the rest of §7's "restore at minimum" list) are Part 3.
 - Exit-policy state (trailing peak, momentum streak) and stop/target
-  persistence on the engine path are Part 2.
+  persistence on the engine path are Part 2 — see below.
 
 | Property | Status |
 |---|---|
@@ -4350,6 +4375,49 @@ each case:
 | `daily_realised_pnl` accumulates across contracts in one day | **Fixed** — was silently wrong before Part 1 (D58 / limitation 22) |
 | Fixed strikes, basket legs, rolling counters | **Still blocked** — no `FixedStrikeEngine`/`MultiLegEngine` consumer |
 | `force_square_off_before_expiry`, settlement simulation | **Not started** — Part 4 |
+
+**Part 2 — position-management state snapshot/restore.** Pre-work found the
+plan's own bullet ("add `snapshot()`/`restore()` to `BaseExit`/`RiskManager`,
+populate `positions.stop_price`/`target_price`") understated four real gaps —
+see **D59-D61** for the mechanisms, and the plan file's own record of the
+pre-work for the reasoning behind each:
+
+1. **No possible stop/target producer, at any depth** — `RiskManager.
+   new_position()` received no entry price, so no manager (today or a
+   hypothetical Phase 9 one built against the old interface) could ever
+   compute an absolute price level. Put to the user directly — the one
+   genuine either-way fork in the part — and decided: widen the interface
+   now rather than add inert properties and defer the plumbing. See **D59**.
+2. **Nothing exposed a strategy's exit engine to the engine layer.**
+   `BaseStrategy` gained `exit_state_snapshot()` / `restore_exit_state()`,
+   no-op defaults, mirroring the pair one layer down on `BaseExit`.
+3. **No per-candle persistence hook existed on the engine path at all** —
+   `strategy_state.payload` was touched only on a fill before this part.
+   `TradingEngine` gained an injected `persist_exit_state` callback, called
+   after every candle a position is open for. Genuinely new write-frequency
+   behaviour, recorded rather than folded silently into "reuse
+   `merge_payload`". Its multi-worker contention cost is unmeasured — see
+   **D61** and **limitation 24**.
+4. **`EngineFixtureStrategy` could only drive `MomentumCloseExit`'s own
+   convenience method**, not the generic `BaseExit.should_exit()` contract
+   `TrailingExit`/`HighestCloseExit`/`ConsecutiveReversalExit` implement —
+   widened with a default-preserving `exit_engine_name` kwarg so the plan's
+   own test scenario (a trailing stop's peak surviving a restart) could be
+   proven through the real worker, not asserted at the unit level only.
+
+**Exit-state recovery is deliberately fail-*open*** — log and continue with
+the strategy's already-reset (empty) state — the only recovery mechanism in
+Phase 6 that is, because a wrong or missing snapshot degrades exit timing
+quality, never safety, unlike position or daily-risk recovery. See **D60**.
+
+| Property | Status |
+|---|---|
+| `TrailingExit`/`HighestCloseExit`/`ConsecutiveReversalExit` snapshot/restore | **Done** — round-trip unit-proven, `CompositeExit` delegates by label |
+| A trailing stop's peak survives a real worker restart and still exits | **Done** — fail-first proven through `run_worker`, with a same-shape negative control |
+| A snapshot naming a different contract is ignored, not applied | **Done** — position still adopts; no `errors` row (fail-open, not fail-closed) |
+| `stop_price`/`target_price` reach `positions` through the full path | **Done** — plumbing only; every value is `None` under today's `FixtureRiskManager` |
+| Negative control: `stop_price`/`target_price` stay NULL under today's config | **Done** — will fail the day a real risk manager reports either, by design |
+| `RiskManager.snapshot()`/`restore()` (internal state, distinct from stop/target) | **Done** — mechanism proven by a local stateful test double, not `FixtureRiskManager` |
 
 ### Phase 5 — mixed-mode supervisor and persistence — **COMPLETE**
 

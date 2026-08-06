@@ -36,6 +36,17 @@ class TrailingExit(BaseExit):
     def reset(self) -> None:
         self._peak_profit = 0.0
 
+    def snapshot(self) -> dict[str, Any]:
+        # Only worth persisting once the trail has actually armed (peak > 0) —
+        # {} at zero keeps an un-triggered trail indistinguishable from "nothing
+        # to restore", which is the correct reading either way.
+        return {"peak_profit": self._peak_profit} if self._peak_profit > 0 else {}
+
+    def restore(self, data: dict[str, Any]) -> None:
+        peak = data.get("peak_profit")
+        if isinstance(peak, int | float):
+            self._peak_profit = float(peak)
+
     def should_exit(
         self,
         position: Any,

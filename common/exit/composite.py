@@ -27,7 +27,11 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from common.logging import get_logger
+
 from .base import BaseExit, get_exit_engine
+
+log = get_logger(__name__)
 
 # config sub-block key -> (registered engine name, evaluation priority).
 # Lower priority number is evaluated first, so its reason wins on a tie.
@@ -77,6 +81,38 @@ class CompositeExit(BaseExit):
         self.last_fired = None
         for e in self._engines:
             e.reset()
+
+    def snapshot(self) -> dict[str, Any]:
+        """Each child's own snapshot, keyed by its ``label``.
+
+        ``build_exit_engine`` selects at most one instance per registered engine
+        name (``_KEY_TO_ENGINE``), so ``label`` is a stable, collision-free key —
+        no index or synthetic id needed. A child with nothing to snapshot
+        (``{}``) is omitted rather than stored empty, keeping "nothing to
+        restore" unambiguous at every level.
+        """
+        return {e.label: snap for e in self._engines if (snap := e.snapshot())}
+
+    def restore(self, data: dict[str, Any]) -> None:
+        """Reapply each child's snapshot by label. Unknown labels are skipped.
+
+        A label present in ``data`` but absent from today's engines means the
+        config changed since the snapshot was written (an engine was removed or
+        renamed) — logged, not raised, per :meth:`BaseExit.restore`'s contract.
+        """
+        by_label = {e.label: e for e in self._engines}
+        for label, child_data in data.items():
+            engine = by_label.get(label)
+            if engine is None:
+                log.warning(
+                    "exit-state snapshot names %r, which is not among today's "
+                    "configured engines (%s); skipping it",
+                    label,
+                    sorted(by_label),
+                )
+                continue
+            if isinstance(child_data, dict):
+                engine.restore(child_data)
 
     def should_exit(
         self,

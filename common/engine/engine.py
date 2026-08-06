@@ -60,7 +60,7 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from common.candles.builder import CandleBuilder, to_ohlc
 from common.indicators.base import OHLC
@@ -130,6 +130,8 @@ class TradingEngine:
         square_off_authority: SquareOffAuthority | None = None,
         recover_position: Callable[[], AdoptedPosition | None] | None = None,
         recover_daily_risk: Callable[[], DailyRiskRecovery | None] | None = None,
+        recover_exit_state: Callable[[], dict[str, Any] | None] | None = None,
+        persist_exit_state: Callable[[dict[str, Any] | None], None] | None = None,
         clock: Callable[[], datetime] = now_ist,
     ) -> None:
         self.cfg = cfg
@@ -171,6 +173,14 @@ class TradingEngine:
         # (offline/tests, and every run with no prior state) => nothing to restore.
         # Phase 6 Part 1 — see _restore_daily_risk.
         self._recover_daily_risk = recover_daily_risk
+        # Optional zero-arg callable returning a previous process's exit-policy
+        # snapshot for the adopted position, and an optional callable this engine
+        # calls with the current snapshot (or None to clear it) after every candle
+        # a position is open for. Both None (offline/tests, and every run with no
+        # persistence layer) => the strategy's own reset() state is all there is,
+        # exactly as before Phase 6 Part 2. See _restore_exit_state, _persist_exit_state.
+        self._recover_exit_state = recover_exit_state
+        self._persist_exit_state_cb = persist_exit_state
         interval = parse_timeframe_minutes(cfg.timeframe)
         self.candles = CandleBuilder(
             interval,
@@ -576,7 +586,7 @@ class TradingEngine:
             last_price=recovered.last_price,
         )
         self.feed.subscribe(recovered.contract.security_id)
-        self.strategy.risk_manager.new_position(recovered.lots)
+        self.strategy.risk_manager.new_position(recovered.lots, entry_price=recovered.entry_price)
         if self._option_candles is not None:
             # A fresh premium stream for the adopted contract. Its history is gone
             # with the process that built it, so the first exit needing consecutive
@@ -585,6 +595,7 @@ class TradingEngine:
             self._option_candle_contract_id = recovered.contract.security_id
             self._last_option_tick_ts = recovered.entry_time
             self._premium_gap_logged = False
+        self._restore_exit_state(recovered.contract.security_id)
         log.info(
             "adopted %s %s x%d @ %.2f from a previous run; no order placed",
             recovered.side.value,
@@ -597,6 +608,92 @@ class TradingEngine:
             f"adopted {recovered.side.value} {recovered.contract.symbol} "
             f"@ {recovered.entry_price:.2f} from a previous run",
         )
+
+    def _restore_exit_state(self, adopted_security_id: str) -> None:
+        """Reapply a previous process's exit-policy snapshot for the adopted position.
+
+        Phase 6 Part 2. Deliberately **fail-open**, unlike position and daily-risk
+        recovery: a missing, foreign or unusable snapshot degrades exit timing
+        quality (a trailing stop re-arms from the current price instead of its
+        true peak), never safety — no entry is at stake here, only how well an
+        *already-adopted* position is managed. So a problem is logged and the
+        strategy's already-:meth:`~common.engine.strategy.BaseStrategy.reset`
+        (empty) exit state is left in place, exactly the philosophy
+        :meth:`~common.engine.positions.PositionManager.adopt` already documents
+        for MFE/MAE restarting at zero.
+        """
+        if self._recover_exit_state is None:
+            return
+        try:
+            snapshot = self._recover_exit_state()
+        except Exception:
+            log.exception(
+                "%s: could not restore exit-policy state; continuing with fresh "
+                "(reset) state — exit timing may differ from before the restart",
+                self.label,
+            )
+            return
+        if not snapshot:
+            return
+        stored_security_id = snapshot.get("security_id")
+        if stored_security_id != adopted_security_id:
+            log.warning(
+                "%s: exit-state snapshot names %r but the adopted position is %r; "
+                "the snapshot is stale and is being ignored",
+                self.label,
+                stored_security_id,
+                adopted_security_id,
+            )
+            return
+        state = snapshot.get("state")
+        if not isinstance(state, dict):
+            log.warning(
+                "%s: exit-state snapshot carries no usable state; ignoring it", self.label
+            )
+            return
+        try:
+            self.strategy.restore_exit_state(state)
+        except Exception:
+            log.exception(
+                "%s: restore_exit_state raised; continuing with fresh (reset) state",
+                self.label,
+            )
+
+    def _persist_exit_state(self) -> None:
+        """Write the strategy's current exit-policy state, or clear it once flat.
+
+        Phase 6 Part 2. Called after every candle (underlying and premium) that
+        could have changed exit-policy state while a position is open, and once
+        more when a position closes, to clear the key so a later, different
+        contract can never inherit a stale snapshot (mirrors
+        ``LifecycleGateway._record_contract``'s clear-on-close for
+        ``OPEN_POSITION_KEY``). A no-op if no callback was injected — every
+        offline/test construction, unchanged from before this part.
+
+        A failure to write is logged, not raised, for the same reason
+        ``_record_contract`` gives for the same choice: this is an observability
+        write, and turning it into an exception here would abandon a position
+        that genuinely exists and is otherwise being managed correctly.
+        """
+        if self._persist_exit_state_cb is None:
+            return
+        pos = self._current_position()
+        payload = (
+            None
+            if pos is None
+            else {
+                "security_id": pos.contract.security_id,
+                "state": self.strategy.exit_state_snapshot(),
+            }
+        )
+        try:
+            self._persist_exit_state_cb(payload)
+        except Exception:
+            log.exception(
+                "%s: could not persist exit-policy state; a restart may re-arm "
+                "this position's exit rules from scratch",
+                self.label,
+            )
 
     def _end_day(self) -> None:
         summary_trades = self.positions.trades
@@ -721,7 +818,14 @@ class TradingEngine:
             return None
         strat_signal = self.strategy.on_option_candle(to_ohlc(completed), tick.exchange_time)
         if strat_signal is not None and strat_signal.action is SignalAction.EXIT:
+            # No persist call here: the caller closes the position on this
+            # return value, and _close() clears the exit-state key itself once
+            # it does — persisting the pre-close state here would just be
+            # overwritten a moment later.
             return strat_signal.exit_reason or ExitReason.STRATEGY_EXIT
+        # Still open: this candle may have advanced exit-policy state (a peak, a
+        # streak) without firing — persist it so a restart resumes from it.
+        self._persist_exit_state()
         return None
 
     def _on_option_tick(self, tick: Tick) -> None:
@@ -793,6 +897,10 @@ class TradingEngine:
             self.strategy.status(),
         )
         if strat_signal is None:
+            # No actionable signal, but the strategy's own on_candle() may still
+            # have advanced its exit-policy state (e.g. a trailing peak driven off
+            # the underlying) without producing one — persist it either way.
+            self._persist_exit_state()
             return
         log.info(
             "SIGNAL %s bar=%s evaluated_at=%s | %s",
@@ -806,6 +914,8 @@ class TradingEngine:
 
         if strat_signal.action is SignalAction.EXIT:
             if pos is not None:
+                # _close() persists (clears) the exit-state key itself, once the
+                # position it belonged to is actually gone.
                 self._close(
                     pos.contract.security_id,
                     pos.last_price,
@@ -814,19 +924,24 @@ class TradingEngine:
                 )
             return
 
-        # ENTER: already in this exact leg -> nothing to do.
+        # ENTER: already in this exact leg -> nothing to do, but persist for the
+        # same reason as the "no signal" branch above.
         if (
             pos is not None
             and pos.contract.option_type == strat_signal.option_type
             and pos.side == strat_signal.side
         ):
+            self._persist_exit_state()
             return
 
-        # Different/opposite leg open -> exit it first.
+        # Different/opposite leg open -> exit it first (_close() persists/clears).
         if pos is not None:
             self._close(pos.contract.security_id, pos.last_price, ts, ExitReason.OPPOSITE_SIGNAL)
 
-        # Enter the new leg if still within the entry window.
+        # Enter the new leg if still within the entry window. Nothing to persist
+        # here yet -- _enter() only queues a pending contract; the exit-state
+        # write happens once _open() actually opens it, via the premium/underlying
+        # candle checkpoints above, the same as any other open position.
         if self.session.can_enter(ts):
             self._enter(strat_signal, ts)
 
@@ -870,6 +985,13 @@ class TradingEngine:
         )
 
     def _open(self, contract: OptionContract, side: OrderSide, price: float, ts: datetime) -> None:
+        # Armed BEFORE the position opens (Phase 6 Part 2, reordered from before):
+        # a manager needs the chance to compute stop_price/target_price off the
+        # reference price so positions.open() can persist them on the same fill
+        # that creates the row. Safe to reorder — new_position() doesn't consult
+        # the position and positions.open() doesn't consult the risk manager, so
+        # no existing behaviour depended on the old order.
+        self.strategy.risk_manager.new_position(self._lots, entry_price=price)
         self.positions.open(
             contract,
             side,
@@ -877,8 +999,9 @@ class TradingEngine:
             ts,
             regime=self._regime.current_regime(),
             regime_features=self._regime.current_features(),
+            stop_price=self.strategy.risk_manager.stop_price,
+            target_price=self.strategy.risk_manager.target_price,
         )
-        self.strategy.risk_manager.new_position(self._lots)
         st = self.strategy.risk_manager.state
         log.info("risk armed for %s: %s", contract.symbol, st)
         self._notify("entry", f"{side.value} {contract.symbol} @ {price:.2f}")
@@ -921,6 +1044,10 @@ class TradingEngine:
             self._option_candles.reset()
             self._option_candle_contract_id = None
             self._last_option_tick_ts = None
+        # Clears the persisted exit-state key now that the book is flat again —
+        # after on_position_closed's reset(), so what's written (nothing) agrees
+        # with what a restart would find in memory.
+        self._persist_exit_state()
 
     def _shutdown(self, ts: datetime) -> None:
         """Honour a square-off request, on the thread that owns the feed.
