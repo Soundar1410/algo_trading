@@ -80,7 +80,7 @@ if TYPE_CHECKING:
     from common.warmup.source import WarmupSource
 
 from .config import EngineConfig
-from .daily_guard import DailyRiskConfig, DailyRiskGuard
+from .daily_guard import DailyRiskConfig, DailyRiskGuard, DailyRiskRecovery
 from .feed import MarketDataFeed
 from .models import (
     AdoptedPosition,
@@ -129,6 +129,7 @@ class TradingEngine:
         square_off_event: threading.Event | None = None,
         square_off_authority: SquareOffAuthority | None = None,
         recover_position: Callable[[], AdoptedPosition | None] | None = None,
+        recover_daily_risk: Callable[[], DailyRiskRecovery | None] | None = None,
         clock: Callable[[], datetime] = now_ist,
     ) -> None:
         self.cfg = cfg
@@ -165,6 +166,11 @@ class TradingEngine:
         # open, for this one to manage rather than re-enter. None (offline/tests, and
         # every run with no prior state) => nothing to adopt. See _start_day.
         self._recover_position = recover_position
+        # Optional zero-arg callable returning today's already-booked daily P&L and
+        # trade count, for the daily guard to resume from rather than re-zero. None
+        # (offline/tests, and every run with no prior state) => nothing to restore.
+        # Phase 6 Part 1 — see _restore_daily_risk.
+        self._recover_daily_risk = recover_daily_risk
         interval = parse_timeframe_minutes(cfg.timeframe)
         self.candles = CandleBuilder(
             interval,
@@ -469,6 +475,7 @@ class TradingEngine:
         self._entry_blocked = None
         if self._daily_guard is not None:
             self._daily_guard.reset()
+            self._restore_daily_risk()
         if self._option_candles is not None:
             self._option_candles.reset()
             self._option_candle_contract_id = None
@@ -481,6 +488,47 @@ class TradingEngine:
         # flat.
         self._adopt_recovered_position()
         log.info("new trading day initialised (fresh state)")
+
+    def _restore_daily_risk(self) -> None:
+        """Seed the daily guard from what a previous process already booked today.
+
+        Phase 6 Part 1. Runs after :meth:`~common.engine.daily_guard.DailyRiskGuard.reset`
+        and before :meth:`_adopt_recovered_position`, so a day that had already hit
+        its loss cap or trade limit before a restart stays halted rather than
+        re-opening for one more trade — and so an adopted position is managed under
+        the *correct* halt state, not a fresh one. Without this, a worker restarting
+        after a loss began the day's loss cap from zero on every restart; nothing
+        read the ``daily_realised_pnl`` this repository already persisted.
+
+        A provider that **raises** fails closed, exactly as :meth:`_adopt_recovered_position`
+        does for a position: we cannot establish today's already-booked P&L and
+        trade count, and trading a fresh cap against an unknown true one is the
+        outcome worth preventing. Only new entries are affected — nothing here
+        touches exits or square-off.
+        """
+        if self._daily_guard is None or self._recover_daily_risk is None:
+            return
+        try:
+            recovered = self._recover_daily_risk()
+        except Exception as exc:
+            log.exception(
+                "%s: could not establish today's already-booked daily risk state", self.label
+            )
+            self._block_entries(
+                f"daily-risk restart recovery failed ({exc}) — unable to establish "
+                "today's already-booked realised P&L and trade count"
+            )
+            return
+        if recovered is None:
+            return
+        halt_reason = self._daily_guard.restore(recovered)
+        if halt_reason is not None:
+            log.warning(
+                "%s: restored daily risk state is already past a limit (%s) — "
+                "no new entries today",
+                self.label,
+                halt_reason,
+            )
 
     def _adopt_recovered_position(self) -> None:
         """Take over a position a previous process opened, placing no order.

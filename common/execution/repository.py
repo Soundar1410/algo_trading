@@ -432,7 +432,7 @@ class ExecutionRepository:
                 (order_status.value, filled_quantity, average_price, _now(), order_id),
             )
             self._record_fill_quote(conn, order_id=order_id, fill=fill)
-            position = self._upsert_position(
+            position, realised_delta = self._upsert_position(
                 conn,
                 runtime_id=runtime_id,
                 fill=fill,
@@ -450,7 +450,7 @@ class ExecutionRepository:
                 execution_mode=fill.execution_mode,
                 trading_date=trading_date,
                 last_candle_end_at=last_candle_end_at,
-                realised_delta=position.realised_pnl,
+                realised_delta=realised_delta,
             )
             return position
 
@@ -500,7 +500,15 @@ class ExecutionRepository:
         trading_date: str,
         stop_price: float | None,
         target_price: float | None,
-    ) -> Position:
+    ) -> tuple[Position, float]:
+        """Apply one fill to its position row. Returns ``(position, realised_delta)``.
+
+        ``realised_delta`` is *this fill's* contribution to realised P&L — the
+        change in ``realised_pnl`` this call makes, not the row's new total. It is
+        what :meth:`_touch_strategy_state` accumulates into the strategy-day's
+        running figure; passing the row's cumulative total there instead was the
+        Phase 6 Part 1 bug (see that method's docstring).
+        """
         current = self._read_position(
             conn,
             strategy_id=fill.strategy_id,
@@ -537,6 +545,7 @@ class ExecutionRepository:
                     now,
                 ),
             )
+            realised_delta = 0.0
         else:
             new_quantity = current.quantity + signed
             realised = current.realised_pnl
@@ -554,6 +563,7 @@ class ExecutionRepository:
                     current.average_price * abs(current.quantity) + fill.price * abs(signed)
                 ) / total
 
+            realised_delta = realised - current.realised_pnl
             status = PositionStatus.CLOSED if new_quantity == 0 else PositionStatus.OPEN
             conn.execute(
                 """
@@ -590,7 +600,7 @@ class ExecutionRepository:
             security_id=security_id,
         )
         assert result is not None
-        return result
+        return result, realised_delta
 
     def _touch_strategy_state(
         self,
@@ -603,6 +613,30 @@ class ExecutionRepository:
         last_candle_end_at: str | None,
         realised_delta: float,
     ) -> None:
+        """Accumulate ``realised_delta`` into the strategy-day's running P&L.
+
+        **Phase 6 Part 1 bug, found and fixed here.** Until now this UPSERT wrote
+        ``daily_realised_pnl = excluded.daily_realised_pnl`` — an overwrite, not an
+        accumulation — while its caller passed the *position's own* cumulative
+        ``realised_pnl`` under the name ``realised_delta``. The two facts together
+        meant the column silently held whichever position was fills-updated last,
+        not the day's total: a strategy that closed one contract and opened a
+        *different* one the same day (a different ``security_id``, hence a
+        different ``positions`` row) lost the first contract's booked P&L from
+        this column the moment the second contract's first fill landed. Invisible
+        until now because nothing read this column back — Phase 6 Part 1's
+        restart-recovery of :class:`~common.engine.daily_guard.DailyRiskGuard` is
+        the first reader, and building recovery on a number that was already wrong
+        would have been worse than not restoring it at all.
+
+        Fixed at the source: :meth:`_upsert_position` now returns the true
+        per-call delta (this fill's own contribution, not the row's new total),
+        and the SQL below adds it to whatever is already stored rather than
+        replacing it — the same "accumulate, never overwrite" fix already applied
+        to ``fills`` -> ``orders`` a few lines above in :meth:`apply_fill`, missed
+        here originally. A fresh row's ``INSERT`` needs no special case: the first
+        delta for a new strategy-day is the whole total so far.
+        """
         conn.execute(
             """
             INSERT INTO strategy_state
@@ -611,7 +645,8 @@ class ExecutionRepository:
             VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (strategy_id, execution_mode, trading_date) DO UPDATE SET
                 last_candle_end_at = COALESCE(excluded.last_candle_end_at, last_candle_end_at),
-                daily_realised_pnl = excluded.daily_realised_pnl,
+                daily_realised_pnl = strategy_state.daily_realised_pnl
+                                     + excluded.daily_realised_pnl,
                 updated_at = excluded.updated_at
             """,
             (
@@ -643,6 +678,31 @@ class ExecutionRepository:
             .fetchall()
         )
         return [_row_to_position(row) for row in rows]
+
+    def closed_position_count(
+        self, *, strategy_id: str, execution_mode: ExecutionMode, trading_date: str
+    ) -> int:
+        """How many round trips this strategy-day has already closed.
+
+        Phase 6 Part 1 — restart recovery for :class:`~common.engine.daily_guard.
+        DailyRiskGuard`'s trade-count limit. Deliberately a query against the
+        authoritative ``positions`` table rather than a new counter column: the
+        count this needs already exists as data, auditable in SQL, and adding a
+        column would be a second, independently-writable copy of the same fact.
+        """
+        row = (
+            self._db.connect()
+            .execute(
+                """
+            SELECT COUNT(*) AS closed FROM positions
+            WHERE strategy_id = ? AND execution_mode = ? AND trading_date = ?
+              AND status = 'CLOSED'
+            """,
+                (strategy_id, execution_mode.value, trading_date),
+            )
+            .fetchone()
+        )
+        return int(row["closed"])
 
     def open_orders(self, *, strategy_id: str, execution_mode: ExecutionMode) -> list[sqlite3.Row]:
         return list(

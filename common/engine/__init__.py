@@ -17,7 +17,7 @@ spec schedules each for "when the first consumer is scheduled", and there is non
 from __future__ import annotations
 
 from .config import EngineConfig, SessionConfig
-from .daily_guard import DailyRiskConfig, DailyRiskGuard, DailyRiskState
+from .daily_guard import DailyRiskConfig, DailyRiskGuard, DailyRiskRecovery, DailyRiskState
 from .engine import TradingEngine
 from .feed import MarketDataFeed, MarketDataStatus, SimulatedFeed
 from .gateway import GatewayExecutionError, LifecycleGateway
@@ -66,6 +66,7 @@ __all__ = [
     "BaseStrategy",
     "DailyRiskConfig",
     "DailyRiskGuard",
+    "DailyRiskRecovery",
     "DailyRiskState",
     "DailySummary",
     "EngineConfig",

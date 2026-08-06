@@ -60,6 +60,20 @@ class DailyRiskState:
     halt_reason: str | None
 
 
+@dataclass(frozen=True)
+class DailyRiskRecovery:
+    """What a previous process had already booked for today, for :meth:`DailyRiskGuard.restore`.
+
+    Phase 6 Part 1. ``realised_pnl`` and ``trade_count`` are whatever a restarting
+    worker's caller derives from persisted state (``strategy_state.daily_realised_pnl``
+    and a count of the day's already-``CLOSED`` positions) — this module has no
+    persistence dependency of its own and never will.
+    """
+
+    realised_pnl: float
+    trade_count: int
+
+
 class DailyRiskGuard:
     """Tracks realised P&L and trade count for the day; latches "halted".
 
@@ -100,6 +114,28 @@ class DailyRiskGuard:
     def square_off_reason(self) -> ExitReason:
         """Which exit reason to force-close open positions with when halting."""
         return self._square_off_reason
+
+    def restore(self, recovered: DailyRiskRecovery) -> str | None:
+        """Seed today's already-booked P&L and trade count after a restart.
+
+        Phase 6 Part 1. Called once, from the engine's ``_start_day`` — after
+        :meth:`reset` and before any new trade can be registered — so a restarting
+        worker's day-level limits reflect what already happened today rather than
+        starting over at zero. Runs the **same** :meth:`_evaluate` the live path
+        uses, so a day that had already crossed a limit before the crash latches
+        ``halted`` immediately, at the *remaining* headroom rather than a fresh
+        full cap, exactly as if the process had never stopped.
+
+        A no-op once already halted (the kill switch latches in :meth:`reset`
+        before this can run, and a recovered count changes nothing about that).
+        Returns a halt reason if the recovered state itself trips a limit, else
+        ``None`` — same contract as :meth:`register_trade`.
+        """
+        if self.halted:
+            return None
+        self._realised = float(recovered.realised_pnl)
+        self._count = int(recovered.trade_count)
+        return self._evaluate()
 
     def register_trade(self, net_pnl: float) -> str | None:
         """Book a completed round-trip's net P&L.

@@ -7,9 +7,9 @@ the next phase. Updated after every phase.
 
 | | |
 |---|---|
-| **Current phase** | **Phase 5 complete** — mixed-mode supervisor and persistence. Config discovery (`discover_enabled_strategies`) and a `ResolvedConfig → WorkerConfig` adapter give `load_resolved_config` its first non-test caller since Phase 0, wired up by a new `runtimes.intraday_options.__main__` entrypoint. `IntradayOptionsSupervisor.add_worker` no longer aborts the group on a live-mode strategy (`ValueError("paper-only")`) — it refuses that one strategy individually via `effective_live_gate`, records the refusal to `errors` and delivers it through the notifier, and every paper strategy in the same group keeps trading. Duplicate-worker prevention was **audited, not rebuilt**: the existing `filelock`-based `worker_lock` already excludes mode from its identity, so a paper and a live config for the same `strategy_id` already collide — closed with two regression tests (one unit, one real-spawned-process) pinning that against a future change rather than adding new machinery. Mode separation across all nine `execution_mode`-bearing tables plus `runtime_heartbeats` (which carries `strategy_id` but no `execution_mode`) is proven end to end, schema-swept, keyed on `strategy_id` rather than `execution_mode` — see **D54**. Positional-options instrument-class rollout is **split**: inert config/package scaffolding shipped (`config/runtimes/positional_options.yaml`, `runtimes/positional_options/__init__.py`), the working supervisor/worker/persistence layer genuinely deferred to Phase 6/9 — see **D56** (corrected on review from an earlier draft that deferred all of it). New deviations **D54-D57**, new limitation **21**. |
-| **Next phase** | Phase 6 (paper recovery and expiry handling) |
-| **Last updated** | 6 August 2026 — Phase 5 complete, see [Known limitations](#6-known-limitations) |
+| **Current phase** | **Phase 6 Part 1 complete** — daily risk state across a restart. A pre-work audit (spec's Phase 6 bullets read directly, checked against the codebase before any implementation) found the phase does **not** follow Phase 5's "mostly wiring" pattern: roughly 60% of bullet 1 (restore positions and strategy/risk state) was already built and tested through Phase 3-5, but the single highest-value gap — `DailyRiskGuard.reset()` zeroing realised P&L and trade count on every restart, including after a loss the day's cap should already have stopped — was a genuine risk-limit bypass with no producer or reader anywhere. Part 1 closes it: `DailyRiskGuard.restore()` seeds the guard from what a previous process already booked, running the same evaluation the live path uses so an already-past-cap restart halts immediately at the *remaining* headroom rather than a fresh full cap; `TradingEngine` gains an injected `recover_daily_risk` provider (mirrors `recover_position`'s shape and its fail-closed behaviour on a raising provider); `engine_worker.recover_daily_risk` supplies it from `strategy_state.daily_realised_pnl` (already written, never read before now) and a `positions.status='CLOSED'` count (queried, not a new stored counter). Building the column's first reader found it was silently wrong for any strategy trading more than one contract per day — **D58**, **limitation 22**, fixed in the same part with fail-first evidence. Deliberately *not* done in Part 1, each for a stated reason: `re_entry_count` stays unwritten rather than counted-but-unenforced (redundant with the now-restored `max_trades` counter, and the persuasive-half-built-state risk named in the plan's standing rule); MFE/MAE, square-off attempts, state-version validation and last-candle idempotency are Part 3. New deviation **D58**, new limitations **22** (found and fixed same part) and **23**. |
+| **Next phase** | Phase 6 Part 2 (position-management state snapshot/restore — exit-policy state and stop/target persistence) |
+| **Last updated** | 6 August 2026 — Phase 6 Part 1 complete, see [Known limitations](#6-known-limitations) |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
 | **Live order placement** | **Not implemented.** Fail-closed. Phase 10 only. |
@@ -26,7 +26,7 @@ the next phase. Updated after every phase.
 | 3 | Preserve custom engines and policies | **Complete.** **Part 1 complete** (live-feed shutdown); **Part 2a complete** (exit registry + SuperTrend port); **Part 2b-i complete** (signal ownership + engine core); **Part 2b-ii-A complete** (the feed seam: tick channel, runtime subscription, `HubTickFeed`); **Part 2b-ii-B-1 complete** (the execution seam: square-off authority, `LifecycleGateway`, entry-block on tick drop); **Part 2b-ii-B-2 complete** (the wiring: worker engine path, supervisor queue delivery, engine restart recovery, D20 reporting bindings). **Phase 3 complete** — its acceptance gate is met in full |
 | 4 | Candle, indicator and paper-execution foundation | **Complete.** **Part 1 complete** (real contract resolution — closes 17, alarms 15). **Part 2 complete** (indicator layer — closes D21). **Part 3 complete** (continuity, timezone, wall-clock square-off — closes 4 and 7, and a live blocker). **Part 4 complete** (warm-up source and injection — closes 16). **Part 5 complete** (`PaperBroker` realism — closes 5 and D11; the live Full-mode gate item ran 6 August 2026 and passed, closing known limitation 20 along the way). **Phase 4 complete** — all five parts done, its one live gate item proven rather than asserted |
 | 5 | Mixed-mode supervisor and persistence | **Complete** |
-| 6 | Paper recovery and expiry handling | Not started |
+| 6 | Paper recovery and expiry handling | **In progress.** **Part 1 complete** (daily risk state across a restart — closes the risk-limit-bypass gap in bullet 1, and finds/fixes **D58**/limitation 22 along the way) |
 | 7 | Operations | Not started |
 | 8 | LaunchAgent validation | Not started |
 | 9 | Real strategies | Not started |
@@ -2196,6 +2196,7 @@ guard. See deviation D6.
 | **D55** | **Worker-lock acquisition stays in the child process, not the supervisor** | The spec's PID/lock startup flow (section 8, step 4) reads "For each enabled strategy, acquire its worker lock and reject duplicate execution" from inside what the surrounding steps describe as the supervisor's own sequence. The implementation acquires in `run_worker` (`runtimes/intraday_options/worker.py`), inside the spawned child, and Phase 5 keeps it there rather than moving it to match the literal wording. A lock held by the parent across `multiprocessing.spawn` does not transfer to the child that actually trades — the parent and child are different OS processes with independent `flock` state — so parent-side acquisition would protect the wrong process: two children could still race for the same strategy's state while the parent's lock sat acquired and irrelevant. `test_duplicate_worker_startup_is_refused` and Phase 5's own `test_a_live_mode_contender_is_still_refused_as_a_duplicate` both depend on the lock being held by the process whose state it protects. |
 | **D56** | **Positional-options rollout is split: inert scaffolding shipped now, the working supervisor/worker/persistence layer genuinely deferred to Phase 6/9 — corrected from an earlier draft that deferred all of it** | Spec bullet 6 reads "add positional options and intraday stocks one at a time; keep positional stocks a placeholder" — naming three things and treating them differently. An earlier version of this deviation read "no strategy exists yet" as sufficient reason to defer everything, which was too broad: the bullet singling out "positional stocks" as *the* placeholder only makes sense if "no consumer yet" wasn't meant to excuse the other two equally, and **D34** — written back in the reference audit — already said "Intraday stocks are Phase 5", i.e. this project's own earlier documentation expected incremental movement here. Corrected split: (1) `config/runtimes/positional_options.yaml` (`enabled: false`) and `runtimes/positional_options/__init__.py` are real, loadable, and shipped — matching the exact precedent `intraday_options.yaml` set in Phase 1, and completely inert since nothing scans `config/runtimes/*.yaml` on its own. (2) The supervisor/worker/config-adapter layer stays deferred, and this part **is** a genuine structural blocker, not merely "no consumer": `positions`/`strategy_state`/`order_intents` all key their UNIQUE identity on `trading_date` (migration `0001`), which fragments a position held across sessions into unrelated rows, and `SquareOffPolicy` is same-day wall-clock exit with no multi-day concept — both are Phase 6's explicit job ("restore open paper positions... by strategy and mode", not by date; `force_square_off_before_expiry`; settlement simulation). Building it now would mean either reusing same-day-shaped persistence incorrectly or inventing Phase 6's answer out of order. `intraday_stocks` gets no placeholder at all — D34's "needs a real consumer" reasoning for its scanner-driven universe is unchanged and still applies there. |
 | **D57** | **`discover_enabled_strategies` has no way to scope strategy files to one runtime** | Recorded as its own deviation, separate from D56, because it is a gap in the *mechanism* rather than a deferred *feature*: `StrategyConfig` carries no `runtime_id`, and neither does the spec's own "required resolved strategy fields" list (section 9), so a strategy's runtime membership is established only by filename convention (spec's own example: `io_supertrend_fast_v1`). `discover_enabled_strategies(config_root, runtime_id)` therefore resolves *every* enabled file under `config/strategies/` against whichever `runtime_id` it is called with — correct today because `intraday_options` is the only caller, unsafe the day a second runtime's supervisor calls it against the same directory. See limitation 21. |
+| **D58** | **`_touch_strategy_state` accumulated the wrong thing — fixed while building its first reader** | Phase 6 Part 1 needed `strategy_state.daily_realised_pnl` to mean "today's total realised P&L" in order to restore `DailyRiskGuard` across a restart, and found that it did not: the UPSERT wrote `daily_realised_pnl = excluded.daily_realised_pnl` (overwrite, not accumulate) while its caller passed *the position's own* cumulative `realised_pnl` under the parameter name `realised_delta`. A strategy that closes one contract and opens a **different** one the same day (a different `security_id`, hence a different `positions` row) silently lost the first contract's booked P&L from this column the moment the second contract's first fill landed. Exactly the shape of the `orders.filled_quantity`/`average_fill_price` bug Phase 4 Part 5 already found and fixed on the sibling column (`test_two_fills_on_one_order_accumulate_rather_than_overwrite`) — missed here because nothing had read `daily_realised_pnl` back until now. `ExecutionRepository._upsert_position` now returns the true per-call delta (this fill's own contribution, computed from the position's realised P&L *before* the update, not its new cumulative total), and `_touch_strategy_state`'s SQL adds it to the stored value rather than replacing it. `test_daily_realised_pnl_accumulates_across_contracts_not_just_the_last_one` (`tests/integration/test_execution_persistence.py`) pins it — demonstrated failing against the pre-fix code first, since the single-contract-per-day shape every other test in the file uses cannot distinguish "accumulate" from "overwrite" (there is only ever one value to keep). See limitation 22. |
 
 #### D22 in detail: the rebuilt premium-candle mapping
 
@@ -4019,6 +4020,33 @@ start/stop/crash/restart tests pass.
     validated `strategy_id` prefix convention enforced at load time rather
     than assumed. Not built now because there is exactly one runtime to test
     either mechanism against — see **D57**.
+22. **~~`strategy_state.daily_realised_pnl` silently held only the last-touched
+    contract's own P&L, not the day's total.~~ FIXED** (Phase 6 Part 1,
+    6 August 2026, found while building the column's first reader). See
+    **D58** for the mechanism. Bounded in practice before the fix: every
+    strategy shipped so far trades at most one contract per day (the
+    fixture path and every existing worker config), and a single-contract
+    day cannot distinguish "accumulate" from "overwrite" — there is only
+    ever one value to keep — so this was never observed live. It would have
+    bitten the first strategy to close one contract and open a different
+    one on the same trading day, which Phase 9's real strategies are
+    expected to do routinely (rolling, re-entry into a different strike).
+23. **`DailyRiskGuard`'s `max_trades`, `daily_profit_target` and
+    `kill_switch` have no configuration surface.** `EngineWorkerConfig` (and
+    the `EngineConfig` it builds) exposes only `max_daily_loss_percent` and
+    `starting_capital` — `TradingEngine._build_daily_guard` constructs
+    `DailyRiskConfig(daily_max_loss=...)` and nothing else, so the other
+    three fields are permanently at their disabled defaults on every worker
+    this repository can actually run today. Not a Phase 6 Part 1 gap
+    specifically — this predates Part 1 and Part 1 did not need to touch
+    it, since `DailyRiskGuard.restore` accepts a `DailyRiskRecovery`
+    regardless of which limits are configured. Recorded now because Part 1
+    is the first code to depend on `DailyRiskGuard` behaving correctly
+    across its full configuration surface (`tests/unit/test_daily_guard.py`
+    exercises `max_trades` and `kill_switch` directly against the guard,
+    since no worker configuration can reach them end to end to prove it
+    there). Closes when a real strategy's configuration needs one of the
+    other three limits — most likely Phase 9.
 
 
 ### Operational risk noted during the audit
@@ -4253,8 +4281,75 @@ mtime is unchanged at the recorded baseline.
 
 Phase 2 is complete, both blocks. **Phase 3 is complete** — all five parts, with its
 acceptance gate met in full. **Phase 4 is complete** — all five parts, its one live
-gate item run and passed. **Phase 5 is complete** — see below. Next is **Phase 6**
-(paper recovery and expiry handling).
+gate item run and passed. **Phase 5 is complete** — see below. **Phase 6 is in
+progress: Part 1 complete**, see below. Next is **Phase 6 Part 2** (position-
+management state snapshot/restore).
+
+### Phase 6 — paper recovery and expiry handling — **Part 1 of 5 complete**
+
+A pre-work audit (spec's Phase 6 bullets read directly from
+`ALGO_TRADING_FORWARD_TESTING_ARCHITECTURE_FINAL.md:2905-2910`, checked against
+the codebase before any implementation) found Phase 6 does **not** follow Phase
+5's "mostly wiring" pattern: bullet 1 (restore positions and strategy/risk state)
+was roughly 60% already built and tested — `recover_position`, `PositionManager.
+adopt`, persisted square-off state and mode-separated recovery all shipped in
+Phases 3-5 — but bullets 3 and 4 (`force_square_off_before_expiry`, exchange-
+settlement simulation) are entirely absent from the repository, and three of
+bullet 2's four items (fixed strikes, basket legs, rolling counters) are blocked
+on `FixedStrikeEngine`/`MultiLegEngine` not being ported, per D56/D34's "needs a
+real consumer" reasoning.
+
+Part 1 closes the audit's single highest-value finding, and it is not from the
+spec's own bullet list: `DailyRiskGuard.reset()` zeroed realised P&L and trade
+count on **every** restart, including one after a loss the day's cap should
+already have stopped, and `strategy_state.daily_realised_pnl` — already written
+by every closed trade — had no reader anywhere. A worker restarting after a loss
+began the day's loss cap from zero. `DailyRiskGuard.restore()` seeds the guard
+from what a previous process already booked, running the guard's own evaluation
+so an already-past-cap restart halts immediately at the *remaining* headroom
+(never a fresh full cap); `TradingEngine` gained an injected `recover_daily_risk`
+provider mirroring `recover_position`'s shape, including fail-closed behaviour on
+a raising provider; `engine_worker.recover_daily_risk` supplies it from the
+existing column plus a `positions.status='CLOSED'` count (queried, not a new
+stored counter — the same "auditable in SQL, no migration" reasoning `closed_
+position_count` documents).
+
+**Building the column's first reader found it was silently wrong.**
+`_touch_strategy_state` overwrote `daily_realised_pnl` on every fill rather than
+accumulating it, so a strategy that closed one contract and opened a *different*
+one the same day lost the first contract's booked P&L the moment the second
+contract's first fill landed — the same bug shape Phase 4 Part 5 already found
+and fixed on the sibling `orders.filled_quantity`/`average_fill_price` columns,
+missed here because nothing read this one back until now. Fixed at the source
+(`ExecutionRepository._upsert_position` now returns the true per-fill delta) with
+fail-first evidence (`test_daily_realised_pnl_accumulates_across_contracts_not_
+just_the_last_one`, demonstrated failing against the pre-fix code). See **D58**
+and limitation 22.
+
+**Deliberately not done in Part 1, each for a stated reason** — the plan's own
+standing rule (no persisted value or docstring claim describing a safety
+behaviour that no code performs) ruled out the cheaper-looking alternative in
+each case:
+
+- `strategy_state.re_entry_count` stays unwritten. §7 lists it, but writing it
+  "counted, not enforced" would be a queryable, persuasive half-claim next to
+  D52's existing hardcoded `risk_decision=ALLOWED` — and it would duplicate the
+  now-restored `max_trades` counter, which is actually enforced. Phase 9
+  populates it alongside the real §13 cap.
+- MFE/MAE, square-off attempts, state-version validation and last-processed-
+  candle idempotency (the rest of §7's "restore at minimum" list) are Part 3.
+- Exit-policy state (trailing peak, momentum streak) and stop/target
+  persistence on the engine path are Part 2.
+
+| Property | Status |
+|---|---|
+| Daily loss cap survives a restart, at remaining headroom | **Done** — `DailyRiskGuard.restore`, fail-first proven |
+| Daily trade-count limit survives a restart | **Done** — same mechanism, unit-proven (no worker config exposes `max_trades` yet — limitation 23) |
+| A restart on a fresh trading date starts the cap at zero | **Done** — no-leak control test |
+| An unrestorable `daily_realised_pnl` fails closed, not silently | **Done** — mirrors `recover_position`'s CRITICAL-error pattern |
+| `daily_realised_pnl` accumulates across contracts in one day | **Fixed** — was silently wrong before Part 1 (D58 / limitation 22) |
+| Fixed strikes, basket legs, rolling counters | **Still blocked** — no `FixedStrikeEngine`/`MultiLegEngine` consumer |
+| `force_square_off_before_expiry`, settlement simulation | **Not started** — Part 4 |
 
 ### Phase 5 — mixed-mode supervisor and persistence — **COMPLETE**
 

@@ -320,3 +320,167 @@ def test_recovery_does_not_reach_across_trading_dates(worker_config, database_pa
     second = _run(worker_config, _SECOND_TAPE)
 
     assert second.recovered_position is False
+
+
+# ------------------------------------- Phase 6 Part 1: daily risk state across a restart
+#
+# ``worker_config`` above has no ``max_daily_loss_percent`` set, so its engine builds
+# no ``DailyRiskGuard`` at all (see ``TradingEngine._build_daily_guard``) — these tests
+# need one, so they get their own fixture and their own strategy_id (a fresh database
+# either way, since ``database_path`` is function-scoped, but a distinct id keeps the
+# intent obviously self-contained on inspection).
+
+DAILY_LOSS_STRATEGY_ID = "engine_daily_loss"
+
+#: Opens and closes within one run, at a real loss — same premium walk as
+#: ``_SECOND_TAPE`` (same relative gaps, so the same 5-minute candle buckets close the
+#: same way), shifted 25 minutes earlier so entry and exit both land in one run instead
+#: of straddling a restart the way ``_FIRST_TAPE``/``_SECOND_TAPE`` deliberately do.
+_LOSS_TAPE = [
+    _tick(UNDERLYING, 24000.0, _ts(9, 16)),
+    _tick(UNDERLYING, 24010.0, _ts(9, 21)),  # closes candle 1 -> ENTER
+    _tick(CE_CONTRACT, 100.0, _ts(9, 21, 30)),  # fills the pending entry
+    _tick(CE_CONTRACT, 105.0, _ts(9, 23)),
+    _tick(CE_CONTRACT, 110.0, _ts(9, 26)),
+    _tick(CE_CONTRACT, 108.0, _ts(9, 28)),
+    _tick(CE_CONTRACT, 90.0, _ts(9, 31)),
+    _tick(CE_CONTRACT, 85.0, _ts(9, 33)),
+    _tick(CE_CONTRACT, 80.0, _ts(9, 36)),  # closes the 108 bucket at 85 -> MOMENTUM_CLOSE exits
+]
+
+#: A second run's attempt at a fresh entry, complete with the fill tick that would
+#: complete it if nothing blocks it. **The fill tick matters**: ``_enter()`` only
+#: queues ``self._pending`` — the gateway is not called, and no order intent exists,
+#: until a matching tick actually arrives (``TradingEngine.on_tick``'s pending-entry
+#: branch). A tape that stopped at the candle-close tick would pass these tests
+#: whether or not the block worked, because neither case reaches the gateway either
+#: way. ``orders_placed`` (``gateway.executions``, one count per run) is what actually
+#: distinguishes them: 0 if blocked, 1 if this entry went through.
+_ENTRY_ATTEMPT_TAPE = [
+    _tick(UNDERLYING, 24000.0, _ts(9, 41)),
+    _tick(UNDERLYING, 24010.0, _ts(9, 46)),  # closes candle 1 -> ENTER
+    _tick(CE_CONTRACT, 100.0, _ts(9, 46, 30)),  # would fill the pending entry, if not blocked
+]
+
+
+@pytest.fixture
+def daily_loss_worker_config(runtime_dirs: dict[str, Path], database_path: Path) -> WorkerConfig:
+    return WorkerConfig(
+        runtime_id=RUNTIME_ID,
+        strategy_id=DAILY_LOSS_STRATEGY_ID,
+        security_id=UNDERLYING,
+        instrument="NIFTY",
+        database_path=database_path,
+        lock_dir=runtime_dirs["lock_dir"],
+        pid_dir=runtime_dirs["pid_dir"],
+        log_dir=runtime_dirs["log_dir"],
+        trading_date=TRADING_DATE,
+        execution_mode=ExecutionMode.PAPER,
+        idle_timeout_seconds=0.5,
+        square_off_policy=SquareOffPolicy(),
+        engine=EngineWorkerConfig(
+            strategy_ref=ENGINE_STRATEGY,
+            strategy_kwargs={"enter_on_candle": 1, "premium_exit": True},
+            timeframe="5m",
+            lot_size=LOT_SIZE,
+            strike_step=50,
+            feed_poll_seconds=0.05,
+            starting_capital=100_000.0,
+            # A cap far smaller than any plausible round-trip loss on this tape (which
+            # runs to roughly -1000 once costs are included) -- these tests care that a
+            # real loss trips it, not the exact rupee figure PaperBroker produces.
+            max_daily_loss_percent=0.01,
+        ),
+    )
+
+
+def _daily_realised_pnl(database_path: Path, strategy_id: str) -> float:
+    row = (
+        Database(database_path)
+        .connect()
+        .execute(
+            "SELECT daily_realised_pnl FROM strategy_state WHERE strategy_id = ?",
+            (strategy_id,),
+        )
+        .fetchone()
+    )
+    return float(row["daily_realised_pnl"])
+
+
+def test_a_restart_after_a_loss_already_past_the_cap_takes_no_new_entry(
+    daily_loss_worker_config, database_path
+):
+    first = _run(daily_loss_worker_config, _LOSS_TAPE)
+    assert first.exit_code == 0, first.error
+    assert first.trades_closed == 1, "the loss tape must actually close, or this proves nothing"
+
+    booked = _daily_realised_pnl(database_path, DAILY_LOSS_STRATEGY_ID)
+    assert booked < -10.0, "the tape must produce a real loss past the configured cap"
+
+    second = _run(daily_loss_worker_config, _ENTRY_ATTEMPT_TAPE)
+
+    assert second.exit_code == 0
+    assert second.orders_placed == 0, "a restart after an already-capped loss must not enter"
+    assert (
+        _repository(database_path).open_positions(
+            strategy_id=DAILY_LOSS_STRATEGY_ID,
+            execution_mode=ExecutionMode.PAPER,
+            trading_date=TRADING_DATE,
+        )
+        == []
+    )
+
+
+def test_a_fresh_trading_date_does_not_carry_the_daily_loss_halt_over(
+    daily_loss_worker_config, database_path
+):
+    """The no-leak rule (spec section 12) applies to daily risk state too."""
+    first = _run(daily_loss_worker_config, _LOSS_TAPE)
+    assert first.trades_closed == 1
+
+    daily_loss_worker_config.trading_date = "2026-07-17"
+    second = _run(daily_loss_worker_config, _ENTRY_ATTEMPT_TAPE)
+
+    assert second.exit_code == 0
+    assert second.orders_placed == 1, "a new trading date must start the daily loss cap at zero"
+
+
+def test_daily_risk_recovery_failure_blocks_entries_without_crashing(
+    daily_loss_worker_config, database_path
+):
+    """A ``strategy_state.daily_realised_pnl`` that will not convert must fail closed.
+
+    Mirrors ``test_an_open_position_with_no_contract_record_blocks_entries_rather_than_trading``:
+    a value written by something other than this build (or corrupted) must never be
+    guessed at, because a wrong guess could be too low and let a strategy trade past a
+    limit it had already hit. Deliberately uses ``_LOSS_TAPE`` (opens and closes,
+    ending flat) rather than the open-position tapes above: this test isolates the
+    daily-risk failure path from position recovery's own — a leftover open position
+    would block the second run's fill through *its* has-position guard regardless of
+    whether the daily-risk block worked, proving nothing about this one.
+    """
+    first = _run(daily_loss_worker_config, _LOSS_TAPE)
+    assert first.exit_code == 0, first.error
+    assert first.trades_closed == 1
+
+    repository = _repository(database_path)
+    with repository.database.transaction() as conn:
+        conn.execute(
+            "UPDATE strategy_state SET daily_realised_pnl = 'not-a-number' WHERE strategy_id = ?",
+            (DAILY_LOSS_STRATEGY_ID,),
+        )
+
+    second = _run(daily_loss_worker_config, _ENTRY_ATTEMPT_TAPE)
+
+    assert second.exit_code == 0, "a recoverable inconsistency must not crash the worker"
+    assert second.orders_placed == 0, "it entered again despite unrestorable daily risk state"
+
+    error = (
+        Database(database_path)
+        .connect()
+        .execute("SELECT severity, component, message FROM errors ORDER BY id DESC LIMIT 1")
+        .fetchone()
+    )
+    assert error["severity"] == "CRITICAL"
+    assert error["component"] == "engine.recovery"
+    assert "daily risk" in error["message"]

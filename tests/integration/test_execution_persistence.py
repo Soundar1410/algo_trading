@@ -338,6 +338,83 @@ def test_the_persisted_average_is_quantity_weighted(repository, session):
     assert row["average_fill_price"] != pytest.approx(200.55)
 
 
+def test_daily_realised_pnl_accumulates_across_contracts_not_just_the_last_one(
+    repository, session
+):
+    """The Phase 6 Part 1 defect found and fixed alongside the bug above.
+
+    ``_touch_strategy_state`` wrote ``daily_realised_pnl = excluded.daily_realised_pnl``
+    — an overwrite, not an accumulation — while its caller passed *this position's*
+    cumulative ``realised_pnl`` under the parameter name ``realised_delta``. A strategy
+    that closes one contract and opens a **different** one the same day silently lost
+    the first contract's booked P&L from this column the instant the second contract's
+    first fill landed — the exact shape of the fill/order accumulation bug the test
+    above pins, missed on this sibling column. Invisible until Phase 6 Part 1 built
+    the column's first reader (restart recovery for ``DailyRiskGuard``); a single
+    contract per day (every other test in this file) cannot distinguish "accumulate"
+    from "overwrite", because there is only ever one value to keep.
+    """
+    lifecycle = _lifecycle(repository, session)
+
+    def _signal_for(security_id: str, side: Side, minute: int, close: float) -> Signal:
+        candle = Candle(
+            security_id=security_id,
+            instrument="NIFTY",
+            open=close,
+            high=close + 1.0,
+            low=close - 1.0,
+            close=close,
+            volume=100,
+            start_at=datetime(2026, 7, 29, 9, minute, tzinfo=IST),
+            end_at=datetime(2026, 7, 29, 9, minute, tzinfo=IST) + timedelta(minutes=1),
+            tick_count=4,
+        )
+        return Signal(
+            strategy_id="st01",
+            execution_mode=ExecutionMode.PAPER,
+            instrument="NIFTY",
+            security_id=security_id,
+            side=side,
+            quantity=50,
+            candle=candle,
+            reference_price=candle.close,
+            evaluated_at=candle.end_at,
+            reason="test",
+        )
+
+    # Contract A: opened and closed at a loss.
+    lifecycle.handle_signal(
+        _signal_for("CONTRACT_A", Side.BUY, minute=15, close=100.0), trading_date=TRADING_DATE
+    )
+    result_a = lifecycle.handle_signal(
+        _signal_for("CONTRACT_A", Side.SELL, minute=16, close=90.0), trading_date=TRADING_DATE
+    )
+    assert result_a.position is not None and result_a.position.status is PositionStatus.CLOSED
+    loss_a = result_a.position.realised_pnl
+    assert loss_a < 0, "contract A must actually lose money, or this proves nothing"
+
+    # Contract B: a different security_id, opened and closed at a profit.
+    lifecycle.handle_signal(
+        _signal_for("CONTRACT_B", Side.BUY, minute=17, close=50.0), trading_date=TRADING_DATE
+    )
+    result_b = lifecycle.handle_signal(
+        _signal_for("CONTRACT_B", Side.SELL, minute=18, close=60.0), trading_date=TRADING_DATE
+    )
+    assert result_b.position is not None and result_b.position.status is PositionStatus.CLOSED
+    profit_b = result_b.position.realised_pnl
+    assert profit_b > 0, "contract B must actually profit, or this proves nothing"
+
+    row = (
+        repository.database.connect()
+        .execute("SELECT daily_realised_pnl FROM strategy_state WHERE strategy_id = ?", ("st01",))
+        .fetchone()
+    )
+    assert row["daily_realised_pnl"] == pytest.approx(loss_a + profit_b), (
+        "the day's total must be both contracts' realised P&L, not just contract B's "
+        "(the old overwrite-not-accumulate bug would leave only profit_b here)"
+    )
+
+
 def test_a_partially_filled_order_is_persisted_as_partially_filled(repository, session):
     broker = PaperBroker(
         config=PaperFillConfig(slippage=SlippageConfig(market_order_ticks=0)),

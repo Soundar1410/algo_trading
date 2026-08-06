@@ -69,6 +69,7 @@ from common.broker import build_broker
 from common.broker.quotes import QuoteBook
 from common.config.paths import load_paths
 from common.engine.config import EngineConfig, SessionConfig
+from common.engine.daily_guard import DailyRiskRecovery
 from common.engine.engine import TradingEngine
 from common.engine.feed import SubscriptionMode
 from common.engine.gateway import LifecycleGateway
@@ -262,6 +263,82 @@ def _record_recovery_failure(
         f"cannot adopt the open position for {config.strategy_id}: {detail}. "
         "New entries are blocked for the day; the position remains OPEN in the "
         "database and is NOT being managed by this process — close it manually."
+    )
+    log.error("%s", message)
+    repository.record_error(
+        runtime_id=config.runtime_id,
+        strategy_id=config.strategy_id,
+        execution_mode=config.execution_mode,
+        severity="CRITICAL",
+        component="engine.recovery",
+        message=message,
+    )
+
+
+def recover_daily_risk(
+    config: WorkerConfig,
+    repository: ExecutionRepository,
+) -> DailyRiskRecovery | None:
+    """Today's already-booked realised P&L and trade count, or ``None``.
+
+    Phase 6 Part 1. ``None`` means there is nothing to restore — either this is
+    the day's first session (no ``strategy_state`` row yet), or the trading date
+    has rolled since the last one, which the caller (``strategy_id``,
+    ``execution_mode``, ``trading_date`` scoped, same as :func:`recover_position`)
+    already guarantees cannot cross into a different day. The daily guard's own
+    :meth:`~common.engine.daily_guard.DailyRiskGuard.reset` — called immediately
+    before this runs — is what makes a fresh day start at zero either way.
+
+    ``realised_pnl`` comes straight from ``strategy_state.daily_realised_pnl``,
+    which every closed trade already writes (``_touch_strategy_state``) but which
+    nothing previously read back. ``trade_count`` is not a stored counter — it is
+    derived from ``positions.status = 'CLOSED'`` for the same strategy/mode/date,
+    so it can never drift from the position rows recovery itself trusts as
+    authoritative (see :func:`recover_position`'s docstring on why disagreement
+    between two records is treated as unrecoverable rather than merged).
+
+    A value that will not convert **raises**, exactly as an unusable contract
+    record does in :func:`recover_position`: a daily loss cap seeded from a
+    guess is worse than one that refuses to seed at all, because the guess could
+    be wrong in the unsafe direction (too low), letting a strategy trade past a
+    limit it had already hit.
+    """
+    row = repository.load_strategy_state(
+        strategy_id=config.strategy_id,
+        execution_mode=config.execution_mode,
+        trading_date=config.trading_date,
+    )
+    if row is None:
+        return None
+    try:
+        raw = row["daily_realised_pnl"]
+        realised_pnl = 0.0 if raw is None else float(raw)
+    except (TypeError, ValueError) as exc:
+        _record_daily_risk_recovery_failure(
+            config, repository, f"strategy_state.daily_realised_pnl is unusable: {exc}"
+        )
+        raise RuntimeError(f"unusable daily_realised_pnl: {exc}") from exc
+    trade_count = repository.closed_position_count(
+        strategy_id=config.strategy_id,
+        execution_mode=config.execution_mode,
+        trading_date=config.trading_date,
+    )
+    return DailyRiskRecovery(realised_pnl=realised_pnl, trade_count=trade_count)
+
+
+def _record_daily_risk_recovery_failure(
+    config: WorkerConfig, repository: ExecutionRepository, detail: str
+) -> None:
+    """Make an unrestorable daily-risk state visible before failing closed.
+
+    Mirrors :func:`_record_recovery_failure` — same severity, same component, so
+    a dashboard query for ``component='engine.recovery'`` catches either failure
+    without needing to know which kind it was.
+    """
+    message = (
+        f"cannot restore today's daily risk state for {config.strategy_id}: {detail}. "
+        "New entries are blocked for the day rather than seeding a loss cap that "
+        "might be wrong."
     )
     log.error("%s", message)
     repository.record_error(
@@ -548,6 +625,9 @@ def _build(
         recovered.adopted = adopted is not None
         return adopted
 
+    def _recover_daily_risk() -> DailyRiskRecovery | None:
+        return recover_daily_risk(config, repository)
+
     engine = TradingEngine(
         cfg,
         feed=feed,
@@ -574,6 +654,7 @@ def _build(
         # wall-clock net consults this same instance rather than a second one.
         square_off_authority=square_off_authority,
         recover_position=_recover,
+        recover_daily_risk=_recover_daily_risk,
         warmup_manager=warmup_manager,
         warmup_source=warmup_source,
     )
