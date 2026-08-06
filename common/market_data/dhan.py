@@ -22,7 +22,10 @@ and 2.2.0. Ticker Data (request code 15, first byte 2) is:
 
     {"type": "Ticker Data", "exchange_segment": int, "security_id": int,
      "LTP": "1234.55",       # str, via "{:.2f}".format(...)
-     "LTT": "09:15:03"}      # str, utcfromtimestamp(e).strftime('%H:%M:%S')
+     "LTT": "09:15:03"}      # str, utcfromtimestamp(e).strftime('%H:%M:%S') --
+                              # but see the correction below: the *value* e is
+                              # built from is IST, not UTC, so utcfromtimestamp
+                              # renders IST digits under a UTC-sounding name.
 
 Phase 1 wrote this defensively and got three things wrong, all corrected here:
 
@@ -37,6 +40,18 @@ Phase 1 wrote this defensively and got three things wrong, all corrected here:
    first byte. Both failed the old ``isinstance(payload, dict)`` guard and
    inflated ``malformed_payloads``, making a genuine shape problem
    indistinguishable from ordinary traffic.
+
+**``LTT``'s wall-clock digits are IST, not UTC — corrected 6 August 2026, known
+limitation 20.** The comment above, and this module's prior documentation, read
+the SDK source and concluded the epoch is rendered against UTC. A real capture
+disproved that: at a genuine 2026-08-06 05:38:49 UTC, ``LTT`` read
+``"11:08:48"`` — the IST wall clock, not UTC. Whatever Dhan's server-side epoch
+actually encodes, the string that reaches this adapter is IST, and
+:func:`reconstruct_exchange_time` now converts it rather than relabelling it.
+This was not one of Phase 1's three defects above — it survived Phase 1, 2 and
+every rehearsal because nothing exercised a live tick against a real clock
+until today; every fixture in the tree was hand-built with an already-correct
+``exchange_time`` and never went through this function.
 
 Depth: **ratified** (Phase 4 Part 5)
 ------------------------------------
@@ -82,6 +97,7 @@ from typing import Any
 
 from common.logging import get_logger
 from common.models import Tick
+from common.utils.timeutils import DEFAULT_TZ, get_tz
 
 from .adapter import TickCallback
 
@@ -134,13 +150,15 @@ DISCONNECT_REASONS: dict[int, str] = {
 DISCONNECT_TOKEN_EXPIRED = 807
 
 #: What ``LTT`` looks like for an instrument that has not traded yet: the SDK
-#: renders epoch 0 through ``strftime('%H:%M:%S')``, giving midnight UTC.
+#: renders epoch 0 through ``strftime('%H:%M:%S')``, giving midnight.
 #:
 #: Such a frame carries an ``LTP`` that is not a real trade price, so it is
 #: rejected outright rather than admitted with a substituted timestamp — the
 #: spec's rule that a stale price is never treated as a fresh unchanged price
-#: (section 10). Midnight UTC is 05:30 IST, and no Dhan segment trades then, so
-#: this sentinel cannot collide with a genuine exchange timestamp.
+#: (section 10). ``LTT`` is IST (known limitation 20), so this sentinel reads
+#: as midnight IST — still outside every Dhan segment's trading hours (NSE
+#: F&O runs 09:15-15:30 IST) — so it cannot collide with a genuine exchange
+#: timestamp either way.
 NEVER_TRADED_LTT = "00:00:00"
 
 
@@ -194,20 +212,32 @@ def reconstruct_exchange_time(
 ) -> datetime | None:
     """Rebuild a full UTC timestamp from Dhan's time-only ``LTT``.
 
-    The SDK renders the exchange epoch as ``strftime('%H:%M:%S')`` against UTC,
-    discarding the date. The date is recovered by picking whichever of yesterday,
-    today or tomorrow places the wall-clock time closest to ``received_at`` —
-    correct for any true latency under twelve hours, and robust across a UTC
-    midnight rollover without special-casing it.
+    **``LTT`` is India Standard Time, not UTC — corrected 6 August 2026, known
+    limitation 20.** This docstring and the code below previously asserted the
+    SDK renders the exchange epoch against UTC. A real captured tick disproved
+    that: at a genuine 2026-08-06 05:38:49 UTC, ``LTT`` read ``"11:08:48"`` —
+    the IST wall clock, five and a half hours ahead of the correct UTC value.
+    The old code combined those digits with a UTC-labelled date, which does
+    not convert anything — it relabels an IST instant as if it were UTC,
+    silently producing an exchange time 5:30 in the future on every live tick.
+    This function now parses the wall-clock time as IST, combines it with an
+    IST calendar date, and *converts* the result to UTC — the missing step.
+
+    The date is recovered by picking whichever of yesterday, today or tomorrow
+    **in IST** places the wall-clock time closest to ``received_at`` — correct
+    for any true latency under twelve hours, and robust across an IST midnight
+    rollover without special-casing it.
 
     (For Indian equity and F&O segments the rollover cannot arise: the session
-    runs 09:15 to 15:30 IST, i.e. 03:45 to 10:00 UTC, so the UTC date is constant
-    throughout. The general form costs nothing and does not depend on that
-    remaining true for other segments.)
+    runs 09:15 to 15:30 IST, comfortably inside one IST calendar day. The
+    general form costs nothing and does not depend on that remaining true for
+    other segments.)
 
-    Also accepts a numeric epoch, which is what a future SDK version would most
-    likely switch to, and an ISO-8601 string. Returns ``None`` when the value is
-    absent or unusable, so the caller can count the fallback.
+    Also accepts a numeric epoch, which is what a future SDK version would
+    most likely switch to — a true Unix epoch is UTC by definition regardless
+    of which zone the exchange operates in, so that branch needed no change —
+    and an ISO-8601 string. Returns ``None`` when the value is absent or
+    unusable, so the caller can count the fallback.
     """
     if raw is None:
         return None
@@ -233,16 +263,18 @@ def reconstruct_exchange_time(
             return None
         return iso if iso.tzinfo else iso.replace(tzinfo=UTC)
 
-    anchor = received_at.astimezone(UTC)
+    ist = get_tz(DEFAULT_TZ)
+    anchor_utc = received_at.astimezone(UTC)
+    anchor_ist = anchor_utc.astimezone(ist)
     candidates = [
         datetime.combine(
-            (anchor + timedelta(days=offset)).date(),
+            (anchor_ist + timedelta(days=offset)).date(),
             parsed_time.time(),
-            tzinfo=UTC,
-        )
+            tzinfo=ist,
+        ).astimezone(UTC)
         for offset in (-1, 0, 1)
     ]
-    return min(candidates, key=lambda moment: abs((moment - anchor).total_seconds()))
+    return min(candidates, key=lambda moment: abs((moment - anchor_utc).total_seconds()))
 
 
 class DhanMarketFeedAdapter:

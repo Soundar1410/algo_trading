@@ -243,6 +243,60 @@ def test_one_live_tick_reaches_the_hub():
 
 
 @needs_credentials
+def test_every_live_tick_has_a_sane_exchange_time():
+    """Standing regression guard for known limitation 20 (fixed 6 August
+    2026): ``reconstruct_exchange_time`` silently produced a timestamp 5:30 in
+    the future because ``LTT`` is IST, not UTC as the code assumed -- caught
+    live, by accident, as the last assertion of an unrelated Full-mode test.
+
+    Deliberately its own test rather than another assertion folded into one of
+    the others above: those exist to prove *other* things (a tick arrives,
+    depth arrives) and would keep passing even if this invariant regressed.
+    This test's only job is the invariant itself, so it cannot be lost in a
+    future edit to what it happened to ride along with.
+
+    Read-only: subscribes to the index alone, in Ticker mode. The invariant
+    must hold for any live tick, so it needs no option resolution or depth.
+    """
+    from common.market_data.dhan import DhanMarketFeedAdapter
+
+    adapter = DhanMarketFeedAdapter(
+        client_id=str(_CLIENT_ID),
+        access_token=_token(),
+        exchange_segment=_SEGMENT,
+        instrument_label="NIFTY",
+    )
+    adapter.subscribe([_SECURITY_ID])
+
+    received: list[Tick] = []
+    finished = threading.Event()
+
+    def _collect(tick: Tick) -> None:
+        received.append(tick)
+        finished.set()
+        adapter.stop()
+
+    thread = threading.Thread(target=lambda: adapter.start(_collect), daemon=True)
+    thread.start()
+    finished.wait(timeout=_TIMEOUT_SECONDS)
+    adapter.request_stop()
+    thread.join(timeout=5.0)
+
+    assert received, f"no tick within {_TIMEOUT_SECONDS}s to check the invariant against"
+    tick = received[0]
+    drift = (tick.exchange_time - tick.received_at).total_seconds()
+    assert drift <= 0, (
+        f"exchange_time is {drift:.1f}s AFTER received_at -- a tick cannot be received "
+        "before the exchange sent it. This is exactly what a relabelled-instead-of-"
+        "converted timezone looks like (known limitation 20)."
+    )
+    assert drift >= -120, (
+        f"exchange_time is {-drift:.1f}s before received_at -- implausible latency for a "
+        "live tick, and consistent with the wrong calendar day or zone being picked."
+    )
+
+
+@needs_credentials
 def test_the_live_payload_matches_the_ratified_shape():
     """The Block 2 ratification assertion.
 

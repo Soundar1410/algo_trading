@@ -128,14 +128,25 @@ def test_the_hub_and_the_engine_agree_about_one_real_shaped_tick():
 
 
 def test_the_adapter_really_does_produce_utc_ticks():
-    """The premise the whole defect rests on. If this ever changes, the tests
-    above stop covering the real case and should be revisited rather than
-    quietly continuing to pass."""
+    """The premise the whole defect rests on — corrected 6 August 2026, known
+    limitation 20.
+
+    This test used to pass ``"04:30:00"`` as ``LTT`` and treat that as already
+    the correct UTC answer — i.e. it assumed the SDK pre-converts to UTC, the
+    same wrong assumption :func:`reconstruct_exchange_time` itself made. A
+    real capture disproved it: ``LTT`` is IST wall-clock. The correct premise
+    is the one this test now states: a real 10:00 IST tick's ``LTT`` reads
+    ``"10:00:00"``, and reconstruction must *convert* that to its true UTC
+    equivalent, 04:30:00 — not relabel the digits. If this premise ever
+    changes, the tests above (which assume already-UTC ticks) stop covering
+    the real case and should be revisited rather than quietly continuing to
+    pass.
+    """
     from common.market_data.dhan import reconstruct_exchange_time
 
-    rebuilt = reconstruct_exchange_time("04:30:00", datetime(2026, 8, 3, 4, 30, 5, tzinfo=UTC))
-    assert rebuilt is not None
-    assert rebuilt.utcoffset() == timedelta(0), "Dhan ticks are no longer UTC-aware"
+    rebuilt = reconstruct_exchange_time("10:00:00", datetime(2026, 8, 3, 4, 30, 5, tzinfo=UTC))
+    assert rebuilt == datetime(2026, 8, 3, 4, 30, 0, tzinfo=UTC)
+    assert rebuilt.utcoffset() == timedelta(0), "the reconstructed value must still be UTC-labelled"
 
 
 # ------------------------------------------------------------------- boundaries

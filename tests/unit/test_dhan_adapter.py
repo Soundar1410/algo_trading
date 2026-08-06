@@ -30,6 +30,7 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -40,6 +41,10 @@ from common.market_data.dhan import (
     DhanMarketFeedAdapter,
     reconstruct_exchange_time,
 )
+
+#: LTT is IST wall-clock (known limitation 20) -- tests that compare a
+#: reconstructed exchange_time back against a raw LTT string must convert.
+IST = ZoneInfo("Asia/Kolkata")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SYNTH_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "dhan_ticker_payloads_synthesised.json"
@@ -293,40 +298,69 @@ def test_per_instrument_labels_are_applied():
 def test_the_time_only_ltt_is_reconstructed_and_not_a_fallback():
     """Defect 1, the most consequential one.
 
-    ``LTT`` is ``strftime('%H:%M:%S')`` against UTC — no date. Phase 1 passed it
-    to ``datetime.fromisoformat``, which raises, so *every* tick silently fell
+    ``LTT`` is time-only — no date. Phase 1 passed it to
+    ``datetime.fromisoformat``, which raises, so *every* tick silently fell
     back to receipt time and candles were bucketed by arrival rather than by
-    exchange time. That is precisely the opposite of the aggregator's contract.
+    exchange time. That is precisely the opposite of the aggregator's
+    contract.
+
+    ``LTT`` is IST wall-clock, not UTC (known limitation 20, fixed 6 August
+    2026), so the reconstructed ``exchange_time`` is genuinely UTC and must be
+    converted back to IST before it matches the raw string byte-for-byte.
     """
     adapter = _adapter()
     tick = adapter.normalise(SYNTH_FRAMES["ticker"][0])
 
     assert tick is not None
-    assert tick.exchange_time.strftime("%H:%M:%S") == SYNTH_FRAMES["ticker"][0]["LTT"]
+    assert (
+        tick.exchange_time.astimezone(IST).strftime("%H:%M:%S") == SYNTH_FRAMES["ticker"][0]["LTT"]
+    )
     assert tick.exchange_time != tick.received_at
     assert adapter.counters.exchange_time_fallbacks == 0
     assert adapter.counters.fallback_ratio == 0.0
 
 
+def test_a_real_captured_ist_ltt_converts_correctly_to_utc():
+    """Fail-first regression for known limitation 20, using the actual values
+    captured live on 6 August 2026. At a genuine receipt of
+    2026-08-06 05:38:49.473969 UTC, Dhan's ``LTT`` read ``"11:08:48"`` — the
+    IST wall clock, not UTC. The old code relabelled those digits as UTC and
+    produced ``2026-08-06 11:08:48+00:00``, a timestamp 5:30 in the future
+    relative to ``received_at``; that is what tripped
+    ``tick.exchange_time <= tick.received_at`` live, the trip-wire this
+    function's caller has always carried. The correct value, converting from
+    IST, is one second *before* receipt — what real exchange latency actually
+    looks like.
+    """
+    received = datetime(2026, 8, 6, 5, 38, 49, 473969, tzinfo=UTC)
+    moment = reconstruct_exchange_time("11:08:48", received)
+    assert moment == datetime(2026, 8, 6, 5, 38, 48, tzinfo=UTC)
+    assert moment <= received, "exchange time must not be in the future relative to receipt"
+
+
 def test_ltt_picks_the_date_closest_to_receipt():
+    """``LTT`` is IST wall-clock (known limitation 20): ``"08:35:03"`` means
+    08:35:03 IST, which converts to 03:05:03 UTC — not 08:35:03 UTC."""
     received = datetime(2026, 7, 30, 8, 35, 10, tzinfo=UTC)
     moment = reconstruct_exchange_time("08:35:03", received)
-    assert moment == datetime(2026, 7, 30, 8, 35, 3, tzinfo=UTC)
+    assert moment == datetime(2026, 7, 30, 3, 5, 3, tzinfo=UTC)
 
 
-def test_ltt_just_before_utc_midnight_resolves_to_the_previous_day():
-    """A rollover guard. It cannot arise for Indian equity/F&O — that session is
-    03:45-10:00 UTC — but it costs nothing and does not assume other segments
-    keep that property."""
-    received = datetime(2026, 7, 31, 0, 0, 5, tzinfo=UTC)
+def test_ltt_just_before_ist_midnight_resolves_to_the_previous_day():
+    """A rollover guard, anchored on IST midnight — the zone ``LTT`` is
+    actually in (known limitation 20; this used to anchor on UTC midnight,
+    the wrong zone). It cannot arise for Indian equity/F&O — that session is
+    09:15-15:30 IST, nowhere near midnight — but it costs nothing and does
+    not assume other segments keep that property."""
+    received = datetime(2026, 7, 30, 18, 30, 5, tzinfo=UTC)  # 2026-07-31 00:00:05 IST
     moment = reconstruct_exchange_time("23:59:58", received)
-    assert moment == datetime(2026, 7, 30, 23, 59, 58, tzinfo=UTC)
+    assert moment == datetime(2026, 7, 30, 18, 29, 58, tzinfo=UTC)  # 2026-07-30 23:59:58 IST
 
 
-def test_ltt_just_after_utc_midnight_resolves_to_the_next_day():
-    received = datetime(2026, 7, 30, 23, 59, 58, tzinfo=UTC)
+def test_ltt_just_after_ist_midnight_resolves_to_the_next_day():
+    received = datetime(2026, 7, 30, 18, 29, 58, tzinfo=UTC)  # 2026-07-30 23:59:58 IST
     moment = reconstruct_exchange_time("00:00:03", received)
-    assert moment == datetime(2026, 7, 31, 0, 0, 3, tzinfo=UTC)
+    assert moment == datetime(2026, 7, 30, 18, 30, 3, tzinfo=UTC)  # 2026-07-31 00:00:03 IST
 
 
 def test_an_epoch_timestamp_is_still_accepted():

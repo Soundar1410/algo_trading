@@ -9,7 +9,7 @@ the next phase. Updated after every phase.
 |---|---|
 | **Current phase** | Phase 4 **Parts 1-4 complete; Part 5 code complete**. **Part 5** (`PaperBroker` realism) closes limitation 5 and deviation D11: depth reaches the fill through a shared `QuoteBook`, a buy takes the ask and a sell the bid, the price is rounded adversely onto the tick grid, limit orders rest and settle from later quotes, partial fills accumulate correctly, and the spec's nine rejection rules are implemented behind a code enum. The pre-work audit corrected two wrong notes in this document and found four things that changed the work — including that Dhan publishes `SEM_TICK_SIZE` in **paise**, so a model trusting the column would have put NIFTY options on a ₹5 grid. New deviations **D48-D53** state what is *not* claimed. Awaiting review |
 | **Next phase** | **Run the outstanding Part 5 gate item** — the opt-in Full-mode depth capture against a real `NSE_FNO` option, which needs market hours (09:15–15:30 IST); command in [Commands](#5-commands). Then Phase 5 |
-| **Last updated** | 6 August 2026 — limitation 18 fixed and closed; limitation 19 (new) recorded, see [Known limitations](#6-known-limitations) |
+| **Last updated** | 6 August 2026 — limitations 18 and 19 fixed and closed; limitation 20 (new) recorded, see [Known limitations](#6-known-limitations) |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
 | **Live order placement** | **Not implemented.** Fail-closed. Phase 10 only. |
@@ -3606,9 +3606,9 @@ start/stop/crash/restart tests pass.
     is real. Full suite unchanged at 1242 passed, 11 skipped, both before and
     after. Not yet re-run against a live account under the new gates.
 
-19. **`dhanClientId` sent as an HTTP header instead of a JSON-body field, on
-    every POST call this repo makes with a hand-rolled `httpx` request.** Found
-    while investigating limitation 18, not yet fixed.
+19. **~~`dhanClientId` sent as an HTTP header instead of a JSON-body field, on
+    every POST call this repo makes with a hand-rolled `httpx` request.~~
+    FIXED** (6 August 2026). Found while investigating limitation 18.
 
     **The bug.** `tests/smoke/test_live_feed_smoke.py`'s `_index_last_price`
     (backs the ATM-strike lookup in two live rehearsal tests) and
@@ -3666,11 +3666,142 @@ start/stop/crash/restart tests pass.
     before trusting either: (a) the option-chain smoke test or the ATM-strike
     lookup that gates the Part 1 and Part 5 live rehearsal tests, or (b) Part
     4's warm-up feature, which reads real pre-market history through the same
-    pattern in production code. A cheap, safe check that spends no additional
-    token generation and risks no further invalidation: reuse the existing
-    valid cached token, add the `client-id` header, inject `dhanClientId` into
-    the POST body to match the SDK's own contract, and retry — read-only calls
-    only, as every call in this file already is. **Not yet fixed.**
+    pattern in production code.
+
+    **Fixed, 6 August 2026.** `common/market_data/dhan_historical.py` and both
+    smoke-test call sites now send `client-id` as the header and inject
+    `dhanClientId` into the JSON body, matching the SDK's contract exactly.
+    Verified fail-first: reverted the fix and confirmed
+    `test_fetch_intraday_builds_the_documented_request_shape`,
+    `test_fetch_intraday_sends_the_documented_auth_headers` (which previously
+    *asserted the bug itself* — it expected `headers["dhanClientId"]`, exactly
+    what the old code sent) and the new
+    `test_index_last_price_builds_the_documented_request_shape` (new
+    injectable-`token`/`http_post` coverage added specifically so the smoke
+    helper's request shape could be asserted without credentials or a network
+    call) all failed against the old shape and passed against the corrected
+    one. **One flagged gap, left as-is**: the option-chain test's `fetch()`
+    closure got the same shape fix but no dedicated shape-asserting unit test
+    of its own — a local closure inside one opt-in live test, judged
+    lower-value than the other two call sites since nothing else depends on
+    it. Full suite unaffected: 1243 passed, 11 skipped at the time of this
+    fix.
+
+20. **~~`reconstruct_exchange_time` relabelled IST as UTC instead of converting
+    it, producing a live exchange timestamp 5:30 ahead of every real one.~~
+    FIXED** (6 August 2026, same day, found running the Part 5 gate item live
+    for the first time).
+
+    **The bug.** `common/market_data/dhan.py`'s docstring and code both
+    asserted "the SDK renders the exchange epoch as `strftime('%H:%M:%S')`
+    against UTC." A real captured tick disproved it: at a genuine
+    2026-08-06 05:38:49 UTC, `LTT` read `"11:08:48"` — the IST wall clock, not
+    UTC. The old code combined those digits with a UTC-labelled date, which
+    does not convert anything — it relabels an IST instant as UTC, producing
+    an `exchange_time` 5:30 in the future on every live tick. It surfaced as
+    the last assertion of an unrelated live test: `tick.exchange_time <=
+    tick.received_at` failed with `exchange_time=2026-08-06 11:08:48 UTC`
+    against `received_at=2026-08-06 05:38:49 UTC` — the ~5.5-hour gap matching
+    the IST offset exactly, which is what pointed at the root cause.
+
+    **Severity, worked through concretely, not just asserted.** Every
+    session/candle predicate converts `exchange_time` to IST via
+    `.astimezone(Asia/Kolkata)` before comparing it to session bounds. Feeding
+    that conversion an already-mislabelled value adds *another* +5:30 on top,
+    so the computed "local" instant is the real IST time plus 5:30, not the
+    real IST time:
+    - `CandleAggregator.add`'s session-window check (`09:15 ≤ local < 15:30`)
+      only holds when `real_IST + 5:30` falls in that range, i.e. real IST
+      `03:45–10:00`. **From 10:00 IST onward — the great majority of every
+      trading day — every live tick would have been silently rejected as
+      "out of session," and zero candles built from live data.** In the
+      narrow 09:15–10:00 IST window ticks would still be accepted but bucketed
+      into the wrong candle (a tick at real 09:20 IST computed as 14:50 IST,
+      landing in the 14:50 bar).
+    - `SessionSquareOffAuthority.due()` compares the same mislabelled local
+      time against the square-off time (~15:15–15:20 IST). `due()` would read
+      true once `real_IST + 5:30 ≥ square_off`, i.e. from roughly **09:45 IST
+      onward** — a real position would have been squared off within half an
+      hour of the session opening, almost regardless of the strategy.
+    - `MarketSession.is_open`/`can_enter` fail the same way — the engine would
+      have treated the market as closed for most of the day and refused
+      entries throughout.
+
+    **Zero downstream consumers were ever exercised with a live tick, so none
+    of the above actually happened.** Traced every production consumer of
+    `Tick.exchange_time` — `CandleAggregator`, `CandleBuilder` (both index and
+    option/premium candles), `MarketSession.is_open`/`can_enter`,
+    `SessionSquareOffAuthority.due`, gap detection in both `engine.py` and
+    `HubTickFeed`, position open/close timestamps, `QuoteBook`/`quoted_at` for
+    `PaperBroker` fills, and the hub/`ReconnectingFeed` last-tick health
+    tracking — and confirmed, by sweeping every test and script that
+    constructs a real `DhanMarketFeedAdapter`, that **none of them ever
+    routed a live tick into any of those consumers**. Every opt-in smoke test
+    that touches a live tick (`test_one_live_tick_reaches_the_hub`,
+    `test_the_live_payload_matches_the_ratified_shape`,
+    `test_a_real_option_contract_delivers_ticks_on_the_fno_segment`, and the
+    Part 5 gate item itself) uses the raw adapter with a bare Python callback
+    that only inspects `Tick` fields directly — never a `MarketDataHub`,
+    `CandleAggregator`, or `TradingEngine`. `scripts/capture_live_tape.py`
+    does the same. Every place that *does* wire a real `CandleAggregator`/
+    `TradingEngine`/`Hub`/`ReconnectingFeed` to a tick stream in the test
+    suite feeds it via `RecordedFeed` or hand-built `Tick(...)` fixtures with
+    directly-specified, already-correct `exchange_time` values — never through
+    `reconstruct_exchange_time`. No LaunchAgent or supervised runtime has ever
+    been started (Phase 7/8 not shipped), so there is no other live-tick path.
+    **No corruption occurred anywhere; the gate item's own trip-wire assertion
+    caught this before anything downstream ever saw a live tick.**
+
+    **Fixed.** `reconstruct_exchange_time` now parses the wall-clock time as
+    IST, combines it with an IST calendar date (the day-picking logic is
+    unchanged in shape, just re-anchored on IST midnight instead of UTC
+    midnight), and converts to UTC via `.astimezone(UTC)` — a real conversion,
+    not a relabel. The numeric-epoch branch is untouched (a true Unix epoch is
+    UTC by definition regardless of exchange timezone); the speculative
+    ISO-8601 fallback branch (never observed live) is also untouched rather
+    than guessed at.
+
+    **Verified fail-first**, not assumed: reverted the fix and reran — six
+    failures, exactly the tests touching this logic, including a **new** test
+    using the actual values captured live,
+    `test_a_real_captured_ist_ltt_converts_correctly_to_utc`
+    (`LTT="11:08:48"`, `received_at=2026-08-06 05:38:49.473969 UTC` →
+    asserts `2026-08-06 05:38:48 UTC`). Restored the fix — all green. Three
+    *existing* tests had encoded the wrong premise and needed correcting, not
+    just the code:
+    - `test_the_time_only_ltt_is_reconstructed_and_not_a_fallback` compared
+      `exchange_time` directly against the raw `LTT` string — only ever true
+      because the old code never converted; now compares via
+      `.astimezone(IST)`.
+    - `test_ltt_just_before/after_utc_midnight_resolves_to_...` re-anchored on
+      IST midnight (the boundary that is actually relevant) with recomputed
+      expected values.
+    - `test_the_adapter_really_does_produce_utc_ticks`
+      (`tests/unit/test_session_timezone_rule.py`) is the more serious one —
+      its docstring called the UTC assumption **"the premise the whole defect
+      rests on"** and asserted it as fact. Rewritten to state and test the
+      corrected premise: a real 10:00 IST tick's `LTT` reads `"10:00:00"`, and
+      reconstruction must convert that to `04:30:00` UTC, not relabel it.
+
+    **New standing regression guard**, not just the assertion that happened to
+    catch this once:
+    `tests/smoke/test_live_feed_smoke.py::test_every_live_tick_has_a_sane_exchange_time`,
+    deliberately its own test rather than another assertion riding along
+    inside a test about something else (which is exactly how this one was
+    only caught by accident). Subscribes to the index alone in Ticker mode —
+    the invariant must hold for any live tick — and asserts both directions:
+    `exchange_time` not after `received_at`, and not implausibly far before it
+    either, so a wrong-day pick would also be caught, not just a wrong-zone
+    one.
+
+    **Documentation corrected at the source**, not just in tests: the module
+    docstring's payload-shape comment, the `NEVER_TRADED_LTT` sentinel comment
+    (same wrong "midnight UTC" reasoning), and the function's own docstring —
+    swept the tree afterward and confirmed no stray uncorrected copies of the
+    "SDK renders against UTC" claim remain.
+
+    Full suite: 1244 passed, 12 skipped (both counts up by one for the two new
+    tests) — no regressions.
 
 
 ### Operational risk noted during the audit
