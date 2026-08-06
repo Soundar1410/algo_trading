@@ -120,15 +120,52 @@ def test_a_run_that_ends_on_its_own_is_not_reported_as_signalled(supervisor_conf
     assert result.clean_feed_shutdown is True
 
 
-def test_the_supervisor_refuses_a_live_mode_worker(supervisor_config, tick_tape_path):
-    """Phase 1 is paper-only; a live worker is never even spawned."""
+def test_a_live_mode_worker_is_refused_and_never_spawned(supervisor_config, tick_tape_path):
+    """A live worker is refused individually — add_worker never raises for it."""
     adapter = RecordedFeedAdapter(load_tick_tape(tick_tape_path))
     supervisor = IntradayOptionsSupervisor(supervisor_config, adapter)
 
-    with pytest.raises(ValueError, match="paper-only"):
-        supervisor.add_worker(
-            _worker(supervisor_config, "livestrat", execution_mode=ExecutionMode.LIVE)
+    channel = supervisor.add_worker(
+        _worker(supervisor_config, "livestrat", execution_mode=ExecutionMode.LIVE)
+    )
+    assert channel is None
+
+
+def test_a_blocked_live_worker_does_not_stop_the_paper_strategy(
+    supervisor_config, tick_tape_path, database_path
+):
+    """Mixed-mode gate: the live strategy is blocked, the paper strategy trades on."""
+    adapter = RecordedFeedAdapter(load_tick_tape(tick_tape_path))
+    supervisor = IntradayOptionsSupervisor(supervisor_config, adapter)
+    supervisor.add_worker(_worker(supervisor_config, "skelfix"))
+    supervisor.add_worker(
+        _worker(supervisor_config, "livestrat", execution_mode=ExecutionMode.LIVE)
+    )
+
+    result = supervisor.run()
+
+    assert result.workers_started == 1
+    assert result.worker_exit_codes == {"skelfix": 0}
+    assert "livestrat" not in result.worker_exit_codes
+
+    conn = Database(database_path).connect()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM fills WHERE strategy_id = 'skelfix'"
+    ).fetchone()[0] == 2
+    # The blocked strategy traded in no mode at all — see the mode-separation
+    # end-to-end test for the exhaustive, schema-driven version of this check.
+    for table in ("signals", "order_intents", "orders", "fills", "positions"):
+        assert (
+            conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE strategy_id = 'livestrat'"
+            ).fetchone()[0]
+            == 0
         )
+    blocked_errors = conn.execute(
+        "SELECT message FROM errors WHERE strategy_id = 'livestrat'"
+    ).fetchall()
+    assert len(blocked_errors) == 1
+    assert "NOT rerouted to paper" in blocked_errors[0]["message"]
 
 
 def test_the_database_is_consistent_after_a_supervised_run(

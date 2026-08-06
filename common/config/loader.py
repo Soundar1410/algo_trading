@@ -205,3 +205,56 @@ def load_resolved_config(
         runtime=runtime,
         strategy=strategy,
     )
+
+
+def discover_enabled_strategies(
+    config_root: Path,
+    runtime_id: str,
+    *,
+    settings: Settings | None = None,
+) -> list[ResolvedConfig]:
+    """Every strategy in ``config/strategies/`` that is enabled, layered under
+    ``runtime_id``.
+
+    This is the supervisor's entrypoint into configuration: without it,
+    :func:`load_resolved_config` has to be called by hand, one ``strategy_id``
+    at a time, which is what every caller before Phase 5 did (only tests).
+
+    **Single-runtime limitation.** ``StrategyConfig`` carries no ``runtime_id``
+    of its own — the spec's own "required resolved strategy fields" (section 9)
+    do not list one either, and a strategy's membership in a runtime group is
+    implied only by naming convention (the spec's own example strategy is
+    ``io_supertrend_fast_v1``, the ``io_`` marking it as ``intraday_options``'s).
+    So this function has no way to tell "belongs to a different runtime" apart
+    from "belongs to this one" — it resolves and returns *every* enabled file in
+    ``config/strategies/`` against the ``runtime_id`` given, which is correct
+    exactly as long as one runtime's supervisor is the only caller. That is
+    true today (only ``intraday_options`` exists). A second runtime being added
+    needs a real membership mechanism — an explicit list in the runtime's own
+    YAML, or a validated ``strategy_id`` prefix convention — before two
+    supervisors can safely call this against the same ``config/strategies/``
+    directory; building that mechanism now, with only one runtime to test it
+    against, would be exactly the untested speculative generality this
+    project's runbook otherwise declines to build ahead of need.
+
+    Strategy files are visited in sorted filename order, so which strategy a
+    supervisor tries to spawn first is deterministic across runs.
+
+    Raises:
+        ConfigError: the same way :func:`load_resolved_config` does, for any
+            strategy file that fails to parse or validate. A broken strategy
+            file is an operator error to fix, not a runtime condition this
+            function degrades around — the group does not start until it is
+            fixed, rather than starting short one strategy nobody noticed.
+    """
+    settings = settings if settings is not None else load_settings()
+    strategies_dir = config_root / "strategies"
+    if not strategies_dir.is_dir():
+        return []
+
+    resolved: list[ResolvedConfig] = []
+    for path in sorted(strategies_dir.glob("*.yaml")):
+        cfg = load_resolved_config(config_root, runtime_id, path.stem, settings=settings)
+        if cfg.strategy.enabled:
+            resolved.append(cfg)
+    return resolved

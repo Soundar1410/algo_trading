@@ -17,6 +17,7 @@ import json
 import multiprocessing as mp
 import os
 import queue as queue_module
+from dataclasses import replace
 from datetime import time
 from pathlib import Path
 
@@ -337,6 +338,62 @@ def test_duplicate_worker_startup_is_refused(worker_config, database_path):
     holder.join(timeout=30)
     assert holder_result.get(timeout=5) == 0
     assert not pid_file.exists(), "a cleanly exited worker must remove its PID file"
+
+
+def test_a_live_mode_contender_is_still_refused_as_a_duplicate(worker_config, database_path):
+    """Regression guard for spec line 2520 ("prevent a second worker for the
+    same strategy ID even when one configuration says paper and another says
+    live"). ``worker_lock``'s identity has no room for mode at all (see
+    ``common.process.locks.worker_lock``), so this is true by construction —
+    proven here with real spawned processes, mirroring
+    ``test_duplicate_worker_startup_is_refused`` above but with the contender's
+    *mode* varied instead of using the identical config twice.
+    """
+    database = Database(database_path)
+    MigrationRunner(database).run_pending()
+    database.close()
+
+    context = mp.get_context("spawn")
+    holder_queue = context.Queue()
+    holder_result = context.Queue()
+    contender_queue = context.Queue()
+    contender_result = context.Queue()
+
+    holder = context.Process(
+        target=_spawn_worker, args=(worker_config, holder_queue, holder_result)
+    )
+    holder.start()
+
+    pid_file = worker_config.pid_dir / f"{RUNTIME_ID}.{STRATEGY_ID}.pid"
+    deadline = 10.0
+    waited = 0.0
+    while not pid_file.exists() and waited < deadline:
+        holder.join(timeout=0.1)
+        waited += 0.1
+    assert pid_file.exists(), "first worker never acquired its lock"
+
+    live_contender_config = replace(worker_config, execution_mode=ExecutionMode.LIVE)
+    contender = context.Process(
+        target=_spawn_worker,
+        args=(live_contender_config, contender_queue, contender_result),
+    )
+    contender.start()
+    contender.join(timeout=30)
+
+    assert not contender.is_alive()
+    assert contender_result.get(timeout=5) == EXIT_DUPLICATE
+
+    # The live-mode contender never even reached the live gate in build_broker
+    # — the lock, not mode, decided the outcome. No row of any kind for it.
+    conn = Database(database_path).connect()
+    sessions = conn.execute(
+        "SELECT COUNT(*) FROM runtime_sessions WHERE strategy_id = ?", (STRATEGY_ID,)
+    ).fetchone()[0]
+    assert sessions == 1, "the refused live-mode contender opened a session it should never have"
+
+    holder_queue.put(None)
+    holder.join(timeout=30)
+    assert holder_result.get(timeout=5) == 0
 
 
 def test_the_same_strategy_can_restart_after_a_clean_exit(worker_config, tick_tape_path):

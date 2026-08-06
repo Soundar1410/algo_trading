@@ -1,0 +1,20 @@
+# Positional options strategy group — inert scaffolding only.
+#
+# Named in the spec's own configuration-organisation example (section 9) and
+# in Phase 5's own instrument-class-rollout bullet ("add positional options
+# and intraday stocks one at a time"). This file is the "one at a time" first
+# step: it makes the runtime_id a real, loadable configuration, and nothing
+# more. There is no `runtimes/positional_options/` supervisor or worker to
+# start it — see that package's `__init__.py` for why, and D56 in the runbook
+# for the full reasoning.
+#
+# `enabled: false` until there is something to enable. Nothing in this
+# repository currently scans config/runtimes/*.yaml on its own, so this file
+# is inert: it exists to be loadable by `load_runtime_config`, not to be
+# discovered automatically.
+
+runtime_id: positional_options
+enabled: false
+live_execution_allowed: false
+shared_market_feed: true
+database: data/operational/positional_options.db

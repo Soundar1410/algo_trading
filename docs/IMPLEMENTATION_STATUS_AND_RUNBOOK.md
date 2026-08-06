@@ -7,9 +7,9 @@ the next phase. Updated after every phase.
 
 | | |
 |---|---|
-| **Current phase** | **Phase 4 complete — Parts 1-5 all complete.** **Part 5** (`PaperBroker` realism) closes limitation 5 and deviation D11: depth reaches the fill through a shared `QuoteBook`, a buy takes the ask and a sell the bid, the price is rounded adversely onto the tick grid, limit orders rest and settle from later quotes, partial fills accumulate correctly, and the spec's nine rejection rules are implemented behind a code enum. The pre-work audit corrected two wrong notes in this document and found four things that changed the work — including that Dhan publishes `SEM_TICK_SIZE` in **paise**, so a model trusting the column would have put NIFTY options on a ₹5 grid. New deviations **D48-D53** state what is *not* claimed. **The live Full-mode gate item ran 6 August 2026 and passed clean** — see "What is asserted rather than proven" under Part 5. Along the way it surfaced and closed known limitations 18, 19 and 20 (none of them Part 5 defects — an auth-gating bug, a request-shape bug, and an exchange-timezone bug, all found only because this was the first time this repo's live path was actually exercised end to end). Awaiting review |
-| **Next phase** | **Phase 4 is done pending your review.** Once reviewed, next is Phase 5 (mixed-mode supervisor and persistence) |
-| **Last updated** | 6 August 2026 — Part 5's live gate item passed; Phase 4 Parts 1-5 all complete; limitations 18, 19 and 20 fixed and closed, see [Known limitations](#6-known-limitations) |
+| **Current phase** | **Phase 5 complete** — mixed-mode supervisor and persistence. Config discovery (`discover_enabled_strategies`) and a `ResolvedConfig → WorkerConfig` adapter give `load_resolved_config` its first non-test caller since Phase 0, wired up by a new `runtimes.intraday_options.__main__` entrypoint. `IntradayOptionsSupervisor.add_worker` no longer aborts the group on a live-mode strategy (`ValueError("paper-only")`) — it refuses that one strategy individually via `effective_live_gate`, records the refusal to `errors` and delivers it through the notifier, and every paper strategy in the same group keeps trading. Duplicate-worker prevention was **audited, not rebuilt**: the existing `filelock`-based `worker_lock` already excludes mode from its identity, so a paper and a live config for the same `strategy_id` already collide — closed with two regression tests (one unit, one real-spawned-process) pinning that against a future change rather than adding new machinery. Mode separation across all nine `execution_mode`-bearing tables plus `runtime_heartbeats` (which carries `strategy_id` but no `execution_mode`) is proven end to end, schema-swept, keyed on `strategy_id` rather than `execution_mode` — see **D54**. Positional-options instrument-class rollout is **split**: inert config/package scaffolding shipped (`config/runtimes/positional_options.yaml`, `runtimes/positional_options/__init__.py`), the working supervisor/worker/persistence layer genuinely deferred to Phase 6/9 — see **D56** (corrected on review from an earlier draft that deferred all of it). New deviations **D54-D57**, new limitation **21**. |
+| **Next phase** | Phase 6 (paper recovery and expiry handling) |
+| **Last updated** | 6 August 2026 — Phase 5 complete, see [Known limitations](#6-known-limitations) |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
 | **Live order placement** | **Not implemented.** Fail-closed. Phase 10 only. |
@@ -25,7 +25,7 @@ the next phase. Updated after every phase.
 | 2 | Dhan and shared-feed hardening | **Complete** — Block 1 (offline) + Block 2 (live) |
 | 3 | Preserve custom engines and policies | **Complete.** **Part 1 complete** (live-feed shutdown); **Part 2a complete** (exit registry + SuperTrend port); **Part 2b-i complete** (signal ownership + engine core); **Part 2b-ii-A complete** (the feed seam: tick channel, runtime subscription, `HubTickFeed`); **Part 2b-ii-B-1 complete** (the execution seam: square-off authority, `LifecycleGateway`, entry-block on tick drop); **Part 2b-ii-B-2 complete** (the wiring: worker engine path, supervisor queue delivery, engine restart recovery, D20 reporting bindings). **Phase 3 complete** — its acceptance gate is met in full |
 | 4 | Candle, indicator and paper-execution foundation | **Complete.** **Part 1 complete** (real contract resolution — closes 17, alarms 15). **Part 2 complete** (indicator layer — closes D21). **Part 3 complete** (continuity, timezone, wall-clock square-off — closes 4 and 7, and a live blocker). **Part 4 complete** (warm-up source and injection — closes 16). **Part 5 complete** (`PaperBroker` realism — closes 5 and D11; the live Full-mode gate item ran 6 August 2026 and passed, closing known limitation 20 along the way). **Phase 4 complete** — all five parts done, its one live gate item proven rather than asserted |
-| 5 | Mixed-mode supervisor and persistence | Not started |
+| 5 | Mixed-mode supervisor and persistence | **Complete** |
 | 6 | Paper recovery and expiry handling | Not started |
 | 7 | Operations | Not started |
 | 8 | LaunchAgent validation | Not started |
@@ -1835,6 +1835,152 @@ happen silently.
 
 ---
 
+### What Phase 5 delivered — mixed-mode supervisor and persistence
+
+**A pre-work audit found most of Phase 5's machinery already built but
+unwired.** The typed per-strategy `enabled`/`mode`/`live_approved`/`engine`
+config (`StrategyConfig`), the fail-closed `effective_live_gate` AND-chain, the
+broker factory's refusal to reroute a blocked live strategy to paper
+(`LiveExecutionBlocked`), and the mode-separated schema (`execution_mode` CHECK
+column and UNIQUE keys on every trading table, since migration `0001`) all
+predate this phase. `load_resolved_config` existed since Phase 0 with **no
+caller outside a test**, and there was no CLI entrypoint anywhere in the
+repository. So Phase 5 is predominantly wiring plus proof, not new subsystems.
+
+**Config discovery and the config-to-worker adapter.**
+`common.config.discover_enabled_strategies(config_root, runtime_id)` enumerates
+`config/strategies/*.yaml` in sorted filename order and resolves every enabled
+one against the given runtime. **Single-runtime limitation, recorded rather
+than solved**: `StrategyConfig` carries no `runtime_id` of its own — neither
+does the spec's own "required resolved strategy fields" list (section 9) — so
+membership in a runtime group is implied only by naming convention (the spec's
+own example is `io_supertrend_fast_v1`). This function cannot yet tell "belongs
+to a different runtime" apart from "belongs to this one"; it is correct exactly
+as long as one runtime's supervisor is the only caller, which is true today
+(only `intraday_options` exists). See **limitation 21**.
+`runtimes.intraday_options.config_adapter.build_worker_config` turns one
+`ResolvedConfig` into a `WorkerConfig`, mapping `strategy.parameters` (required:
+`instrument`, `security_id`; optional: `quantity`, `entry_on_candle`,
+`exit_on_candle`, `paper_execution`, `cost_rates`) and `strategy.risk`'s
+`entry_cutoff`/`square_off_at` into a `SquareOffPolicy`. **Deliberately
+fixture-path only** — `WorkerConfig.engine` is always `None` regardless of
+`StrategyConfig.engine`, because populating an `EngineWorkerConfig` needs
+per-strategy parameters (`strategy_ref`, `timeframe`, `strike_step`, ...) that
+no real strategy exists yet to supply; CLAUDE.md defers real strategies to
+Phase 9, and synthesising them now would be the same "untested code that
+merely looks finished" judgement **D34** already made about
+`EquityScripMaster`.
+
+**The entrypoint.** `runtimes.intraday_options.__main__` (also installed as
+`algo-intraday-options` via `[project.scripts]`) discovers enabled strategies,
+builds their `WorkerConfig`s, evaluates `effective_live_gate` for each, and
+hands them to the supervisor. It refuses to start at all — before touching Dhan
+credentials — when `runtimes/<id>.yaml` has `enabled: false`. Auth bootstrap and
+`DhanMarketFeedAdapter` construction follow the identical pattern
+`scripts/capture_live_tape.py` already established (same `AuthBootstrap`,
+`read_secret`, lazy SDK import).
+
+**Mixed-mode admission — the one real behaviour change.**
+`IntradayOptionsSupervisor.add_worker` used to `raise ValueError(...
+"paper-only")` for any non-paper `WorkerConfig`, which — once a config could
+hold one paper and one live strategy — would have aborted the **entire group**
+on the live strategy's presence, directly violating the mixed-mode gate's "the
+paper strategy continues safely" (spec line 2974). `add_worker` now takes an
+optional `live_gate: LiveGateDecision | None`, consulted only for a live-mode
+worker (irrelevant for paper), and returns `WorkerChannel | None` instead of
+raising: a blocked live strategy is refused **individually** — logged, queued
+in `self._blocked_workers`, and recorded once `run()` opens the repository, via
+`errors` (`severity="ERROR"`, `component="supervisor.live_gate"`) and delivered
+through the notifier (`event_type="live_strategy_blocked"`) — while every paper
+strategy in the group spawns and trades normally. Never rerouted to paper: a
+missing `live_gate` (a caller that forgot to pass one) is treated as a block,
+the same fail-closed default `effective_live_gate` itself uses for a missing
+preflight. The never-reachable-until-Phase-10 case (gate somehow open) still
+refuses, with its own message, for the same reason `common.broker.factory`'s
+hard stop does — belt-and-braces against a future change that opens the gate
+before `DhanLiveBroker` exists to serve it.
+
+**Duplicate-worker prevention — audited and proven, not rebuilt.** Bullet 4
+("prevent a second worker for the same strategy ID even when one configuration
+says paper and another says live", spec line 2520) turned out to already be
+satisfied by construction: `worker_lock`'s identity is
+`f"{runtime_id}.{strategy_id}"` (`common/process/locks.py`) — there is no
+`mode` parameter for it to include. Two new regression tests pin that fact
+against a future "helpful" change that folds `execution_mode` into the
+identity for consistency with the mode-separated tables:
+`test_worker_lock_identity_has_no_room_for_mode` and
+`test_two_worker_locks_for_the_same_strategy_id_collide_regardless_of_caller_intent`
+(unit, `tests/unit/test_process_locks.py`), and
+`test_a_live_mode_contender_is_still_refused_as_a_duplicate` (end-to-end, real
+spawned processes, `tests/end_to_end/test_walking_skeleton.py`) — the last
+proves a live-mode contender is refused **before it ever reaches the live
+gate**, because the lock decides first. **Lock acquisition stays in the child
+worker**, not the supervisor, despite the spec's startup-flow step 4 ("For
+each enabled strategy, acquire its worker lock") reading as supervisor-side —
+see **D55**.
+
+**Mode separation, proven against real persisted state
+(`tests/end_to_end/test_mode_separation.py`).** Runs a real mixed-mode group to
+completion and queries the resulting SQLite file directly, deliberately not
+simplified to "assert zero `execution_mode='live'` rows" — that version passes
+under the exact failure it exists to catch, since a silently-rerouted-to-paper
+strategy would write `execution_mode='paper'` rows and a mode-keyed count would
+still read zero. Every negative assertion is keyed on `strategy_id` instead,
+swept across every table found to carry that column via `sqlite_master`/
+`PRAGMA table_info` rather than a hand-written list — nine tables carry both
+`strategy_id` and `execution_mode` (`errors`, `fills`, `notifications`,
+`order_intents`, `orders`, `positions`, `runtime_sessions`, `signals`,
+`strategy_state`); `runtime_heartbeats` carries `strategy_id` alone, which a
+mode-keyed sweep would have missed entirely; `paper_fill_quotes` carries
+neither and is reached transitively via `orders.id`. `errors`/`notifications`
+are the one deliberate carve-out — a row naming the blocked strategy there is
+the *required* behaviour (an operator reading only the database must be able
+to see it was deliberately blocked, not silently missing), not a leak. A
+positive control (the paper strategy's rows are non-zero) runs first, since
+without it every negative assertion is satisfied just as well by a run that
+crashed on startup and wrote nothing. **D54** records that no production code
+path in this repository calls `repository.record_notification` — the block
+follows the same established pattern every existing alarm in `supervisor.py`
+already uses (`record_error` for persistence, `notifier.send` for delivery),
+so the delivered side is asserted against `RecordingNotifier.events` in tests,
+not a `notifications` table row.
+
+**Instrument-class rollout (spec bullet 6) — corrected on review, and split
+in two.** The bullet ("add positional options and intraday stocks one at a
+time; keep positional stocks a placeholder") was first read as "no strategy
+exists yet, defer all of it" and deferred wholesale — too broad, on review.
+The spec names three things and treats them differently: two get incremental
+movement, one alone is named as the placeholder, which only makes sense if
+"no consumer yet" was not meant to excuse all three equally. Split
+accordingly, see **D56**: `config/runtimes/positional_options.yaml`
+(`enabled: false`) and `runtimes/positional_options/__init__.py` now exist as
+inert scaffolding — real, loadable, zero behavioural change — matching
+exactly the precedent `intraday_options.yaml` set in Phase 1. The
+supervisor/worker/persistence layer stays genuinely deferred, because it
+depends on two design questions Phase 6 owns, not on there being no strategy.
+
+### What Phase 5 deliberately did NOT deliver
+
+- **A real membership mechanism for a second runtime.** See limitation 21.
+- **`EngineWorkerConfig` wiring from `StrategyConfig.parameters`.** Every
+  worker this phase's adapter builds runs the Phase 1 fixture path. Phase 9's
+  first real strategy is what needs this, and is where it belongs.
+- **A `positional_options` supervisor, worker or config adapter.** The runtime
+  YAML and package placeholder do exist (see above); the working parts do
+  not, pending Phase 6's persistence/square-off design. See **D56**.
+- **`intraday_stocks` scaffolding of any kind.** Unlike `positional_options`,
+  no placeholder was added — D34 already named it as needing a real consumer
+  before its scanner-driven universe is worth porting, and that judgement is
+  unchanged here.
+- **A real risk gate.** `OrderIntent.risk_decision` is still hardcoded to
+  `ALLOWED` (**D52**, unchanged) — Phase 5/6 was already named as its owner
+  before this phase started, and nothing here changes that.
+- **LaunchAgent wiring for the new entrypoint.** Phase 8's job; `__main__.py`
+  is run manually (`python -m runtimes.intraday_options` or
+  `algo-intraday-options`) until then.
+
+---
+
 ## 2. Reference-repository reuse inventory
 
 Audited read-only on 29 July 2026. **No file under `Trading_Automation` was
@@ -2046,6 +2192,10 @@ guard. See deviation D6.
 | **D51** | **A partial fill is refused at the gateway rather than propagated into the engine's book** | `FillOutcome` carries a price and charges and no quantity, so there is no way to tell `PositionManager` "you got 25 of the 75 you asked for" without widening the Phase 3 port and its ported regression tests. `LifecycleGateway._require_a_fill` therefore raises on `PARTIALLY_FILLED`. **The branch's previous absence was silent**: a partial has fills and an average price, so it passed every check and the engine recorded a full-size `OpenPosition` for exposure the broker never gave it. The partial is still persisted in full — `orders.filled_quantity` is now a running total — it is simply not reported as a fill. |
 | **D52** | **`MARKET_CLOSED` and `RISK_BLOCKED` have no producer yet** | Both rules are implemented and tested. `RISK_BLOCKED` fires on `OrderIntent.risk_decision`, which `OrderLifecycle` currently hardcodes to `ALLOWED` — a real risk gate is Phase 5/6. `MARKET_CLOSED` needs an injected session predicate and is **off by default**, which is a hazard-driven decision rather than an omission: the engine already gates *entries* on the session, while an exit or a square-off legitimately fires at or after the square-off time, so a broker enforcing this by default would refuse exactly the orders that must never be refused. |
 | **D53** | **`max_quote_age_ms` defaults to off** | The staleness rule compares the quote's exchange timestamp against the wall clock, which is meaningful live and meaningless on a replayed tape — where every timestamp is historical and *every* order would be refused. Tape replay is this repository's default execution path, and a setting that breaks every replay is one that gets switched off everywhere and then protects nothing. **A live-feed configuration must set it** (e.g. `2000`). |
+| **D54** | **A blocked live strategy's admission is recorded to `errors` and delivered through the notifier, never written to the `notifications` table** | `repository.record_notification` is defined (`common/execution/repository.py`) but has **no caller anywhere in production code** — every existing alarm in `supervisor.py` (the limitation-15 stuck-subscription alarm, the limitation-13 unclosable-feed alarm) already follows this same two-step pattern: `record_error` for the persisted record, `notifier.send(NotificationEvent(...))` for delivery, and nothing calls `record_notification`. Phase 5's mixed-mode admission refusal follows the established pattern rather than becoming the first caller of an unused method; `tests/end_to_end/test_mode_separation.py` asserts delivery against `RecordingNotifier.events`, not a `notifications` table row. Revisit if/when something actually wires `record_notification` up — at that point this deviation and the unused-method fact both need re-examining together, not separately. |
+| **D55** | **Worker-lock acquisition stays in the child process, not the supervisor** | The spec's PID/lock startup flow (section 8, step 4) reads "For each enabled strategy, acquire its worker lock and reject duplicate execution" from inside what the surrounding steps describe as the supervisor's own sequence. The implementation acquires in `run_worker` (`runtimes/intraday_options/worker.py`), inside the spawned child, and Phase 5 keeps it there rather than moving it to match the literal wording. A lock held by the parent across `multiprocessing.spawn` does not transfer to the child that actually trades — the parent and child are different OS processes with independent `flock` state — so parent-side acquisition would protect the wrong process: two children could still race for the same strategy's state while the parent's lock sat acquired and irrelevant. `test_duplicate_worker_startup_is_refused` and Phase 5's own `test_a_live_mode_contender_is_still_refused_as_a_duplicate` both depend on the lock being held by the process whose state it protects. |
+| **D56** | **Positional-options rollout is split: inert scaffolding shipped now, the working supervisor/worker/persistence layer genuinely deferred to Phase 6/9 — corrected from an earlier draft that deferred all of it** | Spec bullet 6 reads "add positional options and intraday stocks one at a time; keep positional stocks a placeholder" — naming three things and treating them differently. An earlier version of this deviation read "no strategy exists yet" as sufficient reason to defer everything, which was too broad: the bullet singling out "positional stocks" as *the* placeholder only makes sense if "no consumer yet" wasn't meant to excuse the other two equally, and **D34** — written back in the reference audit — already said "Intraday stocks are Phase 5", i.e. this project's own earlier documentation expected incremental movement here. Corrected split: (1) `config/runtimes/positional_options.yaml` (`enabled: false`) and `runtimes/positional_options/__init__.py` are real, loadable, and shipped — matching the exact precedent `intraday_options.yaml` set in Phase 1, and completely inert since nothing scans `config/runtimes/*.yaml` on its own. (2) The supervisor/worker/config-adapter layer stays deferred, and this part **is** a genuine structural blocker, not merely "no consumer": `positions`/`strategy_state`/`order_intents` all key their UNIQUE identity on `trading_date` (migration `0001`), which fragments a position held across sessions into unrelated rows, and `SquareOffPolicy` is same-day wall-clock exit with no multi-day concept — both are Phase 6's explicit job ("restore open paper positions... by strategy and mode", not by date; `force_square_off_before_expiry`; settlement simulation). Building it now would mean either reusing same-day-shaped persistence incorrectly or inventing Phase 6's answer out of order. `intraday_stocks` gets no placeholder at all — D34's "needs a real consumer" reasoning for its scanner-driven universe is unchanged and still applies there. |
+| **D57** | **`discover_enabled_strategies` has no way to scope strategy files to one runtime** | Recorded as its own deviation, separate from D56, because it is a gap in the *mechanism* rather than a deferred *feature*: `StrategyConfig` carries no `runtime_id`, and neither does the spec's own "required resolved strategy fields" list (section 9), so a strategy's runtime membership is established only by filename convention (spec's own example: `io_supertrend_fast_v1`). `discover_enabled_strategies(config_root, runtime_id)` therefore resolves *every* enabled file under `config/strategies/` against whichever `runtime_id` it is called with — correct today because `intraday_options` is the only caller, unsafe the day a second runtime's supervisor calls it against the same directory. See limitation 21. |
 
 #### D22 in detail: the rebuilt premium-candle mapping
 
@@ -3018,6 +3168,21 @@ this part.
 | **Live stays fail-closed** | All 12 `tests/unit/test_broker_factory.py` tests pass unchanged; `build_broker()` still refuses every live configuration, and no `DhanLiveBroker` order method exists |
 | Scripts are read-only | `tests/unit/test_scripts_are_read_only.py` — no broker import, no `/orders` reference, no `put`/`delete`/`patch` call, and `--status` proven offline by making the socket layer raise |
 
+### Verification results (Phase 5, 6 August 2026)
+
+| Property | Evidence |
+|---|---|
+| `load_resolved_config` has a real, non-test caller | `runtimes.intraday_options.__main__.build_supervisor` and `.main`; `discover_enabled_strategies` calls it once per enabled strategy file |
+| Discovery is deterministic and filters correctly | `test_discovery_returns_only_enabled_strategies`, `test_discovery_resolves_every_enabled_strategy_against_the_given_runtime` (sorted filename order), `test_discovery_returns_empty_when_no_strategies_directory_exists`, `test_discovery_propagates_a_broken_strategy_file` (`tests/unit/test_config_loader.py`) |
+| The adapter maps required/optional parameters and risk times correctly, and refuses a malformed config | 11 tests, `tests/unit/test_config_adapter.py`, including `test_engine_is_always_none_regardless_of_strategy_engine_kind` (the Phase 9 boundary) |
+| A blocked live strategy never stops the group | `test_a_live_mode_worker_is_refused_and_never_spawned`, `test_a_blocked_live_worker_does_not_stop_the_paper_strategy` (`tests/end_to_end/test_supervisor.py`) — the paper strategy's exit code is 0, the live strategy never appears in `worker_exit_codes` |
+| **Mode separation holds against real persisted state, keyed on `strategy_id` not `execution_mode`** | `test_mode_separation_survives_a_mixed_paper_and_live_run` (`tests/end_to_end/test_mode_separation.py`) — schema-swept across all 9 `execution_mode`-bearing tables plus `runtime_heartbeats`, plus `paper_fill_quotes` via an explicit join; positive control on the paper strategy's rows runs first |
+| **Duplicate-worker prevention already covers mode, proven not merely argued** | `test_worker_lock_identity_has_no_room_for_mode`, `test_two_worker_locks_for_the_same_strategy_id_collide_regardless_of_caller_intent` (`tests/unit/test_process_locks.py`); `test_a_live_mode_contender_is_still_refused_as_a_duplicate` (`tests/end_to_end/test_walking_skeleton.py`, real spawned processes) — the live-mode contender is refused by the lock before it ever reaches the live gate |
+| `test_duplicate_worker_startup_is_refused` is unchanged by this phase | Same assertions, same pass, confirming the Phase 1 proof needed no modification — see the Part 1 gate discussion above |
+| No regressions anywhere else | Full suite: **all tests pass**, no new skips beyond the pre-existing opt-in live/smoke gates |
+| `ruff check .` | Clean |
+| `mypy` (`common runtimes strategies dashboards scripts`, strict) | Clean, 119 source files |
+
 ## 4. Package decisions
 
 ### `dhanhq` — pinned `2.2.0`, **ratified** (Phase 2, 30 July 2026)
@@ -3828,6 +3993,33 @@ start/stop/crash/restart tests pass.
     Full suite: 1244 passed, 12 skipped (both counts up by one for the two new
     tests) — no regressions.
 
+21. **`discover_enabled_strategies` cannot scope strategy files to one
+    runtime.** `common.config.discover_enabled_strategies(config_root,
+    runtime_id)` resolves every enabled file under `config/strategies/`
+    against whatever `runtime_id` it is called with, because `StrategyConfig`
+    has no `runtime_id` field to filter on — nor does the spec's own "required
+    resolved strategy fields" list (section 9). A strategy's membership in a
+    runtime group today is only a filename convention (the spec's own example
+    is `io_supertrend_fast_v1`, `io_` implying `intraday_options`), never
+    validated. **Not a live risk today**: `intraday_options` is the only
+    runtime that exists, so "every enabled strategy" and "every enabled
+    strategy belonging to this runtime" are the same set. **Becomes a real
+    risk the day a second runtime is added** (`positional_options` or
+    `intraday_stocks`, per **D56**): two supervisors calling this function
+    against the same `config/strategies/` directory would each discover the
+    other's strategies too, and try to build a `WorkerConfig` for a strategy
+    shaped for a different instrument class. The duplicate-worker lock would
+    still prevent both from actually running the same `strategy_id` at once
+    (whichever supervisor starts second is refused, per **D55**'s proof), so
+    this is a startup-time correctness gap, not a double-order risk — but it
+    would still mean the wrong supervisor sometimes wins the race, or an
+    operator sees a confusing refusal for a strategy their runtime was never
+    meant to own. **Fix needed before a second runtime ships**: either an
+    explicit strategy-to-runtime list in the runtime's own YAML, or a
+    validated `strategy_id` prefix convention enforced at load time rather
+    than assumed. Not built now because there is exactly one runtime to test
+    either mechanism against — see **D57**.
+
 
 ### Operational risk noted during the audit
 
@@ -4061,7 +4253,48 @@ mtime is unchanged at the recorded baseline.
 
 Phase 2 is complete, both blocks. **Phase 3 is complete** — all five parts, with its
 acceptance gate met in full. **Phase 4 is complete** — all five parts, its one live
-gate item run and passed. Next is **Phase 5**.
+gate item run and passed. **Phase 5 is complete** — see below. Next is **Phase 6**
+(paper recovery and expiry handling).
+
+### Phase 5 — mixed-mode supervisor and persistence — **COMPLETE**
+
+A pre-work audit found most of the phase's machinery already built in Phases
+1-4 but unwired — config discovery had no non-test caller, and there was no
+CLI entrypoint anywhere in the repository. So this phase was predominantly
+wiring plus proof, not new subsystems; the one real behaviour change is
+`IntradayOptionsSupervisor.add_worker` refusing a live-mode strategy
+individually instead of aborting the whole group. Duplicate-worker prevention
+(spec bullet 4) turned out to already be satisfied by the existing lock's
+mode-free identity — closed with two regression tests, not new code. Full
+detail, including the positional-options rollout split (inert scaffolding
+shipped, supervisor/worker/persistence deferred to Phase 6/9, **D56**) and
+the one open mechanism gap (**limitation 21**), is in "What Phase 5
+delivered" above.
+
+| Property | Status |
+|---|---|
+| Config discovery + `WorkerConfig` adapter + CLI entrypoint | **Done** |
+| Mixed-mode admission (blocked live strategy does not stop the group) | **Done** |
+| Duplicate-worker prevention across mode | **Audited and proven — already closed since Phase 1** |
+| Mode separation, proven against real persisted state | **Done** — schema-swept, `strategy_id`-keyed |
+| Instrument-class rollout — positional options | **Split**: inert config/package scaffolding shipped; supervisor/worker/persistence deferred to Phase 6/9 — see D56 |
+| Instrument-class rollout — intraday stocks | **Deliberately deferred, no scaffolding** — D34's "needs a real consumer" reasoning unchanged |
+| Real risk gate | **Not this phase** — `RISK_BLOCKED` still has no producer (D52, unchanged) |
+
+**Mixed-mode architecture gate (spec section 6), checked against what shipped:**
+
+- Configuration supports one paper and one live-designated strategy in the
+  same group — **yes**, proven with real `WorkerConfig`s in one supervisor.
+- With global live disabled, the live-designated strategy is blocked rather
+  than rerouted to paper — **yes**, `LiveExecutionBlocked`-style refusal,
+  never a fallback broker.
+- The paper strategy continues safely — **yes**,
+  `test_a_blocked_live_worker_does_not_stop_the_paper_strategy`.
+- Broker factory tests prove strategy-wise routing — **already true since
+  Phase 1** (`common/broker/factory.py`, D5), unchanged by this phase.
+- P&L, correlation IDs and positions remain mode-separated — **yes**, proven
+  end to end rather than merely by schema, across every table that carries
+  `strategy_id`.
 
 ### Phase 4 — candle, indicator and paper-execution foundation — **COMPLETE**
 

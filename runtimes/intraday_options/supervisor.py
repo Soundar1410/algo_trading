@@ -60,7 +60,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from common.config.models import ExecutionMode
+from common.config.models import ExecutionMode, LiveGateDecision
 from common.execution import ExecutionRepository
 from common.feed import DEFAULT_TICK_MAX_DEPTH, SharedFeedHub
 from common.feed.hub import WorkerChannel, build_channel
@@ -212,6 +212,10 @@ class IntradayOptionsSupervisor:
         self._hub = SharedFeedHub(self._feed, interval_seconds=config.candle_interval_seconds)
         self._workers: list[tuple[WorkerConfig, WorkerChannel]] = []
         self._processes: dict[str, mp.process.BaseProcess] = {}
+        #: Live-mode strategies :meth:`add_worker` refused rather than spawned,
+        #: with the human-readable reason. Recorded to persistence once ``run()``
+        #: opens the repository — see the mixed-mode admission gate below.
+        self._blocked_workers: list[tuple[WorkerConfig, str]] = []
         #: Upstream control queues, one per tick-channel worker. The child puts a
         #: security_id on its queue when its engine subscribes to a contract at
         #: runtime; this process drains them and asks the hub, which applies the
@@ -234,8 +238,9 @@ class IntradayOptionsSupervisor:
         worker_config: WorkerConfig,
         *,
         tick_channel: bool = False,
-    ) -> WorkerChannel:
-        """Register a strategy. Its queues are created here, before any spawn.
+        live_gate: LiveGateDecision | None = None,
+    ) -> WorkerChannel | None:
+        """Register a strategy, or refuse it individually. Never abort the group.
 
         ``tick_channel=True`` additionally gives the worker the opt-in raw-tick
         queue the ported engine reads, and an upstream control queue for the
@@ -248,16 +253,29 @@ class IntradayOptionsSupervisor:
         configuration. An engine worker spawned without it refuses to start rather
         than silently running the fixture path — see
         :func:`runtimes.intraday_options.engine_worker.run_engine`.
+
+        Args:
+            live_gate: the caller's :func:`~common.config.models.effective_live_gate`
+                result for this strategy. Only consulted for a live-mode worker;
+                irrelevant, and never evaluated, for paper. Omitting it for a
+                live-mode worker is treated as a block, not an oversight that
+                happens to allow — the same fail-closed default
+                ``effective_live_gate`` itself uses for a missing preflight.
+
+        Returns:
+            The registered channel, or ``None`` if this worker was refused. A
+            live-designated strategy that fails the gate is refused *by
+            itself* — this method never raises for that reason and never stops
+            a paper strategy elsewhere in the same group from starting. Spec
+            line 2973-2974: the live strategy is blocked, not rerouted to
+            paper, and the paper strategy continues safely.
         """
         if worker_config.execution_mode is not ExecutionMode.PAPER:
-            # Phase 1 has no live path at all. The broker factory would refuse
-            # anyway; refusing here too means the supervisor never even spawns
-            # a process that is guaranteed to fail.
-            raise ValueError(
-                f"Strategy {worker_config.strategy_id!r} requests "
-                f"{worker_config.execution_mode.value} mode; Phase 1 is paper-only "
-                "and live execution is not implemented."
+            self._blocked_workers.append(
+                (worker_config, self._live_admission_refusal(worker_config, live_gate))
             )
+            _log.error("%s", self._blocked_workers[-1][1])
+            return None
         channel = build_channel(
             worker_config.strategy_id,
             [worker_config.security_id],
@@ -270,6 +288,33 @@ class IntradayOptionsSupervisor:
         if tick_channel:
             self._control_queues[worker_config.strategy_id] = mp.get_context("spawn").Queue()
         return channel
+
+    @staticmethod
+    def _live_admission_refusal(
+        worker_config: WorkerConfig, live_gate: LiveGateDecision | None
+    ) -> str:
+        """Why a live-mode worker was refused. Always something — never silent."""
+        if live_gate is None:
+            reasons = "no live gate decision was evaluated for this worker"
+        elif not live_gate.allowed:
+            reasons = "; ".join(live_gate.blocked_reasons)
+        else:
+            # Unreachable until Phase 10 delivers DhanLiveBroker order placement.
+            # Written as a hard stop for the same reason common.broker.factory
+            # does (see LiveExecutionBlocked there): if a future change ever lets
+            # the gate open, this must still refuse rather than spawn a process
+            # guaranteed to fail once it reaches build_broker.
+            return (
+                f"Strategy {worker_config.strategy_id!r} passed the live gate, but live "
+                "order placement is not implemented. DhanLiveBroker order methods "
+                "arrive in Phase 10. The rest of the group continues."
+            )
+        return (
+            f"Strategy {worker_config.strategy_id!r} is configured for live execution "
+            f"but the live gate blocks it: {reasons}. This strategy will not start. It "
+            "is deliberately NOT rerouted to paper — a live strategy running as paper "
+            "would misrepresent real exposure. The rest of the group continues."
+        )
 
     def control_queue(self, strategy_id: str) -> Any | None:
         """The upstream subscription-request queue for one worker, if it has one."""
@@ -318,6 +363,30 @@ class IntradayOptionsSupervisor:
             strategy_id=None,
         )
         heartbeat.beat(HealthState.STARTING, force=True)
+
+        # Record every live-mode refusal add_worker() collected, before spawning
+        # anything admitted. Recorded, not just logged: an operator reading only
+        # the database must be able to see that a strategy was deliberately
+        # blocked, not silently missing. See test coverage for the mixed-mode
+        # gate's requirement that this never shows up as a paper-mode row.
+        for worker_config, reason in self._blocked_workers:
+            repository.record_error(
+                runtime_id=self._config.runtime_id,
+                strategy_id=worker_config.strategy_id,
+                execution_mode=worker_config.execution_mode,
+                severity="ERROR",
+                component="supervisor.live_gate",
+                message=reason,
+            )
+            self._notifier.send(
+                NotificationEvent(
+                    event_type="live_strategy_blocked",
+                    message=reason,
+                    runtime_id=self._config.runtime_id,
+                    strategy_id=worker_config.strategy_id,
+                    execution_mode=worker_config.execution_mode,
+                )
+            )
 
         try:
             context = mp.get_context("spawn")

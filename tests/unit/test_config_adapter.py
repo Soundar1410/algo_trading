@@ -1,0 +1,118 @@
+"""ResolvedConfig -> WorkerConfig: the adapter Phase 5 adds."""
+
+from __future__ import annotations
+
+from datetime import time
+from pathlib import Path
+
+import pytest
+
+from common.config import ConfigError, EngineKind, ExecutionMode, ResolvedConfig
+from common.config.models import GlobalConfig, RuntimeConfig, StrategyConfig
+from runtimes.intraday_options.config_adapter import build_worker_config
+
+
+def _cfg(**strategy_overrides) -> ResolvedConfig:
+    strategy_kwargs = {
+        "strategy_id": "io_fixture_v1",
+        "enabled": True,
+        "engine": EngineKind.TRADING_ENGINE,
+        "parameters": {"instrument": "NIFTY", "security_id": "99926000"},
+        "risk": {},
+    }
+    strategy_kwargs.update(strategy_overrides)
+    return ResolvedConfig(
+        global_config=GlobalConfig(),
+        runtime=RuntimeConfig(runtime_id="intraday_options", enabled=True),
+        strategy=StrategyConfig(**strategy_kwargs),
+    )
+
+
+def _build(cfg: ResolvedConfig, tmp_path: Path):
+    return build_worker_config(
+        cfg,
+        database_path=tmp_path / "db.sqlite",
+        lock_dir=tmp_path / "locks",
+        pid_dir=tmp_path / "pid",
+        log_dir=tmp_path / "logs",
+        trading_date="2026-08-06",
+    )
+
+
+def test_required_parameters_are_mapped(tmp_path: Path):
+    worker = _build(_cfg(), tmp_path)
+    assert worker.strategy_id == "io_fixture_v1"
+    assert worker.instrument == "NIFTY"
+    assert worker.security_id == "99926000"
+    assert worker.runtime_id == "intraday_options"
+    assert worker.trading_date == "2026-08-06"
+
+
+def test_missing_security_id_raises_config_error(tmp_path: Path):
+    cfg = _cfg(parameters={"instrument": "NIFTY"})
+    with pytest.raises(ConfigError, match="security_id"):
+        _build(cfg, tmp_path)
+
+
+def test_missing_instrument_raises_config_error(tmp_path: Path):
+    cfg = _cfg(parameters={"security_id": "99926000"})
+    with pytest.raises(ConfigError, match="instrument"):
+        _build(cfg, tmp_path)
+
+
+def test_optional_parameters_default_like_workerconfig(tmp_path: Path):
+    worker = _build(_cfg(), tmp_path)
+    assert worker.quantity == 50
+    assert worker.entry_on_candle == 1
+    assert worker.exit_on_candle == 3
+    assert worker.paper_execution == {}
+
+
+def test_optional_parameters_are_honoured_when_present(tmp_path: Path):
+    cfg = _cfg(
+        parameters={
+            "instrument": "NIFTY",
+            "security_id": "99926000",
+            "quantity": 75,
+            "entry_on_candle": 2,
+            "exit_on_candle": 5,
+            "paper_execution": {"submission_latency_ms": 250},
+        }
+    )
+    worker = _build(cfg, tmp_path)
+    assert worker.quantity == 75
+    assert worker.entry_on_candle == 2
+    assert worker.exit_on_candle == 5
+    assert worker.paper_execution == {"submission_latency_ms": 250}
+
+
+def test_risk_times_become_the_square_off_policy(tmp_path: Path):
+    cfg = _cfg(risk={"entry_cutoff": "15:00", "square_off_at": "15:15"})
+    worker = _build(cfg, tmp_path)
+    assert worker.square_off_policy.entry_cutoff == time(15, 0)
+    assert worker.square_off_policy.square_off_at == time(15, 15)
+
+
+def test_bad_risk_time_format_raises_config_error(tmp_path: Path):
+    cfg = _cfg(risk={"entry_cutoff": "not-a-time"})
+    with pytest.raises(ConfigError, match="entry_cutoff"):
+        _build(cfg, tmp_path)
+
+
+def test_execution_mode_is_carried_through(tmp_path: Path):
+    cfg = _cfg(mode=ExecutionMode.LIVE, live_approved=True)
+    worker = _build(cfg, tmp_path)
+    assert worker.execution_mode is ExecutionMode.LIVE
+
+
+def test_engine_is_always_none_regardless_of_strategy_engine_kind(tmp_path: Path):
+    """Phase 9 boundary: no real strategy exists yet to build an EngineWorkerConfig for."""
+    cfg = _cfg(engine=EngineKind.MULTI_LEG_ENGINE)
+    worker = _build(cfg, tmp_path)
+    assert worker.engine is None
+
+
+def test_config_fingerprint_is_set(tmp_path: Path):
+    worker = _build(_cfg(), tmp_path)
+    assert worker.config_fingerprint
+    assert isinstance(worker.config_fingerprint, str)

@@ -40,6 +40,12 @@ dependencies = [
     "psutil>=5.9",                # PID validation beyond bare pid-file checks
 ]
 
+[project.scripts]
+# Phase 5: the supervisor entrypoint, previously only reachable as
+# `python -m runtimes.intraday_options`. Both keep working; this is a
+# convenience alias installed with the package.
+algo-intraday-options = "runtimes.intraday_options.__main__:main"
+
 [project.optional-dependencies]
 # NOT installed by default: py_lets_be_rational can be awkward to build on some
 # macOS/Python combinations. Add only when a named strategy needs Greek

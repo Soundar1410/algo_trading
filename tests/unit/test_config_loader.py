@@ -17,6 +17,7 @@ from common.config import (
     StrategyConfig,
     apply_env_overrides,
     deep_merge,
+    discover_enabled_strategies,
     effective_live_gate,
     fingerprint,
     load_resolved_config,
@@ -281,6 +282,15 @@ def test_shipped_repository_config_cannot_reach_a_live_allow(populated_config: P
     assert load_global_config(repo_config).live_trading_enabled is False
 
 
+def test_shipped_positional_options_runtime_is_valid_and_disabled():
+    """D56: the positional_options runtime file is real, inert scaffolding —
+    loadable today, disabled until Phase 6/9 build something to enable."""
+    repo_config = Path(__file__).resolve().parents[2] / "config"
+    runtime = load_runtime_config(repo_config, "positional_options")
+    assert runtime.runtime_id == "positional_options"
+    assert runtime.enabled is False
+
+
 # ------------------------------------------------------------- fingerprint
 def test_fingerprint_is_stable_across_key_order():
     a = {"b": 2, "a": {"y": 1, "x": 2}}
@@ -303,3 +313,45 @@ def test_fingerprint_is_deterministic_across_calls(populated_config: Path):
         populated_config, "intraday_options", "io_fixture_v1", settings=Settings()
     )
     assert fingerprint(cfg) == fingerprint(cfg)
+
+
+# --------------------------------------------------------- strategy discovery
+def test_discovery_returns_only_enabled_strategies(populated_config: Path):
+    _write(
+        populated_config / "strategies" / "io_disabled_v1.yaml",
+        "strategy_id: io_disabled_v1\nenabled: false\n",
+    )
+    resolved = discover_enabled_strategies(
+        populated_config, "intraday_options", settings=Settings()
+    )
+    assert [cfg.strategy.strategy_id for cfg in resolved] == ["io_fixture_v1"]
+
+
+def test_discovery_resolves_every_enabled_strategy_against_the_given_runtime(
+    populated_config: Path,
+):
+    _write(
+        populated_config / "strategies" / "io_second_v1.yaml",
+        "strategy_id: io_second_v1\nenabled: true\n",
+    )
+    resolved = discover_enabled_strategies(
+        populated_config, "intraday_options", settings=Settings()
+    )
+    # Sorted filename order: deterministic across runs.
+    assert [cfg.strategy.strategy_id for cfg in resolved] == ["io_fixture_v1", "io_second_v1"]
+    assert all(cfg.runtime.runtime_id == "intraday_options" for cfg in resolved)
+
+
+def test_discovery_returns_empty_when_no_strategies_directory_exists(tmp_path: Path):
+    assert discover_enabled_strategies(tmp_path / "config", "intraday_options") == []
+
+
+def test_discovery_propagates_a_broken_strategy_file(populated_config: Path):
+    """A malformed strategy file is an operator error — the group does not
+    start short one strategy nobody noticed."""
+    _write(
+        populated_config / "strategies" / "io_broken_v1.yaml",
+        "strategy_id: io_broken_v1\nenabled: true\nlive_aproved: true\n",
+    )
+    with pytest.raises(ConfigError, match="Invalid configuration"):
+        discover_enabled_strategies(populated_config, "intraday_options", settings=Settings())
