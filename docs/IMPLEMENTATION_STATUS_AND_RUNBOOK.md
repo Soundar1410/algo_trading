@@ -7,9 +7,9 @@ the next phase. Updated after every phase.
 
 | | |
 |---|---|
-| **Current phase** | Phase 4 **Parts 1-4 complete; Part 5 code complete**. **Part 5** (`PaperBroker` realism) closes limitation 5 and deviation D11: depth reaches the fill through a shared `QuoteBook`, a buy takes the ask and a sell the bid, the price is rounded adversely onto the tick grid, limit orders rest and settle from later quotes, partial fills accumulate correctly, and the spec's nine rejection rules are implemented behind a code enum. The pre-work audit corrected two wrong notes in this document and found four things that changed the work — including that Dhan publishes `SEM_TICK_SIZE` in **paise**, so a model trusting the column would have put NIFTY options on a ₹5 grid. New deviations **D48-D53** state what is *not* claimed. Awaiting review |
-| **Next phase** | **Run the outstanding Part 5 gate item** — the opt-in Full-mode depth capture against a real `NSE_FNO` option, which needs market hours (09:15–15:30 IST); command in [Commands](#5-commands). Then Phase 5 |
-| **Last updated** | 6 August 2026 — limitations 18 and 19 fixed and closed; limitation 20 (new) recorded, see [Known limitations](#6-known-limitations) |
+| **Current phase** | **Phase 4 complete — Parts 1-5 all complete.** **Part 5** (`PaperBroker` realism) closes limitation 5 and deviation D11: depth reaches the fill through a shared `QuoteBook`, a buy takes the ask and a sell the bid, the price is rounded adversely onto the tick grid, limit orders rest and settle from later quotes, partial fills accumulate correctly, and the spec's nine rejection rules are implemented behind a code enum. The pre-work audit corrected two wrong notes in this document and found four things that changed the work — including that Dhan publishes `SEM_TICK_SIZE` in **paise**, so a model trusting the column would have put NIFTY options on a ₹5 grid. New deviations **D48-D53** state what is *not* claimed. **The live Full-mode gate item ran 6 August 2026 and passed clean** — see "What is asserted rather than proven" under Part 5. Along the way it surfaced and closed known limitations 18, 19 and 20 (none of them Part 5 defects — an auth-gating bug, a request-shape bug, and an exchange-timezone bug, all found only because this was the first time this repo's live path was actually exercised end to end). Awaiting review |
+| **Next phase** | **Phase 4 is done pending your review.** Once reviewed, next is Phase 5 (mixed-mode supervisor and persistence) |
+| **Last updated** | 6 August 2026 — Part 5's live gate item passed; Phase 4 Parts 1-5 all complete; limitations 18, 19 and 20 fixed and closed, see [Known limitations](#6-known-limitations) |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
 | **Live order placement** | **Not implemented.** Fail-closed. Phase 10 only. |
@@ -24,7 +24,7 @@ the next phase. Updated after every phase.
 | 1 | Walking skeleton | **Complete** |
 | 2 | Dhan and shared-feed hardening | **Complete** — Block 1 (offline) + Block 2 (live) |
 | 3 | Preserve custom engines and policies | **Complete.** **Part 1 complete** (live-feed shutdown); **Part 2a complete** (exit registry + SuperTrend port); **Part 2b-i complete** (signal ownership + engine core); **Part 2b-ii-A complete** (the feed seam: tick channel, runtime subscription, `HubTickFeed`); **Part 2b-ii-B-1 complete** (the execution seam: square-off authority, `LifecycleGateway`, entry-block on tick drop); **Part 2b-ii-B-2 complete** (the wiring: worker engine path, supervisor queue delivery, engine restart recovery, D20 reporting bindings). **Phase 3 complete** — its acceptance gate is met in full |
-| 4 | Candle, indicator and paper-execution foundation | **In progress.** **Part 1 complete** (real contract resolution — closes 17, alarms 15). **Part 2 complete** (indicator layer — closes D21). **Part 3 complete** (continuity, timezone, wall-clock square-off — closes 4 and 7, and a live blocker). **Part 4 complete** (warm-up source and injection — closes 16). **Part 5 code complete** (`PaperBroker` realism — closes 5 and D11), **pending one live gate item**: the opt-in Full-mode depth capture against a real `NSE_FNO` option has not been run |
+| 4 | Candle, indicator and paper-execution foundation | **Complete.** **Part 1 complete** (real contract resolution — closes 17, alarms 15). **Part 2 complete** (indicator layer — closes D21). **Part 3 complete** (continuity, timezone, wall-clock square-off — closes 4 and 7, and a live blocker). **Part 4 complete** (warm-up source and injection — closes 16). **Part 5 complete** (`PaperBroker` realism — closes 5 and D11; the live Full-mode gate item ran 6 August 2026 and passed, closing known limitation 20 along the way). **Phase 4 complete** — all five parts done, its one live gate item proven rather than asserted |
 | 5 | Mixed-mode supervisor and persistence | Not started |
 | 6 | Paper recovery and expiry handling | Not started |
 | 7 | Operations | Not started |
@@ -1110,7 +1110,7 @@ test). `ruff` and `mypy` clean across 112 source files.
 | `tests/integration/test_execution_persistence.py` (+7) | Two fills accumulating into one `orders` row, the quantity-weighted average, the `PARTIALLY_FILLED` status, and the submission-time quote landing in `paper_fill_quotes` |
 | `tests/unit/test_migrations.py` (+1, 3 updated) | `0003` applies once, replays cleanly, and upgrades a 0001-only database — and that `fills` was **not** widened in place |
 | `tests/integration/test_engine_lifecycle_gateway.py` (+1) | A partial fill raising rather than being reported as whole, with the partial still fully audited |
-| `tests/smoke/test_live_feed_smoke.py` (+1, opt-in) | **The outstanding gate item.** A real `NSE_FNO` option in Full mode delivering a two-sided book |
+| `tests/smoke/test_live_feed_smoke.py` (+1, opt-in) | **The gate item — run live 6 August 2026, passed.** A real `NSE_FNO` option in Full mode delivering a two-sided book, including the exchange-time trip-wire (limitation 20) |
 
 **Tests whose expectations moved, and why each is correct.** Three legs of the
 suite now price differently, and none of it is a weakened assertion:
@@ -1123,19 +1123,32 @@ should not move when pricing changes.
 
 #### What is asserted rather than proven
 
-**The live Full-mode capture has not been run.** `tests/smoke/test_live_feed_smoke.py::
-test_a_real_option_in_full_mode_delivers_a_two_sided_book` is written and opt-in,
-and it is the one gate item that must be run against the real socket during market
-hours (09:15–15:30 IST). Until it passes, the claim "a real `NSE_FNO` option in
-mode 21 delivers a two-sided book" rests on the SDK's source and on a Full frame
-packed from Dhan's documented layout and parsed by the SDK's own `process_full` —
-which is strong evidence about *shape* and no evidence at all about what the
-exchange actually sends. Part 5 is not complete until that capture lands.
+**~~The live Full-mode capture has not been run.~~ CLOSED, 6 August 2026.**
+`tests/smoke/test_live_feed_smoke.py::test_a_real_option_in_full_mode_delivers_a_two_sided_book`
+ran live against the real socket during market hours and passed clean, on the
+default cache-reusing auth path (no fresh login) with the token validated
+beforehand via a real `GET /v2/profile` call. Every assertion held: the mode
+split (index on Ticker, contract on Full mode 21, one adapter, one socket), a
+two-sided book (`bid_price`/`ask_price` both present, `0 < bid ≤ ask`),
+`ticks_with_depth > 0`, `malformed_payloads == 0`, and —
+**`tick.exchange_time <= tick.received_at`**, which is the assertion that
+failed on the *first* live attempt earlier the same day and led to known
+limitation 20. That fix is what made this run fully clean: the first live
+attempt reached a real two-sided book already (proving the depth claim), but
+failed this specific assertion; today's re-run, after the fix landed
+(commit `d055f54`), passed it too. The new standing trip-wire
+(`test_every_live_tick_has_a_sane_exchange_time`, added closing limitation
+20) was also run live and passed. The claim "a real `NSE_FNO` option in mode
+21 delivers a two-sided book" no longer rests only on the SDK's source and a
+packed Full frame — it is now proven against what the exchange actually
+sends. **Part 5 is complete.**
 
 Separately, **D48 is a real residual, not a formality**: on a live feed a market
 order still fills at its submission quote, because the post-latency quote does not
 exist when `submit()` is called. `Fill.latency_applied` and
-`PaperBroker.latency_not_applied` make that a number rather than a paragraph.
+`PaperBroker.latency_not_applied` make that a number rather than a paragraph. D48,
+D51 and D53 remain open by design — they are documented scope boundaries, not
+gate items, and nothing above closes them.
 
 ### What Phase 4 Part 4 delivered — warm-up source and injection
 
@@ -2809,7 +2822,7 @@ the pre-existing `dashboards/app.py` dual-module-name error, unrelated to this p
 | Live still fail-closed | `DhanLiveBroker` absent; `build_broker` unchanged and all 12 factory tests pass; the new resolver touches no order path and `OptionChainService` gained no caller |
 | `Trading_Automation` untouched | Newest source+config mtime re-run against the recorded baseline: **`2026-07-28 10:29:14 .../tests/test_warmup_coordinator.py`** — unchanged |
 | **The offline half of the rehearsal has been RUN against the real master** | `ALGO_LIVE_SMOKE=1 pytest -k test_the_scrip_master_resolves_a_real_contract` → **1 passed in 7.70s**, 1 August 2026. Real numbers below |
-| **Not claimed:** the market-hours half has not been run | `test_a_real_option_contract_delivers_ticks_on_the_fno_segment` needs a live session — an option that has not traded delivers nothing. Until it runs, the **feed** half of "real contracts work" is asserted, not proven. Resolution itself is now proven against the real broker data |
+| **The market-hours half has now been RUN against the real socket** | `ALGO_LIVE_SMOKE=1 pytest -k test_a_real_option_contract_delivers_ticks_on_the_fno_segment` → **1 passed in 2.62s**, 6 August 2026, on the default cache-reusing auth path. The **feed** half of "real contracts work" is proven, not just asserted — a real resolved option contract delivered a live tick on `NSE_FNO` |
 
 **What the real master actually returned** (NIFTY, 1 August 2026):
 
@@ -3211,9 +3224,11 @@ ALGO_LIVE_SMOKE=1 ALGO_SMOKE_EXPIRY=YYYY-MM-DD \
   .venv/bin/python -m pytest tests/smoke -v
 ```
 
-**The Phase 4 Part 5 gate item — outstanding.** Depth is only real on a Full-mode
-subscription to a real `NSE_FNO` option, so it can only be confirmed with the
-socket, during market hours (09:15–15:30 IST):
+**The Phase 4 Part 5 gate item — closed, 6 August 2026.** Depth is only real on a
+Full-mode subscription to a real `NSE_FNO` option, so it could only be confirmed
+with the socket, during market hours (09:15–15:30 IST). It has been: the command
+below ran live and passed, including the exchange-time trip-wire added closing
+limitation 20. Kept here as the repeatable command for any future re-verification:
 
 ```bash
 # The gate assertion: a real option in mode 21 delivers a two-sided book.
@@ -3331,9 +3346,11 @@ start/stop/crash/restart tests pass.
    rather than sized into the engine's book (**D51**). And `max_quote_age_ms`
    defaults to off, so a live configuration must set it (**D53**).
 
-   **One gate item is outstanding**: the opt-in Full-mode capture against a real
-   `NSE_FNO` option has not been run. See "What is asserted rather than proven"
-   under Part 5.
+   **The one gate item is closed.** The opt-in Full-mode capture against a real
+   `NSE_FNO` option ran live on 6 August 2026 and passed clean, including the
+   exchange-time trip-wire added closing limitation 20. See "What is asserted
+   rather than proven" under Part 5. **Limitation 5 and deviation D11 are fully
+   closed; nothing about the fill model remains asserted-not-proven.**
 6. **Migration atomicity is by replay, not transactions** (deviation D6).
 7. **~~Square-off is driven by the candle clock, not a wall clock.~~ CLOSED**
    (Phase 4 Part 3). The candle clock is still the primary trigger and still the
@@ -3576,9 +3593,17 @@ start/stop/crash/restart tests pass.
     configuration defaulted to. Full numbers in the Part 1 gate evidence
     (section 4).
 
-    **What is still asserted rather than proven:** that those ids actually stream.
-    `test_a_real_option_contract_delivers_ticks_on_the_fno_segment` needs market
-    hours and has not been run. Resolution is proven; delivery is not.
+    **~~What is still asserted rather than proven: that those ids actually
+    stream.~~ Proven, 6 August 2026.**
+    `test_a_real_option_contract_delivers_ticks_on_the_fno_segment` ran live
+    (`ALGO_LIVE_SMOKE=1 pytest -k test_a_real_option_contract_delivers_ticks_on_the_fno_segment`
+    → 1 passed in 2.62s), on the default cache-reusing auth path — no fresh
+    login. A real resolved contract delivered a live tick on `NSE_FNO`, with
+    `tick.last_price > 0` and `tick.exchange_time <= tick.received_at` (the
+    latter meaningful now that known limitation 20 is fixed; this run is
+    additional live confirmation of that fix, not just of resolution).
+    Resolution and delivery are now both proven. **Limitation 17 has no
+    remaining residual.**
 
 18. **~~Generating a fresh Dhan access token for the shared client ID invalidates
     whichever token was previously active — for both systems.~~ FIXED** (6 August
@@ -4035,15 +4060,19 @@ mtime is unchanged at the recorded baseline.
 ## 8. Next phase
 
 Phase 2 is complete, both blocks. **Phase 3 is complete** — all five parts, with its
-acceptance gate met in full. Next is **Phase 4**.
+acceptance gate met in full. **Phase 4 is complete** — all five parts, its one live
+gate item run and passed. Next is **Phase 5**.
 
-### Phase 4 — candle, indicator and paper-execution foundation — **IN PROGRESS**
+### Phase 4 — candle, indicator and paper-execution foundation — **COMPLETE**
 
-**All five parts are code complete. One item stands between Phase 4 and done:**
-the opt-in Full-mode depth capture against a real `NSE_FNO` option, which needs the
-socket and market hours (09:15–15:30 IST). The command is in section 5. Until it
-passes, Part 5's central claim — that a real option in mode 21 delivers a
-two-sided book — is inferred from the SDK's source rather than observed.
+**All five parts are complete, including the live gate item.** The opt-in
+Full-mode depth capture against a real `NSE_FNO` option — the item that stood
+between Phase 4 and done — ran live on 6 August 2026 and passed clean. The
+command is in section 5. Part 5's central claim — that a real option in mode 21
+delivers a two-sided book — is now observed against the real socket, not just
+inferred from the SDK's source. Along the way it surfaced and closed known
+limitations 18, 19 and 20 — none of them Part 5 defects, all found only because
+this was the first time the live path was actually exercised end to end.
 
 Split into **five parts, in strict order**, using the rule Phase 3 used five times:
 separate what is provable offline from what changes the deployed shape, and keep
@@ -4055,7 +4084,7 @@ independent concerns apart. **Stop for review after each part.**
 | 2 | Indicator layer (EMA/RSI/VWAP/ATR/ADX) | D21 | — | **COMPLETE** (1 Aug 2026) |
 | 3 | Candle continuity, session/timezone, wall-clock square-off | 4, 7, a live blocker | — | **COMPLETE** (1 Aug 2026) |
 | 4 | Warm-up source and injection | 16 | 2, 3 | **COMPLETE** (5 Aug 2026) |
-| 5 | `PaperBroker` realism | 5, D11 | 1 | **CODE COMPLETE** (5 Aug 2026) — one live gate item outstanding |
+| 5 | `PaperBroker` realism | 5, D11 | 1 | **COMPLETE** (code 5 Aug 2026; live gate item 6 Aug 2026) |
 
 **Why Part 1 came first**, since the ordering was not obvious and the reason
 recorded when this list was first written was the weaker of the two: it is not
@@ -4113,9 +4142,11 @@ record: "What Phase 4 Part 4 delivered" (section 1), deviations D43-D47,
 limitation 16 closed (with both the stated residual and this gap corrected
 rather than left overstated), and the Part 4 gate evidence in section 4.
 
-**Part 5 — `PaperBroker` realism — CODE COMPLETE**, with one live gate item
-outstanding. Limitations 5 and D11 closed; new deviations **D48-D53**. Full
-record: "What Phase 4 Part 5 delivered" (section 1).
+**Part 5 — `PaperBroker` realism — COMPLETE.** Code complete 5 August 2026; its
+live gate item ran and passed 6 August 2026, closing known limitation 20 along
+the way. Limitations 5 and D11 fully closed; new deviations **D48-D53** (D48,
+D51, D53 remain open by design — documented scope boundaries, not gate items).
+Full record: "What Phase 4 Part 5 delivered" (section 1).
 
 **Two notes written here while planning turned out to be wrong, and are corrected
 rather than deleted, because both were load-bearing:**
@@ -4142,10 +4173,10 @@ The comment claiming "Quote/Full add depth" *was* wrong as recorded, and is fixe
 with the code: `process_quote` (mode 17) returns volume and session OHLC and no
 book; only `process_full` (mode 21) carries one.
 
-**Read "What is asserted rather than proven" before treating this part as done.**
-Every offline claim is tested; the claim that a real `NSE_FNO` option in mode 21
-delivers a two-sided book is not yet, because that needs the socket and market
-hours.
+**~~Read "What is asserted rather than proven" before treating this part as
+done.~~ Resolved, 6 August 2026** — see that section: the claim that a real
+`NSE_FNO` option in mode 21 delivers a two-sided book is now proven live, not
+just asserted offline.
 
 **Struck from Phase 4 scope: "mode-namespaced correlation IDs."** The architecture
 document lists it as a Phase 4 bullet, but it has been delivered since Phase 1 at
