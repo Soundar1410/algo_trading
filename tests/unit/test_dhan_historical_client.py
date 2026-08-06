@@ -9,6 +9,14 @@ which Dhan's own documentation does not support for this endpoint (it wants a
 full datetime). Written to fail against a naive
 ``from_at.strftime("%Y-%m-%d")`` port, and to pass against the corrected
 ``"%Y-%m-%d %H:%M:%S"`` format.
+
+**Known limitation 19, fixed.** ``test_fetch_intraday_sends_the_documented_
+auth_headers`` used to assert the bug itself -- it expected a ``dhanClientId``
+header, which is what ``fetch_intraday`` sent until both the client and this
+test were corrected against the installed SDK's own ``dhan_http.py``:
+``"client-id"`` is the header key, and ``dhanClientId`` belongs in the JSON
+body. Both that test and ``test_fetch_intraday_builds_the_documented_request_
+shape`` now assert the corrected shape and would fail against the old one.
 """
 
 from __future__ import annotations
@@ -89,6 +97,7 @@ def test_fetch_intraday_builds_the_documented_request_shape() -> None:
     assert body["exchangeSegment"] == "IDX_I"
     assert body["instrument"] == "INDEX"
     assert body["interval"] == 1
+    assert body["dhanClientId"] == "client-1"
     assert set(body) == {
         "securityId",
         "exchangeSegment",
@@ -96,6 +105,7 @@ def test_fetch_intraday_builds_the_documented_request_shape() -> None:
         "interval",
         "fromDate",
         "toDate",
+        "dhanClientId",
     }
 
 
@@ -117,6 +127,14 @@ def test_fetch_intraday_builds_the_documented_from_and_to_date_format() -> None:
 
 
 def test_fetch_intraday_sends_the_documented_auth_headers() -> None:
+    """Known limitation 19, now fixed. This test used to assert the bug: it
+    expected a "dhanClientId" header, which is what the client sent until this
+    test was corrected against the installed SDK's own dhan_http.py
+    (``"client-id"`` header at ``dhan_http.py:43``; ``dhanClientId`` belongs in
+    the JSON body instead -- see ``test_fetch_intraday_builds_the_documented_
+    request_shape``). Fails against the old shape, passes against the
+    corrected one.
+    """
     post = _RecordingPost([_success_response()])
     client = _client(post)
     client.fetch_intraday(
@@ -128,7 +146,10 @@ def test_fetch_intraday_sends_the_documented_auth_headers() -> None:
     )
     headers = post.calls[0]["headers"]
     assert headers["access-token"] == "token-1"
-    assert headers["dhanClientId"] == "client-1"
+    assert headers["client-id"] == "client-1"
+    assert "dhanClientId" not in headers, (
+        "dhanClientId belongs in the JSON body, not a header -- see known limitation 19"
+    )
 
 
 def test_success_response_is_returned_as_is() -> None:

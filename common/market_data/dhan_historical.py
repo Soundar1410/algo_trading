@@ -22,6 +22,18 @@ fallback for a nested shape anyway, since the still-unverified case (a partial
 candle for the still-forming period during live market hours) has no captured
 evidence in this repository either way.
 
+**Client-identity fields, corrected against the SDK's own source, not just
+documentation (known limitation 19, fixed).** This module used to send
+``dhanClientId`` as an HTTP header and nothing in the JSON body. The installed
+``dhanhq==2.2.0`` SDK's ``dhan_http.py`` shows the real contract for a POST:
+``"client-id"`` is the header key (``dhan_http.py:43``), and ``dhanClientId``
+is injected into the JSON body unconditionally, for every POST, before it is
+sent (``dhan_http.py:53-56``). ``fetch_intraday`` now matches that shape.
+Whether the old shape ever actually failed a live call is not established —
+this endpoint has still never been exercised against a real one — which is
+exactly why the correction is against the SDK's source rather than against an
+observed failure.
+
 **Retry is single-process and single-call scoped, deliberately narrow.** A
 bounded number of attempts with short backoff for *this worker's own* fetch —
 nothing here coordinates across processes. Multiple strategy workers starting
@@ -142,10 +154,18 @@ class DhanHistoricalDataClient:
             # full "YYYY-MM-DD HH:MM:SS" datetime, not a bare date.
             "fromDate": from_at.strftime("%Y-%m-%d %H:%M:%S"),
             "toDate": to_at.strftime("%Y-%m-%d %H:%M:%S"),
+            # Known limitation 19, fixed: the installed SDK's own dhan_http.py
+            # injects this into the body of every POST unconditionally
+            # (dhan_http.py:53-56) -- it does not send it as a header. This
+            # used to be a "dhanClientId" header instead, which the SDK's
+            # source shows Dhan does not read for a POST.
+            "dhanClientId": self._client_id,
         }
         headers = {
             "access-token": self._access_token,
-            "dhanClientId": self._client_id,
+            # "client-id", not "dhanClientId" -- matches the SDK's own header
+            # key (dhan_http.py:43). See known limitation 19.
+            "client-id": self._client_id,
             "Content-Type": "application/json",
         }
 

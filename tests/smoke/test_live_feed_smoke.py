@@ -305,11 +305,15 @@ def test_the_option_chain_throttle_holds_against_the_real_endpoint():
     def fetch(security_id: int, segment: str, chain_expiry: str) -> dict[str, object]:
         response = httpx.post(
             "https://api.dhan.co/v2/optionchain",
-            headers={"access-token": token, "dhanClientId": client_id},
+            # "client-id", not "dhanClientId" -- and dhanClientId belongs in
+            # the body, not a header. See known limitation 19; matches the
+            # SDK's own dhan_http.py.
+            headers={"access-token": token, "client-id": client_id},
             json={
                 "UnderlyingScrip": security_id,
                 "UnderlyingSeg": segment,
                 "Expiry": chain_expiry,
+                "dhanClientId": client_id,
             },
             timeout=15.0,
         )
@@ -594,14 +598,28 @@ def test_the_still_forming_bucket_is_excluded_from_a_live_fetch() -> None:
         )
 
 
-def _index_last_price(meta) -> float:  # type: ignore[no-untyped-def]
-    """The index's LTP, via the same read-only endpoint Phase 2 Block 2 used."""
+def _index_last_price(meta, *, token: str | None = None, http_post=None) -> float:  # type: ignore[no-untyped-def]
+    """The index's LTP, via the same read-only endpoint Phase 2 Block 2 used.
+
+    ``token``/``http_post`` are injectable so the request *shape* can be unit
+    tested without credentials or a network call -- see
+    ``tests/unit/test_smoke_request_shapes.py``, which is what would have
+    caught known limitation 19. Left unset, as every real call here leaves
+    them, this behaves exactly as before: resolve a token the normal way and
+    call the real endpoint.
+    """
     import httpx
 
-    response = httpx.post(
+    resolved_token = token if token is not None else _token()
+    post = http_post or httpx.post
+    response = post(
         "https://api.dhan.co/v2/marketfeed/ltp",
-        headers={"access-token": _token(), "dhanClientId": str(_CLIENT_ID)},
-        json={meta.segment: [int(meta.security_id)]},
+        # "client-id", not "dhanClientId" -- and dhanClientId belongs in the
+        # body, not a header. See known limitation 19; matches the SDK's own
+        # dhan_http.py (client-id header at dhan_http.py:43, dhanClientId
+        # injected into the body at dhan_http.py:53-56).
+        headers={"access-token": resolved_token, "client-id": str(_CLIENT_ID)},
+        json={meta.segment: [int(meta.security_id)], "dhanClientId": str(_CLIENT_ID)},
         timeout=15.0,
     )
     response.raise_for_status()
