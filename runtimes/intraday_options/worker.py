@@ -43,6 +43,7 @@ from __future__ import annotations
 import enum
 import os
 import queue as queue_module
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -62,7 +63,14 @@ from common.notifications import (
     build_notifier,
 )
 from common.persistence import Database, MigrationRunner
-from common.process import DuplicateProcessError, worker_lock
+from common.process import (
+    DuplicateProcessError,
+    clear_square_off_request,
+    read_square_off_request,
+    square_off_request_path,
+    worker_lock,
+)
+from common.process.square_off_requests import SquareOffRequest
 from common.risk import SquareOffPolicy, SquareOffState, SquareOffTrigger
 from strategies.intraday_options import FixtureSignalStrategy
 
@@ -328,6 +336,43 @@ def run_worker(
         lock.release()
 
 
+def run_worker_process(
+    config: WorkerConfig,
+    candle_queue: Any,
+    notifier: Notifier | _NotifierSentinel | None = None,
+    tick_queue: Any = None,
+    control_queue: Any = None,
+) -> None:
+    """The real ``multiprocessing.Process(target=...)`` entry point.
+
+    Phase 7 Part 4 found that ``worker_process.exitcode`` — what the
+    supervisor actually reads to decide whether a worker succeeded — was
+    **always 0 for a worker that returned normally**, however
+    :attr:`WorkerOutcome.exit_code` had been set. ``multiprocessing`` calls
+    its ``target`` and discards the return value; only an uncaught exception
+    (or an explicit ``sys.exit``) changes the child's real exit code. So
+    ``EXIT_DUPLICATE``, an integrity-check failure, and the per-candle
+    exception handler's ``exit_code = 1`` were all invisible to
+    ``worker_exit_codes`` whenever a worker actually ran the way production
+    runs it — through a spawned process — even though each one *looked*
+    correctly recorded in :class:`WorkerOutcome`. Caught by
+    ``test_a_duplicate_worker_is_reported_not_silent``
+    (``tests/end_to_end/test_supervisor.py``), which failed with
+    ``worker_exit_codes["skelfix"] == 0`` where ``EXIT_DUPLICATE`` (3) was
+    expected, against a real spawned duplicate — recorded as D77.
+
+    Deliberately **not** folded into :func:`run_worker` itself: every
+    existing test calls that function directly and inspects the returned
+    :class:`WorkerOutcome` synchronously, in the *same* process as the test.
+    A ``sys.exit()`` there would raise ``SystemExit`` into the test's own
+    call stack, not just the (nonexistent, in that case) child's. This
+    function exists only to be the thing ``multiprocessing.Process`` calls;
+    every direct caller keeps using :func:`run_worker`, unchanged.
+    """
+    outcome = run_worker(config, candle_queue, notifier, tick_queue, control_queue)
+    sys.exit(outcome.exit_code)
+
+
 def _run_locked(
     config: WorkerConfig,
     candle_queue: Any,
@@ -476,6 +521,19 @@ def _run_locked(
     heartbeat.beat(HealthState.running_for(config.execution_mode), force=True)
 
     square_off_state = _load_square_off_state(repository, config)
+    # Phase 7 Part 4: scripts/square_off.py's only channel to this worker — a
+    # file, never a write to `positions` (see the module's own docstring).
+    # Checked once per candle rather than on the Empty-timeout branch below:
+    # the fixture path's square-off signal needs a real candle to price
+    # against (`strategy.square_off_signal(candle)`), so — unlike the ported
+    # engine's `HubTickFeed.on_poll`, which has no such dependency and is
+    # wired to this same request in `engine_worker.py` — a request made while
+    # this worker is idle between candles is honoured on the next candle, not
+    # instantly. Documented, not fixed: the fixture path is the Phase 1
+    # deterministic test-only signal (CLAUDE.md), not the production one.
+    square_off_request_file = square_off_request_path(
+        config.pid_dir.parent, config.runtime_id, config.strategy_id
+    )
 
     try:
         while True:
@@ -492,7 +550,8 @@ def _run_locked(
             candle: Candle = item
             outcome.candles_processed += 1
 
-            square_off_state, squared = _maybe_square_off(
+            operator_request = read_square_off_request(square_off_request_file)
+            square_off_state, squared, handled = _maybe_square_off(
                 config=config,
                 candle=candle,
                 strategy=strategy,
@@ -500,13 +559,28 @@ def _run_locked(
                 repository=repository,
                 notifier=safe_notifier,
                 state=square_off_state,
+                operator_request=operator_request,
             )
+            if operator_request is not None and handled:
+                # Cleared only once the request has actually been acted on —
+                # see the module docstring on why "seen" and "acted" are kept
+                # distinct; a crash between the two must not lose the request.
+                clear_square_off_request(square_off_request_file)
             if squared:
                 outcome.orders_placed += 1
                 outcome.square_off_completed = True
                 break
 
-            if not config.square_off_policy.entries_allowed(candle.end_at):
+            # square_off_state is checked directly, not only the time-of-day
+            # gate below: under the ordinary time trigger the two always agree
+            # (square_off_at is configured after entry_cutoff, so time alone
+            # already denies entries by the moment the state changes), but an
+            # operator's request can move the state to COMPLETED *before* the
+            # configured cutoff, and the time gate alone would not yet know
+            # to refuse a fresh entry on the very candle that just squared off.
+            if square_off_state is not SquareOffState.PENDING or not (
+                config.square_off_policy.entries_allowed(candle.end_at)
+            ):
                 heartbeat.beat(HealthState.BLOCK_NEW_ENTRIES, last_tick_at=candle.end_at)
                 continue
 
@@ -703,14 +777,33 @@ def _maybe_square_off(
     repository: ExecutionRepository,
     notifier: SafeNotifier,
     state: SquareOffState,
-) -> tuple[SquareOffState, bool]:
-    """Square off if the candle clock says so. Returns the new state and whether it acted."""
+    operator_request: SquareOffRequest | None = None,
+) -> tuple[SquareOffState, bool, bool]:
+    """Square off if the candle clock says so, or if an operator asked.
+
+    Returns ``(new_state, acted, handled)``: ``acted`` is whether an order was
+    actually placed (unchanged meaning from before Phase 7 Part 4 — a trigger
+    can fire with no open position to close); ``handled`` is new, and is
+    whether this call's trigger body ran at all, which is what the caller
+    needs to know before it is safe to clear an operator's request file —
+    clearing on ``acted`` alone would leave the file behind forever on a
+    request that found nothing open to close.
+    """
     # expiry=None, explicitly: the fixture path (Phase 1's walking skeleton) holds
     # no OptionContract and has no expiry to know, so Phase 6 Part 4's expiry-lead
     # rule is inert here by construction, not by oversight.
     trigger = config.square_off_policy.trigger_at(candle.end_at, state=state, expiry=None)
-    if trigger is not SquareOffTrigger.SQUARE_OFF:
-        return state, False
+    # An operator request forces the same trigger the time-of-day ladder would
+    # eventually reach — never a second code path. Suppressed once already
+    # COMPLETED for the same reason `trigger_at` itself suppresses re-firing:
+    # a second attempt against an already-flat day has nothing to do.
+    operator_forced = (
+        operator_request is not None
+        and trigger is not SquareOffTrigger.SQUARE_OFF
+        and state is not SquareOffState.COMPLETED
+    )
+    if trigger is not SquareOffTrigger.SQUARE_OFF and not operator_forced:
+        return state, False, False
 
     repository.save_strategy_state(
         runtime_id=config.runtime_id,
@@ -748,7 +841,20 @@ def _maybe_square_off(
             correlation_id=correlation_id,
         )
     )
-    return SquareOffState.COMPLETED, acted
+    if operator_request is not None:
+        # The audit trail's other half: scripts/square_off.py recorded
+        # `square_off_requested` when it wrote the file; this is the worker
+        # recording that its own square-off path actually carried it out —
+        # never the script, which never touches `positions`.
+        repository.record_audit_event(
+            runtime_id=config.runtime_id,
+            action="square_off_completed",
+            actor=operator_request.requested_by,
+            strategy_id=config.strategy_id,
+            execution_mode=config.execution_mode,
+            detail=f"requested at {operator_request.requested_at}: {operator_request.reason}",
+        )
+    return SquareOffState.COMPLETED, acted, True
 
 
 def resolved_config_stub(config: WorkerConfig) -> Any:

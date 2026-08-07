@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from .correlation import CorrelationIdError, build_correlation_id, parse_correlation_id
+from .correlation import (
+    CorrelationIdError,
+    build_correlation_id,
+    parse_correlation_id,
+    strategy_token,
+)
 from .lifecycle import ExecutionResult, OrderLifecycle
 from .repository import ExecutionRepository, SessionRecord
 
@@ -14,4 +19,5 @@ __all__ = [
     "SessionRecord",
     "build_correlation_id",
     "parse_correlation_id",
+    "strategy_token",
 ]

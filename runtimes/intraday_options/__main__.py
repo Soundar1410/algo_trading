@@ -49,6 +49,7 @@ EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_NO_CREDENTIALS = 2
 EXIT_RUNTIME_DISABLED = 3
+EXIT_STRATEGY_NOT_FOUND = 4
 
 
 def build_supervisor(
@@ -59,6 +60,7 @@ def build_supervisor(
     adapter: MarketFeedAdapter,
     settings: Settings | None = None,
     trading_date: str | None = None,
+    strategy_ids: frozenset[str] | None = None,
 ) -> IntradayOptionsSupervisor:
     """Discover this runtime's enabled strategies, admit them, build the group.
 
@@ -67,6 +69,13 @@ def build_supervisor(
     reusing this same wiring — drives this directly instead of reimplementing
     discovery and admission. Assumes the caller has already checked that the
     runtime itself is enabled; :func:`main` does, before this is ever called.
+
+    ``strategy_ids``, when given, admits only strategies whose id is in the
+    set — the rest are discovered and skipped, never refused as blocked or
+    reported as an error. This is ``scripts/start_strategy.py``'s only
+    mechanism (Phase 7 Part 4): a per-strategy start still goes through a
+    supervisor, exactly as an unfiltered start does — the spec is explicit
+    that a bare worker is never spawned outside one.
     """
     settings = settings if settings is not None else load_settings()
     trading_date = trading_date or local_date_in(now_ist()).isoformat()
@@ -97,6 +106,8 @@ def build_supervisor(
     )
 
     for cfg in discover_enabled_strategies(config_root, runtime_id, settings=settings):
+        if strategy_ids is not None and cfg.strategy.strategy_id not in strategy_ids:
+            continue
         worker_config = build_worker_config(
             cfg,
             database_path=database_path,
@@ -120,6 +131,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--runtime-id", default="intraday_options", help="Which runtime group to start."
     )
+    parser.add_argument(
+        "--strategy-id",
+        default=None,
+        help=(
+            "Start only this one strategy — still through this same supervisor "
+            "(scripts/start_strategy.py's only mechanism; a bare worker is never "
+            "spawned outside one). Omit to start every enabled strategy, as before."
+        ),
+    )
     args = parser.parse_args(argv)
 
     settings = load_settings()
@@ -134,6 +154,18 @@ def main(argv: list[str] | None = None) -> int:
             "Set it to true when this group is ready to run."
         )
         return EXIT_RUNTIME_DISABLED
+
+    if args.strategy_id is not None:
+        # Checked before authenticating: a typo'd strategy id should not cost
+        # a Dhan auth request against the ~1-per-2-minute limit.
+        enabled = discover_enabled_strategies(args.config_root, args.runtime_id, settings=settings)
+        enabled_ids = {cfg.strategy.strategy_id for cfg in enabled}
+        if args.strategy_id not in enabled_ids:
+            print(
+                f"{args.strategy_id!r} is not an enabled strategy under "
+                f"runtimes/{args.runtime_id}.yaml (enabled: {sorted(enabled_ids) or ['none']})."
+            )
+            return EXIT_STRATEGY_NOT_FOUND
 
     client_id = read_secret(settings.dhan_client_id)
     if not client_id:
@@ -170,6 +202,7 @@ def main(argv: list[str] | None = None) -> int:
         paths=paths,
         adapter=adapter,
         settings=settings,
+        strategy_ids=frozenset({args.strategy_id}) if args.strategy_id else None,
     )
     # Recorded here rather than inside AuthBootstrap: get_token() ran before
     # this runtime's database (and therefore auth_events) existed — see

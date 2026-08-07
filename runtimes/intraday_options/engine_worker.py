@@ -96,7 +96,12 @@ from common.feed.queues import TickDropNotice
 from common.health import HealthState, HeartbeatWriter
 from common.logging import get_logger
 from common.notifications import NotificationEvent, SafeNotifier
-from common.process import shutdown_signals
+from common.process import (
+    clear_square_off_request,
+    read_square_off_request,
+    shutdown_signals,
+    square_off_request_path,
+)
 from common.utils.timeutils import now_ist
 
 from .worker import (
@@ -462,6 +467,16 @@ def run_engine(
 
     close_previous_session(config, repository, session_id)
 
+    # Phase 7 Part 4: scripts/square_off.py's only channel to this worker — a
+    # file, never a write to `positions`. Just the path here; `_build` wires
+    # a poll-time check of it into the feed's `on_poll` (alongside the
+    # existing wall-clock net), and the run below re-reads it once more,
+    # after the engine has returned, to decide whether a completed
+    # square-off gets attributed to it in the audit trail.
+    square_off_request_file = square_off_request_path(
+        config.pid_dir.parent, config.runtime_id, config.strategy_id
+    )
+
     try:
         engine, gateway, feed, positions, recovered = _build(
             config,
@@ -472,6 +487,7 @@ def run_engine(
             notifier=notifier,
             tick_queue=tick_queue,
             control_queue=control_queue,
+            square_off_request_file=square_off_request_file,
         )
         notifier.send(
             NotificationEvent(
@@ -508,6 +524,25 @@ def run_engine(
     outcome.recovered_position = recovered.adopted
     outcome.stopped_by_request = requested or engine.stopped_by_request
     outcome.square_off_completed = _square_off_completed(config, repository)
+
+    # The audit trail's other half: scripts/square_off.py recorded
+    # `square_off_requested` when it wrote the file; this is the worker
+    # recording that its own square-off path actually carried it out. Only
+    # when the run actually finished the day (persisted COMPLETED) — a
+    # request still pending at shutdown leaves the file in place, so a
+    # restart's own poll picks it up again rather than the request silently
+    # vanishing.
+    operator_request = read_square_off_request(square_off_request_file)
+    if operator_request is not None and outcome.square_off_completed:
+        repository.record_audit_event(
+            runtime_id=config.runtime_id,
+            action="square_off_completed",
+            actor=operator_request.requested_by,
+            strategy_id=config.strategy_id,
+            execution_mode=config.execution_mode,
+            detail=f"requested at {operator_request.requested_at}: {operator_request.reason}",
+        )
+        clear_square_off_request(square_off_request_file)
 
     # The alarm's condition, checked against the outcome rather than a proxy for it:
     # we asked the engine to close everything, it returned, and something is still
@@ -568,6 +603,7 @@ def _build(
     notifier: SafeNotifier,
     tick_queue: Any,
     control_queue: Any,
+    square_off_request_file: Path,
 ) -> tuple[TradingEngine, LifecycleGateway, HubTickFeed, PositionManager, _Recovered]:
     """Assemble the engine and everything behind it."""
     option_selector, option_segment = build_option_selector(config, engine_config)
@@ -689,8 +725,9 @@ def _build(
         # would wait for a tick to carry it into on_tick, and a live session runs
         # with no idle timeout at all — so that wait would be unbounded.
         should_stop=lambda: bool(holder) and holder[0].square_off_requested,
-        on_poll=_wall_clock_square_off(
-            holder, square_off_authority, trading_date=config.trading_date
+        on_poll=_combined_poll(
+            _wall_clock_square_off(holder, square_off_authority, trading_date=config.trading_date),
+            _operator_requested_square_off(holder, square_off_request_file),
         ),
         poll_seconds=engine_config.feed_poll_seconds,
         idle_timeout_seconds=config.idle_timeout_seconds,
@@ -1054,6 +1091,51 @@ def _wall_clock_square_off(
             "carry it, so the close is being requested on the poll timer instead"
         )
         engine.request_square_off("wall clock reached the square-off time")
+
+    return _check
+
+
+def _combined_poll(*checks: Callable[[], None]) -> Callable[[], None]:
+    """Run every ``on_poll`` check in sequence. ``HubTickFeed`` takes exactly
+    one callback (module docstring above ``_wall_clock_square_off``), and
+    Phase 7 Part 4 adds a second, independent reason to poll — so this
+    composes rather than either check absorbing the other's concern."""
+
+    def _check() -> None:
+        for check in checks:
+            check()
+
+    return _check
+
+
+def _operator_requested_square_off(
+    holder: list[TradingEngine], request_path: Path
+) -> Callable[[], None]:
+    """The engine-path half of ``scripts/square_off.py``'s only channel to a
+    running worker (Phase 7 Part 4) — a file, never a write to ``positions``.
+
+    Structurally identical to :func:`_wall_clock_square_off`: one owner
+    (:class:`~common.engine.square_off.SquareOffAuthority`/``TradingEngine``
+    itself) is still preserved, this only supplies a reason to ask the same
+    ``request_square_off`` the wall clock and ``SIGTERM`` already use — there
+    is no second close code path. Unlike the wall clock it does not clear or
+    otherwise consume the file itself: :func:`run_engine` does that once,
+    after the engine has returned and the persisted state confirms the
+    square-off actually completed, so a request seen here but not yet acted
+    on by the time the process dies is not silently lost.
+    """
+
+    def _check() -> None:
+        if not holder:
+            return  # constructed before the engine; nothing to ask yet
+        engine = holder[0]
+        if engine.square_off_requested:
+            return  # already asked; a second file read would just say the same thing
+        request = read_square_off_request(request_path)
+        if request is None:
+            return
+        log.warning("operator-requested square-off: %s", request.reason)
+        engine.request_square_off(f"operator requested: {request.reason}")
 
     return _check
 

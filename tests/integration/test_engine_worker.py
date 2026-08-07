@@ -37,6 +37,7 @@ from common.feed.queues import TickDropNotice
 from common.models import PositionStatus, Tick
 from common.notifications import RecordingNotifier
 from common.persistence import Database
+from common.process import square_off_request_path, write_square_off_request
 from common.risk import SquareOffPolicy
 from runtimes.intraday_options.worker import EngineWorkerConfig, WorkerConfig, run_worker
 
@@ -474,6 +475,49 @@ def test_the_candle_sentinel_also_reaches_the_engine(worker_config, database_pat
     assert outcome.trades_closed == 1, "the sentinel arrived but nothing was squared off"
     conn = Database(database_path).connect()
     assert conn.execute("SELECT status FROM positions").fetchone()["status"] == "CLOSED"
+
+
+def test_an_operator_square_off_request_closes_the_open_position(worker_config, database_path):
+    """``scripts/square_off.py``'s only channel to a running engine worker
+    (Phase 7 Part 4): a request file, picked up by ``HubTickFeed``'s poll
+    timer alongside the existing wall-clock net, forces the same
+    ``request_square_off`` a ``SIGTERM`` or the wall clock would use — never
+    a second close path.
+
+    Written by a background thread once a position is genuinely open, the
+    same reasoning ``test_the_candle_sentinel_also_reaches_the_engine`` uses:
+    writing it up front would prove far less.
+    """
+    request_path = square_off_request_path(worker_config.pid_dir.parent, RUNTIME_ID, STRATEGY_ID)
+
+    def _request_once_open() -> None:
+        if _wait_for_open_position(database_path):
+            write_square_off_request(request_path, requested_by="an_operator", reason="drill")
+
+    requester = threading.Thread(target=_request_once_open, daemon=True)
+    requester.start()
+    outcome = _run(worker_config, _ENTRY_ONLY_TAPE)
+    requester.join(timeout=5.0)
+
+    assert outcome.exit_code == 0, outcome.error
+    assert outcome.stopped_by_request is True
+    assert outcome.square_off_completed is True
+    assert outcome.trades_closed == 1
+    assert outcome.clean_engine_shutdown is True
+
+    conn = Database(database_path).connect()
+    assert conn.execute("SELECT status FROM positions").fetchone()["status"] == "CLOSED"
+
+    # The audit trail's other half: scripts/square_off.py records
+    # `square_off_requested` when it writes the file; this is the worker
+    # recording that its own square-off path actually carried it out.
+    audit_rows = conn.execute(
+        "SELECT actor, action, detail FROM audit_events WHERE strategy_id = ?", (STRATEGY_ID,)
+    ).fetchall()
+    assert len(audit_rows) == 1
+    assert audit_rows[0]["actor"] == "an_operator"
+    assert audit_rows[0]["action"] == "square_off_completed"
+    assert not request_path.is_file(), "a fulfilled request must not linger"
 
 
 def test_a_run_that_ends_on_its_own_is_not_reported_as_requested(worker_config):

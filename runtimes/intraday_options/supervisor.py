@@ -61,7 +61,7 @@ from pathlib import Path
 from typing import Any
 
 from common.config.models import ExecutionMode, LiveGateDecision
-from common.execution import ExecutionRepository
+from common.execution import ExecutionRepository, strategy_token
 from common.execution.health_events import auth_event_for_source
 from common.feed import DEFAULT_TICK_MAX_DEPTH, SharedFeedHub
 from common.feed.hub import WorkerChannel, build_channel
@@ -73,7 +73,7 @@ from common.notifications import NotificationEvent, Notifier, NullNotifier, Safe
 from common.persistence import Database, MigrationRunner
 from common.process import DuplicateProcessError, shutdown_signals, supervisor_lock
 
-from .worker import NOTIFIER_FROM_SETTINGS, WorkerConfig, run_worker
+from .worker import EXIT_DUPLICATE, NOTIFIER_FROM_SETTINGS, WorkerConfig, run_worker_process
 
 _log = get_logger(__name__)
 
@@ -234,6 +234,16 @@ class IntradayOptionsSupervisor:
         #: with the human-readable reason. Recorded to persistence once ``run()``
         #: opens the repository — see the mixed-mode admission gate below.
         self._blocked_workers: list[tuple[WorkerConfig, str]] = []
+        #: strategy_token(strategy_id) -> the first strategy_id that claimed
+        #: it, so :meth:`add_worker` can refuse a second strategy whose
+        #: correlation-ID token would collide with an already-admitted one —
+        #: see :func:`~common.execution.correlation.strategy_token`'s own
+        #: docstring (D78) for the crash this replaces.
+        self._admitted_strategy_tokens: dict[str, str] = {}
+        #: Strategies refused for exactly that reason. Reported the same way
+        #: as ``_blocked_workers``, under its own event type — this is not a
+        #: live-gate decision and must not be reported as one.
+        self._token_collision_refusals: list[tuple[WorkerConfig, str]] = []
         #: Upstream control queues, one per tick-channel worker. The child puts a
         #: security_id on its queue when its engine subscribes to a contract at
         #: runtime; this process drains them and asks the hub, which applies the
@@ -327,6 +337,29 @@ class IntradayOptionsSupervisor:
             )
             _log.error("%s", self._blocked_workers[-1][1])
             return None
+
+        # Checked before this strategy is ever admitted, not after its first
+        # order fails: two strategy_ids that agree on their first four
+        # alphanumeric characters build the identical correlation_id string
+        # on their first order of the day (strategy_token's own docstring —
+        # D78, found via a real worker crash: order_intents.correlation_id's
+        # UNIQUE constraint rejecting the second one).
+        token = strategy_token(worker_config.strategy_id)
+        already_admitted = self._admitted_strategy_tokens.get(token)
+        if already_admitted is not None and already_admitted != worker_config.strategy_id:
+            reason = (
+                f"Strategy {worker_config.strategy_id!r} refused: its correlation-ID "
+                f"token {token!r} collides with already-admitted strategy "
+                f"{already_admitted!r}. Both would build identical correlation IDs on "
+                "their first order of the day, which the database refuses as a "
+                "duplicate. The rest of the group continues; rename one strategy_id "
+                "to resolve."
+            )
+            self._token_collision_refusals.append((worker_config, reason))
+            _log.error("%s", reason)
+            return None
+        self._admitted_strategy_tokens[token] = worker_config.strategy_id
+
         channel = build_channel(
             worker_config.strategy_id,
             [worker_config.security_id],
@@ -491,11 +524,37 @@ class IntradayOptionsSupervisor:
                 )
             )
 
+        # Same pattern, distinct event type: a token collision is not a
+        # live-gate decision and must not be reported as one.
+        for worker_config, reason in self._token_collision_refusals:
+            repository.record_error(
+                runtime_id=self._config.runtime_id,
+                strategy_id=worker_config.strategy_id,
+                execution_mode=worker_config.execution_mode,
+                severity="ERROR",
+                component="supervisor.correlation_token_collision",
+                message=reason,
+            )
+            self._notifier.send(
+                NotificationEvent(
+                    event_type="correlation_token_collision",
+                    message=reason,
+                    runtime_id=self._config.runtime_id,
+                    strategy_id=worker_config.strategy_id,
+                    execution_mode=worker_config.execution_mode,
+                )
+            )
+
         try:
             context = mp.get_context("spawn")
             for worker_config, channel in self._workers:
                 process = context.Process(
-                    target=run_worker,
+                    # run_worker_process, not run_worker: multiprocessing
+                    # discards a target's return value, so only this
+                    # sys.exit()-translating wrapper makes worker_exitcode
+                    # (and worker_exit_codes below) reflect what actually
+                    # happened — see run_worker_process's own docstring (D77).
+                    target=run_worker_process,
                     # Both extra channels travel to the child from here. Until Part
                     # 2b-ii-B-2 they were created and never handed over, which left
                     # the ported engine with no way to receive a tick and no way to
@@ -555,7 +614,10 @@ class IntradayOptionsSupervisor:
                     _log.warning("worker %s did not exit; terminating", strategy_id)
                     worker_process.terminate()
                     worker_process.join(timeout=5.0)
-                result.worker_exit_codes[strategy_id] = worker_process.exitcode or 0
+                exit_code = worker_process.exitcode or 0
+                result.worker_exit_codes[strategy_id] = exit_code
+                if exit_code == EXIT_DUPLICATE:
+                    self._report_duplicate_worker(strategy_id, repository)
 
             for _, channel in self._workers:
                 result.dropped_events[channel.strategy_id] = channel.queue.dropped
@@ -604,6 +666,46 @@ class IntradayOptionsSupervisor:
             cancel = getattr(control_queue, "cancel_join_thread", None)
             if cancel is not None:
                 cancel()
+
+    def _report_duplicate_worker(self, strategy_id: str, repository: ExecutionRepository) -> None:
+        """A worker refused to start — another process already held its lock.
+
+        ``worker.py``'s ``EXIT_DUPLICATE`` has been recorded into ``result.
+        worker_exit_codes`` since Phase 3 Part 2b-ii-B-2, but nothing ever
+        inspected it: the string ``EXIT_DUPLICATE`` appeared nowhere in this
+        module. Without this, a refused worker was a silent zero-length run
+        — the group's own duplicate-worker guard (``worker_lock``) already
+        protects the database; this is what makes the *group* notice, so an
+        operator sees "this strategy never started" instead of just seeing
+        fewer orders than expected with no explanation.
+
+        Every worker this method can ever be called for was admitted as a
+        paper-mode worker (:meth:`add_worker` refuses anything else before
+        it ever reaches ``self._processes``) — so ``execution_mode`` is
+        always PAPER here, not a lookup.
+        """
+        message = (
+            f"{strategy_id} did not start: another process already holds its worker lock "
+            "(exit code EXIT_DUPLICATE). No orders were placed for this strategy this run."
+        )
+        _log.error("%s", message)
+        repository.record_error(
+            runtime_id=self._config.runtime_id,
+            strategy_id=strategy_id,
+            execution_mode=ExecutionMode.PAPER,
+            severity="CRITICAL",
+            component="supervisor.duplicate_worker",
+            message=message,
+        )
+        self._notifier.send(
+            NotificationEvent(
+                event_type="duplicate_worker_refused",
+                message=message,
+                runtime_id=self._config.runtime_id,
+                strategy_id=strategy_id,
+                execution_mode=ExecutionMode.PAPER,
+            )
+        )
 
     def _publish_final_health(
         self,

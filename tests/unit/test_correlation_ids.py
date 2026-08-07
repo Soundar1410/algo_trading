@@ -7,10 +7,12 @@ import pytest
 from common.config.models import ExecutionMode
 from common.execution.correlation import (
     MAX_LENGTH,
+    STRATEGY_TOKEN_LENGTH,
     CorrelationIdError,
     build_correlation_id,
     is_paper,
     parse_correlation_id,
+    strategy_token,
 )
 
 
@@ -141,3 +143,34 @@ def test_parsing_recovers_every_component():
 def test_parsing_rejects_a_malformed_id(bad: str):
     with pytest.raises(CorrelationIdError):
         parse_correlation_id(bad)
+
+
+# --------------------------------------------------------- strategy_token
+def test_strategy_token_matches_what_build_correlation_id_embeds():
+    """Public exactly so a caller admitting strategies (the supervisor) can
+    check for a collision before either strategy ever places an order —
+    see the function's own docstring, D78."""
+    correlation_id = build_correlation_id(
+        execution_mode=ExecutionMode.PAPER,
+        runtime_id="intraday_options",
+        strategy_id="io_supertrend_fast_v1",
+        trading_date="2026-07-29",
+        sequence_number=1,
+    )
+    embedded_token = correlation_id.split("_")[2]
+    assert strategy_token("io_supertrend_fast_v1") == embedded_token
+
+
+def test_strategy_token_is_case_insensitive_and_strips_non_alphanumerics():
+    assert strategy_token("IO_Skel_Fix") == strategy_token("io-skel-fix")
+
+
+def test_two_different_strategy_ids_can_produce_the_same_token():
+    """The property that makes this collision-prone rather than collision-
+    proof — pinned directly, not just implied by the supervisor's guard
+    against it. D78: this is exactly what happened to "skelone"/"skeltwo"."""
+    assert strategy_token("skelone") == strategy_token("skeltwo") == "skel"
+
+
+def test_strategy_token_length_matches_the_documented_constant():
+    assert len(strategy_token("intraday_options_supertrend")) == STRATEGY_TOKEN_LENGTH

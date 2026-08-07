@@ -7,9 +7,9 @@ the next phase. Updated after every phase.
 
 | | |
 |---|---|
-| **Current phase** | **Phase 7 — Operations, Part 3 of 5 complete** (the Streamlit dashboard), **plus an addendum**. `dashboards/app.py`'s Phase 1 single tile (`RuntimeTile`, four inline `SELECT`s) is retired; the dashboard is now a real multipage app — Master, Intraday Options and System Health read through `common.health.snapshot`/`connect_readonly` via a new shared `dashboards/_shared.py` (`load_snapshot`, one place that turns a missing/locked/pre-migration database into a message rather than a traceback); Positional Options and Intraday Stocks are honest stub pages, since neither runtime exists. One spec-asked-for field is deliberately not shown rather than fabricated: engine type/legs/baskets/strikes/per-leg P&L/roll count (`MultiLegEngine`/`FixedStrikeEngine` are not ported — D56/D34). `tests/unit/test_dashboard.py` drives every page's `render()` with a fake streamlit module and AST-checks that no page imports a broker, a feed, or the write-capable `Database` class. A real, pre-existing flaky-test cause (SQLite/Python clock skew producing a fractionally negative heartbeat age) was found and fixed at the source — **D75**. All five pages verified with a real `streamlit run` (HTTP 200, clean server log) in addition to the unit suite. **Addendum:** global/runtime live-gate status (`effective_live_gate`, config-sourced) added back to Master — config and the operational database are different resources, and the AST regression tests pass unmodified for `app.py` with the new `common.config` import, confirmed by running them individually. A "disabled strategy" count remains unshown — still invisible to both the database and to `discover_enabled_strategies` (which returns only enabled ones), not something the addendum's config read happens to answer. Parts 4-5 (PID hardening + operator commands, retention/backups) remain. |
-| **Next phase** | Phase 7 Part 4 — PID handling and operator commands. |
-| **Last updated** | 7 August 2026 — Phase 7 Part 3 complete, see [Known limitations](#6-known-limitations) |
+| **Current phase** | **Phase 7 — Operations, Part 4 of 5 complete** (PID handling and operator commands). PID ownership now discriminates on `psutil.Process.create_time()`, not liveness alone — demonstrated fail-first against unmodified code before the fix, per the plan's own standard (**D76**). Fixing it surfaced two previously-hidden bugs: `multiprocessing.Process(target=run_worker, ...)` was silently discarding every real spawned worker's exit code (**D77**), which unmasked a strategy-id correlation-token collision the parallel-worker test had never actually reached (**D78**) — both fixed. Seven new operator scripts (`status`, `validate_environment`, `stop_runtime`, `stop_strategy`, `square_off --confirm`, `start_runtime`, `start_strategy`) plus `authenticate` (a pure alias for `auth_bootstrap`), an `audit_events` table (migration `0004`), and a file-based square-off request channel (`common/process/square_off_requests.py`) polled by both the fixture and ported-engine worker paths — never a second writer against `positions`. `tests/unit/test_scripts_are_read_only.py` now proves two different things for two tiers: the read-only tier (unchanged Dhan-API-safety checks) and a new control tier (no broker import, no direct write to a trading table). Part 5 (retention and backups) remains. |
+| **Next phase** | Phase 7 Part 5 — retention and backups. |
+| **Last updated** | 7 August 2026 — Phase 7 Part 4 complete, see [Known limitations](#6-known-limitations) |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
 | **Live order placement** | **Not implemented.** Fail-closed. Phase 10 only. |
@@ -27,7 +27,7 @@ the next phase. Updated after every phase.
 | 4 | Candle, indicator and paper-execution foundation | **Complete.** **Part 1 complete** (real contract resolution — closes 17, alarms 15). **Part 2 complete** (indicator layer — closes D21). **Part 3 complete** (continuity, timezone, wall-clock square-off — closes 4 and 7, and a live blocker). **Part 4 complete** (warm-up source and injection — closes 16). **Part 5 complete** (`PaperBroker` realism — closes 5 and D11; the live Full-mode gate item ran 6 August 2026 and passed, closing known limitation 20 along the way). **Phase 4 complete** — all five parts done, its one live gate item proven rather than asserted |
 | 5 | Mixed-mode supervisor and persistence | **Complete** |
 | 6 | Paper recovery and expiry handling | **Complete — all five parts.** **Part 1** (daily risk state across a restart — closes the risk-limit-bypass gap in bullet 1, and finds/fixes **D58**/limitation 22 along the way). **Part 2** (position-management state snapshot/restore — exit-policy state via `BaseExit`/`RiskManager`/`BaseStrategy` snapshot hooks, and stop/target persistence through a widened `RiskManager`/`ExecutionGateway`, fail-open on a bad snapshot, negative-control-tested). **Part 3** (MFE/MAE, square-off attempts, state-version validation and position-gated last-candle idempotency — the rest of §7's "restore at minimum" list). **Part 4** (`force_square_off_before_expiry` composed into the existing `SquareOffAuthority` seam — **D66-D68**; `simulate_exchange_settlement` refused at config load, none of spec section 11's eight settlement-policy items built — limitation 27). **Part 5** (the phase's record: bullets re-checked against what is built, not assumed; D56's persistence-identity gap given a written candidate direction, not an implementation — **D69**, limitation 30). Bullet 2's fixed strikes/basket legs/rolling counters remain blocked on `FixedStrikeEngine`/`MultiLegEngine` — D56/D34, unchanged, not this phase's to close |
-| 7 | Operations | **Part 1 complete** (health snapshot layer — `common/health/snapshot.py`, `auth_events`/`feed_events` writers and producers, configurable heartbeat interval). **Part 2 complete** (Telegram in production — real notifier construction at both entrypoints, deferred delivery, rate limiting/aggregation, `notifications`-table persistence, redacted rendering — D71-D74). **Part 3 complete** (the Streamlit dashboard — Master/Intraday Options/System Health pages plus two honest stubs, reading through `common.health.snapshot` for operational state — D75; addendum adds `effective_live_gate` status to Master, config-sourced, the one deliberate exception to database-only reads). Parts 4-5 (PID/operator commands, retention) not started |
+| 7 | Operations | **Part 1 complete** (health snapshot layer — `common/health/snapshot.py`, `auth_events`/`feed_events` writers and producers, configurable heartbeat interval). **Part 2 complete** (Telegram in production — real notifier construction at both entrypoints, deferred delivery, rate limiting/aggregation, `notifications`-table persistence, redacted rendering — D71-D74). **Part 3 complete** (the Streamlit dashboard — Master/Intraday Options/System Health pages plus two honest stubs, reading through `common.health.snapshot` for operational state — D75; addendum adds `effective_live_gate` status to Master, config-sourced, the one deliberate exception to database-only reads). **Part 4 complete** (PID ownership hardened onto `create_time()`, fail-first proven — D76; two previously-hidden bugs found and fixed along the way — D77/D78; seven operator scripts plus `authenticate`, `audit_events` migration `0004`, file-based square-off request channel). Part 5 (retention) not started |
 | 8 | LaunchAgent validation | Not started |
 | 9 | Real strategies | Not started |
 | 10 | Controlled live readiness | Not started |
@@ -2214,6 +2214,9 @@ guard. See deviation D6.
 | **D73** | **`TradingEngine.__init__` was silently double-wrapping an already-built `SafeNotifier` in a second one — type-valid (`SafeNotifier` structurally satisfies `Notifier`), functionally wrong** | `worker.py` builds exactly one `SafeNotifier` per process and, on the engine path, hands it straight through (`engine_worker.run_engine(notifier=safe_notifier, ...)` → `TradingEngine(notifier=notifier, ...)`). `TradingEngine.__init__` unconditionally did `self.notifier = SafeNotifier(notifier or NullNotifier())` — wrapping the inner `SafeNotifier` in an outer one. This predates Part 2 and was harmless while `SafeNotifier` had no state worth duplicating; it stopped being harmless the moment Part 2 gave it success/failure counters, an aggregation window and (for the engine path specifically) `deferred=True`/`on_failure` — all of which would have lived on the *inner*, untouched `SafeNotifier`, while `TradingEngine` only ever calls `.send()` on the outer one. Found while designing the deferred-mode wiring, not by a failing test — no existing assertion checked notifier identity or counted double-delivery. Fixed: `TradingEngine.__init__` now checks `isinstance(notifier, SafeNotifier)` and reuses it exactly as given; a bare `Notifier` still gets the fallback wrap, which now defaults `deferred=True` since that branch is reachable from `on_tick` regardless of caller. `test_the_engine_reuses_an_already_built_safenotifier_rather_than_double_wrapping` and `test_a_bare_notifier_is_wrapped_deferred_by_default` cover both branches directly. |
 | **D74** | **`NotificationEvent.rendered()` now runs its own output through the active logging redactor — closing a real gap between what `common/logging/redaction.py`'s docstring claimed ("printed, persisted **or notified**") and what was actually enforced** | `SecretRedactingFilter` is a `logging.Filter`, reachable only via a handler `addFilter()` call — it was never wired anywhere near `TelegramNotifier.send()` (which builds its payload straight from `event.rendered()`, no `logging` call involved) or `record_notification`'s DB write. The specific Telegram guarantee was sound regardless — the bot token is read from `SecretStr` at send time and never stored on `NotificationEvent`, so nothing token-shaped could reach `rendered()` — but the *general* claim was aspirational, and Part 2 gives `rendered()` three new fields plus a real `notifications.message` column to write into, raising the stakes of leaving it that way. `rendered()` now calls `common.logging.active_redactor()` and returns the redacted text when a redactor is active (every production process; `setup_logging()` runs before any notifier is built), unredacted when none is (most unit tests, which never call `setup_logging`) — a real second layer where the docstring already claimed one, not a fix to a live leak. `test_a_known_secret_is_redacted_from_the_rendered_message` and `test_rendering_is_unredacted_when_no_logging_has_been_configured` cover both states. |
 | **D75** | **A heartbeat's age can compute fractionally negative from SQLite/Python clock skew; `common.health.snapshot` now clamps it to zero rather than reporting a beat "from the future"** | `_process_health` and `_strategy_healths` both compute `(julianday('now') - julianday(beat_at)) * 86400.0` — SQLite's own clock — against a `beat_at` string written moments earlier from Python's `datetime.now(UTC)`. Found as an intermittent failure of Phase 7 Part 1's own `test_the_group_heartbeat_is_the_strategy_id_is_null_row` on a full-suite run, not written into the plan on purpose: `heartbeat_age_seconds == -0.0010058283805847168` where the test asserted `>= 0.0`. The two clocks are each individually correct; a read moments after the write occasionally samples them close enough that the subtraction goes fractionally negative. Not chased out of the SQL (`MAX(0, ...)` there would hide the same measurement one layer down, and any future caller of the raw query would rediscover it); fixed with a new `_non_negative_age()` helper applied in Python at both computation sites, the same judgement `PositionManager.adopt` already applies to MFE/MAE restarting at zero rather than a small negative — a truly negative age is not a fact worth reporting as one. `test_a_negative_age_from_clock_skew_between_sqlite_and_python_clamps_to_zero` pins the fix directly and deterministically, rather than relying on re-running the previously-flaky test enough times to trust it. |
+| **D76** | **The PID-reuse incident was demonstrated on unmodified code before `common/process/locks.py` was touched, per the plan's fail-first standard — not assumed from reading the code** | `current_owner()` checked liveness alone (`_process_is_alive`, a bare `os.kill(pid, 0)`), and the module's own docstring already (falsely) claimed a command/start-marker check that nothing in the code performed. `test_a_live_process_that_is_not_ours_is_not_an_owner` (`tests/unit/test_process_locks.py`) was added first and run against the unmodified module: it spawns a real, signalable `time.sleep(60)` subprocess (deliberately not `pid: 1` — `_process_is_alive` treats a `PermissionError` from an unsignallable PID as "alive", so a `pid: 1` fixture would exercise the code path without reproducing the actual hazard: SIGTERM to `launchd` fails with `EPERM` and harms nothing), writes its PID into a PID-file fixture claiming the identity `intraday_options.supervisor`, and asserts `current_owner() is None`. Observed failure on unmodified code: `current_owner()` returned a populated `LockOwner(pid=29477, ...)` for the unrelated live process — proof that a PID recycled onto any live, signalable process today reads as a valid owner. Fixed by discriminating on `psutil.Process.create_time()` (exact, kernel-assigned once at process creation; a reused PID cannot share it) rather than the recorded command string, which is unstable in exactly the cases that matter — a `spawn`ed worker's `sys.argv` is a multiprocessing bootstrap line, and a repository move changes every recorded path, so matching on it risked the *inverse* incident (refusing to stop a supervisor that genuinely is ours). The paired over-strictness guard, `test_a_genuinely_live_holder_is_still_recognised`, covers a lock this process actually holds and a spawned child with a multiprocessing-bootstrap-shaped `command` string in its fixture — proving a command mismatch alone no longer matters — and passed both before and after the fix, so the tightened check provably did not swing the other way. `clear_stale_pid_file()` (verified stale cleanup — spec step 6's second clause, previously unimplemented) and `IntradayOptionsSupervisor` acting on `EXIT_DUPLICATE` (previously recorded and never inspected — a refused worker was silently a zero-length run) round out Part 4's PID hardening. See "PID-reuse drill, by hand" in Part 4's own writeup below for the same defect confirmed once more against the real `scripts/stop_runtime.py`. |
+| **D77** | **`multiprocessing.Process(target=run_worker, ...)` discarded every `WorkerOutcome.exit_code` a real spawned worker computed — `worker_process.exitcode` was always 0 regardless — found by Part 4's own new test, not by reading the code for it** | `multiprocessing` calls its `target` and discards the return value; only an uncaught exception or an explicit `sys.exit()` changes a spawned child's real OS exit code, and `run_worker` only ever returned `WorkerOutcome`. `test_a_duplicate_worker_is_reported_not_silent` (`tests/end_to_end/test_supervisor.py`, written to prove the supervisor now acts on `EXIT_DUPLICATE` — see D76) asserted `result.worker_exit_codes["skelfix"] == EXIT_DUPLICATE` against a real spawned duplicate and got `0`. This was not specific to `EXIT_DUPLICATE`: the integrity-check-failure exit path and the per-candle exception handler's `exit_code = 1` in `worker.py` were equally invisible to `worker_exit_codes` through any real `spawn`ed process, every one of them silently reporting success. Fixed with a new `run_worker_process()` wrapper — calls `run_worker()` then `sys.exit(outcome.exit_code)` — used **only** as the `multiprocessing.Process` target; `run_worker()` itself is unchanged, because dozens of existing tests call it directly, in the test's own process, and expect a returned `WorkerOutcome`, not a raised `SystemExit`. `supervisor.py`'s `context.Process(target=...)` now points at `run_worker_process`. |
+| **D78** | **`strategy_token()`'s 4-character truncation lets two different strategy ids collide on the same `correlation_id`, which the parallel-worker test only reached once D77 stopped masking the crash as a clean exit** | Re-running the suite after fixing D77 surfaced a second, previously-hidden failure: `test_two_workers_receive_identical_bars` raised `sqlite3.IntegrityError: UNIQUE constraint failed: order_intents.correlation_id`. `common/execution/correlation.py` truncates a strategy id to 4 characters for the embedded token; `"skelone"` and `"skeltwo"` both truncate to `"skel"`, and since `next_sequence_number` is scoped by the full, untruncated strategy id, both strategies independently compute sequence 1 for their first order — byte-identical `correlation_id` strings. Previously invisible because D77 silently turned the resulting crash (exit code 1) into a reported 0. Not fixed by redesigning the correlation-ID format — too large a change, under time pressure, to a heavily-used, well-tested module — but by refusing the collision at admission time: `strategy_token()` is now a public function (the exact token `build_correlation_id` will embed, explicitly **not** guaranteed unique), and `IntradayOptionsSupervisor.add_worker()` refuses the second strategy whose token collides with an already-admitted one, recording an `errors` row (`component="supervisor.correlation_token_collision"`) and a notification — the same individual-refusal shape the existing live-gate admission check already uses, never crashing the group or corrupting `order_intents`. The triggering test was renamed to non-colliding strategy ids (`alphaskel`/`bravoskel`) to verify its own original intent again; `test_a_worker_whose_correlation_token_collides_is_refused_not_crashed` covers the original colliding pair directly. |
 
 #### D22 in detail: the rebuilt premium-candle mapping
 
@@ -3386,6 +3389,58 @@ A rejected TOTP is often a drifted local clock rather than a wrong secret; the
 error message says so and how to check, because the two produce identical
 responses from Dhan.
 
+### Operator commands (Phase 7 Part 4)
+
+`scripts/authenticate` is a pure alias for `scripts/auth_bootstrap` above — either
+name works. Every command below writes at most one row, to `audit_events`; none
+opens a second writer against `positions`/`orders`/`fills`.
+
+```bash
+# Read-only status/preflight — safe at any hour, no network call.
+.venv/bin/python -m scripts.status --runtime-id intraday_options [--json]
+.venv/bin/python -m scripts.validate_environment
+
+# Start (thin wrappers over `python -m runtimes.intraday_options`):
+.venv/bin/python -m scripts.start_runtime intraday_options
+.venv/bin/python -m scripts.start_strategy io_supertrend_fast_v1   # still through a supervisor
+
+# Stop — reads the PID file, verifies the recorded process is the one that
+# actually wrote it (create_time, not liveness alone — D76), sends SIGTERM.
+# Refuses, and signals nothing, if ownership does not verify.
+.venv/bin/python -m scripts.stop_strategy --strategy-id io_vwap_straddle_v1
+.venv/bin/python -m scripts.stop_runtime --runtime-id intraday_options
+
+# Square off one strategy. Never touches `positions` directly: writes a request
+# file the running worker itself polls and closes through its own square-off
+# path. --confirm is mandatory.
+.venv/bin/python -m scripts.square_off --strategy-id io_supertrend_fast_v1 --confirm
+```
+
+**The PID-reuse drill** (the plan's own end-to-end verification item, run by hand
+against the real script, not only its unit tests):
+
+```bash
+# 1. Start a throwaway process to stand in for a reused PID.
+sleep 300 &
+SLEEPER_PID=$!
+
+# 2. Point a runtime's PID file at it (the shape `stop_runtime` reads).
+python3 -c "
+import json, psutil, pathlib
+pid = $SLEEPER_PID
+path = pathlib.Path('data/runtime/pid/intraday_options.supervisor.pid')
+path.write_text(json.dumps({
+    'pid': pid, 'identity': 'intraday_options.supervisor', 'command': 'unrelated',
+    'acquired_at': '2026-08-07T09:00:00+00:00', 'create_time': 0.0,  # wrong on purpose
+}))
+"
+
+# 3. It must refuse — and say why — and the sleeper must still be running.
+.venv/bin/python -m scripts.stop_runtime --runtime-id intraday_options
+kill -0 "$SLEEPER_PID" && echo "sleeper still running, as required"
+kill "$SLEEPER_PID"
+```
+
 ### Block 2 — live read-only ratification (completed 30 July 2026)
 
 Run **only** with `.env` populated, during market hours. Every call is read-only
@@ -4479,9 +4534,143 @@ mtime is unchanged at the recorded baseline.
 Phase 2 is complete, both blocks. **Phase 3 is complete** — all five parts, with its
 acceptance gate met in full. **Phase 4 is complete** — all five parts, its one live
 gate item run and passed. **Phase 5 is complete** — see below. **Phase 6 is
-complete** — all five parts, see below. **Phase 7 is in progress — Part 3 of 5
-complete**, see below. Next is **Phase 7 Part 4 — PID handling and operator
-commands**.
+complete** — all five parts, see below. **Phase 7 is in progress — Part 4 of 5
+complete**, see below. Next is **Phase 7 Part 5 — retention and backups**.
+
+### Phase 7 — Operations — **Part 4 of 5 complete** (PID handling and operator commands)
+
+Approved plan, verbatim scope: implement the PID ownership validation the module
+docstring already claimed and did not do, discriminating on process start time
+rather than command path; add verified stale-PID-file cleanup; make the supervisor
+act on `EXIT_DUPLICATE`; restructure `tests/unit/test_scripts_are_read_only.py`'s
+hard-pinned whitelist into a read-only tier and a control tier; build `scripts/
+status`, `scripts/validate_environment`, `scripts/stop_runtime`/`stop_strategy`,
+`scripts/square_off --confirm`, `scripts/start_runtime`/`start_strategy`, and a
+`scripts/authenticate` alias; add an `audit_events` migration following 0002's
+precedent. Marked in the plan as "the one property in the plan where a wrong
+implementation causes a real operational incident" and built accordingly: fail-first,
+with the defect demonstrated on today's unmodified code before any fix was written.
+
+**The fail-first proof (D76).** `test_a_live_process_that_is_not_ours_is_not_an_owner`
+was added to `tests/unit/test_process_locks.py` before `psutil` was imported anywhere
+or `locks.py` was touched. It spawns a real, signalable `time.sleep(60)` subprocess —
+deliberately not `pid: 1`, which `_process_is_alive`'s existing `PermissionError`
+handling treats as "alive" without reproducing the actual hazard (`SIGTERM` to
+`launchd` fails with `EPERM` and harms nothing) — writes its PID into a fixture
+claiming the identity `intraday_options.supervisor`, and asserts `current_owner() is
+None`. Run against unmodified code: **it failed**, exactly as the plan predicted —
+`current_owner()` returned a populated `LockOwner` for the unrelated live process,
+because liveness was the only thing checked. That observed failure is the evidence,
+recorded in full as **D76** above. The paired over-strictness guard,
+`test_a_genuinely_live_holder_is_still_recognised` (a lock this process actually
+holds, plus a spawned child with a multiprocessing-bootstrap-shaped `command` string
+in its fixture), passed both before and after the fix — confirming the tightened
+check does not swing the other way and start refusing a supervisor that really is
+ours.
+
+**The fix.** `LockOwner` gained a required `create_time: float` field — the decision —
+plus `executable`/`project_root`, diagnostic-only, surfaced in `DuplicateProcessError`
+messages but never compared. `_verified_owner(pid, expected_create_time)` reads
+`psutil.Process(pid).create_time()`, treats `psutil.NoSuchProcess` and
+`psutil.AccessDenied` alike as "not verified" (fail-closed: a process this system
+actually started runs at our own privilege level, so `AccessDenied` should never
+legitimately fire against our own PID file), and compares by exact float equality —
+deliberate, since any tolerance wide enough to matter would let a process
+started-and-killed within that window slip through as a false match, precisely the
+failure mode the check exists to close. `current_owner()` now calls it;
+`clear_stale_pid_file()` is new (spec step 6's second clause, previously
+unimplemented) and safe to call unconditionally, including right before `acquire()`
+takes the lock, because a genuinely-held lock's PID file always verifies. The
+supervisor now acts on `EXIT_DUPLICATE` — previously recorded at `supervisor.py:450`
+and never inspected, so a refused duplicate worker was silently a zero-length run;
+it now records a `CRITICAL` `errors` row (`component="supervisor.duplicate_worker"`)
+and sends a `duplicate_worker_refused` notification.
+
+**D77, found by the supervisor's own new test, not by inspection.**
+`test_a_duplicate_worker_is_reported_not_silent` — written to prove the
+`EXIT_DUPLICATE` wiring above against a real spawned duplicate — asserted
+`result.worker_exit_codes["skelfix"] == EXIT_DUPLICATE` and got `0`.
+`multiprocessing.Process(target=run_worker, ...)` discards `run_worker`'s return value
+entirely; only `sys.exit()` or an uncaught exception changes a spawned child's real
+exit code, so `EXIT_DUPLICATE`, an integrity-check failure, and the per-candle
+exception handler's `exit_code = 1` had all been invisible to `worker_exit_codes`
+through every real `spawn`ed worker since they existed, each one silently reporting
+success. Fixed with a `run_worker_process()` wrapper (`run_worker()` then
+`sys.exit(outcome.exit_code)`) used only as the `multiprocessing.Process` target —
+`run_worker()` itself is unchanged, since dozens of existing tests call it directly
+and would break under an unconditional `sys.exit()`. See **D77** above.
+
+**D78, found only once D77 stopped masking it.** Re-running the suite after the D77
+fix surfaced a second, previously-hidden failure: `test_two_workers_receive_
+identical_bars` raised a `UNIQUE constraint failed: order_intents.correlation_id`.
+`strategy_token()`'s 4-character truncation lets `"skelone"` and `"skeltwo"` collide
+on the same token, and since sequence numbers are scoped by the full strategy id,
+both strategies' first orders produced byte-identical correlation IDs. Fixed at
+admission time — `IntradayOptionsSupervisor.add_worker()` now refuses the second
+colliding strategy (an `errors` row plus a notification, the same individual-refusal
+shape the live-gate check already uses), not by redesigning the correlation-ID format
+itself. See **D78** above, and `tests/unit/test_correlation_ids.py`'s four new tests
+for the newly-public `strategy_token()`.
+
+**Operator commands.** `tests/unit/test_scripts_are_read_only.py`'s hard-pinned
+`{"auth_bootstrap.py", "capture_live_tape.py"}` whitelist is now two tiers: a
+**read-only tier** (`auth_bootstrap.py`/`authenticate.py`, `capture_live_tape.py`,
+`status.py`, `validate_environment.py`) keeping all four original Dhan-API-safety
+assertions unchanged, and a **control tier** (`stop_runtime.py`, `stop_strategy.py`,
+`square_off.py`, `start_runtime.py`, `start_strategy.py`, `_operator_common.py`)
+proving instead that no script imports a broker and no script writes directly to a
+trading table (`signals`/`order_intents`/`orders`/`fills`/`positions`/
+`strategy_state`) — every control-tier write goes through
+`ExecutionRepository.record_audit_event`, the new `audit_events` sink (migration
+`0004`, following 0002's precedent: purely additive, `IF NOT EXISTS`, no column that
+can hold a secret).
+
+* `scripts/status` — read-only, prints `HealthSnapshot` (`common.health.read_
+  snapshot`) via `connect_readonly`; `--json` for machine-readable output.
+* `scripts/validate_environment` — read-only preflight per spec §13: project root,
+  writable directories, disk space, system time (reported, not verified against a
+  network source — no such source exists in this offline-by-design script), Dhan/
+  Telegram credentials, database integrity, and a path-drift check against
+  `PROJECT_ROOT`.
+* `scripts/stop_runtime` / `scripts/stop_strategy` — read the PID file, verify
+  ownership with the D76 check, send `SIGTERM`, record an audit event either way
+  (refused or signalled). Never guesses: no verified owner means nothing is
+  signalled. Confirmed by hand against a real PID-reuse fixture (a spawned sleeper
+  process, a PID file naming it with a wrong `create_time`) — refused, and the
+  sleeper was still running afterwards; against a genuine owner — signalled, and the
+  process exited.
+* `scripts/square_off --strategy-id X --confirm` — writes a request file
+  (`common/process/square_off_requests.py`, atomic temp-file-then-replace, the same
+  pattern `locks.py`'s PID file uses) that the running worker itself polls and
+  executes through its own square-off path; the script never opens a write
+  connection to `positions`. `--confirm` is mandatory — without it, nothing is
+  written and nothing is asked of any worker. Records `square_off_requested`; the
+  worker records `square_off_completed` once it actually closes (or finds nothing
+  to close), and clears the request file only then — a crash between "seen" and
+  "acted" does not lose the request. Wired into both worker shapes: the fixture path
+  checks the request once per candle (it needs a real candle to price a close
+  against, so an idle gap between candles delays but never loses a request — the
+  fixture path is Phase 1's deterministic test-only signal, not production);
+  the ported engine path checks it on `HubTickFeed`'s existing poll timer, composed
+  alongside the wall-clock square-off net, so it lands within one poll interval
+  regardless of tick flow.
+* `scripts/start_runtime` / `scripts/start_strategy` — thin wrappers translating the
+  spec's positional-argument invocation into the real entrypoint's `--runtime-id`/
+  `--strategy-id` flags. `runtimes/intraday_options/__main__.py`'s `build_supervisor`
+  gained an additive `strategy_ids` filter so a per-strategy start still goes through
+  a supervisor exactly as an unfiltered start does — the spec is explicit that a bare
+  worker is never spawned outside one. An unknown `--strategy-id` is refused before
+  authenticating, so a typo does not cost a Dhan auth request.
+* `scripts/authenticate` — a pure alias for `scripts/auth_bootstrap.py` (re-exports
+  its `main`/exit codes), satisfying the spec's naming without duplicating or
+  renaming the original, whose own tests are untouched.
+
+**Verification.** Full suite green (`.venv/bin/python -m pytest -q`), `ruff check .`
+clean, `mypy` clean (146 source files). The PID-reuse drill from the plan's own
+end-to-end verification list (start a throwaway sleeper, point a PID file at it, run
+`stop_runtime`) was run by hand against the real script, not only its unit tests —
+refused, with the sleeper still running afterwards; a genuine owner was signalled and
+exited cleanly.
 
 ### Phase 7 — Operations — **Part 3 of 5 complete** (the Streamlit dashboard)
 

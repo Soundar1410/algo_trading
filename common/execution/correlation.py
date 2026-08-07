@@ -34,6 +34,12 @@ from common.config.models import ExecutionMode
 #: the format, not something to discover at submission time.
 MAX_LENGTH = 25
 
+#: How many characters of a sanitised strategy_id become its correlation-ID
+#: token. Short enough to keep the whole ID inside MAX_LENGTH; see
+#: strategy_token's own docstring for the collision this creates and how a
+#: caller admitting strategies is expected to guard against it.
+STRATEGY_TOKEN_LENGTH = 4
+
 _NAMESPACE_BY_MODE = {ExecutionMode.PAPER: "p", ExecutionMode.LIVE: "l"}
 _MODE_BY_NAMESPACE = {v: k for k, v in _NAMESPACE_BY_MODE.items()}
 
@@ -65,6 +71,27 @@ def _token(value: str, limit: int) -> str:
     return cleaned[:limit]
 
 
+def strategy_token(strategy_id: str) -> str:
+    """The exact token :func:`build_correlation_id` will embed for this
+    strategy — public so a caller admitting strategies can check for a
+    collision *before* either one ever places an order.
+
+    **Not guaranteed unique.** Two strategy IDs agreeing on their first
+    :data:`STRATEGY_TOKEN_LENGTH` alphanumeric characters (case-insensitive)
+    — ``io_skelone`` and ``io_skeltwo``, say — produce the identical token,
+    and therefore the identical ``correlation_id`` string on each one's
+    first order of the day. Discovered exactly this way: two strategies in
+    one test whose IDs happened to share a four-character prefix collided
+    on ``order_intents.correlation_id``'s UNIQUE constraint, surfacing as a
+    plain worker crash rather than a controlled refusal (Phase 7 Part 4,
+    D78). ``IntradayOptionsSupervisor.add_worker`` calls this on every
+    admission and refuses a strategy whose token collides with one already
+    admitted, the same way it already refuses a live-mode strategy the gate
+    blocks — before this function existed, nothing checked at all.
+    """
+    return _token(strategy_id, limit=STRATEGY_TOKEN_LENGTH)
+
+
 def build_correlation_id(
     *,
     execution_mode: ExecutionMode,
@@ -94,8 +121,10 @@ def build_correlation_id(
 
     namespace = _NAMESPACE_BY_MODE[execution_mode]
     runtime_token = _initials(runtime_id, limit=3)
-    strategy_token = _token(strategy_id, limit=4)
-    candidate = f"{namespace}_{runtime_token}_{strategy_token}_{compact_date}_{sequence_number:04d}"
+    strategy_id_token = _token(strategy_id, limit=STRATEGY_TOKEN_LENGTH)
+    candidate = (
+        f"{namespace}_{runtime_token}_{strategy_id_token}_{compact_date}_{sequence_number:04d}"
+    )
 
     if len(candidate) > MAX_LENGTH:
         raise CorrelationIdError(

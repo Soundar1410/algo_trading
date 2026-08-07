@@ -279,10 +279,11 @@ def test_shipped_migrations_start_at_the_walking_skeleton():
     from common.persistence.migrations import VERSIONS_DIR
 
     shipped = discover_migrations(VERSIONS_DIR)
-    assert [m.version for m in shipped] == ["0001", "0002", "0003"]
+    assert [m.version for m in shipped] == ["0001", "0002", "0003", "0004"]
     assert shipped[0].name == "walking_skeleton"
     assert shipped[1].name == "feed_and_auth_health"
     assert shipped[2].name == "paper_fill_realism"
+    assert shipped[3].name == "operator_audit"
 
 
 def test_shipped_migrations_apply_to_a_fresh_database(tmp_path: Path):
@@ -292,7 +293,7 @@ def test_shipped_migrations_apply_to_a_fresh_database(tmp_path: Path):
     database = Database(tmp_path / "operational" / "intraday_options.db")
     applied = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
 
-    assert [m.version for m in applied] == ["0001", "0002", "0003"]
+    assert [m.version for m in applied] == ["0001", "0002", "0003", "0004"]
     assert database.integrity_check() == []
     assert database.foreign_key_check() == []
 
@@ -325,7 +326,7 @@ def test_later_migrations_upgrade_a_database_created_by_0001_alone(tmp_path: Pat
 
     applied = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
 
-    assert [m.version for m in applied] == ["0002", "0003"]
+    assert [m.version for m in applied] == ["0002", "0003", "0004"]
     with database.connect() as conn:
         survivors = conn.execute("SELECT COUNT(*) FROM runtime_sessions").fetchone()[0]
         tables = {
@@ -335,6 +336,7 @@ def test_later_migrations_upgrade_a_database_created_by_0001_alone(tmp_path: Pat
     assert survivors == 1, "a later migration must not disturb existing rows"
     assert {"auth_events", "feed_events", "option_chain_snapshots"} <= tables
     assert "paper_fill_quotes" in tables
+    assert "audit_events" in tables
     assert database.integrity_check() == []
 
 
@@ -372,7 +374,7 @@ def test_no_phase_two_table_can_store_a_secret(tmp_path: Path):
 
     forbidden = ("token", "secret", "pin", "password", "totp", "client_id", "access")
     with database.connect() as conn:
-        for table in ("auth_events", "feed_events", "option_chain_snapshots"):
+        for table in ("auth_events", "feed_events", "option_chain_snapshots", "audit_events"):
             columns = [row["name"] for row in conn.execute(f"PRAGMA table_info({table})")]
             for column in columns:
                 lowered = column.lower()

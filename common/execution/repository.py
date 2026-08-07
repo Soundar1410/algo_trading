@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from common.config.models import ExecutionMode
+from common.execution.audit_events import AUDIT_ACTIONS
 from common.execution.health_events import AUTH_EVENTS, FEED_EVENTS
 from common.models import (
     CURRENT_STATE_VERSION,
@@ -919,6 +920,45 @@ class ExecutionRepository:
                     component,
                     message,
                     context,
+                    _now(),
+                ),
+            )
+
+    def record_audit_event(
+        self,
+        *,
+        runtime_id: str,
+        action: str,
+        actor: str,
+        strategy_id: str | None = None,
+        execution_mode: ExecutionMode | None = None,
+        detail: str | None = None,
+    ) -> None:
+        """Write one row to ``audit_events`` (migration 0004).
+
+        Spec section 11: "Live-impacting commands must require explicit
+        confirmation and log an audit event." This is that sink — every
+        control-tier script (``stop_runtime``, ``stop_strategy``,
+        ``square_off``) calls it once per action, never per tick or candle.
+        """
+        if action not in AUDIT_ACTIONS:
+            raise ValueError(
+                f"unknown audit action {action!r}; must be one of {sorted(AUDIT_ACTIONS)}"
+            )
+        with self._db.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO audit_events
+                    (runtime_id, strategy_id, execution_mode, action, actor, detail, occurred_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    runtime_id,
+                    strategy_id,
+                    execution_mode.value if execution_mode else None,
+                    action,
+                    actor,
+                    detail,
                     _now(),
                 ),
             )

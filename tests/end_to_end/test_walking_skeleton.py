@@ -31,6 +31,7 @@ from common.market_data import RecordedFeedAdapter, load_tick_tape
 from common.models import PositionStatus
 from common.notifications import RecordingNotifier
 from common.persistence import Database, MigrationRunner, connect_readonly
+from common.process import square_off_request_path, write_square_off_request
 from common.risk import SquareOffPolicy
 from dashboards.app import load_master
 from dashboards.intraday_options import load_intraday_options
@@ -474,6 +475,79 @@ def test_the_worker_squares_off_at_the_configured_time(
         trading_date=TRADING_DATE,
     )
     assert open_positions == []
+
+
+def test_an_operator_square_off_request_is_honoured_not_just_the_clock(
+    worker_config, tick_tape_path, database_path, runtime_dirs
+):
+    """``scripts/square_off.py``'s only channel to a running worker (Phase 7
+    Part 4): a request file, checked once per candle, forces the same
+    square-off path the time-of-day ladder would eventually reach — never a
+    second one. ``worker_config``'s default policy (``SquareOffPolicy()``)
+    never fires by time within this six-candle tape, so a closed position
+    here can only be the request's doing.
+
+    The request is written *after* the first candle is dequeued (during the
+    second ``get()``, simulating an operator acting while the worker is
+    already running with an open position) rather than before ``run_worker``
+    starts — writing it up front would make the very first candle's forced
+    square-off pre-empt the entry itself, which is a real, separate property
+    (an operator request must also block entries from that point on) already
+    covered by the ``entries_blocked`` assertion in the sibling test above,
+    not what this test means to isolate.
+    """
+    candles = _candles(tick_tape_path)
+    config = worker_config
+    config.exit_on_candle = 99  # keep the position open until square-off
+
+    request_path = square_off_request_path(
+        runtime_dirs["pid_dir"].parent, RUNTIME_ID, STRATEGY_ID
+    )
+
+    class _RequestAfterFirstCandle(queue_module.Queue):
+        """Writes the operator's request once the entry candle has been
+        consumed, so it is visible starting from the *next* candle."""
+
+        def get(self, *args, **kwargs):
+            item = super().get(*args, **kwargs)
+            self._gets = getattr(self, "_gets", 0) + 1
+            # Written while fetching the *second* candle — strictly after the
+            # first candle's own processing (including its entry) is behind
+            # us, so it is visible starting only from this candle onward.
+            if self._gets == 2:
+                write_square_off_request(
+                    request_path, requested_by="an_operator", reason="manual test"
+                )
+            return item
+
+    queue: queue_module.Queue = _RequestAfterFirstCandle()
+    for candle in candles:
+        queue.put(candle)
+    queue.put(None)
+
+    outcome = run_worker(config, queue, RecordingNotifier())
+
+    repository = ExecutionRepository(Database(database_path))
+    state = repository.load_strategy_state(
+        strategy_id=STRATEGY_ID, execution_mode=ExecutionMode.PAPER, trading_date=TRADING_DATE
+    )
+    assert state is not None
+    assert state["square_off_state"] == "COMPLETED"
+    assert outcome.square_off_completed is True
+    assert repository.open_positions(
+        strategy_id=STRATEGY_ID, execution_mode=ExecutionMode.PAPER, trading_date=TRADING_DATE
+    ) == []
+
+    # The request is consumed, not left behind for the next run to re-trigger.
+    assert not request_path.is_file()
+
+    audit_rows = Database(database_path).connect().execute(
+        "SELECT actor, action, detail FROM audit_events WHERE strategy_id = ?", (STRATEGY_ID,)
+    ).fetchall()
+    assert len(audit_rows) == 1
+    assert audit_rows[0]["actor"] == "an_operator"
+    assert audit_rows[0]["action"] == "square_off_completed"
+    assert "manual test" in audit_rows[0]["detail"]
 
 
 def test_no_new_entry_is_opened_after_the_cutoff(worker_config, tick_tape_path, database_path):

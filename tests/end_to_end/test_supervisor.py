@@ -70,10 +70,16 @@ def test_the_supervisor_spawns_a_worker_that_trades(
 
 
 def test_two_workers_receive_identical_bars(supervisor_config, tick_tape_path, database_path):
+    # Deliberately non-colliding correlation-ID prefixes ("alph"/"brav") —
+    # this test's own property is "identical bars reach both workers", not
+    # the admission-time token-collision guard (see
+    # test_a_worker_whose_correlation_token_collides_is_refused below for
+    # that, discovered via this test using "skelone"/"skeltwo" originally
+    # and crashing on order_intents.correlation_id's UNIQUE constraint).
     adapter = RecordedFeedAdapter(load_tick_tape(tick_tape_path))
     supervisor = IntradayOptionsSupervisor(supervisor_config, adapter)
-    supervisor.add_worker(_worker(supervisor_config, "skelone"))
-    supervisor.add_worker(_worker(supervisor_config, "skeltwo"))
+    supervisor.add_worker(_worker(supervisor_config, "alphaskel"))
+    supervisor.add_worker(_worker(supervisor_config, "bravoskel"))
 
     result = supervisor.run()
 
@@ -90,6 +96,45 @@ def test_two_workers_receive_identical_bars(supervisor_config, tick_tape_path, d
     assert len(rows) == 2
     assert rows[0]["candle_end_at"] == rows[1]["candle_end_at"]
     assert rows[0]["candle_close"] == rows[1]["candle_close"]
+
+
+def test_a_worker_whose_correlation_token_collides_is_refused_not_crashed(
+    supervisor_config, tick_tape_path, database_path
+):
+    """D78: "skelone"/"skeltwo" both reduce to the correlation-ID token
+    "skel" (common.execution.correlation.strategy_token, first four
+    alphanumeric characters). Before this guard existed, the second
+    strategy's first order raised sqlite3.IntegrityError on order_intents.
+    correlation_id's UNIQUE constraint — a worker crash, not a controlled
+    refusal — discovered via test_two_workers_receive_identical_bars using
+    exactly this pair of names. add_worker now catches it at admission,
+    the same way it already catches a live-mode strategy the gate blocks.
+    """
+    adapter = RecordedFeedAdapter(load_tick_tape(tick_tape_path))
+    supervisor = IntradayOptionsSupervisor(supervisor_config, adapter)
+    first = supervisor.add_worker(_worker(supervisor_config, "skelone"))
+    second = supervisor.add_worker(_worker(supervisor_config, "skeltwo"))
+
+    assert first is not None
+    assert second is None  # refused, not spawned
+
+    result = supervisor.run()
+
+    assert result.workers_started == 1
+    assert "skeltwo" not in result.worker_exit_codes
+
+    conn = Database(database_path).connect()
+    row = conn.execute(
+        "SELECT severity, component, message FROM errors WHERE strategy_id = 'skeltwo'"
+    ).fetchone()
+    assert row is not None
+    assert row["severity"] == "ERROR"
+    assert row["component"] == "supervisor.correlation_token_collision"
+    assert "skelone" in row["message"]
+    # The admitted strategy is completely unaffected.
+    assert conn.execute(
+        "SELECT COUNT(*) FROM fills WHERE strategy_id = 'skelone'"
+    ).fetchone()[0] == 2
 
 
 def test_no_events_are_dropped_at_normal_volume(supervisor_config, tick_tape_path):
@@ -166,6 +211,58 @@ def test_a_blocked_live_worker_does_not_stop_the_paper_strategy(
     ).fetchall()
     assert len(blocked_errors) == 1
     assert "NOT rerouted to paper" in blocked_errors[0]["message"]
+
+
+def test_a_duplicate_worker_is_reported_not_silent(
+    supervisor_config, tick_tape_path, database_path
+):
+    """Phase 7 Part 4: EXIT_DUPLICATE has been recorded into worker_exit_codes
+    since Phase 3 Part 2b-ii-B-2 but nothing ever inspected it — a refused
+    worker was a silent zero-length run. This is what "act on it" means: an
+    errors row and a notification, the same pattern the mixed-mode live-gate
+    refusal above already uses.
+
+    The pre-held lock is real, not simulated: worker_lock's flock exclusion
+    works the same way against a lock this test process holds directly as it
+    does against a second OS process (test_a_second_lock_on_the_same_identity
+    _is_refused already proves the mechanism itself; this proves the
+    supervisor notices when its own spawned child hits it).
+    """
+    from common.notifications import RecordingNotifier
+    from common.process import worker_lock
+
+    held = worker_lock(
+        runtime_id=RUNTIME_ID,
+        strategy_id="skelfix",
+        lock_dir=supervisor_config.lock_dir,
+        pid_dir=supervisor_config.pid_dir,
+    ).acquire()
+    try:
+        adapter = RecordedFeedAdapter(load_tick_tape(tick_tape_path))
+        notifier = RecordingNotifier()
+        supervisor = IntradayOptionsSupervisor(supervisor_config, adapter, notifier=notifier)
+        supervisor.add_worker(_worker(supervisor_config, "skelfix"))
+
+        result = supervisor.run()
+    finally:
+        held.release()
+
+    from runtimes.intraday_options.worker import EXIT_DUPLICATE
+
+    assert result.worker_exit_codes["skelfix"] == EXIT_DUPLICATE
+
+    conn = Database(database_path).connect()
+    row = conn.execute(
+        "SELECT severity, component, message FROM errors WHERE strategy_id = 'skelfix'"
+    ).fetchone()
+    assert row is not None
+    assert row["severity"] == "CRITICAL"
+    assert row["component"] == "supervisor.duplicate_worker"
+    assert "did not start" in row["message"]
+
+    duplicate_events = [e for e in notifier.events if e.event_type == "duplicate_worker_refused"]
+    assert len(duplicate_events) == 1
+    assert duplicate_events[0].strategy_id == "skelfix"
 
 
 def test_the_database_is_consistent_after_a_supervised_run(
