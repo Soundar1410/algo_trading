@@ -21,6 +21,7 @@ import dashboards.intraday_options as io_page
 import dashboards.intraday_stocks as stocks_page
 import dashboards.positional_options as positional_page
 import dashboards.system_health as health_page
+from common.config import Settings
 from common.config.models import ExecutionMode
 from common.execution import ExecutionRepository
 from common.persistence import Database, MigrationRunner, connect_readonly
@@ -249,6 +250,209 @@ def test_no_disabled_count_is_fabricated(fake_st: _FakeStreamlit):
     )
     master_page.render(fake_st, card)
     assert any("disabled" in c.lower() for c in fake_st.captions)
+
+
+# ------------------------------------------------------ Master: live-gate
+def _write_config(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+GLOBAL_YAML_GATE_CLOSED = """
+global:
+  live_trading_enabled: false
+  timezone: Asia/Kolkata
+runtime_defaults:
+  enabled: false
+  live_execution_allowed: false
+strategy_defaults:
+  enabled: false
+  mode: paper
+  live_approved: false
+"""
+
+
+def test_load_live_gate_status_reads_global_and_runtime_flags(config_root: Path):
+    _write_config(config_root / "global.yaml", GLOBAL_YAML_GATE_CLOSED)
+    _write_config(
+        config_root / "runtimes" / f"{RUNTIME_ID}.yaml",
+        f"runtime_id: {RUNTIME_ID}\nenabled: true\nlive_execution_allowed: false\n",
+    )
+
+    status = master_page.load_live_gate_status(config_root, RUNTIME_ID, Settings())
+
+    assert isinstance(status, master_page.LiveGateStatus)
+    assert status.global_live_trading_enabled is False
+    assert status.runtime_live_execution_allowed is False
+    assert status.live_strategies == ()
+
+
+def test_load_live_gate_status_evaluates_the_real_gate_for_live_mode_strategies(
+    config_root: Path,
+):
+    """Reuses effective_live_gate itself — this is exactly what the
+    supervisor's own admission gate would decide for this strategy."""
+    _write_config(config_root / "global.yaml", GLOBAL_YAML_GATE_CLOSED)
+    _write_config(
+        config_root / "runtimes" / f"{RUNTIME_ID}.yaml",
+        f"runtime_id: {RUNTIME_ID}\nenabled: true\n",
+    )
+    _write_config(
+        config_root / "strategies" / "io_live_v1.yaml",
+        "strategy_id: io_live_v1\nenabled: true\nmode: live\nlive_approved: true\n",
+    )
+
+    status = master_page.load_live_gate_status(config_root, RUNTIME_ID, Settings())
+
+    assert len(status.live_strategies) == 1
+    strategy = status.live_strategies[0]
+    assert strategy.strategy_id == "io_live_v1"
+    assert strategy.allowed is False  # global.live_trading_enabled is false
+    assert any("live_trading_enabled" in r for r in strategy.blocked_reasons)
+
+
+def test_load_live_gate_status_ignores_paper_mode_strategies(config_root: Path):
+    _write_config(config_root / "global.yaml", GLOBAL_YAML_GATE_CLOSED)
+    _write_config(
+        config_root / "runtimes" / f"{RUNTIME_ID}.yaml",
+        f"runtime_id: {RUNTIME_ID}\nenabled: true\n",
+    )
+    _write_config(
+        config_root / "strategies" / "io_paper_v1.yaml",
+        "strategy_id: io_paper_v1\nenabled: true\nmode: paper\n",
+    )
+
+    status = master_page.load_live_gate_status(config_root, RUNTIME_ID, Settings())
+
+    assert status.live_strategies == ()
+
+
+def test_a_missing_runtime_config_returns_config_unavailable_not_an_exception(
+    config_root: Path,
+):
+    _write_config(config_root / "global.yaml", GLOBAL_YAML_GATE_CLOSED)
+    # No runtimes/intraday_options.yaml written at all.
+
+    status = master_page.load_live_gate_status(config_root, RUNTIME_ID, Settings())
+
+    assert isinstance(status, master_page.ConfigUnavailable)
+
+
+def test_load_master_without_config_root_leaves_live_gate_none(
+    repository: ExecutionRepository, database_path: Path
+):
+    """Every call site before this feature existed keeps working unchanged."""
+    _seed_group(repository)
+
+    card = master_page.load_master(database_path, RUNTIME_ID, TRADING_DATE)
+
+    assert card.live_gate is None
+
+
+def test_load_master_with_config_root_attaches_live_gate(
+    repository: ExecutionRepository, database_path: Path, config_root: Path
+):
+    _seed_group(repository)
+    _write_config(config_root / "global.yaml", GLOBAL_YAML_GATE_CLOSED)
+    _write_config(
+        config_root / "runtimes" / f"{RUNTIME_ID}.yaml",
+        f"runtime_id: {RUNTIME_ID}\nenabled: true\n",
+    )
+
+    card = master_page.load_master(
+        database_path, RUNTIME_ID, TRADING_DATE, config_root=config_root, settings=Settings()
+    )
+
+    assert isinstance(card.live_gate, master_page.LiveGateStatus)
+    assert card.live_gate.global_live_trading_enabled is False
+
+
+def test_master_render_omits_the_live_gate_section_when_none(fake_st: _FakeStreamlit):
+    card = master_page.RuntimeCard(
+        runtime_id=RUNTIME_ID,
+        group_health_state="RUNNING_PAPER",
+        heartbeat_age_seconds=1.0,
+        paper_count=1,
+        live_count=0,
+        failed_count=0,
+        total_count=1,
+        open_positions=0,
+        orders_today=0,
+        realised_pnl_paper=0.0,
+        realised_pnl_live=0.0,
+        feed_last_event="connected",
+        broker_healthy=True,
+        database_healthy=True,
+        recent_errors=(),
+        live_gate=None,
+    )
+    master_page.render(fake_st, card)
+    assert not any("Live-gate" in m for m in fake_st.markdowns)
+
+
+def test_master_render_shows_the_live_gate_section(fake_st: _FakeStreamlit):
+    live_gate = master_page.LiveGateStatus(
+        global_live_trading_enabled=False,
+        runtime_live_execution_allowed=True,
+        live_strategies=(
+            master_page.StrategyLiveGate(
+                strategy_id="io_live_v1",
+                allowed=False,
+                blocked_reasons=("global.live_trading_enabled is false",),
+            ),
+        ),
+    )
+    card = master_page.RuntimeCard(
+        runtime_id=RUNTIME_ID,
+        group_health_state="RUNNING_PAPER",
+        heartbeat_age_seconds=1.0,
+        paper_count=1,
+        live_count=1,
+        failed_count=0,
+        total_count=2,
+        open_positions=0,
+        orders_today=0,
+        realised_pnl_paper=0.0,
+        realised_pnl_live=0.0,
+        feed_last_event="connected",
+        broker_healthy=True,
+        database_healthy=True,
+        recent_errors=(),
+        live_gate=live_gate,
+    )
+    master_page.render(fake_st, card)
+
+    assert any("Live-gate" in m for m in fake_st.markdowns)
+    assert ("Global live trading", "disabled") in fake_st.metrics
+    assert ("Runtime live execution", "allowed") in fake_st.metrics
+    assert any("io_live_v1" in w and "blocked" in w for w in fake_st.warnings)
+
+
+def test_master_render_warns_when_config_is_unavailable(fake_st: _FakeStreamlit):
+    card = master_page.RuntimeCard(
+        runtime_id=RUNTIME_ID,
+        group_health_state="RUNNING_PAPER",
+        heartbeat_age_seconds=1.0,
+        paper_count=1,
+        live_count=0,
+        failed_count=0,
+        total_count=1,
+        open_positions=0,
+        orders_today=0,
+        realised_pnl_paper=0.0,
+        realised_pnl_live=0.0,
+        feed_last_event="connected",
+        broker_healthy=True,
+        database_healthy=True,
+        recent_errors=(),
+        live_gate=master_page.ConfigUnavailable("runtimes/intraday_options.yaml not found"),
+    )
+    master_page.render(fake_st, card)
+
+    assert any("Live-gate status unavailable" in w for w in fake_st.warnings)
+    # The rest of the page must still render — a broken YAML file degrades
+    # only this section, never the snapshot-backed rest of the page.
+    assert ("Group health", "RUNNING_PAPER") in fake_st.metrics
 
 
 # ==================================================== Intraday Options page

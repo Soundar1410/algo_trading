@@ -7,7 +7,7 @@ the next phase. Updated after every phase.
 
 | | |
 |---|---|
-| **Current phase** | **Phase 7 — Operations, Part 3 of 5 complete** (the Streamlit dashboard). `dashboards/app.py`'s Phase 1 single tile (`RuntimeTile`, four inline `SELECT`s) is retired; the dashboard is now a real multipage app — Master, Intraday Options and System Health read exclusively through `common.health.snapshot`/`connect_readonly` via a new shared `dashboards/_shared.py` (`load_snapshot`, one place that turns a missing/locked/pre-migration database into a message rather than a traceback); Positional Options and Intraday Stocks are honest stub pages, since neither runtime exists. Two spec-asked-for fields are deliberately not shown rather than fabricated: a "disabled strategy" count (invisible to runtime state — a disabled strategy never starts, never heartbeats) and engine type/legs/baskets/strikes/per-leg P&L/roll count (`MultiLegEngine`/`FixedStrikeEngine` are not ported — D56/D34). `tests/unit/test_dashboard.py` drives every page's `render()` with a fake streamlit module and AST-checks that no page imports a broker, a feed, or the write-capable `Database` class. A real, pre-existing flaky-test cause (SQLite/Python clock skew producing a fractionally negative heartbeat age) was found and fixed at the source — **D75**. All five pages verified with a real `streamlit run` (HTTP 200, clean server log) in addition to the unit suite. Parts 4-5 (PID hardening + operator commands, retention/backups) remain. |
+| **Current phase** | **Phase 7 — Operations, Part 3 of 5 complete** (the Streamlit dashboard), **plus an addendum**. `dashboards/app.py`'s Phase 1 single tile (`RuntimeTile`, four inline `SELECT`s) is retired; the dashboard is now a real multipage app — Master, Intraday Options and System Health read through `common.health.snapshot`/`connect_readonly` via a new shared `dashboards/_shared.py` (`load_snapshot`, one place that turns a missing/locked/pre-migration database into a message rather than a traceback); Positional Options and Intraday Stocks are honest stub pages, since neither runtime exists. One spec-asked-for field is deliberately not shown rather than fabricated: engine type/legs/baskets/strikes/per-leg P&L/roll count (`MultiLegEngine`/`FixedStrikeEngine` are not ported — D56/D34). `tests/unit/test_dashboard.py` drives every page's `render()` with a fake streamlit module and AST-checks that no page imports a broker, a feed, or the write-capable `Database` class. A real, pre-existing flaky-test cause (SQLite/Python clock skew producing a fractionally negative heartbeat age) was found and fixed at the source — **D75**. All five pages verified with a real `streamlit run` (HTTP 200, clean server log) in addition to the unit suite. **Addendum:** global/runtime live-gate status (`effective_live_gate`, config-sourced) added back to Master — config and the operational database are different resources, and the AST regression tests pass unmodified for `app.py` with the new `common.config` import, confirmed by running them individually. A "disabled strategy" count remains unshown — still invisible to both the database and to `discover_enabled_strategies` (which returns only enabled ones), not something the addendum's config read happens to answer. Parts 4-5 (PID hardening + operator commands, retention/backups) remain. |
 | **Next phase** | Phase 7 Part 4 — PID handling and operator commands. |
 | **Last updated** | 7 August 2026 — Phase 7 Part 3 complete, see [Known limitations](#6-known-limitations) |
 | **Python** | 3.11.9 (arm64 macOS) |
@@ -27,7 +27,7 @@ the next phase. Updated after every phase.
 | 4 | Candle, indicator and paper-execution foundation | **Complete.** **Part 1 complete** (real contract resolution — closes 17, alarms 15). **Part 2 complete** (indicator layer — closes D21). **Part 3 complete** (continuity, timezone, wall-clock square-off — closes 4 and 7, and a live blocker). **Part 4 complete** (warm-up source and injection — closes 16). **Part 5 complete** (`PaperBroker` realism — closes 5 and D11; the live Full-mode gate item ran 6 August 2026 and passed, closing known limitation 20 along the way). **Phase 4 complete** — all five parts done, its one live gate item proven rather than asserted |
 | 5 | Mixed-mode supervisor and persistence | **Complete** |
 | 6 | Paper recovery and expiry handling | **Complete — all five parts.** **Part 1** (daily risk state across a restart — closes the risk-limit-bypass gap in bullet 1, and finds/fixes **D58**/limitation 22 along the way). **Part 2** (position-management state snapshot/restore — exit-policy state via `BaseExit`/`RiskManager`/`BaseStrategy` snapshot hooks, and stop/target persistence through a widened `RiskManager`/`ExecutionGateway`, fail-open on a bad snapshot, negative-control-tested). **Part 3** (MFE/MAE, square-off attempts, state-version validation and position-gated last-candle idempotency — the rest of §7's "restore at minimum" list). **Part 4** (`force_square_off_before_expiry` composed into the existing `SquareOffAuthority` seam — **D66-D68**; `simulate_exchange_settlement` refused at config load, none of spec section 11's eight settlement-policy items built — limitation 27). **Part 5** (the phase's record: bullets re-checked against what is built, not assumed; D56's persistence-identity gap given a written candidate direction, not an implementation — **D69**, limitation 30). Bullet 2's fixed strikes/basket legs/rolling counters remain blocked on `FixedStrikeEngine`/`MultiLegEngine` — D56/D34, unchanged, not this phase's to close |
-| 7 | Operations | **Part 1 complete** (health snapshot layer — `common/health/snapshot.py`, `auth_events`/`feed_events` writers and producers, configurable heartbeat interval). **Part 2 complete** (Telegram in production — real notifier construction at both entrypoints, deferred delivery, rate limiting/aggregation, `notifications`-table persistence, redacted rendering — D71-D74). **Part 3 complete** (the Streamlit dashboard — Master/Intraday Options/System Health pages plus two honest stubs, all reading through `common.health.snapshot` only — D75). Parts 4-5 (PID/operator commands, retention) not started |
+| 7 | Operations | **Part 1 complete** (health snapshot layer — `common/health/snapshot.py`, `auth_events`/`feed_events` writers and producers, configurable heartbeat interval). **Part 2 complete** (Telegram in production — real notifier construction at both entrypoints, deferred delivery, rate limiting/aggregation, `notifications`-table persistence, redacted rendering — D71-D74). **Part 3 complete** (the Streamlit dashboard — Master/Intraday Options/System Health pages plus two honest stubs, reading through `common.health.snapshot` for operational state — D75; addendum adds `effective_live_gate` status to Master, config-sourced, the one deliberate exception to database-only reads). Parts 4-5 (PID/operator commands, retention) not started |
 | 8 | LaunchAgent validation | Not started |
 | 9 | Real strategies | Not started |
 | 10 | Controlled live readiness | Not started |
@@ -4494,14 +4494,22 @@ including a regression test that no page module imports a broker, a feed, or a
 write connection.
 
 **"Exclusively snapshot.py and connect_readonly" is stricter than the plan's own
-Master-page bullet, and the stricter reading won.** The plan's original Part 3 text
-named `effective_live_gate` as a Master-page data source for "global and runtime
-live-gate status" — but `effective_live_gate` takes a `ResolvedConfig`, which means
-reading `config/`, not the database. Given the explicit, repeated instruction to
-read *exclusively* from the snapshot and a read-only connection, live-gate status is
-**not shown** on Master this part, rather than quietly reached around the
-constraint. Flagged here rather than silently dropped — reversible in a later part
-if wanted.
+Master-page bullet — flagged, then corrected once reviewed.** The plan's original
+Part 3 text named `effective_live_gate` as a Master-page data source for "global and
+runtime live-gate status", but `effective_live_gate` takes a `ResolvedConfig`, which
+means reading `config/`, not the database. First shipped with live-gate status
+**not shown**, flagged explicitly rather than silently dropped, precisely so it could
+be revisited. Reviewed and corrected in the same part: config and the operational
+database are different resources, and "exclusively snapshot.py and connect_readonly"
+was never actually about config — it was about the database specifically (no write
+connection, no second ad-hoc SQL path) plus no broker/feed import. Verified directly
+before adding it back, not assumed: `common.config` and everything it imports
+transitively (`common.risk.squareoff`, `pydantic`, `yaml`, the standard library)
+touches neither `common.broker` nor `common.market_data` nor the write-capable
+`common.persistence.Database`, and `tests/unit/test_dashboard.py`'s AST regression
+tests pass unmodified for `app.py` with the new import present — they check for
+broker/feed/write-`Database` imports specifically, which config reading is none of.
+Live-gate status now ships on Master; see the addendum below.
 
 **Two spec-asked-for fields are deliberately not shown, and the difference between
 them is why one is a data-source limit and the other is an honesty decision:**
@@ -4593,10 +4601,58 @@ Streamlit's own execution context — the one thing the unit suite cannot exerci
 since nothing pytest does replicates how Streamlit sets up `sys.path` for a page it
 discovers by directory convention rather than by import.
 
+#### Addendum: live-gate status added to Master
+
+Requested directly after the part above shipped: add `effective_live_gate` status
+back to Master, sourced from config, confirm the AST regression test still passes,
+and confirm this does not reopen whatever risk "exclusively snapshot/connect_readonly"
+was actually guarding against.
+
+`RuntimeCard` gains one new field, `live_gate: LiveGateStatus | ConfigUnavailable |
+None = None` — defaulted so every call site and every test written against
+`load_master`/`RuntimeCard` before this addendum keeps working completely unchanged;
+`config_root` is a new *optional* keyword on `load_master`, and only supplying it
+computes the section at all. `LiveGateStatus` carries the two account/runtime-level
+booleans (`global_live_trading_enabled`, `runtime_live_execution_allowed` — spec's
+own "global and runtime" framing, distinct from strategy-level) read directly off
+`GlobalConfig`/`RuntimeConfig`, plus `effective_live_gate` evaluated for real —
+not re-derived — against every *enabled*, *live-mode* strategy
+(`discover_enabled_strategies` already resolves each one fully), so what Master shows
+is exactly what the supervisor's own admission gate would decide for that strategy,
+reasons included.
+
+Isolated into its own failure type, `ConfigUnavailable`, deliberately not reusing
+`SnapshotUnavailable`: a malformed or absent `config/runtimes/<id>.yaml` is now a real
+possibility this page has to handle (it wasn't, before this addendum touched config at
+all), and it must degrade *only* the live-gate section — a broken YAML file must never
+blank the snapshot-backed rest of an otherwise-healthy page. `load_master` still
+returns a plain `SnapshotUnavailable` when the *database* read fails, unchanged;
+`ConfigUnavailable` only ever appears inside `RuntimeCard.live_gate`, never as
+`load_master`'s own top-level return type.
+
+Verified precisely, not assumed: `common.config`'s own import list and every module it
+imports (`common/config/loader.py`, `common/config/models.py`,
+`common/config/__init__.py`, and `common.risk.squareoff` transitively) were read
+directly and confirmed to touch only `pydantic`/`yaml`/the standard library — no
+`common.broker`, no `common.market_data`, no write-capable `common.persistence.
+Database`. `tests/unit/test_dashboard.py::test_no_dashboard_module_imports_a_broker_or_a_feed[app.py]`
+and `::test_no_dashboard_module_imports_the_write_capable_database_class[app.py]` both
+still pass unmodified with the new `common.config` import present, run individually to
+confirm rather than inferred from the full suite passing. Re-verified live against the
+real repo: `streamlit run dashboards/app.py` against the actual `config/global.yaml`/
+`config/runtimes/intraday_options.yaml` returned HTTP 200 with an empty server log, the
+same two-part verification (unit suite + a real running instance) the part itself used.
+
+9 new tests in `tests/unit/test_dashboard.py` cover `load_live_gate_status` directly
+(global/runtime flags, a live-mode strategy correctly blocked by the real gate, a
+paper-mode strategy correctly excluded, a missing runtime config returning
+`ConfigUnavailable` rather than raising), `load_master`'s backward-compatible default
+and its `config_root`-supplied path, and `render()` for all three states (no live-gate
+requested, a real status, and an unavailable one that must not blank the rest of the
+page).
+
 **Deliberately not done in Part 3:**
 
-- Global/runtime live-gate status on Master — see above; needs `common.config`, ruled
-  out by this part's read-source constraint.
 - Engine type, legs/baskets, strikes/expiry, per-leg P&L, roll count — see above;
   `MultiLegEngine`/`FixedStrikeEngine` produce none of this data yet.
 - A "disabled strategy" count — see above; invisible to runtime state alone.
