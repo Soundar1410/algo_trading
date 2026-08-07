@@ -12,6 +12,7 @@ from common.config import (
     ExecutionMode,
     ExpiryPolicy,
     GlobalConfig,
+    HealthConfig,
     ResolvedConfig,
     RuntimeConfig,
     Settings,
@@ -89,6 +90,39 @@ def test_runtime_inherits_global_defaults_and_overrides_them(populated_config: P
     assert runtime.enabled is True  # from the runtime file
     assert runtime.live_execution_allowed is False  # inherited from global defaults
     assert runtime.shared_market_feed is True
+
+
+def test_a_runtime_with_no_health_block_gets_the_documented_default(populated_config: Path):
+    """common.health.heartbeat.DEFAULT_INTERVAL_SECONDS and this default must
+    never silently drift apart — see tests/unit/test_heartbeat.py's own check
+    of the other direction."""
+    runtime = load_runtime_config(populated_config, "intraday_options")
+    assert runtime.health == HealthConfig()
+    assert runtime.health.heartbeat_interval_seconds == 10.0
+
+
+def test_a_runtime_yaml_can_override_the_heartbeat_interval(populated_config: Path):
+    _write(
+        populated_config / "runtimes" / "intraday_options.yaml",
+        "runtime_id: intraday_options\nenabled: true\nhealth:\n  heartbeat_interval_seconds: 5\n",
+    )
+    runtime = load_runtime_config(populated_config, "intraday_options")
+    assert runtime.health.heartbeat_interval_seconds == 5.0
+
+
+def test_a_non_positive_heartbeat_interval_is_rejected():
+    with pytest.raises(Exception, match="greater than 0"):
+        HealthConfig(heartbeat_interval_seconds=0)
+
+
+def test_an_unknown_key_inside_the_health_block_is_rejected(populated_config: Path):
+    _write(
+        populated_config / "runtimes" / "intraday_options.yaml",
+        "runtime_id: intraday_options\nenabled: true\nhealth:\n  heartbeat_interval_seconds: 5\n"
+        "  hearbeat_interval_seconds: 5\n",
+    )
+    with pytest.raises(ConfigError):
+        load_runtime_config(populated_config, "intraday_options")
 
 
 def test_strategy_inherits_global_then_runtime_then_own_file(populated_config: Path):

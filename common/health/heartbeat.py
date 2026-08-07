@@ -13,6 +13,7 @@ that is slow to query exactly when an incident needs it.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime
 from enum import StrEnum
 
@@ -54,12 +55,17 @@ class HeartbeatWriter:
         runtime_id: str,
         strategy_id: str | None,
         interval_seconds: float = DEFAULT_INTERVAL_SECONDS,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._repo = repository
         self._session_id = session_id
         self._runtime_id = runtime_id
         self._strategy_id = strategy_id
         self._interval = interval_seconds
+        #: Injectable so the rate-limit gate can be tested without sleeping —
+        #: the same pattern :class:`~common.feed.reconnect.ReconnectingFeed`
+        #: uses for its own ``clock``/``sleep``/``rng``.
+        self._clock = clock
         self._last_beat: datetime | None = None
 
     def beat(
@@ -77,7 +83,7 @@ class HeartbeatWriter:
         FAILED or STOPPING must be recorded immediately, not up to ten seconds
         later when the process may no longer exist.
         """
-        now = datetime.now(UTC)
+        now = self._clock()
         within_interval = (
             self._last_beat is not None and (now - self._last_beat).total_seconds() < self._interval
         )

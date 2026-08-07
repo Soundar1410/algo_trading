@@ -722,6 +722,50 @@ def test_notifications_are_persisted(repository):
     assert row["delivered"] == 1
 
 
+# ------------------------------------------------- diagnostic events (Phase 7)
+def test_auth_events_are_persisted(repository):
+    repository.record_auth_event(
+        runtime_id="intraday_options",
+        event="token_reused_from_cache",
+        token_source="cache",
+        token_expiry="2026-07-30T09:00:00+05:30",
+        requests_made=0,
+    )
+    row = repository.database.connect().execute("SELECT * FROM auth_events").fetchone()
+    assert row["event"] == "token_reused_from_cache"
+    assert row["token_source"] == "cache"
+    assert row["requests_made"] == 0
+
+
+def test_an_unknown_auth_event_is_refused_before_reaching_sqlite(repository):
+    with pytest.raises(ValueError, match="unknown auth event"):
+        repository.record_auth_event(runtime_id="intraday_options", event="not_a_real_event")
+    assert repository.database.connect().execute("SELECT COUNT(*) FROM auth_events").fetchone()[
+        0
+    ] == 0
+
+
+def test_feed_events_are_persisted(repository):
+    repository.record_feed_event(
+        runtime_id="intraday_options",
+        event="disconnected",
+        reason_code=807,
+        reason="access token expired",
+    )
+    row = repository.database.connect().execute("SELECT * FROM feed_events").fetchone()
+    assert row["event"] == "disconnected"
+    assert row["reason_code"] == 807
+    assert row["gap_candles_discarded"] == 0
+
+
+def test_an_unknown_feed_event_is_refused_before_reaching_sqlite(repository):
+    with pytest.raises(ValueError, match="unknown feed event"):
+        repository.record_feed_event(runtime_id="intraday_options", event="not_a_real_event")
+    assert repository.database.connect().execute("SELECT COUNT(*) FROM feed_events").fetchone()[
+        0
+    ] == 0
+
+
 def test_the_database_stays_consistent_after_a_full_cycle(repository, session):
     lifecycle = _lifecycle(repository, session)
     lifecycle.handle_signal(_signal(Side.BUY, minute=15), trading_date=TRADING_DATE)

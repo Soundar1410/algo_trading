@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from common.config.models import ExecutionMode
+from common.execution.health_events import AUTH_EVENTS, FEED_EVENTS
 from common.models import (
     CURRENT_STATE_VERSION,
     Candle,
@@ -918,6 +919,80 @@ class ExecutionRepository:
                     component,
                     message,
                     context,
+                    _now(),
+                ),
+            )
+
+    # ---------------------------------------------------------- diagnostics
+    def record_auth_event(
+        self,
+        *,
+        runtime_id: str,
+        event: str,
+        token_source: str | None = None,
+        token_expiry: str | None = None,
+        requests_made: int = 0,
+        detail: str | None = None,
+    ) -> None:
+        """Write one row to ``auth_events`` (migration 0002).
+
+        Written on state changes and failures only, never per tick or per
+        candle — the migration's own rule (see its module docstring).
+        """
+        if event not in AUTH_EVENTS:
+            raise ValueError(f"unknown auth event {event!r}; must be one of {sorted(AUTH_EVENTS)}")
+        with self._db.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO auth_events
+                    (runtime_id, event, token_source, token_expiry, requests_made,
+                     detail, occurred_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (runtime_id, event, token_source, token_expiry, requests_made, detail, _now()),
+            )
+
+    def record_feed_event(
+        self,
+        *,
+        runtime_id: str,
+        event: str,
+        reason_code: int | None = None,
+        reason: str | None = None,
+        attempt: int | None = None,
+        downtime_seconds: float | None = None,
+        expected_subscriptions: int | None = None,
+        active_subscriptions: int | None = None,
+        gap_candles_discarded: int = 0,
+        security_id: str | None = None,
+    ) -> None:
+        """Write one row to ``feed_events`` (migration 0002).
+
+        Written on state changes and failures only, never per tick or per
+        candle — the migration's own rule (see its module docstring).
+        """
+        if event not in FEED_EVENTS:
+            raise ValueError(f"unknown feed event {event!r}; must be one of {sorted(FEED_EVENTS)}")
+        with self._db.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO feed_events
+                    (runtime_id, event, reason_code, reason, attempt, downtime_seconds,
+                     expected_subscriptions, active_subscriptions, gap_candles_discarded,
+                     security_id, occurred_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    runtime_id,
+                    event,
+                    reason_code,
+                    reason,
+                    attempt,
+                    downtime_seconds,
+                    expected_subscriptions,
+                    active_subscriptions,
+                    gap_candles_discarded,
+                    security_id,
                     _now(),
                 ),
             )

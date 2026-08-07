@@ -14,6 +14,7 @@ from .queues import (
 )
 from .reconnect import (
     FeedHealth,
+    FeedHealthEvent,
     FeedUnavailableError,
     ReconnectingFeed,
     ReconnectPolicy,
@@ -25,6 +26,7 @@ __all__ = [
     "DROP_NOTICE_EVERY",
     "BoundedWorkerQueue",
     "FeedHealth",
+    "FeedHealthEvent",
     "FeedUnavailableError",
     "QueueStats",
     "ReconnectPolicy",

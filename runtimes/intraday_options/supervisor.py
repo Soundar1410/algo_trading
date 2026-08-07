@@ -56,16 +56,17 @@ import queue as queue_module
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 from common.config.models import ExecutionMode, LiveGateDecision
 from common.execution import ExecutionRepository
+from common.execution.health_events import auth_event_for_source
 from common.feed import DEFAULT_TICK_MAX_DEPTH, SharedFeedHub
 from common.feed.hub import WorkerChannel, build_channel
-from common.feed.reconnect import ReconnectingFeed
-from common.health import HealthState, HeartbeatWriter
+from common.feed.reconnect import FeedHealthEvent, ReconnectingFeed
+from common.health import DEFAULT_INTERVAL_SECONDS, HealthState, HeartbeatWriter
 from common.logging import get_logger
 from common.market_data.adapter import MarketFeedAdapter
 from common.notifications import NotificationEvent, Notifier, NullNotifier, SafeNotifier
@@ -159,6 +160,11 @@ class SupervisorConfig:
     #: rather than the candle queue's assumptions — see
     #: :data:`common.feed.queues.DEFAULT_TICK_MAX_DEPTH`.
     tick_queue_depth: int = DEFAULT_TICK_MAX_DEPTH
+    #: From ``RuntimeConfig.health.heartbeat_interval_seconds`` — see
+    #: :mod:`common.config.models`. Defaulted independently rather than
+    #: importing the config layer here, so a direct construction (every
+    #: existing test) keeps working unchanged.
+    heartbeat_interval_seconds: float = DEFAULT_INTERVAL_SECONDS
 
 
 @dataclass
@@ -228,10 +234,43 @@ class IntradayOptionsSupervisor:
         #: Latched once the limitation-15 alarm has fired, so a condition that
         #: persists produces one notification rather than one per poll.
         self._stuck_subscription_alarmed = False
+        #: Security IDs already reported stale, so a `feed_events` row is written
+        #: once per instrument per stale spell rather than once per poll. An
+        #: instrument that later gets a fresh tick drops out on its own — see
+        #: :meth:`_check_stale_instruments`.
+        self._stale_instruments_alarmed: set[str] = set()
+        #: Set via :meth:`set_startup_auth_outcome` before :meth:`run`, since the
+        #: token is obtained before this object's repository exists. ``None``
+        #: means no outcome was recorded — a caller that never calls the setter
+        #: (every existing test) gets the previous, unaudited behaviour.
+        self._startup_auth_outcome: tuple[str, str | None, int] | None = None
+        #: The feed's health events land here, not in a repository call directly:
+        #: the feed runs on its own thread (module docstring), and the repository's
+        #: sqlite3 connection was opened on *this* one — sqlite3 refuses a
+        #: cross-thread call outright. This queue is the same handoff
+        #: :attr:`_control_queues` already uses for the opposite direction; see
+        #: :meth:`_drain_feed_health_events`. Unbounded deliberately: these are
+        #: state-transition events, not tick-rate ones (migration 0002's own
+        #: rule), so there is no load pattern here to bound against.
+        self._feed_health_events: queue_module.Queue[FeedHealthEvent] = queue_module.Queue()
 
     @property
     def hub(self) -> SharedFeedHub:
         return self._hub
+
+    def set_startup_auth_outcome(
+        self, *, source: str, token_expiry: str | None, requests_made: int
+    ) -> None:
+        """Record the token outcome from :meth:`~common.authentication.bootstrap.
+        AuthBootstrap.get_token`, called before this repository existed.
+
+        ``source`` is ``TokenOutcome.source`` verbatim ("environment"/"cache"/
+        "generated") — stored as ``auth_events.token_source`` and separately
+        mapped to the ``auth_events.event`` vocabulary by
+        :func:`~common.execution.health_events.auth_event_for_source` when
+        :meth:`run` writes it, matching the migration's own column comment.
+        """
+        self._startup_auth_outcome = (source, token_expiry, requests_made)
 
     def add_worker(
         self,
@@ -361,8 +400,26 @@ class IntradayOptionsSupervisor:
             session_id=session.id,
             runtime_id=self._config.runtime_id,
             strategy_id=None,
+            interval_seconds=self._config.heartbeat_interval_seconds,
         )
         heartbeat.beat(HealthState.STARTING, force=True)
+
+        # Late-bound: the feed was constructed in __init__, before this
+        # repository existed. The sink only enqueues — it must never touch the
+        # repository directly, because it runs on the feed thread and the
+        # repository's connection belongs to this one. See
+        # _drain_feed_health_events for the thread that actually writes.
+        self._feed.set_health_event_sink(self._feed_health_events.put)
+
+        if self._startup_auth_outcome is not None:
+            source, token_expiry, requests_made = self._startup_auth_outcome
+            repository.record_auth_event(
+                runtime_id=self._config.runtime_id,
+                event=auth_event_for_source(source),
+                token_source=source,
+                token_expiry=token_expiry,
+                requests_made=requests_made,
+            )
 
         # Record every live-mode refusal add_worker() collected, before spawning
         # anything admitted. Recorded, not just logged: an operator reading only
@@ -571,12 +628,15 @@ class IntradayOptionsSupervisor:
             # climbs all session — indistinguishable from a dead supervisor.
             while not wake.wait(timeout=HEARTBEAT_POLL_SECONDS):
                 self._drain_control_queues()
+                self._drain_feed_health_events(repository)
                 self._check_stuck_subscription(heartbeat, repository)
+                self._check_stale_instruments(repository)
                 self._beat_running(heartbeat)
-            # Once more after the wake: a request that arrived in the same instant
-            # the feed finished is still worth applying, and costs nothing if the
-            # queues are empty.
+            # Once more after the wake: a request — or a health event — that
+            # arrived in the same instant the feed finished is still worth
+            # applying, and costs nothing if the queues are empty.
             self._drain_control_queues()
+            self._drain_feed_health_events(repository)
             if signalled.is_set():
                 result.stopped_by_signal = True
                 _log.info("shutdown requested; asking the feed to finish")
@@ -623,6 +683,26 @@ class IntradayOptionsSupervisor:
                     continue
                 security_id, segment, mode = parsed
                 self._hub.request_subscription(strategy_id, security_id, segment=segment, mode=mode)
+
+    def _drain_feed_health_events(self, repository: ExecutionRepository) -> None:
+        """Write every queued ``feed_events`` row on this (the repository's) thread.
+
+        The feed thread only ever enqueues (:meth:`run`'s ``set_health_event_sink``
+        call) — it must not call the repository directly, since its sqlite3
+        connection belongs to this thread. A write that raises is logged and
+        dropped rather than allowed to break the poll loop: a `feed_events` row is
+        diagnostic, not something the run depends on, and the same isolation
+        discipline ``SafeNotifier`` applies to Telegram belongs here too.
+        """
+        while True:
+            try:
+                event = self._feed_health_events.get_nowait()
+            except queue_module.Empty:
+                break
+            try:
+                repository.record_feed_event(runtime_id=self._config.runtime_id, **asdict(event))
+            except Exception:
+                _log.exception("failed to persist a feed_events row (event=%s)", event.event)
 
     def _beat_running(self, heartbeat: HeartbeatWriter) -> None:
         """One rate-limited liveness beat, carrying the group's queue picture."""
@@ -684,6 +764,9 @@ class IntradayOptionsSupervisor:
             component="feed",
             message=message,
         )
+        repository.record_feed_event(
+            runtime_id=self._config.runtime_id, event="degraded", reason=message
+        )
         self._notifier.send(
             NotificationEvent(
                 event_type="subscription_not_applied",
@@ -692,6 +775,28 @@ class IntradayOptionsSupervisor:
                 execution_mode=ExecutionMode.PAPER,
             )
         )
+
+    def _check_stale_instruments(self, repository: ExecutionRepository) -> None:
+        """Write a ``feed_events`` row for each newly-stale instrument.
+
+        Deliberately lighter-weight than :meth:`_check_stuck_subscription`: a
+        single quiet far-OTM strike is explicitly *not* a broken feed (see
+        :data:`~common.feed.reconnect.DEFAULT_STALENESS_SECONDS`'s own
+        comment), so this writes a diagnostic row for the dashboard/CLI to
+        show, not an ``errors`` row or a notification. Latched per instrument:
+        an instrument stays "already reported" until a fresh tick clears it
+        from :meth:`~common.feed.reconnect.FeedHealth.stale_instruments`, so a
+        quiet strike produces one row, not one every poll.
+        """
+        stale = set(self._feed.health.stale_instruments())
+        newly_stale = stale - self._stale_instruments_alarmed
+        for security_id in sorted(newly_stale):
+            repository.record_feed_event(
+                runtime_id=self._config.runtime_id,
+                event="stale_instrument",
+                security_id=security_id,
+            )
+        self._stale_instruments_alarmed = stale
 
     def _raise_silent_feed_alarm(
         self,
@@ -723,6 +828,9 @@ class IntradayOptionsSupervisor:
             severity="CRITICAL",
             component="feed",
             message=message,
+        )
+        repository.record_feed_event(
+            runtime_id=self._config.runtime_id, event="degraded", reason=message
         )
         self._notifier.send(
             NotificationEvent(

@@ -68,6 +68,27 @@ class FeedUnavailableError(RuntimeError):
     """
 
 
+@dataclass(frozen=True)
+class FeedHealthEvent:
+    """One row's worth of ``feed_events`` data (migration 0002), emitted at a
+    state transition. See :meth:`ReconnectingFeed.set_health_event_sink`.
+
+    Field names mirror :meth:`common.execution.repository.ExecutionRepository.
+    record_feed_event`'s keyword arguments exactly, so a sink can forward one
+    via ``record_feed_event(runtime_id=..., **dataclasses.asdict(event))``.
+    """
+
+    event: str
+    reason_code: int | None = None
+    reason: str | None = None
+    attempt: int | None = None
+    downtime_seconds: float | None = None
+    expected_subscriptions: int | None = None
+    active_subscriptions: int | None = None
+    gap_candles_discarded: int = 0
+    security_id: str | None = None
+
+
 @dataclass
 class ReconnectPolicy:
     """Bounded exponential backoff with jitter."""
@@ -159,6 +180,7 @@ class ReconnectingFeed:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         rng: Callable[[], float] = random.random,
         staleness_seconds: float = DEFAULT_STALENESS_SECONDS,
+        on_health_event: Callable[[FeedHealthEvent], None] | None = None,
     ) -> None:
         self._adapter = adapter
         self._policy = policy or ReconnectPolicy()
@@ -195,6 +217,13 @@ class ReconnectingFeed:
         #: would kill a runtime on its ninth instant recovery of the day.
         self._consecutive_failures = 0
         self.health = FeedHealth()
+        #: Optional sink for ``feed_events`` rows (migration 0002). ``None`` by
+        #: default — most callers of :class:`ReconnectingFeed` are tests with no
+        #: database, and the supervisor's own repository does not exist yet at
+        #: construction time (it opens after the group lock is acquired), so this
+        #: is late-bound via :meth:`set_health_event_sink` rather than passed at
+        #: construction in production.
+        self._on_health_event = on_health_event
 
     # ------------------------------------------------------------- properties
     @property
@@ -216,6 +245,24 @@ class ReconnectingFeed:
     @property
     def policy(self) -> ReconnectPolicy:
         return self._policy
+
+    def set_health_event_sink(self, sink: Callable[[FeedHealthEvent], None] | None) -> None:
+        """Late-bind (or clear) the ``feed_events`` sink after construction.
+
+        The supervisor calls this once its repository exists, before the feed
+        thread starts. A sink that raises never breaks the feed — see
+        :meth:`_emit_health_event` — the same isolation discipline
+        :class:`~common.notifications.base.SafeNotifier` applies to Telegram.
+        """
+        self._on_health_event = sink
+
+    def _emit_health_event(self, event: FeedHealthEvent) -> None:
+        if self._on_health_event is None:
+            return
+        try:
+            self._on_health_event(event)
+        except Exception:
+            _log.exception("feed health event sink raised; continuing (event=%s)", event.event)
 
     # ----------------------------------------------------------- subscription
     def subscribe(
@@ -291,6 +338,14 @@ class ReconnectingFeed:
 
                 attempt = self._consecutive_failures
                 if attempt >= self._policy.max_attempts:
+                    self._emit_health_event(
+                        FeedHealthEvent(
+                            event="reconnect_exhausted",
+                            attempt=attempt,
+                            reason=str(exc),
+                            reason_code=self.health.last_disconnect_code,
+                        )
+                    )
                     raise FeedUnavailableError(
                         f"Feed did not recover after {attempt} attempts; last error: {exc}. "
                         "Failing closed rather than continuing without market data."
@@ -304,6 +359,14 @@ class ReconnectingFeed:
                     self._policy.max_attempts,
                     delay,
                     self.health.last_disconnect_reason,
+                )
+                self._emit_health_event(
+                    FeedHealthEvent(
+                        event="reconnect_attempted",
+                        attempt=attempt,
+                        reason=self.health.last_disconnect_reason,
+                        reason_code=self.health.last_disconnect_code,
+                    )
                 )
                 self._sleep(delay)
                 self._reconnect()
@@ -406,6 +469,9 @@ class ReconnectingFeed:
                 # thing that restores the attempt budget.
                 self._consecutive_failures = 0
                 _log.info("feed no longer degraded: fresh tick for %s", tick.security_id)
+                self._emit_health_event(
+                    FeedHealthEvent(event="recovered", security_id=tick.security_id)
+                )
             on_tick(tick)
             if self._stop_requested.is_set():
                 # A stop asked for by another thread, taken up here — inside the
@@ -421,11 +487,12 @@ class ReconnectingFeed:
         now = self._clock()
         self.health.connected = True
         self.health.last_connected_at = now
+        gap_seconds: float | None = None
         if self.health.last_disconnected_at is not None:
-            self.health.total_downtime_seconds += (
-                now - self.health.last_disconnected_at
-            ).total_seconds()
+            gap_seconds = (now - self.health.last_disconnected_at).total_seconds()
+            self.health.total_downtime_seconds += gap_seconds
             self.health.last_disconnected_at = None
+        self._emit_health_event(FeedHealthEvent(event="connected", downtime_seconds=gap_seconds))
 
     def _mark_disconnected(self, exc: Exception | None) -> None:
         self.health.connected = False
@@ -442,6 +509,14 @@ class ReconnectingFeed:
             self.health.last_disconnect_reason = f"{type(exc).__name__}: {exc}"
         else:
             self.health.last_disconnect_reason = "feed exited without being stopped"
+
+        self._emit_health_event(
+            FeedHealthEvent(
+                event="disconnected",
+                reason_code=self.health.last_disconnect_code,
+                reason=self.health.last_disconnect_reason,
+            )
+        )
 
         # Invalidate any bar that was open during the outage.
         if self._on_feed_gap is not None:
@@ -482,4 +557,11 @@ class ReconnectingFeed:
             self._adapter.subscribe(self._security_ids)
         self.health.active_subscriptions = len(
             getattr(self._adapter, "subscribed", self._security_ids)
+        )
+        self._emit_health_event(
+            FeedHealthEvent(
+                event="resubscribed",
+                expected_subscriptions=self.health.expected_subscriptions,
+                active_subscriptions=self.health.active_subscriptions,
+            )
         )

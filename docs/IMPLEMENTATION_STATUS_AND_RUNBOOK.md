@@ -7,9 +7,9 @@ the next phase. Updated after every phase.
 
 | | |
 |---|---|
-| **Current phase** | **Phase 6 complete — all five parts.** Part 5 closes the phase with a record, not code: re-examined all four spec bullets against what is actually built and found bullets 1 and 3 done, bullet 2's remaining items still legitimately blocked (unchanged, D56/D34), and bullet 4 satisfied by refusal (nothing in this repository can hold through expiry, so its precondition is vacuously and safely enforced). The one real gap — D56's persistence-identity question for a position spanning multiple `trading_date`s — was checked for blast radius before deciding what to do about it: 6+ `ExecutionRepository` methods, every recovery function, and dozens of existing tests all key on `trading_date`. Building a fix now would mean guessing what "a cycle" means with no real positional strategy to answer that question — put to the user directly, decided: **document, do not build**. **D69** records the candidate direction (an additional `cycle_id` column, `trading_date` untouched) as a starting point for whoever eventually builds it, not a commitment. `runtimes/positional_options/__init__.py` updated to match. See limitation 30. |
-| **Next phase** | Phase 7 — Operations. Not yet scoped in this document. |
-| **Last updated** | 7 August 2026 — Phase 6 complete, see [Known limitations](#6-known-limitations) |
+| **Current phase** | **Phase 7 — Operations, Part 1 of 5 complete** (health snapshot layer). A pre-work audit read the spec's Phase 7 line (`Harden Streamlit, Telegram, health snapshots, worker/supervisor PID handling, log retention and manual commands`) and checked each of the six items against the codebase before planning: the isolation contracts (`SafeNotifier`, read-only DB, `flock`-based locks) were already solid, but `TelegramNotifier` was never constructed in production, migration 0002's `auth_events`/`feed_events` tables had no writer at all, and the dashboard built its own ad-hoc SELECTs. Part 1 builds the one thing everything else in the phase reads from: `common/health/snapshot.py`'s `HealthSnapshot`/`read_snapshot`, writers for the two previously-dead diagnostic tables (`ExecutionRepository.record_auth_event`/`record_feed_event`), producers wired at every real state transition (feed reconnect/disconnect/degrade/recover, the stuck-subscription and silent-feed alarms, a startup broker-health check, the supervisor's own startup auth outcome), and a configurable heartbeat interval (`HealthConfig`, spec line 2482's "configurable" made actually true). A real cross-thread SQLite bug was found and fixed before it shipped — see **D70**. Parts 2-5 (Telegram production wiring, the Streamlit dashboard, PID hardening + operator commands, retention/backups) remain. |
+| **Next phase** | Phase 7 Part 2 — Telegram production wiring. |
+| **Last updated** | 7 August 2026 — Phase 7 Part 1 complete, see [Known limitations](#6-known-limitations) |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
 | **Live order placement** | **Not implemented.** Fail-closed. Phase 10 only. |
@@ -27,7 +27,7 @@ the next phase. Updated after every phase.
 | 4 | Candle, indicator and paper-execution foundation | **Complete.** **Part 1 complete** (real contract resolution — closes 17, alarms 15). **Part 2 complete** (indicator layer — closes D21). **Part 3 complete** (continuity, timezone, wall-clock square-off — closes 4 and 7, and a live blocker). **Part 4 complete** (warm-up source and injection — closes 16). **Part 5 complete** (`PaperBroker` realism — closes 5 and D11; the live Full-mode gate item ran 6 August 2026 and passed, closing known limitation 20 along the way). **Phase 4 complete** — all five parts done, its one live gate item proven rather than asserted |
 | 5 | Mixed-mode supervisor and persistence | **Complete** |
 | 6 | Paper recovery and expiry handling | **Complete — all five parts.** **Part 1** (daily risk state across a restart — closes the risk-limit-bypass gap in bullet 1, and finds/fixes **D58**/limitation 22 along the way). **Part 2** (position-management state snapshot/restore — exit-policy state via `BaseExit`/`RiskManager`/`BaseStrategy` snapshot hooks, and stop/target persistence through a widened `RiskManager`/`ExecutionGateway`, fail-open on a bad snapshot, negative-control-tested). **Part 3** (MFE/MAE, square-off attempts, state-version validation and position-gated last-candle idempotency — the rest of §7's "restore at minimum" list). **Part 4** (`force_square_off_before_expiry` composed into the existing `SquareOffAuthority` seam — **D66-D68**; `simulate_exchange_settlement` refused at config load, none of spec section 11's eight settlement-policy items built — limitation 27). **Part 5** (the phase's record: bullets re-checked against what is built, not assumed; D56's persistence-identity gap given a written candidate direction, not an implementation — **D69**, limitation 30). Bullet 2's fixed strikes/basket legs/rolling counters remain blocked on `FixedStrikeEngine`/`MultiLegEngine` — D56/D34, unchanged, not this phase's to close |
-| 7 | Operations | Not started |
+| 7 | Operations | **Part 1 complete** (health snapshot layer — `common/health/snapshot.py`, `auth_events`/`feed_events` writers and producers, configurable heartbeat interval). Parts 2-5 (Telegram, dashboard, PID/operator commands, retention) not started |
 | 8 | LaunchAgent validation | Not started |
 | 9 | Real strategies | Not started |
 | 10 | Controlled live readiness | Not started |
@@ -2208,6 +2208,7 @@ guard. See deviation D6.
 | **D67** | **An unparseable or missing expiry makes the rule inert, not overdue — the opposite failure direction from an unreadable persisted `square_off_state`** | `PersistedSquareOffAuthority._load_state`'s existing rule fails an unreadable value *towards* squaring off (limitation-worthy corruption degrades to `PENDING`, which still lets the clock decide) because nothing else will ever close the position if it does not. The expiry rule cannot borrow that direction: `SimulatedOptionChainResolver`'s placeholder expiry (`"WEEKLY"`, the default every existing simulated/fixture config carries) is the *common* case, not the exceptional one, and failing it towards `SQUARE_OFF` would force-close a fixture run on its very first tick — the one behaviour Part 4 was required not to introduce (no test in the existing suite configures a real expiry, so every one of them would have broken). Since the ordinary time-of-day ladder still runs when the expiry rule is inert, there is no unsafe direction to fail towards, unlike the persisted-state case. `holding_overdue` therefore returns `False` for `None`, an empty string, or anything `date.fromisoformat` on the leading 10 characters rejects — the same 10-character slicing `common.engine.regime._is_expiry_day` already uses on `OptionContract.expiry`. `PersistedSquareOffAuthority.__init__` logs the unparseable case once, at construction, rather than per `due()` call (see runbook limitation 28). |
 | **D68** | **`expiry_policy`/`square_off_before_expiry_days` are typed top-level `StrategyConfig` fields, not `risk:` dict keys** | Spec section 11 shows `expiry_policy: force_square_off_before_expiry` as a bare YAML key with no parent block, and section 9's "required resolved strategy fields" list does not name it at all — the config-hierarchy home was genuinely unspecified, and put to the user directly during planning. `StrategyConfig.risk` is `dict[str, Any]`; `_StrictModel`'s `extra="forbid"` reaches every top-level field but not inside an untyped dict, so a key placed in `risk` could carry a silent typo (`square_off_before_expiry_day`, singular) with no refusal at all — exactly the failure `_StrictModel`'s own docstring exists to prevent for every other safety-relevant field. Decided: both fields are typed, top-level, `_StrictModel`-covered fields on `StrategyConfig`, alongside `mode`/`live_approved`/`engine`, not inside `risk`. `config_adapter._square_off_policy` now takes the whole `StrategyConfig`, not just its `risk` dict, to read them. |
 | **D69** | **D56's persistence-identity question gets a written candidate direction, not an implementation — checked and found too large and too speculative to build now, put to the user directly** | Phase 6 Part 5 re-examined D56's claim that "restore open paper positions and strategy/risk state by strategy and mode" (spec bullet 1) is not fully closed while `positions`/`strategy_state`/`order_intents` key their UNIQUE identity on `trading_date`, fragmenting any position held across sessions. Before deciding what to do about it, the actual blast radius was checked rather than assumed: `trading_date` is a mandatory, exact-match parameter on 6+ `ExecutionRepository` methods (`open_positions`, `load_strategy_state`, `save_strategy_state`, `previous_incomplete_session`, and others), every recovery function in `engine_worker.py` (`recover_position`, `recover_daily_risk`, `recover_exit_state`), `PersistedSquareOffAuthority`'s own key, the fixture path in `worker.py`, and `WorkerConfig.trading_date` itself — plus dozens of existing tests asserting on that exact shape. Building a cross-session identity now would mean guessing what "a cycle" operationally means (calendar days? an explicit roll event? adjustment legs?) with no real positional strategy to answer that question — precisely the "inventing Phase 6's answer out of order" trap D56 itself named, just relocated from Phase 5 to now instead of avoided. Put to the user directly (implement now vs. document only); decided: document only. The candidate direction, recorded so a future implementer does not start from zero: introduce `cycle_id` as an **additional** column on the three tables, assigned when a position/cycle opens and held stable until it fully closes, however many `trading_date`s that spans — `trading_date` itself is untouched and keeps its own, independently correct, "state must never leak between days" guarantee for the intraday positions that exist today (migration `0001`'s own stated reason for including it). A positional worker would eventually query "the open cycle for this strategy/mode" via `cycle_id` rather than `trading_date`. Explicitly not built: no migration, no repository method, no test. Revisit only once Phase 9 supplies a real positional strategy whose actual session/rollover/adjustment shape can validate — or invalidate — this direction. See limitation 30 and `runtimes/positional_options/__init__.py`. |
+| **D70** | **A `feed_events` sink may only enqueue, never write — the feed runs on its own thread, and the repository's `sqlite3` connection belongs to the thread that opened it** | Phase 7 Part 1's first version of the health-event wiring had `ReconnectingFeed`'s new `on_health_event` callback call `repository.record_feed_event(...)` directly. `ReconnectingFeed.start()` is driven from a dedicated feed thread (`supervisor.py`'s own module docstring: "a live deployment... enforces the ownership rule... `start()` blocks on a worker thread"), while `ExecutionRepository`'s `Database` connection is opened once, in `run()`, on the supervisor's own thread. `sqlite3.Connection` objects refuse cross-thread use by default (`sqlite3.ProgrammingError: SQLite objects created in a thread can only be used in that same thread`) — caught immediately by `test_the_feeds_health_events_reach_the_repository_once_run_opens_it`, not discovered later or in production. Fixed with the same pattern the supervisor already uses for the opposite direction (a worker's runtime-subscription request travelling *to* the feed thread via `_control_queues`/`_drain_control_queues`): the sink (`self._feed_health_events.put`, a plain `queue.Queue[FeedHealthEvent]`) only enqueues from the feed thread; a new `_drain_feed_health_events`, called from the supervisor's existing 1-second poll loop (the same loop that already drains control queues and checks the stuck-subscription alarm) is the only code that ever calls `repository.record_feed_event`, and it always runs on the thread that opened the connection. A write that raises inside the drain is logged and dropped, the same isolation `SafeNotifier` gives Telegram — a diagnostic row must never be able to interrupt the poll loop. |
 
 #### D22 in detail: the rebuilt premium-candle mapping
 
@@ -4199,6 +4200,22 @@ start/stop/crash/restart tests pass.
     rollover/adjustment shape can validate the candidate direction — or
     replace it.
 
+31. **A pre-database authentication failure is not persisted to
+    `auth_events`.** `IntradayOptionsSupervisor.set_startup_auth_outcome`
+    (Phase 7 Part 1) records a *successful* `AuthBootstrap.get_token()`
+    outcome once `run()` opens this runtime's database — but `get_token()`
+    runs in `__main__.py`, before that database exists (before the runtime is
+    even confirmed enabled to start). A rejected credential, a rate limit, or
+    a cooldown-suppressed attempt at that point stays `print()`+log only, the
+    same as before Part 1. Persisting it would mean opening (and therefore
+    creating) the operational database before knowing whether the runtime
+    should start at all — a larger design question than one part's scope.
+    Not a safety gap: `AuthBootstrap` fails closed regardless (module
+    docstring: "There is no degraded mode"), so a failed auth still stops the
+    runtime from starting; only the *audit trail* of that failure is
+    incomplete. Revisit if operators need to query historical auth failures
+    from the database rather than the log.
+
 
 ### Operational risk noted during the audit
 
@@ -4433,8 +4450,127 @@ mtime is unchanged at the recorded baseline.
 Phase 2 is complete, both blocks. **Phase 3 is complete** — all five parts, with its
 acceptance gate met in full. **Phase 4 is complete** — all five parts, its one live
 gate item run and passed. **Phase 5 is complete** — see below. **Phase 6 is
-complete** — all five parts, see below. Next is **Phase 7 — Operations**, not yet
-scoped in this document.
+complete** — all five parts, see below. **Phase 7 is in progress — Part 1 of 5
+complete**, see below. Next is **Phase 7 Part 2 — Telegram production wiring**.
+
+### Phase 7 — Operations — **Part 1 of 5 complete** (health snapshot layer)
+
+The spec's Phase 7 entry (`ALGO_TRADING_FORWARD_TESTING_ARCHITECTURE_FINAL.md:
+2912-2914`) is one sentence: harden Streamlit, Telegram, health snapshots,
+worker/supervisor PID handling, log retention and manual commands. A pre-work
+audit checked each item against the codebase before any implementation, the
+same discipline every phase since Phase 0 has used. The finding that shaped
+delivery order: the *isolation* contracts were already solid and well tested
+(`SafeNotifier` wraps Telegram at all three construction sites and swallows
+any exception; `connect_readonly` enforces `mode=ro` at the SQLite driver
+level; `common/process/locks.py`'s `flock`-based exclusion is real and tested)
+— but almost nothing above those contracts existed. Sharpest single finding:
+migration 0002 (Phase 2) shipped `auth_events` and `feed_events` with CHECK-
+constrained vocabularies and useful columns (`reason_code`, `downtime_
+seconds`, `expected_subscriptions`), and **nothing in the repository ever
+wrote to either table** — `grep` for both names outside `tests/unit/test_
+migrations.py` returned nothing. `TelegramNotifier` was never constructed
+outside a test; `runtimes/intraday_options/__main__.py` built the supervisor
+without a `notifier=` argument, so every one of the 17 existing notification
+call sites delivered into a `NullNotifier` in production. The dashboard
+(`dashboards/app.py`) built its own four inline `SELECT`s rather than sharing
+a read model — every future page would have repeated that.
+
+Decided with the user, three scope questions: (1) the dashboard ships three
+real pages (Master, Intraday Options, System Health) plus honest stub pages
+for Positional Options and Intraday Stocks, whose runtimes and tables do not
+exist yet; (2) operator commands never open a second writer — reads are
+read-only, `stop_*` signals a PID, `square_off` writes a request the running
+worker executes through its own existing square-off path; (3) delivery is five
+reviewed parts, mirroring Phase 6's pattern, because six loosely-related items
+each needing new subsystems is the largest remaining scope of any phase so
+far.
+
+**Part 1 builds the layer everything else in the phase reads from**, so it
+went first:
+
+- **`common/health/snapshot.py`** — `HealthSnapshot` and `read_snapshot()`,
+  covering the spec's six health sub-models (process, authentication, market
+  data, broker, database, strategies) from a single already-open connection.
+  Deliberately takes a connection rather than a path, the same discipline
+  `dashboards/app.py` already used: the caller decides whether that connection
+  is `connect_readonly` or a write connection open for another reason, and
+  nothing in this module can mutate the database regardless. Broker health is
+  *derived* (the latest `errors` row with `component='broker'`), not polled —
+  there is no live broker connection to query from a read-only connection in
+  another process, and a dashboard opening its own broker connection is
+  exactly the side-effecting import the dashboard forbids.
+- **`common/execution/health_events.py`** — the Python-side mirror of the two
+  CHECK-constrained vocabularies, and `auth_event_for_source`, the one place
+  `TokenOutcome.source` ("environment"/"cache"/"generated") maps onto the
+  `auth_events` vocabulary (`token_reused_from_env`/etc.).
+  `ExecutionRepository.record_auth_event`/`record_feed_event` validate against
+  it before ever reaching SQLite.
+- **Feed events wired at every real transition**, not invented: `connected`,
+  `disconnected`, `reconnect_attempted` and `reconnect_exhausted` from
+  `ReconnectingFeed`'s own state-transition points (a new `on_health_event`
+  hook, late-bound via `set_health_event_sink` because the feed is built
+  before the supervisor's repository exists); `resubscribed` from
+  `_reconnect()`; `recovered` from the existing degraded→clear check inside
+  the tick callback, so nothing new runs on the tick hot path. `degraded` is
+  **not** a new tick-rate check — it reuses the two alarms that already fire
+  rarely (`_check_stuck_subscription`, `_raise_silent_feed_alarm`), which now
+  also write a `feed_events` row alongside the `errors` row and notification
+  they already sent. `stale_instrument` is new, latched per instrument the
+  same way the stuck-subscription alarm is latched per run, so a quiet far-OTM
+  strike produces one row, not one per poll.
+- **A startup broker-health check** (`worker.py:_check_broker_health`) calls
+  the long-dead `Broker.is_healthy()` once, before the first candle, and
+  records an `errors` row if it says no. `PaperBroker.is_healthy()` always
+  returns `True` — there is nothing for it to be unhealthy about — so this
+  never fires today; it exists so the pattern is in place before Phase 10's
+  `DhanLiveBroker`, where a real connectivity failure is exactly the thing
+  worth knowing before the first order rather than after.
+- **The startup auth outcome** reaches `auth_events` through
+  `IntradayOptionsSupervisor.set_startup_auth_outcome`, called from
+  `__main__.py` right after `AuthBootstrap.get_token()` succeeds. It cannot be
+  recorded any earlier: the token is obtained *before* this runtime's
+  database exists. A pre-database auth **failure** is therefore not persisted
+  — see limitation 31.
+- **The heartbeat interval is configurable**, closing the literal gap spec
+  line 2482 names ("every 5 to 15 seconds is enough, and the interval is
+  configurable"): `HealthConfig.heartbeat_interval_seconds` on
+  `RuntimeConfig`, read into both `SupervisorConfig` and `WorkerConfig` by
+  their respective `__main__.py`/`config_adapter.py` wiring points.
+  `HeartbeatWriter` also gained an injectable `clock` (matching
+  `ReconnectingFeed`'s own `clock`/`sleep`/`rng` pattern), so its rate-limit
+  gate — previously untested except incidentally through supervisor/worker
+  integration tests — now has a direct unit test
+  (`tests/unit/test_heartbeat.py`).
+
+**A real bug, found by the fail-first test discipline before it shipped.**
+The first version of the feed-events wiring called
+`repository.record_feed_event(...)` directly from the sink `ReconnectingFeed`
+invokes — but the feed runs on its own thread (the module's own documented
+"thread ownership" rule), and the repository's `sqlite3` connection was opened
+on the *supervisor's* thread. `sqlite3.ProgrammingError: SQLite objects
+created in a thread can only be used in that same thread` — caught by
+`test_the_feeds_health_events_reach_the_repository_once_run_opens_it` on the
+first run, not discovered later. Fixed the same way the supervisor already
+solves the opposite-direction problem (`_control_queues`/
+`_drain_control_queues`): the sink only enqueues onto a plain
+`queue.Queue[FeedHealthEvent]`; a new `_drain_feed_health_events`, called from
+the same 1-second poll loop that already drains control queues and checks the
+stuck-subscription alarm, is the only thing that ever calls
+`repository.record_feed_event`. See **D70**.
+
+**Deliberately not done in Part 1:**
+
+- Telegram is still never constructed in production — Part 2.
+- The dashboard still reads nothing from this new layer — Part 3. It remains
+  the single Phase-1 tile today.
+- No PID/lock hardening, no operator commands — Part 4.
+- No retention, no backups — Part 5.
+- A pre-database auth *failure* (a rejected credential, a rate limit, before
+  this runtime's database exists) is not persisted to `auth_events` — see
+  limitation 31. Persisting it would mean opening (and therefore creating) the
+  operational database before knowing whether the runtime should start at
+  all, which is a larger design question than Part 1's scope.
 
 ### Phase 6 — paper recovery and expiry handling — **Complete, all five parts**
 

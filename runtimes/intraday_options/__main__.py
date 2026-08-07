@@ -83,6 +83,7 @@ def build_supervisor(
             lock_dir=paths.lock_root,
             pid_dir=paths.pid_root,
             log_dir=paths.log_root,
+            heartbeat_interval_seconds=runtime_cfg.health.heartbeat_interval_seconds,
         ),
         adapter,
     )
@@ -161,6 +162,15 @@ def main(argv: list[str] | None = None) -> int:
         paths=paths,
         adapter=adapter,
         settings=settings,
+    )
+    # Recorded here rather than inside AuthBootstrap: get_token() ran before
+    # this runtime's database (and therefore auth_events) existed — see
+    # IntradayOptionsSupervisor.set_startup_auth_outcome's docstring. A
+    # pre-database auth *failure* is not persisted; it stays print()+log only.
+    supervisor.set_startup_auth_outcome(
+        source=outcome.source,
+        token_expiry=outcome.expiry_time,
+        requests_made=outcome.requests_made,
     )
     result = supervisor.run()
     _log.info(

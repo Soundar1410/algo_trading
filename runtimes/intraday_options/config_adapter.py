@@ -121,4 +121,5 @@ def build_worker_config(
         square_off_policy=_square_off_policy(cfg.strategy),
         config_fingerprint=fingerprint(cfg),
         engine=None,  # Phase 9 boundary — see module docstring.
+        heartbeat_interval_seconds=cfg.runtime.health.heartbeat_interval_seconds,
     )

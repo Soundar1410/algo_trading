@@ -56,6 +56,19 @@ class GlobalConfig(_StrictModel):
     timezone: str = "Asia/Kolkata"
 
 
+class HealthConfig(_StrictModel):
+    """Operational tuning for one runtime group's health reporting.
+
+    Spec line 2482: "every 5 to 15 seconds is enough, and the interval is
+    configurable." Before Phase 7 Part 1 this was a constructor default
+    (``common.health.heartbeat.DEFAULT_INTERVAL_SECONDS``) that both the
+    supervisor and every worker silently accepted — nothing in config ever
+    reached it, so "configurable" was true of the code but not of the system.
+    """
+
+    heartbeat_interval_seconds: float = Field(default=10.0, gt=0)
+
+
 class RuntimeConfig(_StrictModel):
     """One strategy group: lifecycle and live permission, never a shared mode."""
 
@@ -64,6 +77,7 @@ class RuntimeConfig(_StrictModel):
     live_execution_allowed: bool = False
     shared_market_feed: bool = True
     database: str | None = None
+    health: HealthConfig = Field(default_factory=HealthConfig)
 
     @field_validator("runtime_id")
     @classmethod

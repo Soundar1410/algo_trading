@@ -15,6 +15,7 @@ import pytest
 
 from common.candles import CandleAggregator
 from common.feed import (
+    FeedHealthEvent,
     FeedUnavailableError,
     ReconnectingFeed,
     ReconnectPolicy,
@@ -404,6 +405,100 @@ def test_a_fresh_instrument_is_not_stale():
 
     soon = SESSION_START + timedelta(seconds=30)
     assert feed.health.stale_instruments(now=soon, threshold_seconds=120) == ()
+
+
+# --------------------------------------------------- feed_events (Phase 7 Part 1)
+def test_connected_and_disconnected_events_are_emitted_on_a_reconnect():
+    adapter = _ScriptedAdapter([_tick(1)], ConnectionResetError("socket died"), [_tick(61)])
+    events: list[FeedHealthEvent] = []
+    feed = _feed(adapter, on_health_event=events.append)
+    feed.subscribe([SECURITY_ID])
+
+    feed.start(lambda _t: None)
+
+    names = [e.event for e in events]
+    assert "connected" in names
+    assert "disconnected" in names
+    disconnected = next(e for e in events if e.event == "disconnected")
+    assert disconnected.reason is not None
+
+
+def test_reconnect_attempted_and_resubscribed_are_emitted():
+    adapter = _ScriptedAdapter([_tick(1)], ConnectionResetError("drop"), [])
+    events: list[FeedHealthEvent] = []
+    feed = _feed(adapter, on_health_event=events.append)
+    feed.subscribe([SECURITY_ID, OTHER_ID])
+
+    feed.start(lambda _t: None)
+
+    attempted = [e for e in events if e.event == "reconnect_attempted"]
+    assert len(attempted) == 1
+    assert attempted[0].attempt == 1
+    resubscribed = [e for e in events if e.event == "resubscribed"]
+    assert len(resubscribed) == 1
+    assert resubscribed[0].expected_subscriptions == 2
+    assert resubscribed[0].active_subscriptions == 2
+
+
+def test_reconnect_exhausted_is_emitted_when_the_budget_runs_out():
+    adapter = _ScriptedAdapter(*[ConnectionResetError("nope") for _ in range(10)])
+    events: list[FeedHealthEvent] = []
+    feed = _feed(
+        adapter, on_health_event=events.append, policy=ReconnectPolicy(max_attempts=3)
+    )
+    feed.subscribe([SECURITY_ID])
+
+    with pytest.raises(FeedUnavailableError):
+        feed.start(lambda _t: None)
+
+    exhausted = [e for e in events if e.event == "reconnect_exhausted"]
+    assert len(exhausted) == 1
+    assert exhausted[0].attempt == 3
+
+
+def test_recovered_is_emitted_only_on_the_tick_that_clears_degraded():
+    adapter = _ScriptedAdapter([_tick(1)], ConnectionResetError("drop"), [_tick(61), _tick(62)])
+    events: list[FeedHealthEvent] = []
+    feed = _feed(adapter, on_health_event=events.append)
+    feed.subscribe([SECURITY_ID])
+
+    feed.start(lambda _t: None)
+
+    recovered = [e for e in events if e.event == "recovered"]
+    # Once for the first connection's first tick, once for the reconnect's.
+    assert len(recovered) == 2
+    assert recovered[-1].security_id == SECURITY_ID
+
+
+def test_a_raising_health_event_sink_does_not_break_the_feed():
+    """The same isolation SafeNotifier gives Telegram: a failing sink must
+    never be able to stop trading by taking the feed down with it."""
+
+    def _exploding(_event: FeedHealthEvent) -> None:
+        raise RuntimeError("database is down")
+
+    adapter = _ScriptedAdapter([_tick(1)])
+    feed = _feed(adapter, on_health_event=_exploding)
+    feed.subscribe([SECURITY_ID])
+
+    received: list[Tick] = []
+    feed.start(received.append)
+
+    assert len(received) == 1
+
+
+def test_the_sink_can_be_replaced_after_construction():
+    """The supervisor's repository does not exist at __init__ time; the sink
+    must be settable later, before the feed thread starts."""
+    adapter = _ScriptedAdapter([_tick(1)])
+    feed = _feed(adapter)
+    feed.subscribe([SECURITY_ID])
+
+    events: list[FeedHealthEvent] = []
+    feed.set_health_event_sink(events.append)
+    feed.start(lambda _t: None)
+
+    assert any(e.event == "connected" for e in events)
 
 
 # ------------------------------------------- candle integrity across the gap

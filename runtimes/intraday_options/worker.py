@@ -46,10 +46,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from common.broker import build_broker
+from common.broker import Broker, build_broker
 from common.config.models import ExecutionMode
 from common.execution import ExecutionRepository, OrderLifecycle
-from common.health import HealthState, HeartbeatWriter
+from common.health import DEFAULT_INTERVAL_SECONDS, HealthState, HeartbeatWriter
 from common.logging import get_logger, setup_logging
 from common.models import Candle, PositionStatus
 from common.notifications import NotificationEvent, Notifier, NullNotifier, SafeNotifier
@@ -176,6 +176,10 @@ class WorkerConfig:
     #: Set to drive the ported engine instead of the fixture strategy. See the module
     #: docstring for why the code behind it is imported lazily.
     engine: EngineWorkerConfig | None = None
+    #: From ``RuntimeConfig.health.heartbeat_interval_seconds`` — see
+    #: :mod:`common.config.models`. A primitive, like every other field here,
+    #: so this stays picklable for the spawned child (module docstring).
+    heartbeat_interval_seconds: float = DEFAULT_INTERVAL_SECONDS
 
 
 @dataclass
@@ -287,6 +291,7 @@ def _run_locked(
         session_id=session.id,
         runtime_id=config.runtime_id,
         strategy_id=config.strategy_id,
+        interval_seconds=config.heartbeat_interval_seconds,
     )
     heartbeat.beat(HealthState.STARTING, force=True)
 
@@ -345,6 +350,7 @@ def _run_locked(
         paper_execution=config.paper_execution,
         cost_rates=config.cost_rates,
     )
+    _check_broker_health(config, broker, repository)
     lifecycle = OrderLifecycle(
         repository=repository,
         broker=broker,
@@ -472,6 +478,36 @@ def _run_locked(
     heartbeat.beat(HealthState.STOPPED, force=True)
     database.close()
     return outcome
+
+
+def _check_broker_health(
+    config: WorkerConfig, broker: Broker, repository: ExecutionRepository
+) -> None:
+    """Check the broker once at startup, and record it if it says it is unhealthy.
+
+    ``PaperBroker.is_healthy()`` always returns ``True`` — it has no connection
+    to be unhealthy about — so this never fires today. It exists so the check
+    is not dead code (the Phase 7 audit's own finding) and so the pattern is
+    already in place for the engine path and for ``DhanLiveBroker`` (Phase 10),
+    where a real connectivity failure is exactly the thing worth knowing before
+    the first candle rather than after the first failed order.
+
+    Not called per-candle: a broker health check is a startup fact, not a tick
+    -rate one, matching the "never per tick or per candle" rule migration 0002
+    states for these diagnostic writes.
+    """
+    if broker.is_healthy():
+        return
+    message = f"broker {broker.name!r} reported unhealthy at worker startup"
+    _log.error("%s", message)
+    repository.record_error(
+        runtime_id=config.runtime_id,
+        strategy_id=config.strategy_id,
+        execution_mode=config.execution_mode,
+        severity="ERROR",
+        component="broker",
+        message=message,
+    )
 
 
 def _recover(
