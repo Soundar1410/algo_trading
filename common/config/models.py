@@ -15,6 +15,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from common.risk.squareoff import ExpiryPolicy
+
 
 class ExecutionMode(StrEnum):
     """How one strategy's orders are executed. Immutable for a worker session."""
@@ -72,7 +74,14 @@ class RuntimeConfig(_StrictModel):
 
 
 class StrategyConfig(_StrictModel):
-    """One strategy instance: its own mode, approval, engine and parameters."""
+    """One strategy instance: its own mode, approval, engine and parameters.
+
+    ``expiry_policy``/``square_off_before_expiry_days`` are typed top-level
+    fields rather than ``risk`` keys (Phase 6 Part 4, spec section 11):
+    ``risk`` is an untyped ``dict[str, Any]``, so ``_StrictModel``'s
+    ``extra="forbid"`` cannot catch a typo inside it — exactly the silent-typo
+    failure this class's own docstring warns about for the top-level fields.
+    """
 
     strategy_id: str
     enabled: bool = False
@@ -81,12 +90,33 @@ class StrategyConfig(_StrictModel):
     engine: EngineKind = EngineKind.TRADING_ENGINE
     risk: dict[str, Any] = Field(default_factory=dict)
     parameters: dict[str, Any] = Field(default_factory=dict)
+    expiry_policy: ExpiryPolicy = ExpiryPolicy.FORCE_SQUARE_OFF_BEFORE_EXPIRY
+    square_off_before_expiry_days: int = Field(default=0, ge=0)
 
     @field_validator("strategy_id")
     @classmethod
     def _non_empty(cls, v: str) -> str:
         if not v.strip():
             raise ValueError("strategy_id must not be empty")
+        return v
+
+    @field_validator("expiry_policy")
+    @classmethod
+    def _no_settlement_simulation_yet(cls, v: ExpiryPolicy) -> ExpiryPolicy:
+        if v is ExpiryPolicy.SIMULATE_EXCHANGE_SETTLEMENT:
+            raise ValueError(
+                "expiry_policy: simulate_exchange_settlement is refused: exchange-"
+                "settlement simulation is not implemented. Spec section 11 requires "
+                "a versioned settlement policy covering the expiry calendar and "
+                "last-trading-day handling, final settlement price capture, ITM/OTM "
+                "determination, index-option cash settlement, exercise/assignment "
+                "event recording, effective-dated exercise STT and other charges, "
+                "T+1 settlement timing, and stock-option physical-settlement "
+                "obligations/delivery margin/assignment risk — and states this value "
+                "may be used only after settlement tests pass. Until then "
+                "force_square_off_before_expiry is the only permitted value; stock "
+                "options must remain force-square-off regardless."
+            )
         return v
 
 

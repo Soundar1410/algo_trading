@@ -34,11 +34,20 @@ The seam is :class:`SquareOffAuthority`: two methods, injected at construction.
 The times themselves are reconciled in :mod:`common.engine.config`:
 ``SessionConfig`` is *derived from* the policy, so two independently configured
 square-off times cannot drift apart.
+
+Phase 6 Part 4 adds an expiry-driven trigger (``force_square_off_before_expiry``).
+It composes into the same seam rather than becoming a third decider:
+:class:`PersistedSquareOffAuthority` is given the held contract's expiry at
+construction and passes it straight through to
+:meth:`~common.risk.squareoff.SquareOffPolicy.trigger_at`, which is still the one
+place ``due()`` asks. No new persisted state, no second write path — an
+expiry-driven close goes through the exact same ``IN_PROGRESS``/``COMPLETED``
+bookkeeping below.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from common.config.models import ExecutionMode
@@ -132,6 +141,7 @@ class PersistedSquareOffAuthority:
         strategy_id: str,
         execution_mode: ExecutionMode,
         trading_date: str,
+        expiry: str | None = None,
     ) -> None:
         self._policy = policy
         self._repo = repository
@@ -139,6 +149,24 @@ class PersistedSquareOffAuthority:
         self._strategy_id = strategy_id
         self._mode = execution_mode
         self._trading_date = trading_date
+        # Phase 6 Part 4: the held contract's own expiry, resolved once by the
+        # caller (the worker knows which contract it holds; this class does
+        # not). Composed into the same trigger_at() the time-of-day ladder
+        # already goes through — see squareoff.py's module docstring for why
+        # this is not a second decider. An unparseable value is logged once
+        # here, at construction, rather than on every due() call, and the rule
+        # is then inert for the rest of this authority's life.
+        self._expiry = expiry
+        if expiry is not None:
+            try:
+                date.fromisoformat(str(expiry)[:10])
+            except ValueError:
+                log.warning(
+                    "square-off expiry %r for %s is not a parseable ISO date; the "
+                    "expiry-lead rule is inert for this run",
+                    expiry,
+                    self._strategy_id,
+                )
         #: Observable so a test can assert this does not write on every tick.
         self.writes = 0
         self._attempt_recorded = False
@@ -185,7 +213,10 @@ class PersistedSquareOffAuthority:
 
     # ---------------------------------------------------------------- deciding
     def due(self, ts: datetime) -> bool:
-        if self._policy.trigger_at(ts, state=self._state) is not SquareOffTrigger.SQUARE_OFF:
+        if (
+            self._policy.trigger_at(ts, state=self._state, expiry=self._expiry)
+            is not SquareOffTrigger.SQUARE_OFF
+        ):
             return False
         if not self._attempt_recorded:
             self._attempt_recorded = True

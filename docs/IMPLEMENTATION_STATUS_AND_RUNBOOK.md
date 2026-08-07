@@ -7,9 +7,9 @@ the next phase. Updated after every phase.
 
 | | |
 |---|---|
-| **Current phase** | **Phase 6 Part 3 complete** — the remaining §7 "restore at minimum" gaps. Pre-work found the same pattern as Parts 1-2: each item named a destination but not a write *path*. MFE/MAE gained a genuinely new write path — `ExecutionRepository.update_position_marks`, outside the fill path entirely — reusing Part 2's per-candle-while-open checkpoint rather than adding a new one; seeded on adopt via two new `AdoptedPosition` fields, applied before any mark so a restored baseline (not zero) is what the first post-restart tick compares against. Square-off attempts needed `save_strategy_state` widened with an accumulate-in-SQL counter (the same pattern D58 established for `daily_realised_pnl`) and a semantic decision (every persisted write counts, not just retries) made explicit rather than left implicit. State-version validation needed three sub-decisions the plan's one-liner didn't make: where `CURRENT_STATE_VERSION` lives (`common/models/trading.py`, a genuine leaf both `common.execution` and `common.engine` already depend on, keeping the write side out of the `common.engine`-import direction Parts 1-2 were careful to avoid); that `save_strategy_state` must stamp it explicitly rather than rely on the schema default; and that `recover_position`'s own `read_payload` call — unwrapped until now — needed its own try/except to preserve the `CRITICAL`-row precedent every other position-recovery failure gets. Last-candle idempotency was put to the user directly (the one genuine either-way fork): write `last_candle_end_at` unconditionally on every candle (matching the spec's literal day-level framing) or gate it on "position open" like Part 2, avoiding new write-frequency on top of limitation 24's already-unmeasured contention question — decided: gate it, recording the flat-day residual as a new limitation rather than leaving it implicit. **One planned test was found architecturally impossible while building it, not before**: state-version corruption cannot reach exit-state recovery's fail-open path independently of position recovery's fail-closed one, because both read the same row's same column and position recovery always runs first — corrected in the test file and here, not left asserting what the plan draft claimed. |
-| **Next phase** | Phase 6 Part 4 (`force_square_off_before_expiry`, and the settlement gate) |
-| **Last updated** | 6 August 2026 — Phase 6 Part 3 complete, see [Known limitations](#6-known-limitations) |
+| **Current phase** | **Phase 6 complete — all five parts.** Part 5 closes the phase with a record, not code: re-examined all four spec bullets against what is actually built and found bullets 1 and 3 done, bullet 2's remaining items still legitimately blocked (unchanged, D56/D34), and bullet 4 satisfied by refusal (nothing in this repository can hold through expiry, so its precondition is vacuously and safely enforced). The one real gap — D56's persistence-identity question for a position spanning multiple `trading_date`s — was checked for blast radius before deciding what to do about it: 6+ `ExecutionRepository` methods, every recovery function, and dozens of existing tests all key on `trading_date`. Building a fix now would mean guessing what "a cycle" means with no real positional strategy to answer that question — put to the user directly, decided: **document, do not build**. **D69** records the candidate direction (an additional `cycle_id` column, `trading_date` untouched) as a starting point for whoever eventually builds it, not a commitment. `runtimes/positional_options/__init__.py` updated to match. See limitation 30. |
+| **Next phase** | Phase 7 — Operations. Not yet scoped in this document. |
+| **Last updated** | 7 August 2026 — Phase 6 complete, see [Known limitations](#6-known-limitations) |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
 | **Live order placement** | **Not implemented.** Fail-closed. Phase 10 only. |
@@ -26,7 +26,7 @@ the next phase. Updated after every phase.
 | 3 | Preserve custom engines and policies | **Complete.** **Part 1 complete** (live-feed shutdown); **Part 2a complete** (exit registry + SuperTrend port); **Part 2b-i complete** (signal ownership + engine core); **Part 2b-ii-A complete** (the feed seam: tick channel, runtime subscription, `HubTickFeed`); **Part 2b-ii-B-1 complete** (the execution seam: square-off authority, `LifecycleGateway`, entry-block on tick drop); **Part 2b-ii-B-2 complete** (the wiring: worker engine path, supervisor queue delivery, engine restart recovery, D20 reporting bindings). **Phase 3 complete** — its acceptance gate is met in full |
 | 4 | Candle, indicator and paper-execution foundation | **Complete.** **Part 1 complete** (real contract resolution — closes 17, alarms 15). **Part 2 complete** (indicator layer — closes D21). **Part 3 complete** (continuity, timezone, wall-clock square-off — closes 4 and 7, and a live blocker). **Part 4 complete** (warm-up source and injection — closes 16). **Part 5 complete** (`PaperBroker` realism — closes 5 and D11; the live Full-mode gate item ran 6 August 2026 and passed, closing known limitation 20 along the way). **Phase 4 complete** — all five parts done, its one live gate item proven rather than asserted |
 | 5 | Mixed-mode supervisor and persistence | **Complete** |
-| 6 | Paper recovery and expiry handling | **In progress.** **Part 1 complete** (daily risk state across a restart — closes the risk-limit-bypass gap in bullet 1, and finds/fixes **D58**/limitation 22 along the way). **Part 2 complete** (position-management state snapshot/restore — exit-policy state via `BaseExit`/`RiskManager`/`BaseStrategy` snapshot hooks, and stop/target persistence through a widened `RiskManager`/`ExecutionGateway`, fail-open on a bad snapshot, negative-control-tested). **Part 3 complete** (MFE/MAE, square-off attempts, state-version validation and position-gated last-candle idempotency — the rest of §7's "restore at minimum" list) |
+| 6 | Paper recovery and expiry handling | **Complete — all five parts.** **Part 1** (daily risk state across a restart — closes the risk-limit-bypass gap in bullet 1, and finds/fixes **D58**/limitation 22 along the way). **Part 2** (position-management state snapshot/restore — exit-policy state via `BaseExit`/`RiskManager`/`BaseStrategy` snapshot hooks, and stop/target persistence through a widened `RiskManager`/`ExecutionGateway`, fail-open on a bad snapshot, negative-control-tested). **Part 3** (MFE/MAE, square-off attempts, state-version validation and position-gated last-candle idempotency — the rest of §7's "restore at minimum" list). **Part 4** (`force_square_off_before_expiry` composed into the existing `SquareOffAuthority` seam — **D66-D68**; `simulate_exchange_settlement` refused at config load, none of spec section 11's eight settlement-policy items built — limitation 27). **Part 5** (the phase's record: bullets re-checked against what is built, not assumed; D56's persistence-identity gap given a written candidate direction, not an implementation — **D69**, limitation 30). Bullet 2's fixed strikes/basket legs/rolling counters remain blocked on `FixedStrikeEngine`/`MultiLegEngine` — D56/D34, unchanged, not this phase's to close |
 | 7 | Operations | Not started |
 | 8 | LaunchAgent validation | Not started |
 | 9 | Real strategies | Not started |
@@ -2204,6 +2204,10 @@ guard. See deviation D6.
 | **D63** | **`square_off_attempts` accumulates via the same "add a delta in SQL" pattern D58 fixed `daily_realised_pnl` onto, and every persisted write counts, not only retries** | `save_strategy_state` had no `square_off_attempts` parameter at all before Phase 6 Part 3, and the SQL never referenced the column. Two semantic readings were possible: increment only on a *fresh* attempt (the `due()` → `IN_PROGRESS` transition specifically, which `PersistedSquareOffAuthority._load_state` already treats as "a new attempt started" when it inherits a stalled `IN_PROGRESS`), or increment on every `_save()` call (both the `IN_PROGRESS` and `COMPLETED` writes). Decided: every call, matching the plan's literal wording ("increment... in `_save`") and staying simplest — a monotonic count of persisted state transitions for the day, always >= 2 on a day that reaches `COMPLETED`, higher only when a crash forced a retry. `increment_square_off_attempts: bool = False`, written as `square_off_attempts = square_off_attempts + ?` — race-free without a read first, the same reasoning D58 already established for the sibling column. |
 | **D64** | **`recover_position` gained its own try/except around `read_payload`, to preserve the `CRITICAL`-row precedent a bare propagation would have broken** | `read_payload`'s "never raises on bad data" rule is narrowed for exactly one case (Phase 6 Part 3): a `state_version` this build does not recognise raises `UnsupportedStateVersion` rather than being silently misread, because unlike a payload that merely fails to decode, a version mismatch means the payload might be a shape this build cannot safely interpret. Checked directly rather than assumed: `recover_position` called `read_payload` unwrapped, so a raise would have propagated past `_record_recovery_failure`'s `CRITICAL`-row write, reaching only `TradingEngine`'s generic except-block — which blocks entries but writes no error row, breaking the same precedent every other position-recovery failure (`OPEN_POSITION_KEY` missing, an unusable contract record, a stale `security_id`) already gets. `recover_position` now wraps the call, mirroring the try/except already around the `OptionContract(...)` construction two lines below it. `recover_exit_state` needed no equivalent change — its call site is already inside `TradingEngine._restore_exit_state`'s existing fail-open wrapper (D60), so it inherits the right severity for any exception type without a special case — see **D65** for why that path is, in practice, never actually reached by a `state_version` failure specifically. |
 | **D65** | **Position-gated `last_candle_end_at`, decided directly with the user — the one genuine either-way fork in Part 3 — and a planned test corrected mid-build once its premise proved architecturally unreachable** | Nothing wrote `last_candle_end_at` on the engine path before this part. Two options: write it unconditionally on every candle (matching §7's literal day-level framing, independent of position state) or gate it on "position open" like Part 2's `_persist_exit_state`, reusing that checkpoint rather than adding a new always-on one. The first adds new write frequency on top of limitation 24's already-unmeasured contention question; the second does not. Decided with the user: gate it. Idempotent replay is guaranteed exactly when it matters most (indicator and MFE/MAE double-counting risk during active management); a flat day's candles are not idempotently resumable — recorded as limitation 25, not left implicit. Separately, the Part 3 plan draft claimed exit-state recovery's fail-open path (D60) would be independently provable through the same `state_version` corruption that fails position recovery closed. Building the test found this is architecturally impossible: `state_version` gates the whole `strategy_state` row, not a key within it, and `recover_exit_state` is only ever called from inside `_adopt_recovered_position` — *after* `recover_position` has already succeeded. A version bad enough to block one blocks both, and position recovery, which runs first, always intercepts it first. The test was rewritten to assert what is actually true (both fail together, position recovery's fail-closed path wins) rather than left asserting the original, unreachable claim. D60's fail-open mechanism remains real and independently provable for the failures Part 2's own test already covers (a foreign `security_id`, or no snapshot at all) — those do not depend on `state_version` and are unaffected by this finding. |
+| **D66** | **The expiry-lead rule composes into `SquareOffPolicy.trigger_at` as an optional keyword, checked after persisted state and ahead of the time-of-day ladder — not a second decider, and not a change to `SessionSquareOffAuthority`** | Phase 6 Part 4 needed a contract held past its own expiry to force-close regardless of time of day. The runbook's own composition rule for this seam — stated four times already for the wall-clock net (§8, limitation 7 write-up): "the authority still decides… so there is no second square-off code path" — applies unchanged here. `trigger_at(moment, *, state, expiry=None)` checks `state in {COMPLETED, IN_PROGRESS}` first (so persisted completion still suppresses an overdue day exactly as it suppresses a post-`square_off_at` restart), then `holding_overdue(moment, expiry)`, then the existing ladder — every existing call site that omits `expiry` is byte-identical to before. `PersistedSquareOffAuthority` gained a keyword-only `expiry` constructor argument, resolved once by its caller (the worker knows which contract it holds; the authority does not) and passed straight through on every `due()` call — no new persisted state, no new write path; an expiry-driven close still latches `IN_PROGRESS` once and writes `COMPLETED` from the same `completed()`. `SessionSquareOffAuthority` (the offline, clock-only default) is deliberately untouched: it has no contract to ask about expiry and no persistence to make an expiry rule meaningful anyway. |
+| **D67** | **An unparseable or missing expiry makes the rule inert, not overdue — the opposite failure direction from an unreadable persisted `square_off_state`** | `PersistedSquareOffAuthority._load_state`'s existing rule fails an unreadable value *towards* squaring off (limitation-worthy corruption degrades to `PENDING`, which still lets the clock decide) because nothing else will ever close the position if it does not. The expiry rule cannot borrow that direction: `SimulatedOptionChainResolver`'s placeholder expiry (`"WEEKLY"`, the default every existing simulated/fixture config carries) is the *common* case, not the exceptional one, and failing it towards `SQUARE_OFF` would force-close a fixture run on its very first tick — the one behaviour Part 4 was required not to introduce (no test in the existing suite configures a real expiry, so every one of them would have broken). Since the ordinary time-of-day ladder still runs when the expiry rule is inert, there is no unsafe direction to fail towards, unlike the persisted-state case. `holding_overdue` therefore returns `False` for `None`, an empty string, or anything `date.fromisoformat` on the leading 10 characters rejects — the same 10-character slicing `common.engine.regime._is_expiry_day` already uses on `OptionContract.expiry`. `PersistedSquareOffAuthority.__init__` logs the unparseable case once, at construction, rather than per `due()` call (see runbook limitation 28). |
+| **D68** | **`expiry_policy`/`square_off_before_expiry_days` are typed top-level `StrategyConfig` fields, not `risk:` dict keys** | Spec section 11 shows `expiry_policy: force_square_off_before_expiry` as a bare YAML key with no parent block, and section 9's "required resolved strategy fields" list does not name it at all — the config-hierarchy home was genuinely unspecified, and put to the user directly during planning. `StrategyConfig.risk` is `dict[str, Any]`; `_StrictModel`'s `extra="forbid"` reaches every top-level field but not inside an untyped dict, so a key placed in `risk` could carry a silent typo (`square_off_before_expiry_day`, singular) with no refusal at all — exactly the failure `_StrictModel`'s own docstring exists to prevent for every other safety-relevant field. Decided: both fields are typed, top-level, `_StrictModel`-covered fields on `StrategyConfig`, alongside `mode`/`live_approved`/`engine`, not inside `risk`. `config_adapter._square_off_policy` now takes the whole `StrategyConfig`, not just its `risk` dict, to read them. |
+| **D69** | **D56's persistence-identity question gets a written candidate direction, not an implementation — checked and found too large and too speculative to build now, put to the user directly** | Phase 6 Part 5 re-examined D56's claim that "restore open paper positions and strategy/risk state by strategy and mode" (spec bullet 1) is not fully closed while `positions`/`strategy_state`/`order_intents` key their UNIQUE identity on `trading_date`, fragmenting any position held across sessions. Before deciding what to do about it, the actual blast radius was checked rather than assumed: `trading_date` is a mandatory, exact-match parameter on 6+ `ExecutionRepository` methods (`open_positions`, `load_strategy_state`, `save_strategy_state`, `previous_incomplete_session`, and others), every recovery function in `engine_worker.py` (`recover_position`, `recover_daily_risk`, `recover_exit_state`), `PersistedSquareOffAuthority`'s own key, the fixture path in `worker.py`, and `WorkerConfig.trading_date` itself — plus dozens of existing tests asserting on that exact shape. Building a cross-session identity now would mean guessing what "a cycle" operationally means (calendar days? an explicit roll event? adjustment legs?) with no real positional strategy to answer that question — precisely the "inventing Phase 6's answer out of order" trap D56 itself named, just relocated from Phase 5 to now instead of avoided. Put to the user directly (implement now vs. document only); decided: document only. The candidate direction, recorded so a future implementer does not start from zero: introduce `cycle_id` as an **additional** column on the three tables, assigned when a position/cycle opens and held stable until it fully closes, however many `trading_date`s that spans — `trading_date` itself is untouched and keeps its own, independently correct, "state must never leak between days" guarantee for the intraday positions that exist today (migration `0001`'s own stated reason for including it). A positional worker would eventually query "the open cycle for this strategy/mode" via `cycle_id` rather than `trading_date`. Explicitly not built: no migration, no repository method, no test. Revisit only once Phase 9 supplies a real positional strategy whose actual session/rollover/adjustment shape can validate — or invalidate — this direction. See limitation 30 and `runtimes/positional_options/__init__.py`. |
 
 #### D22 in detail: the rebuilt premium-candle mapping
 
@@ -4099,6 +4103,102 @@ start/stop/crash/restart tests pass.
     (limitation 24) is acceptable and lifts the "position open" gate, or a
     cheaper day-level heartbeat write is found.
 
+26. **`square_off_before_expiry_days` counts calendar days, not trading
+    days.** Phase 6 Part 4. A holiday sitting inside the configured lead
+    window shortens it in trading-day terms — e.g. a two-day lead with one
+    holiday in between only buys one trading day of actual pre-expiry
+    warning. Harmless at the shipped default (`0`: the lead is zero days
+    either way), and `SquareOffPolicy` has no holiday calendar to consult
+    even if it wanted to (`MarketSession._holidays` lives one layer up, at
+    the session, not the policy). Closes when the lead is configured
+    non-zero for the first time, or when spec section 11's own "expiry
+    calendar and last-trading-day handling" item of the settlement policy
+    (still entirely unbuilt — see limitation 27) lands and can be reused
+    here instead of duplicated.
+
+27. **Exchange-settlement simulation (`expiry_policy:
+    simulate_exchange_settlement`) is not implemented, and is refused at
+    config load, not merely undocumented.** Phase 6 Part 4 delivers only
+    the safer half of spec section 11: `force_square_off_before_expiry`.
+    None of the eight items section 11 requires before the alternative may
+    be used exist in this repository — expiry calendar and last-trading-day
+    handling, final settlement price capture, ITM/OTM determination,
+    index-option cash settlement, exercise/assignment event recording,
+    exercise-related STT and other charges effective-dated to the
+    settlement date, T+1 settlement timing, and stock-option
+    physical-settlement obligations/delivery margin/assignment risk. A
+    `StrategyConfig` naming `simulate_exchange_settlement` is rejected by a
+    `field_validator` at load, naming this precondition in the raised
+    `ConfigError`, and `SquareOffPolicy.__post_init__` refuses the same
+    value again as defence in depth against direct construction bypassing
+    the loader. No configuration in this repository can enable it today.
+    Closes when a versioned settlement policy covering all eight items
+    ships and passes its own settlement tests — spec section 11's explicit
+    precondition — not before.
+
+28. **The Phase 1 fixture path's expiry is structurally unknowable, so
+    Part 4's expiry-lead rule is permanently inert there.** The fixture
+    strategy (`FixtureSignalStrategy`, `runtimes/intraday_options/
+    worker.py`) trades a bare `security_id`, never an `OptionContract` —
+    there is no expiry field anywhere on its path to know. `_maybe_square_off`
+    now calls `trigger_at(..., expiry=None)` explicitly, with a comment
+    recording that this is by construction rather than an oversight. Not a
+    gap to close: the fixture exists only to exercise Phase 1's plumbing
+    end to end and is explicitly documented as never a template for a real
+    strategy (see its own file's opening comment). Closes only if the
+    fixture path is ever extended to carry a real contract, which is not
+    planned.
+
+29. **Adding `StrategyConfig.expiry_policy`/`.square_off_before_expiry_days`
+    moved `fingerprint(cfg)` for every strategy, including ones whose YAML
+    is untouched.** Verified before accepting this cost rather than assumed
+    harmless: `config_fingerprint` is write-only across this repository —
+    audited every consumer in `common/`, `runtimes/`, `scripts/`,
+    `dashboards/` and found no `SELECT`, comparison or lookup keyed on it
+    anywhere; it is written into three columns (`sessions`, `order_intents`,
+    `orders`, migration `0001`) and never read back. No `.db`/`.sqlite` is
+    git-tracked and `logs/algo_trading.log` contains zero occurrences of
+    "fingerprint" as of this phase, so no operational record depends on a
+    stable value across this change. `MarketSession.fingerprint` is a
+    *different* fingerprint (session timing/calendar only) and is
+    unaffected — `SessionConfig.from_square_off_policy` reads only
+    `entry_cutoff`/`square_off_at`/`timezone` off the policy. The residual
+    cost: two runs with byte-identical strategy YAML, one either side of
+    this change, now carry different fingerprints, which reads as "the
+    configuration changed" to the human the fingerprint exists to serve.
+    Deliberately not mitigated by excluding the new fields from the
+    canonical digest — a safety-relevant field that does not move the
+    fingerprint is the worse failure, and doing so would contradict
+    `test_fingerprint_changes_when_any_value_changes`'s own premise. Spec
+    ARCH:3003 scopes live approval to "that strategy instance and
+    configuration fingerprint"; that binding is unimplemented (`live_approved`
+    is a plain bool with no fingerprint tie) and Phase 10 does not exist yet,
+    so nothing is invalidated today, but Phase 10 must know the fingerprint
+    domain moved here, and any paper-acceptance record predating this phase
+    needs re-deriving before binding it to a fingerprint. Closes if a
+    fingerprint *version* or schema-generation marker is ever introduced.
+
+30. **A position or strategy-state row still cannot survive across a
+    `trading_date` boundary — D56's gap, still open by design, now with a
+    written candidate direction rather than none.** `positions`,
+    `strategy_state` and `order_intents` all key their identity on
+    `trading_date` (migration `0001`), so a position held across sessions
+    would fragment across unrelated rows under the current schema. Not a
+    live risk today: nothing in this repository holds a position across a
+    `trading_date` boundary — square-off (including Part 4's expiry
+    trigger) always resolves within the trading date it started in, and no
+    positional strategy or worker exists to need otherwise. Becomes a real
+    risk the day a positional strategy is built (Phase 9) without first
+    revisiting this. **D69** records the candidate direction (an
+    additional `cycle_id` column, `trading_date` untouched) but explicitly
+    stops short of building it — the blast radius (6+ `ExecutionRepository`
+    methods, every recovery function, dozens of existing tests) and the
+    unanswered question of what "a cycle" operationally means make
+    building it now speculative rather than incremental. Closes when
+    Phase 9 supplies a real positional strategy whose actual session/
+    rollover/adjustment shape can validate the candidate direction — or
+    replace it.
+
 
 ### Operational risk noted during the audit
 
@@ -4332,11 +4432,11 @@ mtime is unchanged at the recorded baseline.
 
 Phase 2 is complete, both blocks. **Phase 3 is complete** — all five parts, with its
 acceptance gate met in full. **Phase 4 is complete** — all five parts, its one live
-gate item run and passed. **Phase 5 is complete** — see below. **Phase 6 is in
-progress: Parts 1-3 complete**, see below. Next is **Phase 6 Part 4**
-(`force_square_off_before_expiry`, and the settlement gate).
+gate item run and passed. **Phase 5 is complete** — see below. **Phase 6 is
+complete** — all five parts, see below. Next is **Phase 7 — Operations**, not yet
+scoped in this document.
 
-### Phase 6 — paper recovery and expiry handling — **Part 3 of 5 complete**
+### Phase 6 — paper recovery and expiry handling — **Complete, all five parts**
 
 A pre-work audit (spec's Phase 6 bullets read directly from
 `ALGO_TRADING_FORWARD_TESTING_ARCHITECTURE_FINAL.md:2905-2910`, checked against
@@ -4400,7 +4500,8 @@ each case:
 | An unrestorable `daily_realised_pnl` fails closed, not silently | **Done** — mirrors `recover_position`'s CRITICAL-error pattern |
 | `daily_realised_pnl` accumulates across contracts in one day | **Fixed** — was silently wrong before Part 1 (D58 / limitation 22) |
 | Fixed strikes, basket legs, rolling counters | **Still blocked** — no `FixedStrikeEngine`/`MultiLegEngine` consumer |
-| `force_square_off_before_expiry`, settlement simulation | **Not started** — Part 4 |
+| `force_square_off_before_expiry` | **Done** — Part 4, see below |
+| Exchange-settlement simulation (`simulate_exchange_settlement`) | **Not implemented, refused at config load** — Part 4, see below and limitation 27 |
 
 **Part 2 — position-management state snapshot/restore.** Pre-work found the
 plan's own bullet ("add `snapshot()`/`restore()` to `BaseExit`/`RiskManager`,
@@ -4512,6 +4613,165 @@ snapshot at all), which do not depend on `state_version`. See **D65**.
 | A restored candle watermark blocks reprocessing | **Done, position-gated** — fail-first proven, with a same-tape no-watermark control |
 | A flat restart does not inherit a stale watermark | **Done** — proven directly |
 | Idempotent replay on a flat (no position) day | **Not covered** — limitation 25 |
+
+**Part 4 — `force_square_off_before_expiry` and the settlement gate.** Pre-work
+(exploration + a dedicated Plan pass, both read before any code) found the spec
+underspecifies two things `grep` confirmed exist nowhere in the repository or
+either doc: how `expiry_policy` fits the config hierarchy (shown as a bare YAML
+key in spec section 11, absent from section 9's own "required resolved strategy
+fields" list), and `square_off_before_expiry_days` itself, which names nothing
+the spec or the runbook had used before. Both forks were put to the user
+directly before writing any code, not decided unilaterally:
+
+1. **When an overdue day fires.** Immediately, at the first `due()` — any time
+   of day, not gated on the ordinary `square_off_at`. Firing only at the
+   existing square-off time would make the whole trigger behaviourally
+   identical to the clock it composes into, which is not testable and adds
+   nothing observable. Decided with the user.
+2. **The lead's default and unit.** `0`, calendar days. The last day a contract
+   may be held is expiry day itself, so every existing intraday config and
+   test stays behaviour-unchanged unless a run genuinely outlives its
+   contract's expiry date. Trading-day counting was considered and rejected
+   for now — it needs a holiday calendar `SquareOffPolicy` does not have, and
+   is meaningless at a zero-day default anyway. Recorded as **limitation 26**
+   rather than built ahead of a real need. Decided with the user.
+
+**The composition, not a second decider.** `SquareOffPolicy.trigger_at` gained
+one optional `expiry` keyword, checked after the persisted-state guard and
+ahead of the existing time-of-day ladder — every call site that omits it (the
+policy's own tests, the fixture path, `SessionSquareOffAuthority`, which is not
+touched at all) is byte-identical to before. `PersistedSquareOffAuthority`
+gained a keyword-only `expiry` constructor argument, resolved once by
+`engine_worker._build` from whichever resolver `build_option_selector` chose —
+`DhanOptionChainResolver.expiry` (a real ISO date) when one is wired,
+`engine_config.expiry` (`None` by default) otherwise, so every simulated/fixture
+run keeps today's behaviour without being told to. See **D66**.
+
+**The unsafe alternative is refused, not stubbed.** `simulate_exchange_settlement`
+is the spec's only other permitted value, gated by its own text ("only after
+settlement tests pass"). None of spec section 11's eight settlement-policy
+items exist in this repository — expiry calendar/last-trading-day handling,
+final settlement price capture, ITM/OTM determination, index-option cash
+settlement, exercise/assignment recording, effective-dated exercise STT and
+other charges, T+1 timing, stock-option physical-settlement obligations —
+so building a shell of it would be exactly the "untested code that merely
+looks finished" D34 already declined to do elsewhere. A `field_validator` on
+`StrategyConfig.expiry_policy` refuses the value at config load with the
+precondition named in the raised `ConfigError`; `SquareOffPolicy.__post_init__`
+refuses it again, independently, as defence in depth against direct
+construction bypassing the loader. See **limitation 27**.
+
+**Inert, not overdue, on a bad expiry — the opposite direction from the
+persisted-state precedent.** An unreadable persisted `square_off_state` fails
+*towards* squaring off, because nothing else will ever close the position if it
+does not. The expiry rule cannot borrow that direction: `SimulatedOptionChainResolver`'s
+placeholder `"WEEKLY"` expiry is the *common* case every existing
+config carries, not an edge case, and failing it towards `SQUARE_OFF` would
+force-close every fixture run on its first tick. Since the ordinary
+time-of-day ladder still runs when the rule is inert, there is no unsafe
+direction to fail towards here. Logged once, at authority construction, not
+per `due()` call. See **D67**, **limitation 28**.
+
+**`expiry_policy`/`square_off_before_expiry_days` are typed `StrategyConfig`
+fields, not `risk:` keys** — `risk` is an untyped dict that `_StrictModel`'s
+`extra="forbid"` cannot reach inside, so a typo there would be silently
+ignored rather than refused, exactly the failure every other top-level safety
+field is protected from. See **D68**.
+
+**A fingerprint-stability audit was run before accepting the field additions'
+cost, not assumed harmless.** Adding fields to `StrategyConfig` moves
+`fingerprint(cfg)` for every strategy, including ones whose YAML did not
+change. Checked rather than waved through: `config_fingerprint` is write-only
+everywhere in this repository — no `SELECT`, comparison or lookup keyed on it
+exists in `common/`, `runtimes/`, `scripts/` or `dashboards/` — so nothing
+breaks. The residual cost (an old row now reads as "different configuration"
+when it was not) is recorded as **limitation 29**, along with the one real
+dependency found: spec ARCH:3003 scopes live approval to a configuration
+fingerprint, which is unimplemented today but which Phase 10 must be told the
+fingerprint domain moved here before relying on it.
+
+An end-to-end integration test (`tests/integration/test_engine_square_off.py::
+test_an_overdue_expiry_force_closes_an_open_position_end_to_end`) drives the
+real `TradingEngine`, a real `PersistedSquareOffAuthority` and a real SQLite
+database across two threads (the engine's own, since the test spawns it the
+same way the cross-thread square-off tests in the same file already do):
+entry happens on the contract's own expiry date (not yet overdue at the
+zero-day default), the position stays open until a tick dated the next
+calendar day arrives, and that single tick force-closes it with
+`ExitReason.SQUARE_OFF` before any time-of-day check — proven failing first
+against the trigger with the composition disabled, restored, then proven
+passing.
+
+| Property | Status |
+|---|---|
+| An overdue expiry force-closes before the entry cutoff, at any time of day | **Done** — fail-first proven at both the policy-unit and real-engine/real-database level |
+| Persisted `COMPLETED`/`IN_PROGRESS` still suppress an overdue expiry, exactly as they suppress a post-`square_off_at` restart | **Done** — unit-proven against a real `ExecutionRepository` |
+| The expiry-driven trigger writes `IN_PROGRESS` once, not per tick, and reaches exactly 2 attempts on a normal day | **Done** — same invariant Part 3 pinned for the time-of-day trigger, now proven for this one too |
+| A restart on an already-overdue day reads `COMPLETED` and does not re-close | **Done** — unit-proven |
+| Every existing simulated/fixture config is behaviour-unchanged (no expiry configured) | **Done** — full suite green unmodified elsewhere, plus an explicit byte-identical-trigger test |
+| An unparseable or missing expiry is inert rather than overdue | **Done** — unit-proven, with a construction-time WARNING pinned via `caplog` |
+| `simulate_exchange_settlement` is reachable by no configuration | **Done** — refused at config load and at direct `SquareOffPolicy` construction, independently |
+| Exchange-settlement simulation itself (spec section 11's eight items) | **Not built** — limitation 27, the gate this part does not cross |
+| `square_off_before_expiry_days` honours holidays | **Not built** — limitation 26, calendar days only |
+| `config_fingerprint` stability across this change | **Audited, not assumed** — write-only everywhere today; residual cosmetic cost recorded as limitation 29 |
+
+**Part 5 — the phase's record, not more code.** With bullets 1, 3 and (by
+refusal) 4 done, the question this part actually answers is whether Phase 6
+is substantively complete or whether something is being marked done that
+is not. Re-read fresh rather than assumed:
+
+1. **Bullet 1** ("restore open paper positions and strategy/risk state by
+   strategy and mode") is done for every position this repository can
+   produce — recovery is mode-separated and strategy-scoped, tested across
+   Parts 1-3. D56 had glossed the bullet's "by strategy and mode" as also
+   meaning "not by date," flagging the `trading_date`-scoped UNIQUE keys as
+   an unmet part of the bullet. That gloss is a reasonable reading but not
+   the bullet's literal text, and nothing today needs a position to survive
+   a `trading_date` boundary — square-off, including Part 4's expiry
+   trigger, always resolves within the trading date it started in.
+2. **Bullet 2**'s fixed strikes, basket legs and rolling counters are
+   unchanged: still blocked on `FixedStrikeEngine`/`MultiLegEngine` not
+   being ported, the same D56/D34 "needs a real consumer" reasoning that
+   has held since Phase 5. Not this phase's to close.
+3. **Bullet 3** — done, Part 4.
+4. **Bullet 4** ("add exchange-settlement simulation *before* any strategy
+   intentionally holds through expiry") is a conditional, not an
+   unconditional build order. Nothing in this repository can hold through
+   expiry — `simulate_exchange_settlement` is refused outright — so the
+   precondition is enforced, not merely unmet. Read this way, the bullet is
+   satisfied by refusal, not left undone.
+
+**D56's residual gap got one real question, checked before deciding what to
+do about it.** Is the `trading_date`-scoped persistence identity worth
+fixing now, given it is real and named as "a genuine structural blocker" in
+D56's own words? The blast radius was checked, not assumed: `trading_date`
+is a mandatory, exact-match parameter on 6+ `ExecutionRepository` methods,
+every recovery function in `engine_worker.py`, `PersistedSquareOffAuthority`'s
+own key, the fixture path, and `WorkerConfig.trading_date` itself — plus
+dozens of existing tests asserting on that exact shape. Building a fix now
+would mean guessing what "a cycle" operationally means (calendar days? an
+explicit roll event? adjustment legs?) with no real positional strategy to
+answer that question — the same "inventing Phase 6's answer out of order"
+trap D56 named in Phase 5, just relocated to now instead of avoided. Put to
+the user directly (implement now vs. document only); decided: document
+only. **D69** records the candidate direction — an additional `cycle_id`
+column, `trading_date` left untouched — as a starting point for whoever
+eventually builds it, explicitly not a commitment. `runtimes/
+positional_options/__init__.py` updated to cite it instead of gesturing at
+"Phase 6" in the abstract. See **limitation 30**.
+
+No code, no migration, no test changed in this part — the record is the
+deliverable.
+
+| Property | Status |
+|---|---|
+| Spec bullet 1 (restore positions/strategy state by strategy and mode) | **Done**, for every position this repository can produce |
+| Spec bullet 2 (fixed strikes, basket legs, rolling counters) | **Still blocked** — no `FixedStrikeEngine`/`MultiLegEngine` consumer, unchanged since Phase 5 |
+| Spec bullet 2 (custom exit state) | **Done** — Part 2 |
+| Spec bullet 3 (`force_square_off_before_expiry`) | **Done** — Part 4 |
+| Spec bullet 4 (exchange-settlement simulation before holding through expiry) | **Satisfied by refusal** — nothing can hold through expiry today |
+| D56's persistence-identity question | **Given a written candidate direction, not implemented** — **D69**, limitation 30 |
+| `runtimes/positional_options/__init__.py` | **Updated** to reflect Part 4's exit-timing answer and cite D69 |
 
 ### Phase 5 — mixed-mode supervisor and persistence — **COMPLETE**
 

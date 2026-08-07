@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from common.config import ConfigError, EngineKind, ExecutionMode, ResolvedConfig
+from common.config import ConfigError, EngineKind, ExecutionMode, ExpiryPolicy, ResolvedConfig
 from common.config.models import GlobalConfig, RuntimeConfig, StrategyConfig
 from runtimes.intraday_options.config_adapter import build_worker_config
 
@@ -116,3 +116,16 @@ def test_config_fingerprint_is_set(tmp_path: Path):
     worker = _build(_cfg(), tmp_path)
     assert worker.config_fingerprint
     assert isinstance(worker.config_fingerprint, str)
+
+
+# --------------------------------------------- expiry_policy (Phase 6 Part 4)
+def test_expiry_policy_defaults_reach_the_square_off_policy(tmp_path: Path):
+    worker = _build(_cfg(), tmp_path)
+    assert worker.square_off_policy.expiry_policy is ExpiryPolicy.FORCE_SQUARE_OFF_BEFORE_EXPIRY
+    assert worker.square_off_policy.square_off_before_expiry_days == 0
+
+
+def test_a_configured_expiry_lead_reaches_the_square_off_policy(tmp_path: Path):
+    cfg = _cfg(square_off_before_expiry_days=3)
+    worker = _build(cfg, tmp_path)
+    assert worker.square_off_policy.square_off_before_expiry_days == 3

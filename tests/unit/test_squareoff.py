@@ -7,13 +7,17 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from common.risk import SquareOffPolicy, SquareOffState, SquareOffTrigger
+from common.risk import ExpiryPolicy, SquareOffPolicy, SquareOffState, SquareOffTrigger
 
 IST = ZoneInfo("Asia/Kolkata")
 
 
 def _at(hour: int, minute: int) -> datetime:
     return datetime(2026, 7, 29, hour, minute, tzinfo=IST)
+
+
+def _on(year: int, month: int, day: int, hour: int, minute: int) -> datetime:
+    return datetime(year, month, day, hour, minute, tzinfo=IST)
 
 
 def test_entries_are_allowed_before_the_cutoff():
@@ -93,3 +97,80 @@ def test_times_are_configurable():
     assert not policy.entries_allowed(_at(11, 5))
     trigger = policy.trigger_at(_at(11, 30), state=SquareOffState.PENDING)
     assert trigger is SquareOffTrigger.SQUARE_OFF
+
+
+# ---------------------------------------------- expiry lead (Phase 6 Part 4)
+#: Pins the truth table settled with the user during planning:
+#:   day  < expiry - N  -> normal clock only
+#:   day == expiry - N  -> normal clock only (flat by square_off_at anyway)
+#:   day  > expiry - N  -> SQUARE_OFF from the first due(), any time of day
+def test_holding_is_not_overdue_before_expiry_day_at_the_default_lead():
+    policy = SquareOffPolicy()  # square_off_before_expiry_days=0
+    assert not policy.holding_overdue(_on(2026, 8, 26, 9, 20), "2026-08-27")
+
+
+def test_holding_is_not_overdue_on_expiry_day_itself_at_the_default_lead():
+    policy = SquareOffPolicy()
+    assert not policy.holding_overdue(_on(2026, 8, 27, 9, 20), "2026-08-27")
+
+
+def test_holding_is_overdue_the_day_after_expiry_at_the_default_lead():
+    policy = SquareOffPolicy()
+    assert policy.holding_overdue(_on(2026, 8, 28, 9, 20), "2026-08-27")
+
+
+def test_a_configured_lead_pushes_the_last_holding_day_earlier():
+    policy = SquareOffPolicy(square_off_before_expiry_days=2)
+    assert not policy.holding_overdue(_on(2026, 8, 25, 9, 20), "2026-08-27")
+    assert policy.holding_overdue(_on(2026, 8, 26, 9, 20), "2026-08-27")
+
+
+def test_the_zero_lead_default_is_byte_identical_to_no_expiry_at_all():
+    """The no-behaviour-change guarantee: N=0 on expiry day changes nothing."""
+    policy = SquareOffPolicy()
+    with_expiry = policy.trigger_at(_at(10, 0), state=SquareOffState.PENDING, expiry="2026-07-29")
+    without_expiry = policy.trigger_at(_at(10, 0), state=SquareOffState.PENDING)
+    assert with_expiry is without_expiry is SquareOffTrigger.NONE
+
+
+def test_an_overdue_expiry_forces_square_off_before_the_entry_cutoff():
+    """The 'immediately, at the first due()' decision: no waiting for square_off_at."""
+    policy = SquareOffPolicy()
+    trigger = policy.trigger_at(
+        _on(2026, 8, 28, 9, 20), state=SquareOffState.PENDING, expiry="2026-08-27"
+    )
+    assert trigger is SquareOffTrigger.SQUARE_OFF
+
+
+def test_persisted_completed_state_still_suppresses_an_overdue_expiry():
+    policy = SquareOffPolicy()
+    trigger = policy.trigger_at(
+        _on(2026, 8, 28, 9, 20), state=SquareOffState.COMPLETED, expiry="2026-08-27"
+    )
+    assert trigger is SquareOffTrigger.NONE
+
+
+def test_persisted_in_progress_state_still_suppresses_an_overdue_expiry():
+    policy = SquareOffPolicy()
+    trigger = policy.trigger_at(
+        _on(2026, 8, 28, 9, 20), state=SquareOffState.IN_PROGRESS, expiry="2026-08-27"
+    )
+    assert trigger is SquareOffTrigger.NONE
+
+
+@pytest.mark.parametrize("bad_expiry", ["WEEKLY", "", None])
+def test_an_unparseable_or_missing_expiry_is_inert_not_overdue(bad_expiry):
+    """A simulated contract's placeholder expiry must not force-close a fixture
+    run on its first tick — see runbook limitation 28."""
+    policy = SquareOffPolicy()
+    assert not policy.holding_overdue(_on(2026, 8, 28, 9, 20), bad_expiry)
+
+
+def test_simulate_exchange_settlement_is_refused_at_construction():
+    with pytest.raises(ValueError, match="not implemented"):
+        SquareOffPolicy(expiry_policy=ExpiryPolicy.SIMULATE_EXCHANGE_SETTLEMENT)
+
+
+def test_a_negative_lead_is_refused():
+    with pytest.raises(ValueError, match="must not be negative"):
+        SquareOffPolicy(square_off_before_expiry_days=-1)

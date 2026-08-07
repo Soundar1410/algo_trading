@@ -148,6 +148,46 @@ def test_an_engine_that_already_asked_is_not_asked_again():
     assert engine.reasons == []
 
 
+# --------------------------------------- an overdue expiry, real authority
+#
+# The net itself is unchanged for Phase 6 Part 4 — it only ever asks
+# `authority.due(now)`. What changes is what a real `PersistedSquareOffAuthority`
+# answers. This proves the composition end to end: an expiry-overdue day closes
+# on the poll timer alone, with **no tick** involved anywhere in the call, which
+# is the scenario the net exists for in the first place.
+def test_the_net_closes_an_expiry_overdue_day_with_no_tick_involved():
+    import tempfile
+    from pathlib import Path
+
+    from common.config.models import ExecutionMode
+    from common.engine.square_off import PersistedSquareOffAuthority
+    from common.execution import ExecutionRepository
+    from common.persistence import Database, MigrationRunner
+    from common.risk import SquareOffPolicy
+
+    with tempfile.TemporaryDirectory() as tmp:
+        database = Database(Path(tmp) / "wall_clock.sqlite")
+        MigrationRunner(database).run_pending()
+        repository = ExecutionRepository(database)
+
+        authority = PersistedSquareOffAuthority(
+            SquareOffPolicy(),
+            repository,
+            runtime_id="intraday_options",
+            strategy_id="expiry_net",
+            execution_mode=ExecutionMode.PAPER,
+            trading_date=TRADING_DATE,
+            expiry="2026-08-02",  # one calendar day before TRADING_DATE
+        )
+        engine = _FakeEngine()
+        # 10:00 IST, well before entry_cutoff — the ordinary clock would stay silent.
+        morning = datetime(2026, 8, 3, 10, 0, tzinfo=IST)
+        _net(engine, authority, now=morning)()
+
+        assert engine.square_off_requested is True
+        database.close()
+
+
 # ------------------------------------------------------------------ the hook
 def test_the_feed_calls_the_hook_on_every_poll_wake():
     """The net is only as good as the loop that drives it. Proven against the

@@ -39,6 +39,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from common.config.models import ExecutionMode
 from common.engine import engine as engine_module
 from common.engine.config import EngineConfig, SessionConfig
 from common.engine.engine import TradingEngine
@@ -46,7 +47,11 @@ from common.engine.feed import MarketDataFeed, SimulatedFeed
 from common.engine.models import ExitReason
 from common.engine.positions import InMemoryGateway, PositionManager
 from common.engine.selection import OptionSelector, SimulatedOptionChainResolver
+from common.engine.square_off import PersistedSquareOffAuthority, SquareOffAuthority
+from common.execution import ExecutionRepository
 from common.models import Tick
+from common.persistence import Database, MigrationRunner
+from common.risk import SquareOffPolicy
 from strategies.intraday_options.engine_fixture_strategy import EngineFixtureStrategy
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -138,7 +143,12 @@ class _SilentFeed(MarketDataFeed):
         self._release.set()
 
 
-def _build_engine(feed: MarketDataFeed) -> tuple[TradingEngine, PositionManager]:
+def _build_engine(
+    feed: MarketDataFeed,
+    *,
+    square_off_authority: SquareOffAuthority | None = None,
+    expiry: str | None = None,
+) -> tuple[TradingEngine, PositionManager]:
     positions = PositionManager(InMemoryGateway(slippage_points=0.0), lots=1)
     engine = TradingEngine(
         EngineConfig(
@@ -152,11 +162,12 @@ def _build_engine(feed: MarketDataFeed) -> tuple[TradingEngine, PositionManager]
         ),
         feed=feed,
         option_selector=OptionSelector(
-            SimulatedOptionChainResolver("NIFTY", lot_size=65), strike_step=50
+            SimulatedOptionChainResolver("NIFTY", lot_size=65), strike_step=50, expiry=expiry
         ),
         strategy=EngineFixtureStrategy(enter_on_candle=1),
         position_manager=positions,
         underlying_security_id=UNDERLYING,
+        square_off_authority=square_off_authority,
     )
     return engine, positions
 
@@ -416,6 +427,95 @@ def test_an_untriggered_run_is_not_reported_as_stopped_by_request() -> None:
     assert not engine.square_off_requested
     assert not engine.stopped_by_request
     assert engine.wait_until_stopped(0.0)
+
+
+# -------------------------------------- 8. expiry-driven (Phase 6 Part 4)
+def test_an_overdue_expiry_force_closes_an_open_position_end_to_end(tmp_path: Path) -> None:
+    """The composed trigger, proven through the real engine and a real database.
+
+    Entry happens on the contract's own expiry date (2026-07-16), which is not
+    yet overdue at the default zero-day lead. The position stays open until a
+    tick dated the *next* calendar day arrives — at which point ``due()`` must
+    return ``True`` immediately, before any time-of-day check, closing the
+    position with ``ExitReason.SQUARE_OFF`` rather than leaving it simply
+    absent (spec ARCH:1965), and persisting ``square_off_state=COMPLETED`` to
+    the same repository row the ordinary time-of-day trigger writes.
+
+    The engine (and the authority behind it, and the SQLite connection behind
+    that) is built **inside** the engine-run thread, not handed across from the
+    main thread: sqlite3 connections are thread-bound, and every other test in
+    this file that reaches a real connection does so from a single thread —
+    this is the first to run the engine on a *different* thread while also
+    touching a database, so it has to open that database where it will be used.
+    """
+    database_path = tmp_path / "expiry_e2e.sqlite"
+    expiry = "2026-07-16"
+    contract_id = f"SIM:NIFTY:{expiry}:24000:CE"
+    feed = _BlockingFeed()
+    holder: dict[str, object] = {}
+
+    def _run_on_its_own_thread() -> None:
+        database = Database(database_path)
+        MigrationRunner(database).run_pending()
+        repository = ExecutionRepository(database)
+        authority = PersistedSquareOffAuthority(
+            SquareOffPolicy(),  # default expiry_policy, square_off_before_expiry_days=0
+            repository,
+            runtime_id="intraday_options",
+            strategy_id="expiry_e2e",
+            execution_mode=ExecutionMode.PAPER,
+            trading_date="2026-07-16",
+            expiry=expiry,
+        )
+        engine, positions = _build_engine(feed, square_off_authority=authority, expiry=expiry)
+        holder["engine"] = engine
+        holder["positions"] = positions
+        holder["authority"] = authority
+        try:
+            engine.run()
+        finally:
+            database.close()
+
+    runner = threading.Thread(target=_run_on_its_own_thread, name="engine-run", daemon=True)
+    runner.start()
+    try:
+        for tick in (
+            _tick(UNDERLYING, 24000.0, _ts(9, 16)),
+            _tick(UNDERLYING, 24010.0, _ts(9, 21)),  # closes candle #1 -> ENTER
+            _tick(contract_id, 100.0, _ts(9, 21, 30)),  # fills the pending entry
+        ):
+            feed.deliver(tick)
+        deadline = threading.Event()
+        for _ in range(150):
+            positions = holder.get("positions")
+            if positions is not None and positions.has_position():  # type: ignore[union-attr]
+                break
+            deadline.wait(0.02)
+        else:
+            raise AssertionError("the tape never opened a position")
+
+        # A tick dated the day after expiry: overdue, at any time of day.
+        next_day = datetime(2026, 7, 17, 9, 16, tzinfo=IST)
+        feed.deliver(_tick(UNDERLYING, 24005.0, next_day))
+        runner.join(timeout=JOIN_TIMEOUT)
+    finally:
+        if runner.is_alive():  # pragma: no cover - only on an unexpected hang
+            feed.finish()
+            runner.join(timeout=JOIN_TIMEOUT)
+
+    assert not runner.is_alive(), "the engine never returned after the overdue tick"
+    positions = holder["positions"]
+    assert not positions.has_position()  # type: ignore[union-attr]
+    assert len(positions.trades) == 1  # type: ignore[union-attr]
+    assert positions.trades[0].exit_reason is ExitReason.SQUARE_OFF  # type: ignore[union-attr]
+
+    verify_db = Database(database_path)
+    verify_repository = ExecutionRepository(verify_db)
+    state = verify_repository.load_strategy_state(
+        strategy_id="expiry_e2e", execution_mode=ExecutionMode.PAPER, trading_date="2026-07-16"
+    )
+    assert state["square_off_state"] == "COMPLETED"
+    verify_db.close()
 
 
 def test_a_feed_that_raises_still_squares_off_before_the_error_propagates() -> None:

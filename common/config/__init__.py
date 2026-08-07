@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+# Re-exported alongside the other strategy-config enums (EngineKind,
+# ExecutionMode) even though it is defined in common.risk — see models.py's
+# import-direction note for why the definition lives there instead.
+from common.risk.squareoff import ExpiryPolicy
+
 from .fingerprint import fingerprint
 from .loader import (
     ConfigError,
@@ -30,6 +35,7 @@ __all__ = [
     "ConfigError",
     "EngineKind",
     "ExecutionMode",
+    "ExpiryPolicy",
     "GlobalConfig",
     "LiveGateDecision",
     "ProjectPaths",

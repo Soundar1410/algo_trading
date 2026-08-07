@@ -375,6 +375,84 @@ def test_yesterdays_completion_does_not_suppress_today(
     assert _authority(repository).due(_at(15, 25)) is True
 
 
+# ------------------------------------------- expiry-driven square-off (Part 4)
+#
+# TRADING_DATE is 2026-07-31. The default lead (square_off_before_expiry_days=0)
+# makes 2026-07-31 the last day a contract expiring 2026-07-31 may be held, so an
+# expiry of 2026-07-30 is what makes *this* trading date overdue.
+
+
+def test_an_overdue_expiry_makes_due_true_before_the_entry_cutoff(
+    repository: ExecutionRepository,
+) -> None:
+    """The 'immediately, at the first due()' decision, against the real authority."""
+    authority = _authority(repository, expiry="2026-07-30")
+    assert authority.due(_at(9, 20)) is True
+
+
+def test_an_expiry_on_the_trading_date_itself_is_not_yet_overdue(
+    repository: ExecutionRepository,
+) -> None:
+    authority = _authority(repository, expiry=TRADING_DATE)
+    assert authority.due(_at(9, 20)) is False
+    assert authority.due(_at(15, 15)) is True  # the ordinary clock still fires
+
+
+def test_an_authority_built_with_no_expiry_behaves_exactly_as_before(
+    repository: ExecutionRepository,
+) -> None:
+    """Negative control: omitting ``expiry`` must be indistinguishable from
+    Part 3's authority — no worker that never sets it changes behaviour."""
+    authority = _authority(repository)
+    assert authority.due(_at(9, 20)) is False
+    assert authority.due(_at(15, 15)) is True
+
+
+def test_an_overdue_expiry_writes_in_progress_once_not_per_tick(
+    repository: ExecutionRepository,
+) -> None:
+    authority = _authority(repository, expiry="2026-07-30")
+    for minute in range(5):
+        assert authority.due(_at(9, 20 + minute)) is True
+    assert authority.writes == 1
+    row = _stored(repository)
+    assert row["square_off_state"] == SquareOffState.IN_PROGRESS.value
+
+
+def test_an_overdue_expiry_day_reaches_exactly_two_attempts(
+    repository: ExecutionRepository,
+) -> None:
+    """Same invariant Part 3 pinned for the time-of-day trigger: a normal day
+    (however it is triggered) makes exactly two persisted writes."""
+    authority = _authority(repository, expiry="2026-07-30")
+    authority.due(_at(9, 20))
+    authority.completed(_at(9, 20))
+    assert _stored(repository)["square_off_attempts"] == 2
+
+
+def test_a_restart_on_an_overdue_day_reads_completed_and_does_not_reclose(
+    repository: ExecutionRepository,
+) -> None:
+    first = _authority(repository, expiry="2026-07-30")
+    first.due(_at(9, 20))
+    first.completed(_at(9, 20))
+
+    restarted = _authority(repository, expiry="2026-07-30")
+    assert restarted.due(_at(9, 25)) is False
+
+
+def test_an_unparseable_expiry_logs_once_at_construction_and_stays_inert(
+    repository: ExecutionRepository, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A simulated contract's placeholder expiry (e.g. ``'WEEKLY'``) must not
+    force-close a run on its first tick — logged once, not per due() call."""
+    with caplog.at_level(logging.WARNING):
+        authority = _authority(repository, expiry="WEEKLY")
+    assert any("not a parseable ISO date" in record.getMessage() for record in caplog.records)
+    assert authority.due(_at(9, 20)) is False  # inert, not overdue
+    assert authority.due(_at(15, 15)) is True  # the ordinary clock still fires
+
+
 # ------------------------------------------------------- the configured times
 
 

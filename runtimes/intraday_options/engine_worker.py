@@ -656,6 +656,14 @@ def _build(
 
     warmup_manager, warmup_source = build_warmup_manager(config, engine_config)
 
+    # Phase 6 Part 4: the session's own resolved expiry, if one exists.
+    # DhanOptionChainResolver exposes a real ISO date (fixed at construction,
+    # in build_option_selector above); SimulatedOptionChainResolver exposes
+    # none, so this falls back to engine_config.expiry (default None) and the
+    # expiry-lead rule stays inert for every simulated/fixture run, exactly as
+    # it does today.
+    resolved_expiry = getattr(option_selector.resolver, "expiry", None) or engine_config.expiry
+
     # Hoisted above the feed so the wall-clock net below and the engine share **one**
     # authority instance. Two would mean two `_load_state()` reads and two
     # `_attempt_recorded` flags — i.e. two deciders against one position, which is
@@ -667,6 +675,7 @@ def _build(
         strategy_id=config.strategy_id,
         execution_mode=config.execution_mode,
         trading_date=config.trading_date,
+        expiry=resolved_expiry,
     )
 
     feed = HubTickFeed(

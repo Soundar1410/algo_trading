@@ -563,7 +563,10 @@ def _maybe_square_off(
     state: SquareOffState,
 ) -> tuple[SquareOffState, bool]:
     """Square off if the candle clock says so. Returns the new state and whether it acted."""
-    trigger = config.square_off_policy.trigger_at(candle.end_at, state=state)
+    # expiry=None, explicitly: the fixture path (Phase 1's walking skeleton) holds
+    # no OptionContract and has no expiry to know, so Phase 6 Part 4's expiry-lead
+    # rule is inert here by construction, not by oversight.
+    trigger = config.square_off_policy.trigger_at(candle.end_at, state=state, expiry=None)
     if trigger is not SquareOffTrigger.SQUARE_OFF:
         return state, False
 

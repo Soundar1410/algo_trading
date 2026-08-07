@@ -10,6 +10,7 @@ from common.config import (
     ConfigError,
     EngineKind,
     ExecutionMode,
+    ExpiryPolicy,
     GlobalConfig,
     ResolvedConfig,
     RuntimeConfig,
@@ -173,6 +174,50 @@ def test_id_mismatch_between_filename_and_body_is_rejected(populated_config: Pat
     )
     with pytest.raises(ConfigError, match="mismatch"):
         load_strategy_config(populated_config, "io_fixture_v1")
+
+
+# --------------------------------------------- expiry_policy (Phase 6 Part 4)
+def test_expiry_policy_defaults_to_force_square_off_before_expiry(populated_config: Path):
+    strategy = load_strategy_config(populated_config, "io_fixture_v1")
+    assert strategy.expiry_policy is ExpiryPolicy.FORCE_SQUARE_OFF_BEFORE_EXPIRY
+    assert strategy.square_off_before_expiry_days == 0
+
+
+def test_simulate_exchange_settlement_is_refused_at_load(populated_config: Path):
+    """Spec section 11: only permitted 'after settlement tests pass'. None exist."""
+    _write(
+        populated_config / "strategies" / "io_fixture_v1.yaml",
+        "strategy_id: io_fixture_v1\nenabled: true\nexpiry_policy: simulate_exchange_settlement\n",
+    )
+    with pytest.raises(ConfigError, match="settlement tests pass"):
+        load_strategy_config(populated_config, "io_fixture_v1")
+
+
+def test_an_unknown_expiry_policy_value_is_rejected(populated_config: Path):
+    _write(
+        populated_config / "strategies" / "io_fixture_v1.yaml",
+        "strategy_id: io_fixture_v1\nenabled: true\nexpiry_policy: hold_forever\n",
+    )
+    with pytest.raises(ConfigError):
+        load_strategy_config(populated_config, "io_fixture_v1")
+
+
+def test_a_negative_square_off_before_expiry_days_is_rejected(populated_config: Path):
+    _write(
+        populated_config / "strategies" / "io_fixture_v1.yaml",
+        "strategy_id: io_fixture_v1\nenabled: true\nsquare_off_before_expiry_days: -1\n",
+    )
+    with pytest.raises(ConfigError):
+        load_strategy_config(populated_config, "io_fixture_v1")
+
+
+def test_a_configured_expiry_lead_is_loaded(populated_config: Path):
+    _write(
+        populated_config / "strategies" / "io_fixture_v1.yaml",
+        "strategy_id: io_fixture_v1\nenabled: true\nsquare_off_before_expiry_days: 2\n",
+    )
+    strategy = load_strategy_config(populated_config, "io_fixture_v1")
+    assert strategy.square_off_before_expiry_days == 2
 
 
 # ------------------------------------------------------------ env overrides

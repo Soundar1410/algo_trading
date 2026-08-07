@@ -29,7 +29,7 @@ from datetime import time
 from pathlib import Path
 from typing import Any
 
-from common.config import ConfigError, ResolvedConfig, fingerprint
+from common.config import ConfigError, ResolvedConfig, StrategyConfig, fingerprint
 from common.risk import SquareOffPolicy
 
 from .worker import WorkerConfig
@@ -58,7 +58,9 @@ def _time_from_hhmm(value: str, *, field: str, strategy_id: str) -> time:
         ) from exc
 
 
-def _square_off_policy(risk: dict[str, Any], strategy_id: str) -> SquareOffPolicy:
+def _square_off_policy(strategy: StrategyConfig) -> SquareOffPolicy:
+    risk = strategy.risk
+    strategy_id = strategy.strategy_id
     kwargs: dict[str, Any] = {}
     if "entry_cutoff" in risk:
         kwargs["entry_cutoff"] = _time_from_hhmm(
@@ -68,6 +70,13 @@ def _square_off_policy(risk: dict[str, Any], strategy_id: str) -> SquareOffPolic
         kwargs["square_off_at"] = _time_from_hhmm(
             risk["square_off_at"], field="square_off_at", strategy_id=strategy_id
         )
+    # Phase 6 Part 4: typed StrategyConfig fields, not risk keys — see
+    # StrategyConfig's own docstring for why. The config loader has already
+    # refused simulate_exchange_settlement, so SquareOffPolicy's own
+    # __post_init__ refusal is unreachable from here; it stays as the
+    # defence-in-depth check for direct construction.
+    kwargs["expiry_policy"] = strategy.expiry_policy
+    kwargs["square_off_before_expiry_days"] = strategy.square_off_before_expiry_days
     return SquareOffPolicy(**kwargs)
 
 
@@ -109,7 +118,7 @@ def build_worker_config(
         exit_on_candle=int(parameters.get("exit_on_candle", 3)),
         paper_execution=dict(parameters.get("paper_execution", {})),
         cost_rates=dict(parameters.get("cost_rates", {})),
-        square_off_policy=_square_off_policy(cfg.strategy.risk, strategy_id),
+        square_off_policy=_square_off_policy(cfg.strategy),
         config_fingerprint=fingerprint(cfg),
         engine=None,  # Phase 9 boundary — see module docstring.
     )

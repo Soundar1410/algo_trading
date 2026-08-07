@@ -19,8 +19,12 @@ runtime_defaults:
   shared_market_feed: true
 
 # Defaults inherited by every strategy; runtime and strategy files override
-# these key by key. Both safety defaults are the restrictive ones.
+# these key by key. All safety defaults are the restrictive ones.
 strategy_defaults:
   enabled: false
   mode: paper
   live_approved: false
+  # Spec section 11's own safer default, made explicit here rather than left
+  # implicit in code. simulate_exchange_settlement is refused at config load
+  # until a tested settlement simulator exists (Phase 6 Part 4).
+  expiry_policy: force_square_off_before_expiry
