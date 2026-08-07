@@ -1,133 +1,169 @@
-"""Read-only Streamlit dashboard — one tile, for the walking skeleton.
+"""Read-only Streamlit dashboard — Master page.
 
-Two constraints from the spec shape this file:
+``streamlit run dashboards/app.py`` is this platform's one entry point; the
+other four pages (``dashboards/pages/``) are Streamlit's native multipage
+convention, auto-discovered from this script's directory.
 
-* **The dashboard is read-only.** It opens the database through
-  :func:`~common.persistence.database.connect_readonly`, which uses SQLite's
-  ``mode=ro`` URI, so a write is refused by the driver itself rather than by
-  convention. It cannot run a migration or mutate operational state even if
-  someone later imports the wrong helper into a page.
-* **The dashboard never opens a market-data connection.** It reads persisted
-  state only. A second WebSocket from a dashboard would compete with the
-  supervisor's shared feed for the same subscription budget.
+Two constraints from the spec shape every page in this package, this one
+included:
 
-Phase 1 ships one tile. The multipage layout the spec describes is Phase 7,
-where the dashboard is hardened; building five pages now would mean five pages
-reading tables that do not exist yet.
+* **The dashboard is read-only.** Every page reads through
+  :func:`~dashboards._shared.load_snapshot`, which opens the database with
+  :func:`~common.persistence.database.connect_readonly` — SQLite's ``mode=ro``
+  URI, so a write is refused by the driver itself rather than by convention.
+* **The dashboard never opens a market-data connection, a broker, or a write
+  connection.** A second WebSocket from a dashboard would compete with the
+  supervisor's shared feed for the same subscription budget, and a broker
+  import here is exactly the side-effecting import the spec forbids.
+  ``tests/unit/test_dashboard.py`` enforces this by AST-walking every module
+  in this package.
 
-The data functions are importable and tested directly; Streamlit is imported
+Phase 1 shipped one tile reading four inline ``SELECT``s
+(``RuntimeTile``/``_build_tile``, now retired). Phase 7 Part 1 built
+:mod:`common.health.snapshot` specifically so no page — this one included —
+ever writes its own SQL again; Part 3 is what actually puts that layer behind
+a page.
+
+Data functions are importable and tested directly; Streamlit is imported
 lazily so the test suite never needs it at collection time.
 """
 
 from __future__ import annotations
 
-import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from common.persistence import connect_readonly
+from common.health import HealthSnapshot
+
+from ._shared import SnapshotUnavailable, load_snapshot
+
+#: Spec section 9 requires reconciliation status on the Master page.
+#: Reconciliation itself is Phase 10 throughout the spec (controlled-live
+#: only) — shown explicitly rather than as a blank so an operator does not
+#: mistake "not built yet" for "nothing to reconcile".
+RECONCILIATION_STATUS = "Not implemented (Phase 10 — controlled live)"
 
 
 @dataclass(frozen=True)
-class RuntimeTile:
-    """Everything the single Phase 1 tile shows."""
+class RuntimeCard:
+    """One runtime group's summary — the Master page's one card.
+
+    Deliberately singular today: this platform has exactly one real runtime
+    (``intraday_options``); ``positional_options`` and ``intraday_stocks``
+    have no supervisor, no database and their own stub pages. ``load_master``
+    takes one ``runtime_id`` rather than discovering "every configured
+    runtime" because doing that would mean reading ``config/runtimes/*.yaml``
+    — a different read path than every other page in this package uses, for
+    a list that has exactly one real entry today. A future second runtime
+    calls this once per group, the same way ``main`` below would loop.
+
+    ``disabled_count`` is deliberately absent. A strategy with ``enabled:
+    false`` in config never starts a worker, so it never writes a heartbeat
+    and is invisible to :func:`~common.health.snapshot.read_snapshot` — spec
+    asks for a "disabled" count, but this page's data source (the database
+    alone) cannot answer it without also reading strategy config, which
+    would be a second read path for one field. Not shown, not faked as zero.
+    """
 
     runtime_id: str
-    execution_mode: str
-    health_state: str
+    group_health_state: str | None
     heartbeat_age_seconds: float | None
+    paper_count: int
+    live_count: int
+    failed_count: int
+    total_count: int
     open_positions: int
-    realised_pnl: float
     orders_today: int
-    last_error: str | None
-
-    @property
-    def mode_label(self) -> str:
-        """Always explicit. An operator must never guess whether this is real money."""
-        if self.execution_mode == "paper":
-            return f"{self.execution_mode.upper()} (simulated)"
-        return self.execution_mode.upper()
+    realised_pnl_paper: float
+    realised_pnl_live: float
+    feed_last_event: str | None
+    broker_healthy: bool
+    database_healthy: bool
+    recent_errors: tuple[str, ...]
 
 
-def load_tile(database_path: Path | str, runtime_id: str, trading_date: str) -> RuntimeTile:
-    """Read one runtime's summary through a read-only connection."""
-    conn = connect_readonly(database_path)
-    try:
-        return _build_tile(conn, runtime_id, trading_date)
-    finally:
-        conn.close()
+def load_master(
+    database_path: Path | str, runtime_id: str, trading_date: str
+) -> RuntimeCard | SnapshotUnavailable:
+    """Build the one runtime card this page shows, or say why it cannot."""
+    result = load_snapshot(database_path, runtime_id, trading_date)
+    if isinstance(result, SnapshotUnavailable):
+        return result
+    return _card_from_snapshot(result)
 
 
-def _build_tile(conn: sqlite3.Connection, runtime_id: str, trading_date: str) -> RuntimeTile:
-    heartbeat = conn.execute(
-        """
-        SELECT health_state, beat_at,
-               (julianday('now') - julianday(beat_at)) * 86400.0 AS age_seconds
-        FROM runtime_heartbeats
-        WHERE runtime_id = ?
-        ORDER BY id DESC LIMIT 1
-        """,
-        (runtime_id,),
-    ).fetchone()
-
-    positions = conn.execute(
-        """
-        SELECT COUNT(*) AS open_count, COALESCE(SUM(realised_pnl), 0.0) AS realised
-        FROM positions
-        WHERE runtime_id = ? AND trading_date = ? AND execution_mode = 'paper'
-        """,
-        (runtime_id, trading_date),
-    ).fetchone()
-
-    open_count = conn.execute(
-        """
-        SELECT COUNT(*) AS c FROM positions
-        WHERE runtime_id = ? AND trading_date = ? AND status = 'OPEN' AND quantity != 0
-        """,
-        (runtime_id, trading_date),
-    ).fetchone()
-
-    orders = conn.execute(
-        """
-        SELECT COUNT(*) AS c FROM orders o
-        JOIN order_intents i ON i.id = o.intent_id
-        WHERE o.runtime_id = ? AND i.trading_date = ?
-        """,
-        (runtime_id, trading_date),
-    ).fetchone()
-
-    error = conn.execute(
-        "SELECT message FROM errors WHERE runtime_id = ? ORDER BY id DESC LIMIT 1",
-        (runtime_id,),
-    ).fetchone()
-
-    return RuntimeTile(
-        runtime_id=runtime_id,
-        execution_mode="paper",
-        health_state=heartbeat["health_state"] if heartbeat else "STOPPED",
-        heartbeat_age_seconds=float(heartbeat["age_seconds"]) if heartbeat else None,
-        open_positions=int(open_count["c"]) if open_count else 0,
-        realised_pnl=float(positions["realised"]) if positions else 0.0,
-        orders_today=int(orders["c"]) if orders else 0,
-        last_error=error["message"] if error else None,
+def _card_from_snapshot(snapshot: HealthSnapshot) -> RuntimeCard:
+    paper_count = sum(1 for s in snapshot.strategies if s.execution_mode == "paper")
+    live_count = sum(1 for s in snapshot.strategies if s.execution_mode == "live")
+    failed_count = sum(1 for s in snapshot.strategies if s.health_state == "FAILED")
+    return RuntimeCard(
+        runtime_id=snapshot.runtime_id,
+        group_health_state=snapshot.group.health_state if snapshot.group else None,
+        heartbeat_age_seconds=(
+            snapshot.group.heartbeat_age_seconds if snapshot.group else None
+        ),
+        paper_count=paper_count,
+        live_count=live_count,
+        failed_count=failed_count,
+        total_count=len(snapshot.strategies),
+        open_positions=snapshot.open_positions,
+        orders_today=snapshot.orders_today,
+        realised_pnl_paper=snapshot.realised_pnl_paper,
+        realised_pnl_live=snapshot.realised_pnl_live,
+        feed_last_event=snapshot.market_data.last_event,
+        broker_healthy=snapshot.broker.healthy,
+        database_healthy=snapshot.database.integrity_ok,
+        recent_errors=snapshot.recent_errors,
     )
 
 
-def render(streamlit: Any, tile: RuntimeTile) -> None:
-    """Draw the tile. Takes the streamlit module so this stays testable."""
-    streamlit.subheader(f"{tile.runtime_id} — {tile.mode_label}")
-    columns = streamlit.columns(4)
-    columns[0].metric("Health", tile.health_state)
-    columns[1].metric(
+def render(streamlit: Any, result: RuntimeCard | SnapshotUnavailable) -> None:
+    """Draw the Master page. Takes the streamlit module so this stays testable."""
+    if isinstance(result, SnapshotUnavailable):
+        streamlit.info(result.reason)
+        return
+
+    card = result
+    streamlit.subheader(f"{card.runtime_id} — supervisor")
+
+    top = streamlit.columns(4)
+    top[0].metric("Group health", card.group_health_state or "STOPPED")
+    top[1].metric(
         "Heartbeat age",
-        "—" if tile.heartbeat_age_seconds is None else f"{tile.heartbeat_age_seconds:.0f}s",
+        "—" if card.heartbeat_age_seconds is None else f"{card.heartbeat_age_seconds:.0f}s",
     )
-    columns[2].metric("Open positions", tile.open_positions)
-    columns[3].metric("Realised P&L", f"{tile.realised_pnl:,.2f}")
-    streamlit.caption(f"Orders today: {tile.orders_today}")
-    if tile.last_error:
-        streamlit.error(f"Last error: {tile.last_error}")
+    top[2].metric("Open positions", card.open_positions)
+    top[3].metric(
+        "Strategies",
+        f"{card.total_count} (paper {card.paper_count} / live {card.live_count})",
+    )
+    streamlit.caption(f"Orders today: {card.orders_today}")
+
+    if card.failed_count:
+        streamlit.error(f"{card.failed_count} strategy(ies) in FAILED state")
+
+    streamlit.caption(
+        "Strategy counts are read from runtime state, not config — a "
+        "strategy with enabled: false in YAML never starts and so never "
+        "appears here. No 'disabled' count is shown for that reason."
+    )
+
+    pnl = streamlit.columns(2)
+    pnl[0].metric("Realised P&L — paper", f"{card.realised_pnl_paper:,.2f}")
+    pnl[1].metric("Realised P&L — live", f"{card.realised_pnl_live:,.2f}")
+
+    status = streamlit.columns(3)
+    status[0].metric("Feed", card.feed_last_event or "no data yet")
+    status[1].metric("Broker", "healthy" if card.broker_healthy else "error")
+    status[2].metric("Database", "ok" if card.database_healthy else "problem")
+
+    streamlit.caption(f"Reconciliation: {RECONCILIATION_STATUS}")
+
+    if card.recent_errors:
+        streamlit.subheader("Recent errors")
+        for message in card.recent_errors:
+            streamlit.error(message)
 
 
 def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
@@ -137,7 +173,7 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
 
     from common.config import load_paths
 
-    st.set_page_config(page_title="algo_trading — paper forward testing", layout="wide")
+    st.set_page_config(page_title="algo_trading — Master", layout="wide")
     st.title("algo_trading")
     st.caption(
         "Read-only. Paper forward testing on live market data. "
@@ -149,11 +185,7 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
     database_path = paths.database_path(runtime_id)
     trading_date = _dt.date.today().isoformat()
 
-    if not database_path.is_file():
-        st.info(f"No database yet at {database_path}. Start the supervisor first.")
-        return
-
-    render(st, load_tile(database_path, runtime_id, trading_date))
+    render(st, load_master(database_path, runtime_id, trading_date))
 
 
 if __name__ == "__main__":  # pragma: no cover

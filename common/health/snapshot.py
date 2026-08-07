@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -116,13 +117,28 @@ class DatabaseHealth:
 
 @dataclass(frozen=True)
 class StrategyHealth:
-    """One strategy's latest heartbeat and most recent error, if any."""
+    """One strategy's latest heartbeat and most recent error, if any.
+
+    Deliberately does **not** carry engine type, legs/baskets, strikes/expiry,
+    per-leg P&L or roll count — spec's Intraday Options page asks for all of
+    these, but they describe ``MultiLegEngine``/``FixedStrikeEngine``, and
+    per D56/D34 neither is ported into this codebase yet. Adding fields for
+    data no engine produces would be exactly the "looks finished but isn't"
+    trap the runbook already declines elsewhere. ``pid``, ``square_off_
+    state`` and ``entries_blocked`` are genuinely persisted per strategy
+    (``runtime_sessions``, ``strategy_state``) and are added here for
+    exactly that reason — real columns, not invented ones.
+    """
 
     strategy_id: str
     health_state: str
     heartbeat_age_seconds: float | None
     execution_mode: str | None
     last_error: str | None
+    pid: int | None
+    square_off_state: str | None
+    entries_blocked: bool | None
+    open_positions: int
 
 
 @dataclass(frozen=True)
@@ -165,7 +181,7 @@ def read_snapshot(
         trading_date=trading_date,
         generated_at=datetime.now(UTC).isoformat(),
         group=_process_health(conn, runtime_id, strategy_id=None),
-        strategies=_strategy_healths(conn, runtime_id),
+        strategies=_strategy_healths(conn, runtime_id, trading_date),
         auth=_auth_health(conn, runtime_id),
         market_data=_market_data_health(conn, runtime_id),
         broker=_broker_health(conn, runtime_id),
@@ -176,6 +192,22 @@ def read_snapshot(
         orders_today=_orders_today(conn, runtime_id, trading_date),
         recent_errors=_recent_errors(conn, runtime_id, recent_error_limit),
     )
+
+
+def _non_negative_age(raw: Any) -> float:
+    """Clamp a computed age to zero.
+
+    ``julianday('now')`` (SQLite's own clock) and the Python ``datetime.now(UTC)``
+    that produced ``beat_at`` are sampled a fraction of a millisecond apart, and
+    on a heartbeat read moments after it was written the subtraction
+    occasionally comes out fractionally negative (observed: ~-0.001s) — not a
+    real age, clock skew between two clocks that are each individually
+    correct. A truly negative age is not a fact worth reporting as one; zero
+    is visibly the floor rather than plausibly a beat from the future, the
+    same judgement ``PositionManager.adopt`` already makes for MFE/MAE
+    restarting at zero rather than a small negative.
+    """
+    return max(0.0, float(raw))
 
 
 # --------------------------------------------------------------------- process
@@ -204,7 +236,7 @@ def _process_health(
     return ProcessHealth(
         strategy_id=strategy_id,
         health_state=heartbeat["health_state"],
-        heartbeat_age_seconds=float(heartbeat["age_seconds"]),
+        heartbeat_age_seconds=_non_negative_age(heartbeat["age_seconds"]),
         last_tick_at=heartbeat["last_tick_at"],
         queue_depth=heartbeat["queue_depth"],
         dropped_events=int(heartbeat["dropped_events"] or 0),
@@ -214,7 +246,9 @@ def _process_health(
     )
 
 
-def _strategy_healths(conn: sqlite3.Connection, runtime_id: str) -> tuple[StrategyHealth, ...]:
+def _strategy_healths(
+    conn: sqlite3.Connection, runtime_id: str, trading_date: str
+) -> tuple[StrategyHealth, ...]:
     strategy_ids = conn.execute(
         """
         SELECT DISTINCT strategy_id FROM runtime_heartbeats
@@ -239,7 +273,7 @@ def _strategy_healths(conn: sqlite3.Connection, runtime_id: str) -> tuple[Strate
         ).fetchone()
         session = conn.execute(
             """
-            SELECT execution_mode FROM runtime_sessions
+            SELECT execution_mode, pid FROM runtime_sessions
             WHERE runtime_id = ? AND strategy_id = ?
             ORDER BY id DESC LIMIT 1
             """,
@@ -250,15 +284,43 @@ def _strategy_healths(conn: sqlite3.Connection, runtime_id: str) -> tuple[Strate
             "ORDER BY id DESC LIMIT 1",
             (runtime_id, strategy_id),
         ).fetchone()
+        execution_mode = session["execution_mode"] if session else None
+        # strategy_state is keyed on execution_mode too — a strategy that
+        # switched mode across restarts (paper -> live-approved, say) must
+        # read the row for its *current* mode, not an earlier day's.
+        state = (
+            conn.execute(
+                """
+                SELECT square_off_state, entries_blocked FROM strategy_state
+                WHERE runtime_id = ? AND strategy_id = ? AND execution_mode = ?
+                      AND trading_date = ?
+                """,
+                (runtime_id, strategy_id, execution_mode, trading_date),
+            ).fetchone()
+            if execution_mode is not None
+            else None
+        )
+        open_positions = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM positions
+            WHERE runtime_id = ? AND strategy_id = ? AND trading_date = ?
+                  AND status = 'OPEN' AND quantity != 0
+            """,
+            (runtime_id, strategy_id, trading_date),
+        ).fetchone()
         results.append(
             StrategyHealth(
                 strategy_id=strategy_id,
                 health_state=heartbeat["health_state"] if heartbeat else "STOPPED",
                 heartbeat_age_seconds=(
-                    float(heartbeat["age_seconds"]) if heartbeat is not None else None
+                    _non_negative_age(heartbeat["age_seconds"]) if heartbeat is not None else None
                 ),
-                execution_mode=session["execution_mode"] if session else None,
+                execution_mode=execution_mode,
                 last_error=error["message"] if error else None,
+                pid=int(session["pid"]) if session else None,
+                square_off_state=state["square_off_state"] if state else None,
+                entries_blocked=(bool(state["entries_blocked"]) if state else None),
+                open_positions=int(open_positions["c"]) if open_positions else 0,
             )
         )
     return tuple(results)

@@ -409,6 +409,12 @@ def test_square_off_completion_sends_exactly_one_notification() -> None:
 
     feed = _BlockingFeed()
     recorder = RecordingNotifier()
+    # A bare RecordingNotifier gets TradingEngine's fallback wrap, which
+    # defaults deferred=True (it must, to protect the tick thread in
+    # production) — so the send is asynchronous, on SafeNotifier's own drain
+    # thread. runner.join() below only waits for the engine, not that
+    # thread; close() after it is what makes the assertion deterministic
+    # rather than racing the drain thread.
     engine, positions = _build_engine(feed, notifier=recorder)
 
     runner = threading.Thread(target=engine.run, name="engine-run", daemon=True)
@@ -419,6 +425,7 @@ def test_square_off_completion_sends_exactly_one_notification() -> None:
         engine.request_square_off("operator")
     feed.deliver(_tick(CE_CONTRACT, 95.0, _ts(9, 23)))
     runner.join(timeout=JOIN_TIMEOUT)
+    engine.notifier.close()
 
     completions = [e for e in recorder.events if e.event_type == "square_off_completed"]
     assert len(completions) == 1

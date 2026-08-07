@@ -15,7 +15,7 @@ import pytest
 
 from common.config.models import ExecutionMode
 from common.execution import ExecutionRepository
-from common.health.snapshot import read_snapshot
+from common.health.snapshot import _non_negative_age, read_snapshot
 from common.persistence import Database, MigrationRunner, connect_readonly
 
 RUNTIME_ID = "intraday_options"
@@ -55,6 +55,17 @@ def test_an_empty_database_returns_a_snapshot_with_no_group_and_zeroed_totals(
     assert snapshot.recent_errors == ()
     assert snapshot.database.integrity_ok is True
     assert snapshot.database.migration_version is not None
+
+
+def test_a_negative_age_from_clock_skew_between_sqlite_and_python_clamps_to_zero():
+    """A real, observed flake, not a hypothetical: julianday('now') (SQLite's
+    clock) and the Python datetime.now(UTC) that produced beat_at are
+    sampled a fraction of a millisecond apart, and a read moments after a
+    write occasionally computes a tiny negative age (~-0.001s) — clock skew
+    between two individually-correct clocks, not a beat from the future."""
+    assert _non_negative_age(-0.0010058283805847168) == 0.0
+    assert _non_negative_age(3.5) == 3.5
+    assert _non_negative_age(0.0) == 0.0
 
 
 def test_the_group_heartbeat_is_the_strategy_id_is_null_row(
@@ -108,6 +119,120 @@ def test_a_strategy_heartbeat_does_not_leak_into_the_group_reading(
     assert snapshot.strategies[0].strategy_id == "st01"
     assert snapshot.strategies[0].health_state == "RUNNING_PAPER"
     assert snapshot.strategies[0].execution_mode == "paper"
+    assert snapshot.strategies[0].pid == 1234
+
+
+def test_a_strategys_square_off_state_and_entries_blocked_come_from_strategy_state(
+    repository: ExecutionRepository, database_path: Path
+):
+    repository.open_session(
+        runtime_id=RUNTIME_ID,
+        strategy_id="st01",
+        execution_mode=ExecutionMode.PAPER,
+        process_role="worker",
+        pid=1,
+    )
+    session = repository.open_session(
+        runtime_id=RUNTIME_ID,
+        strategy_id="st01",
+        execution_mode=ExecutionMode.PAPER,
+        process_role="worker",
+        pid=42,
+    )
+    repository.record_heartbeat(
+        session_id=session.id,
+        runtime_id=RUNTIME_ID,
+        strategy_id="st01",
+        health_state="BLOCK_NEW_ENTRIES",
+    )
+    repository.save_strategy_state(
+        runtime_id=RUNTIME_ID,
+        strategy_id="st01",
+        execution_mode=ExecutionMode.PAPER,
+        trading_date=TRADING_DATE,
+        square_off_state="IN_PROGRESS",
+        entries_blocked=True,
+    )
+
+    snapshot = _snapshot(database_path)
+
+    strategy = snapshot.strategies[0]
+    assert strategy.pid == 42  # the latest session's, not the first
+    assert strategy.square_off_state == "IN_PROGRESS"
+    assert strategy.entries_blocked is True
+
+
+def test_a_strategy_with_no_persisted_state_reports_none_not_a_default(
+    repository: ExecutionRepository, database_path: Path
+):
+    session = repository.open_session(
+        runtime_id=RUNTIME_ID,
+        strategy_id="st01",
+        execution_mode=ExecutionMode.PAPER,
+        process_role="worker",
+        pid=1,
+    )
+    repository.record_heartbeat(
+        session_id=session.id, runtime_id=RUNTIME_ID, strategy_id="st01", health_state="STARTING"
+    )
+
+    snapshot = _snapshot(database_path)
+
+    strategy = snapshot.strategies[0]
+    assert strategy.square_off_state is None
+    assert strategy.entries_blocked is None
+    assert strategy.open_positions == 0
+
+
+def test_a_strategys_open_positions_are_counted_for_its_own_trading_date_only(
+    repository: ExecutionRepository, database_path: Path
+):
+    session = repository.open_session(
+        runtime_id=RUNTIME_ID,
+        strategy_id="st01",
+        execution_mode=ExecutionMode.PAPER,
+        process_role="worker",
+        pid=1,
+    )
+    repository.record_heartbeat(
+        session_id=session.id,
+        runtime_id=RUNTIME_ID,
+        strategy_id="st01",
+        health_state="RUNNING_PAPER",
+    )
+    conn = repository.database.connect()
+    conn.execute(
+        """
+        INSERT INTO positions
+            (runtime_id, strategy_id, execution_mode, trading_date, instrument,
+             security_id, quantity, average_price, status, opened_at, updated_at)
+        VALUES (?, 'st01', 'paper', ?, 'NIFTY', '1', 50, 100.0, 'OPEN', 'x', 'x')
+        """,
+        (RUNTIME_ID, TRADING_DATE),
+    )
+    # A closed position, and one on a different trading date: neither counts.
+    conn.execute(
+        """
+        INSERT INTO positions
+            (runtime_id, strategy_id, execution_mode, trading_date, instrument,
+             security_id, quantity, average_price, status, opened_at, updated_at)
+        VALUES (?, 'st01', 'paper', ?, 'NIFTY', '2', 0, 100.0, 'CLOSED', 'x', 'x')
+        """,
+        (RUNTIME_ID, TRADING_DATE),
+    )
+    conn.execute(
+        """
+        INSERT INTO positions
+            (runtime_id, strategy_id, execution_mode, trading_date, instrument,
+             security_id, quantity, average_price, status, opened_at, updated_at)
+        VALUES (?, 'st01', 'paper', '2020-01-01', 'NIFTY', '3', 50, 100.0, 'OPEN', 'x', 'x')
+        """,
+        (RUNTIME_ID,),
+    )
+
+    snapshot = _snapshot(database_path)
+
+    assert snapshot.strategies[0].open_positions == 1
 
 
 def test_a_strategys_latest_error_is_attached_to_its_own_row_only(

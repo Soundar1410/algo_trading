@@ -32,7 +32,8 @@ from common.models import PositionStatus
 from common.notifications import RecordingNotifier
 from common.persistence import Database, MigrationRunner, connect_readonly
 from common.risk import SquareOffPolicy
-from dashboards.app import load_tile
+from dashboards.app import load_master
+from dashboards.intraday_options import load_intraday_options
 from runtimes.intraday_options.worker import EXIT_DUPLICATE, WorkerConfig, run_worker
 
 TRADING_DATE = "2026-07-29"
@@ -195,15 +196,30 @@ def test_a_failing_notifier_does_not_stop_trading(worker_config, tick_tape_path,
 def test_the_dashboard_tile_renders_from_a_read_only_connection(
     worker_config, tick_tape_path, database_path
 ):
-    """Gate: 'one dashboard tile works'."""
+    """Gate: 'one dashboard tile works'.
+
+    Phase 7 Part 3 retired the Phase 1 single tile (RuntimeTile/load_tile,
+    four inline SELECTs) in favour of the multipage app reading through
+    common.health.snapshot. The gate's spirit — a read-only dashboard read
+    works end to end after a real run — now has two assertions: the Master
+    page's card, and the Intraday Options page's per-strategy mode badge,
+    which is where the "simulated" wording moved (dashboards/intraday_
+    options.py's own docstring explains why: Master shows paper/live *counts*
+    across strategies, not one strategy's own mode)."""
     run_worker(worker_config, _feed_queue(_candles(tick_tape_path)), RecordingNotifier())
 
-    tile = load_tile(database_path, RUNTIME_ID, TRADING_DATE)
-    assert tile.runtime_id == RUNTIME_ID
-    assert tile.execution_mode == "paper"
-    assert "simulated" in tile.mode_label
-    assert tile.orders_today == 2
-    assert tile.health_state
+    card = load_master(database_path, RUNTIME_ID, TRADING_DATE)
+    assert card.runtime_id == RUNTIME_ID
+    assert card.orders_today == 2
+    assert card.group_health_state is None  # skelfix is a worker row, not a group one
+
+    view = load_intraday_options(database_path, RUNTIME_ID, TRADING_DATE)
+    assert len(view.strategies) == 1
+    strategy = view.strategies[0]
+    assert strategy.strategy_id == STRATEGY_ID
+    assert strategy.execution_mode == "paper"
+    assert "simulated" in strategy.mode_label
+    assert strategy.health_state
 
 
 def test_the_dashboard_connection_cannot_write(worker_config, tick_tape_path, database_path):

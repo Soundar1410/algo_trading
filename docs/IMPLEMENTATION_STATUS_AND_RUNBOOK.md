@@ -7,9 +7,9 @@ the next phase. Updated after every phase.
 
 | | |
 |---|---|
-| **Current phase** | **Phase 7 — Operations, Part 2 of 5 complete** (Telegram in production). `TelegramNotifier` is now actually constructed at both production entrypoints — the supervisor (`__main__.py`, from `Settings`) and every spawned worker (independently, from its own freshly-loaded `Settings`, since `spawn` cannot hand a child the parent's already-built object). `SafeNotifier` gained deferred (queued, off-thread) delivery so a slow Telegram send can never stall `TradingEngine`'s tick thread; rate limiting and repeated-message aggregation, replacing the intent of the two hand-rolled per-call-site latches (the latches themselves stay, since both also gate non-notification state); a real `notifications`-table writer via an injected, cross-thread-safe `on_failure` hook; and three new rendered fields (timestamp, correlation ID, required action), redacted through the same filter `common/logging/redaction.py`'s docstring already claimed covered "notified" text but never actually enforced. Two real bugs were found and fixed before shipping — a cross-process pickling bug in the notifier sentinel (**D72**) and a pre-existing notifier double-wrap in `TradingEngine` (**D73**) — see below. Parts 3-5 (the Streamlit dashboard, PID hardening + operator commands, retention/backups) remain. |
-| **Next phase** | Phase 7 Part 3 — the Streamlit dashboard. |
-| **Last updated** | 7 August 2026 — Phase 7 Part 2 complete, see [Known limitations](#6-known-limitations) |
+| **Current phase** | **Phase 7 — Operations, Part 3 of 5 complete** (the Streamlit dashboard). `dashboards/app.py`'s Phase 1 single tile (`RuntimeTile`, four inline `SELECT`s) is retired; the dashboard is now a real multipage app — Master, Intraday Options and System Health read exclusively through `common.health.snapshot`/`connect_readonly` via a new shared `dashboards/_shared.py` (`load_snapshot`, one place that turns a missing/locked/pre-migration database into a message rather than a traceback); Positional Options and Intraday Stocks are honest stub pages, since neither runtime exists. Two spec-asked-for fields are deliberately not shown rather than fabricated: a "disabled strategy" count (invisible to runtime state — a disabled strategy never starts, never heartbeats) and engine type/legs/baskets/strikes/per-leg P&L/roll count (`MultiLegEngine`/`FixedStrikeEngine` are not ported — D56/D34). `tests/unit/test_dashboard.py` drives every page's `render()` with a fake streamlit module and AST-checks that no page imports a broker, a feed, or the write-capable `Database` class. A real, pre-existing flaky-test cause (SQLite/Python clock skew producing a fractionally negative heartbeat age) was found and fixed at the source — **D75**. All five pages verified with a real `streamlit run` (HTTP 200, clean server log) in addition to the unit suite. Parts 4-5 (PID hardening + operator commands, retention/backups) remain. |
+| **Next phase** | Phase 7 Part 4 — PID handling and operator commands. |
+| **Last updated** | 7 August 2026 — Phase 7 Part 3 complete, see [Known limitations](#6-known-limitations) |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
 | **Live order placement** | **Not implemented.** Fail-closed. Phase 10 only. |
@@ -27,7 +27,7 @@ the next phase. Updated after every phase.
 | 4 | Candle, indicator and paper-execution foundation | **Complete.** **Part 1 complete** (real contract resolution — closes 17, alarms 15). **Part 2 complete** (indicator layer — closes D21). **Part 3 complete** (continuity, timezone, wall-clock square-off — closes 4 and 7, and a live blocker). **Part 4 complete** (warm-up source and injection — closes 16). **Part 5 complete** (`PaperBroker` realism — closes 5 and D11; the live Full-mode gate item ran 6 August 2026 and passed, closing known limitation 20 along the way). **Phase 4 complete** — all five parts done, its one live gate item proven rather than asserted |
 | 5 | Mixed-mode supervisor and persistence | **Complete** |
 | 6 | Paper recovery and expiry handling | **Complete — all five parts.** **Part 1** (daily risk state across a restart — closes the risk-limit-bypass gap in bullet 1, and finds/fixes **D58**/limitation 22 along the way). **Part 2** (position-management state snapshot/restore — exit-policy state via `BaseExit`/`RiskManager`/`BaseStrategy` snapshot hooks, and stop/target persistence through a widened `RiskManager`/`ExecutionGateway`, fail-open on a bad snapshot, negative-control-tested). **Part 3** (MFE/MAE, square-off attempts, state-version validation and position-gated last-candle idempotency — the rest of §7's "restore at minimum" list). **Part 4** (`force_square_off_before_expiry` composed into the existing `SquareOffAuthority` seam — **D66-D68**; `simulate_exchange_settlement` refused at config load, none of spec section 11's eight settlement-policy items built — limitation 27). **Part 5** (the phase's record: bullets re-checked against what is built, not assumed; D56's persistence-identity gap given a written candidate direction, not an implementation — **D69**, limitation 30). Bullet 2's fixed strikes/basket legs/rolling counters remain blocked on `FixedStrikeEngine`/`MultiLegEngine` — D56/D34, unchanged, not this phase's to close |
-| 7 | Operations | **Part 1 complete** (health snapshot layer — `common/health/snapshot.py`, `auth_events`/`feed_events` writers and producers, configurable heartbeat interval). **Part 2 complete** (Telegram in production — real notifier construction at both entrypoints, deferred delivery, rate limiting/aggregation, `notifications`-table persistence, redacted rendering — D71-D74). Parts 3-5 (dashboard, PID/operator commands, retention) not started |
+| 7 | Operations | **Part 1 complete** (health snapshot layer — `common/health/snapshot.py`, `auth_events`/`feed_events` writers and producers, configurable heartbeat interval). **Part 2 complete** (Telegram in production — real notifier construction at both entrypoints, deferred delivery, rate limiting/aggregation, `notifications`-table persistence, redacted rendering — D71-D74). **Part 3 complete** (the Streamlit dashboard — Master/Intraday Options/System Health pages plus two honest stubs, all reading through `common.health.snapshot` only — D75). Parts 4-5 (PID/operator commands, retention) not started |
 | 8 | LaunchAgent validation | Not started |
 | 9 | Real strategies | Not started |
 | 10 | Controlled live readiness | Not started |
@@ -2213,6 +2213,7 @@ guard. See deviation D6.
 | **D72** | **The notifier sentinel (`NOTIFIER_FROM_SETTINGS`) must be an `Enum` member, not a plain sentinel object — a plain one does not survive the `spawn` pickle round trip with its identity intact** | `run_worker`'s arguments cross the `spawn` boundary through `pickle` (module docstring: "a fresh interpreter... unpickles its arguments"). The first version of this sentinel was a bare `object()`-holding class instance; unpickling it in the child constructs a *new* instance, so `notifier is NOTIFIER_FROM_SETTINGS` silently evaluated `False` inside every spawned worker regardless of what the parent passed, and the un-recognised sentinel value fell straight through to being used *as* a notifier — `AttributeError: '...' object has no attribute 'send'` the moment anything called it. Caught immediately, not in production: the existing supervisor end-to-end suite already spawns real workers through the real `context.Process(target=run_worker, ...)` path, and nine of those tests failed the moment this shipped (`test_undelivered_ticks_do_not_wedge_the_supervisors_exit` and siblings in `test_supervisor.py`/`test_supervisor_signal.py`/`test_mode_separation.py`). Fixed by making the sentinel an `enum.Enum` member — pickle's specifically-documented, guaranteed-identity-preserving singleton mechanism — rather than inventing a custom `__reduce__`. `tests/unit/test_notifier_sentinel.py` adds a direct, minimal regression test (a real `pickle.dumps`/`loads` round trip, plus the negative control: a plain module-level sentinel class demonstrably does *not* survive the same round trip) alongside the indirect coverage the spawning tests already provided. |
 | **D73** | **`TradingEngine.__init__` was silently double-wrapping an already-built `SafeNotifier` in a second one — type-valid (`SafeNotifier` structurally satisfies `Notifier`), functionally wrong** | `worker.py` builds exactly one `SafeNotifier` per process and, on the engine path, hands it straight through (`engine_worker.run_engine(notifier=safe_notifier, ...)` → `TradingEngine(notifier=notifier, ...)`). `TradingEngine.__init__` unconditionally did `self.notifier = SafeNotifier(notifier or NullNotifier())` — wrapping the inner `SafeNotifier` in an outer one. This predates Part 2 and was harmless while `SafeNotifier` had no state worth duplicating; it stopped being harmless the moment Part 2 gave it success/failure counters, an aggregation window and (for the engine path specifically) `deferred=True`/`on_failure` — all of which would have lived on the *inner*, untouched `SafeNotifier`, while `TradingEngine` only ever calls `.send()` on the outer one. Found while designing the deferred-mode wiring, not by a failing test — no existing assertion checked notifier identity or counted double-delivery. Fixed: `TradingEngine.__init__` now checks `isinstance(notifier, SafeNotifier)` and reuses it exactly as given; a bare `Notifier` still gets the fallback wrap, which now defaults `deferred=True` since that branch is reachable from `on_tick` regardless of caller. `test_the_engine_reuses_an_already_built_safenotifier_rather_than_double_wrapping` and `test_a_bare_notifier_is_wrapped_deferred_by_default` cover both branches directly. |
 | **D74** | **`NotificationEvent.rendered()` now runs its own output through the active logging redactor — closing a real gap between what `common/logging/redaction.py`'s docstring claimed ("printed, persisted **or notified**") and what was actually enforced** | `SecretRedactingFilter` is a `logging.Filter`, reachable only via a handler `addFilter()` call — it was never wired anywhere near `TelegramNotifier.send()` (which builds its payload straight from `event.rendered()`, no `logging` call involved) or `record_notification`'s DB write. The specific Telegram guarantee was sound regardless — the bot token is read from `SecretStr` at send time and never stored on `NotificationEvent`, so nothing token-shaped could reach `rendered()` — but the *general* claim was aspirational, and Part 2 gives `rendered()` three new fields plus a real `notifications.message` column to write into, raising the stakes of leaving it that way. `rendered()` now calls `common.logging.active_redactor()` and returns the redacted text when a redactor is active (every production process; `setup_logging()` runs before any notifier is built), unredacted when none is (most unit tests, which never call `setup_logging`) — a real second layer where the docstring already claimed one, not a fix to a live leak. `test_a_known_secret_is_redacted_from_the_rendered_message` and `test_rendering_is_unredacted_when_no_logging_has_been_configured` cover both states. |
+| **D75** | **A heartbeat's age can compute fractionally negative from SQLite/Python clock skew; `common.health.snapshot` now clamps it to zero rather than reporting a beat "from the future"** | `_process_health` and `_strategy_healths` both compute `(julianday('now') - julianday(beat_at)) * 86400.0` — SQLite's own clock — against a `beat_at` string written moments earlier from Python's `datetime.now(UTC)`. Found as an intermittent failure of Phase 7 Part 1's own `test_the_group_heartbeat_is_the_strategy_id_is_null_row` on a full-suite run, not written into the plan on purpose: `heartbeat_age_seconds == -0.0010058283805847168` where the test asserted `>= 0.0`. The two clocks are each individually correct; a read moments after the write occasionally samples them close enough that the subtraction goes fractionally negative. Not chased out of the SQL (`MAX(0, ...)` there would hide the same measurement one layer down, and any future caller of the raw query would rediscover it); fixed with a new `_non_negative_age()` helper applied in Python at both computation sites, the same judgement `PositionManager.adopt` already applies to MFE/MAE restarting at zero rather than a small negative — a truly negative age is not a fact worth reporting as one. `test_a_negative_age_from_clock_skew_between_sqlite_and_python_clamps_to_zero` pins the fix directly and deterministically, rather than relying on re-running the previously-flaky test enough times to trust it. |
 
 #### D22 in detail: the rebuilt premium-candle mapping
 
@@ -4478,8 +4479,131 @@ mtime is unchanged at the recorded baseline.
 Phase 2 is complete, both blocks. **Phase 3 is complete** — all five parts, with its
 acceptance gate met in full. **Phase 4 is complete** — all five parts, its one live
 gate item run and passed. **Phase 5 is complete** — see below. **Phase 6 is
-complete** — all five parts, see below. **Phase 7 is in progress — Part 2 of 5
-complete**, see below. Next is **Phase 7 Part 3 — the Streamlit dashboard**.
+complete** — all five parts, see below. **Phase 7 is in progress — Part 3 of 5
+complete**, see below. Next is **Phase 7 Part 4 — PID handling and operator
+commands**.
+
+### Phase 7 — Operations — **Part 3 of 5 complete** (the Streamlit dashboard)
+
+Approved plan, verbatim scope: Master, Intraday Options and System Health pages
+reading exclusively from `common/health/snapshot.py` and `connect_readonly()`,
+stub pages for Positional Options and Intraday Stocks, robust handling of a
+missing/locked/pre-migration database (a message, not a traceback), and
+`tests/unit/test_dashboard.py` driving `render()` with a fake streamlit module,
+including a regression test that no page module imports a broker, a feed, or a
+write connection.
+
+**"Exclusively snapshot.py and connect_readonly" is stricter than the plan's own
+Master-page bullet, and the stricter reading won.** The plan's original Part 3 text
+named `effective_live_gate` as a Master-page data source for "global and runtime
+live-gate status" — but `effective_live_gate` takes a `ResolvedConfig`, which means
+reading `config/`, not the database. Given the explicit, repeated instruction to
+read *exclusively* from the snapshot and a read-only connection, live-gate status is
+**not shown** on Master this part, rather than quietly reached around the
+constraint. Flagged here rather than silently dropped — reversible in a later part
+if wanted.
+
+**Two spec-asked-for fields are deliberately not shown, and the difference between
+them is why one is a data-source limit and the other is an honesty decision:**
+
+- **A "disabled strategy" count** — spec's Master page bullet. A strategy with
+  `enabled: false` in config never starts a worker, so it never writes a heartbeat
+  and is structurally invisible to `read_snapshot`; showing it would need reading
+  `config/strategies/*.yaml`, a second read path the "exclusively" constraint above
+  already rules out for this part. `RuntimeCard` has no `disabled_count` field, and
+  `test_no_disabled_count_is_fabricated` pins that it stays absent rather than a
+  silently-wrong zero.
+- **Engine type, open legs/baskets, selected strikes/expiry, per-leg P&L, roll
+  count** — spec's Intraday Options page bullet. Not a data-source limit: even
+  reading every table `common.health.snapshot` could ever cover, none of this data
+  exists, because `MultiLegEngine`/`FixedStrikeEngine` are not ported into this
+  codebase (runbook D56/D34, unchanged since Phase 3's reuse audit). Building UI
+  plumbing for an engine that produces no data would be exactly the "looks finished
+  but isn't" pattern the runbook already declines elsewhere for the same two
+  engines. `dashboards/intraday_options.py`'s `NOT_YET_AVAILABLE` constant states
+  this on the page itself, not just in a docstring an operator will never read.
+
+**What *is* shown on Intraday Options is real, not a reduced echo of Master.**
+`StrategyHealth` (Part 1's own dataclass) gained three genuinely-persisted fields
+this part — `pid` (`runtime_sessions`, the same column `ProcessHealth` already reads
+for the group, just not previously read per-strategy), `square_off_state`/
+`entries_blocked` (`strategy_state`, keyed on `(strategy_id, execution_mode,
+trading_date)` — a strategy that changed mode across restarts reads its *current*
+mode's row, not an earlier day's), and `open_positions` (a per-strategy `COUNT(*)`
+against `positions`, scoped to its own `trading_date` so a stale contract from
+another day can never inflate today's count). All four are additive to a dataclass
+nothing outside `snapshot.py` constructs directly — checked before assuming it, not
+after: `grep` for `StrategyHealth(` across `tests/` returned nothing, so widening it
+could not silently break an existing direct construction anywhere.
+
+**The "simulated" wording moved, not was lost.** Phase 1's `RuntimeTile.mode_label`
+property — "PAPER (simulated)" / "LIVE", the guarantee an operator must never guess
+whether a number is real money — is retired along with the rest of `RuntimeTile`,
+but the property itself, word for word, now lives on `dashboards.intraday_
+options.StrategyRow` (and the module-level `mode_label()` function it wraps), since
+Master shows paper/live *counts* across strategies, not one strategy's own mode —
+the per-strategy badge belongs on the page that actually has one strategy per row.
+`tests/end_to_end/test_walking_skeleton.py`'s dashboard gate test (`'one dashboard
+tile works'`) is updated to match: it now calls `dashboards.app.load_master` for the
+group-level assertions and `dashboards.intraday_options.load_intraday_options` for
+the mode-badge assertion, rather than the retired `load_tile`.
+
+**Robustness.** `dashboards/_shared.py` is new: `load_snapshot(database_path,
+runtime_id, trading_date)` is the one place that turns "no database file", "locked
+past the read connection's busy timeout" and "pre-migration or corrupt (a queried
+table does not exist)" into a `SnapshotUnavailable(reason)` value every page's
+`render()` checks for, instead of each of five pages growing its own
+`try/except`. The missing-file and pre-migration cases are exercised for real (an
+absent path; a genuinely empty, migration-less SQLite file); the locked case is
+exercised by monkeypatching `read_snapshot` to raise `sqlite3.OperationalError`
+directly — a real concurrent lock needs a second connection holding a write
+transaction past the busy timeout, which would make the test slow and
+timing-dependent for no extra safety actually proven, since the code path under
+test does not care *why* SQLite raised, only that the exception is caught.
+
+**D75, found while running the new test suite, not written into it on purpose:**
+`test_the_group_heartbeat_is_the_strategy_id_is_null_row` (Part 1) failed
+intermittently on a full-suite run — `heartbeat_age_seconds == -0.0010058283805847168`
+where `>= 0.0` was expected. Root cause: `common.health.snapshot._process_health`
+computes age as `(julianday('now') - julianday(beat_at)) * 86400.0` — SQLite's own
+clock — against a `beat_at` written a moment earlier from Python's `datetime.now(UTC)`.
+The two clocks are each individually correct but sampled a fraction of a millisecond
+apart, and on a read moments after the write the subtraction occasionally comes out
+fractionally negative. Not a logic bug, and not worth chasing out of the query
+(`MAX(0, ...)` in SQL would hide the same measurement, just one layer down) — fixed by
+clamping in Python, a new `_non_negative_age()` helper applied at both computation
+sites (`_process_health` and `_strategy_healths`), with the same judgement the
+codebase already applies to MFE/MAE restarting at zero rather than a small negative
+(`PositionManager.adopt`): a truly negative age is not a fact worth reporting as one.
+`test_a_negative_age_from_clock_skew_between_sqlite_and_python_clamps_to_zero` pins
+the fix directly, deterministically, rather than relying on re-running the flaky test
+enough times to trust it.
+
+**Verified two ways.** The unit suite (`tests/unit/test_dashboard.py`, 45 tests) drives
+every page's `render()` with a fake streamlit module and checks the AST of every file
+in `dashboards/` (including the four `pages/*.py` shims) for a broker, feed or
+write-capable-`Database` import. Separately, `streamlit run dashboards/app.py` was
+started for real (streamlit 1.60.0, already installed) and all five pages —
+`/`, `/Intraday_Options`, `/Positional_Options`, `/Intraday_Stocks`, `/System_Health`
+— were fetched over HTTP: 200 on every one, an empty server log (no traceback, no
+`ModuleNotFoundError`), confirming the `pages/*.py` shims' defensive `sys.path`
+fix-up (walking up to `pyproject.toml`, the same technique `common.config.paths.
+_discover_root_from_source` uses) actually resolves `dashboards.*` imports under
+Streamlit's own execution context — the one thing the unit suite cannot exercise,
+since nothing pytest does replicates how Streamlit sets up `sys.path` for a page it
+discovers by directory convention rather than by import.
+
+**Deliberately not done in Part 3:**
+
+- Global/runtime live-gate status on Master — see above; needs `common.config`, ruled
+  out by this part's read-source constraint.
+- Engine type, legs/baskets, strikes/expiry, per-leg P&L, roll count — see above;
+  `MultiLegEngine`/`FixedStrikeEngine` produce none of this data yet.
+- A "disabled strategy" count — see above; invisible to runtime state alone.
+- Lock-file status on System Health (PID is shown; whether the matching `.lock` is
+  still held is filesystem state, Part 4's job, not this page's read path).
+- No PID hardening, no operator commands — Part 4.
+- No retention, no backups — Part 5.
 
 ### Phase 7 — Operations — **Part 2 of 5 complete** (Telegram in production)
 
