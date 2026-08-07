@@ -37,6 +37,7 @@ from common.config import (
 from common.config.secrets import read_secret
 from common.logging import get_logger, setup_logging
 from common.market_data.adapter import MarketFeedAdapter
+from common.notifications import build_notifier
 from common.utils.timeutils import local_date_in, now_ist
 
 from .config_adapter import build_worker_config
@@ -86,6 +87,13 @@ def build_supervisor(
             heartbeat_interval_seconds=runtime_cfg.health.heartbeat_interval_seconds,
         ),
         adapter,
+        # Real Telegram when settings carry credentials, else NullNotifier —
+        # settings is already resolved above, so there is exactly one place
+        # in this function that decides it. Group-level events (this
+        # supervisor's own) are sent from here; each spawned worker below
+        # decides independently, from its own environment, because spawn
+        # cannot hand it this object — see NOTIFIER_FROM_SETTINGS's docstring.
+        notifier=build_notifier(settings),
     )
 
     for cfg in discover_enabled_strategies(config_root, runtime_id, settings=settings):

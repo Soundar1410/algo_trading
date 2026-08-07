@@ -121,6 +121,8 @@ class TradingEngine:
         underlying_instrument: str = "",
         runtime_id: str = "engine",
         notifier: Notifier | None = None,
+        notify_deferred: bool = True,
+        persist_notification_failure: Callable[[NotificationEvent, str], None] | None = None,
         history_provider: Callable[[], list[Candle]] | None = None,
         reporter: EngineReporter | None = None,
         report: ReportWriter | None = None,
@@ -145,7 +147,31 @@ class TradingEngine:
         # trade or a square-off; the reference hand-rolled a try/except around one
         # of its five notify calls, and this repository already has the wrapper
         # that guarantees it for all of them.
-        self.notifier = SafeNotifier(notifier or NullNotifier())
+        #
+        # **Reused, not re-wrapped, when the caller already handed in a
+        # SafeNotifier.** worker.py builds exactly one SafeNotifier per worker
+        # process and passes it straight through into this constructor on the
+        # engine path (via engine_worker.run_engine); wrapping it again here
+        # would silently double every count, apply two independent aggregation
+        # windows to the same event, and mean a caller's `deferred=True` (the
+        # property that actually matters — see `notify_deferred` below) lives
+        # on an *inner* SafeNotifier that this class never touches directly.
+        # A caller that hands in a bare Notifier (every offline/unit-test
+        # construction of this class) gets the fallback wrap, as before.
+        self.notifier = (
+            notifier
+            if isinstance(notifier, SafeNotifier)
+            else SafeNotifier(
+                notifier or NullNotifier(),
+                # Defaults True: this notifier's send() is reached from
+                # on_tick (see _notify below), and a slow channel must never
+                # stall tick processing. Only relevant for the fallback wrap —
+                # a caller supplying an already-built SafeNotifier decided its
+                # own deferred-ness when it built it.
+                deferred=notify_deferred,
+                on_failure=persist_notification_failure,
+            )
+        )
         self._runtime_id = runtime_id
         self._reporter: EngineReporter = reporter or NullReporter()
         self.underlying_id = underlying_security_id
@@ -1204,6 +1230,14 @@ class TradingEngine:
         # optimistically would let a restart skip a book that is still open.
         self._square_off.completed(ts)
         log.info("trading day complete; stopping feed")
+        # The engine path's own success event — before this, only the fixture
+        # path (worker.py's _maybe_square_off) notified on completion; the
+        # engine path had only the *failure* alarm
+        # (engine_worker._raise_silent_engine_alarm), never this. Guarded by
+        # the same _squared_off latch as the rest of this method, so it fires
+        # exactly once per engine instance, the same way every other
+        # once-per-run event in this codebase is guarded.
+        self._notify("square_off_completed", f"{self.label} squared off at {ts.isoformat()}")
         self.feed.stop()
 
     def _notify(self, event_type: str, message: str) -> None:

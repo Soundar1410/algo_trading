@@ -73,7 +73,7 @@ from common.notifications import NotificationEvent, Notifier, NullNotifier, Safe
 from common.persistence import Database, MigrationRunner
 from common.process import DuplicateProcessError, shutdown_signals, supervisor_lock
 
-from .worker import WorkerConfig, run_worker
+from .worker import NOTIFIER_FROM_SETTINGS, WorkerConfig, run_worker
 
 _log = get_logger(__name__)
 
@@ -103,6 +103,18 @@ SUPERVISOR_ROLE = "supervisor"
 #: arrive continuously, so reaching this means the group has received **no**
 #: tick at all for that long — which is already an incident by itself.
 STUCK_SUBSCRIPTION_SECONDS = 30.0
+
+#: feed_events whose occurrence is itself worth telling a human about, as
+#: opposed to the other five (connected, reconnect_attempted, resubscribed,
+#: stale_instrument, degraded) which stay diagnostic-only — every reconnect
+#: *attempt* during a flapping connection, or the routine "connected" a normal
+#: reconnect ends with, would be exactly the noise spec 2539 ("do not send
+#: every tick, candle or heartbeat") and 2554 ("aggregate repeated errors")
+#: warn against. ``degraded`` is deliberately excluded here too: the two
+#: alarms that already write it (_check_stuck_subscription,
+#: _raise_silent_feed_alarm) already send their own, more specific
+#: notification alongside it.
+_CHAT_WORTHY_FEED_EVENTS = frozenset({"disconnected", "recovered", "reconnect_exhausted"})
 
 
 def _parse_subscription_request(request: object) -> tuple[str, int | None, int | None] | None:
@@ -403,6 +415,32 @@ class IntradayOptionsSupervisor:
             interval_seconds=self._config.heartbeat_interval_seconds,
         )
         heartbeat.beat(HealthState.STARTING, force=True)
+        self._notifier.send(
+            NotificationEvent(
+                event_type="runtime_started",
+                message=f"{self._config.runtime_id} supervisor starting",
+                runtime_id=self._config.runtime_id,
+                execution_mode=ExecutionMode.PAPER,
+            )
+        )
+
+        # Late-bound: this SafeNotifier was built in __init__, before this
+        # repository existed — mirrors set_health_event_sink just below for
+        # exactly the same reason. Safe to call record_notification from this
+        # callback: it only ever runs on this thread (this SafeNotifier is
+        # not deferred), the same thread that owns the repository.
+        self._notifier.set_on_failure(
+            lambda event, reason: repository.record_notification(
+                runtime_id=self._config.runtime_id,
+                strategy_id=event.strategy_id,
+                execution_mode=event.execution_mode,
+                channel=self._notifier.channel,
+                event_type=event.event_type,
+                message=event.rendered(),
+                delivered=False,
+                failure_reason=reason,
+            )
+        )
 
         # Late-bound: the feed was constructed in __init__, before this
         # repository existed. The sink only enqueues — it must never touch the
@@ -419,6 +457,14 @@ class IntradayOptionsSupervisor:
                 token_source=source,
                 token_expiry=token_expiry,
                 requests_made=requests_made,
+            )
+            self._notifier.send(
+                NotificationEvent(
+                    event_type="authenticated",
+                    message=f"token source={source}",
+                    runtime_id=self._config.runtime_id,
+                    execution_mode=ExecutionMode.PAPER,
+                )
             )
 
         # Record every live-mode refusal add_worker() collected, before spawning
@@ -458,7 +504,12 @@ class IntradayOptionsSupervisor:
                     args=(
                         worker_config,
                         channel.queue.raw,
-                        None,  # notifier: a child never needs credentials
+                        # Not this supervisor's own notifier object — spawn
+                        # starts a fresh interpreter, so there is no object to
+                        # hand across. This sentinel tells the child to build
+                        # its own from its own environment. See
+                        # NOTIFIER_FROM_SETTINGS's docstring in worker.py.
+                        NOTIFIER_FROM_SETTINGS,
                         channel.tick_queue.raw if channel.tick_queue is not None else None,
                         self._control_queues.get(worker_config.strategy_id),
                     ),
@@ -574,6 +625,19 @@ class IntradayOptionsSupervisor:
             heartbeat.beat(HealthState.STOPPING, force=True)
             heartbeat.beat(HealthState.STOPPED, force=True)
             reason = "signal" if result.stopped_by_signal else "clean_shutdown"
+            # The group-level counterpart to "runtime_started" above. The
+            # unclean case already has its own notification
+            # (feed_shutdown_unclean, _raise_silent_feed_alarm) — this is not
+            # a duplicate of that, it is the event for the ordinary case that
+            # alarm exists to be the exception to.
+            self._notifier.send(
+                NotificationEvent(
+                    event_type="runtime_stopped",
+                    message=f"{self._config.runtime_id} supervisor stopped ({reason})",
+                    runtime_id=self._config.runtime_id,
+                    execution_mode=ExecutionMode.PAPER,
+                )
+            )
         else:
             # DEGRADED was already written, forced, when the feed failed to stop.
             # It stays the last word.
@@ -703,6 +767,15 @@ class IntradayOptionsSupervisor:
                 repository.record_feed_event(runtime_id=self._config.runtime_id, **asdict(event))
             except Exception:
                 _log.exception("failed to persist a feed_events row (event=%s)", event.event)
+            if event.event in _CHAT_WORTHY_FEED_EVENTS:
+                self._notifier.send(
+                    NotificationEvent(
+                        event_type=f"feed_{event.event}",
+                        message=event.reason or event.event,
+                        runtime_id=self._config.runtime_id,
+                        execution_mode=ExecutionMode.PAPER,
+                    )
+                )
 
     def _beat_running(self, heartbeat: HeartbeatWriter) -> None:
         """One rate-limited liveness beat, carrying the group's queue picture."""

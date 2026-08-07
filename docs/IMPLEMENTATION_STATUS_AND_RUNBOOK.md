@@ -7,9 +7,9 @@ the next phase. Updated after every phase.
 
 | | |
 |---|---|
-| **Current phase** | **Phase 7 — Operations, Part 1 of 5 complete** (health snapshot layer). A pre-work audit read the spec's Phase 7 line (`Harden Streamlit, Telegram, health snapshots, worker/supervisor PID handling, log retention and manual commands`) and checked each of the six items against the codebase before planning: the isolation contracts (`SafeNotifier`, read-only DB, `flock`-based locks) were already solid, but `TelegramNotifier` was never constructed in production, migration 0002's `auth_events`/`feed_events` tables had no writer at all, and the dashboard built its own ad-hoc SELECTs. Part 1 builds the one thing everything else in the phase reads from: `common/health/snapshot.py`'s `HealthSnapshot`/`read_snapshot`, writers for the two previously-dead diagnostic tables (`ExecutionRepository.record_auth_event`/`record_feed_event`), producers wired at every real state transition (feed reconnect/disconnect/degrade/recover, the stuck-subscription and silent-feed alarms, a startup broker-health check, the supervisor's own startup auth outcome), and a configurable heartbeat interval (`HealthConfig`, spec line 2482's "configurable" made actually true). A real cross-thread SQLite bug was found and fixed before it shipped — see **D70**. Parts 2-5 (Telegram production wiring, the Streamlit dashboard, PID hardening + operator commands, retention/backups) remain. |
-| **Next phase** | Phase 7 Part 2 — Telegram production wiring. |
-| **Last updated** | 7 August 2026 — Phase 7 Part 1 complete, see [Known limitations](#6-known-limitations) |
+| **Current phase** | **Phase 7 — Operations, Part 2 of 5 complete** (Telegram in production). `TelegramNotifier` is now actually constructed at both production entrypoints — the supervisor (`__main__.py`, from `Settings`) and every spawned worker (independently, from its own freshly-loaded `Settings`, since `spawn` cannot hand a child the parent's already-built object). `SafeNotifier` gained deferred (queued, off-thread) delivery so a slow Telegram send can never stall `TradingEngine`'s tick thread; rate limiting and repeated-message aggregation, replacing the intent of the two hand-rolled per-call-site latches (the latches themselves stay, since both also gate non-notification state); a real `notifications`-table writer via an injected, cross-thread-safe `on_failure` hook; and three new rendered fields (timestamp, correlation ID, required action), redacted through the same filter `common/logging/redaction.py`'s docstring already claimed covered "notified" text but never actually enforced. Two real bugs were found and fixed before shipping — a cross-process pickling bug in the notifier sentinel (**D72**) and a pre-existing notifier double-wrap in `TradingEngine` (**D73**) — see below. Parts 3-5 (the Streamlit dashboard, PID hardening + operator commands, retention/backups) remain. |
+| **Next phase** | Phase 7 Part 3 — the Streamlit dashboard. |
+| **Last updated** | 7 August 2026 — Phase 7 Part 2 complete, see [Known limitations](#6-known-limitations) |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
 | **Live order placement** | **Not implemented.** Fail-closed. Phase 10 only. |
@@ -27,7 +27,7 @@ the next phase. Updated after every phase.
 | 4 | Candle, indicator and paper-execution foundation | **Complete.** **Part 1 complete** (real contract resolution — closes 17, alarms 15). **Part 2 complete** (indicator layer — closes D21). **Part 3 complete** (continuity, timezone, wall-clock square-off — closes 4 and 7, and a live blocker). **Part 4 complete** (warm-up source and injection — closes 16). **Part 5 complete** (`PaperBroker` realism — closes 5 and D11; the live Full-mode gate item ran 6 August 2026 and passed, closing known limitation 20 along the way). **Phase 4 complete** — all five parts done, its one live gate item proven rather than asserted |
 | 5 | Mixed-mode supervisor and persistence | **Complete** |
 | 6 | Paper recovery and expiry handling | **Complete — all five parts.** **Part 1** (daily risk state across a restart — closes the risk-limit-bypass gap in bullet 1, and finds/fixes **D58**/limitation 22 along the way). **Part 2** (position-management state snapshot/restore — exit-policy state via `BaseExit`/`RiskManager`/`BaseStrategy` snapshot hooks, and stop/target persistence through a widened `RiskManager`/`ExecutionGateway`, fail-open on a bad snapshot, negative-control-tested). **Part 3** (MFE/MAE, square-off attempts, state-version validation and position-gated last-candle idempotency — the rest of §7's "restore at minimum" list). **Part 4** (`force_square_off_before_expiry` composed into the existing `SquareOffAuthority` seam — **D66-D68**; `simulate_exchange_settlement` refused at config load, none of spec section 11's eight settlement-policy items built — limitation 27). **Part 5** (the phase's record: bullets re-checked against what is built, not assumed; D56's persistence-identity gap given a written candidate direction, not an implementation — **D69**, limitation 30). Bullet 2's fixed strikes/basket legs/rolling counters remain blocked on `FixedStrikeEngine`/`MultiLegEngine` — D56/D34, unchanged, not this phase's to close |
-| 7 | Operations | **Part 1 complete** (health snapshot layer — `common/health/snapshot.py`, `auth_events`/`feed_events` writers and producers, configurable heartbeat interval). Parts 2-5 (Telegram, dashboard, PID/operator commands, retention) not started |
+| 7 | Operations | **Part 1 complete** (health snapshot layer — `common/health/snapshot.py`, `auth_events`/`feed_events` writers and producers, configurable heartbeat interval). **Part 2 complete** (Telegram in production — real notifier construction at both entrypoints, deferred delivery, rate limiting/aggregation, `notifications`-table persistence, redacted rendering — D71-D74). Parts 3-5 (dashboard, PID/operator commands, retention) not started |
 | 8 | LaunchAgent validation | Not started |
 | 9 | Real strategies | Not started |
 | 10 | Controlled live readiness | Not started |
@@ -2209,6 +2209,10 @@ guard. See deviation D6.
 | **D68** | **`expiry_policy`/`square_off_before_expiry_days` are typed top-level `StrategyConfig` fields, not `risk:` dict keys** | Spec section 11 shows `expiry_policy: force_square_off_before_expiry` as a bare YAML key with no parent block, and section 9's "required resolved strategy fields" list does not name it at all — the config-hierarchy home was genuinely unspecified, and put to the user directly during planning. `StrategyConfig.risk` is `dict[str, Any]`; `_StrictModel`'s `extra="forbid"` reaches every top-level field but not inside an untyped dict, so a key placed in `risk` could carry a silent typo (`square_off_before_expiry_day`, singular) with no refusal at all — exactly the failure `_StrictModel`'s own docstring exists to prevent for every other safety-relevant field. Decided: both fields are typed, top-level, `_StrictModel`-covered fields on `StrategyConfig`, alongside `mode`/`live_approved`/`engine`, not inside `risk`. `config_adapter._square_off_policy` now takes the whole `StrategyConfig`, not just its `risk` dict, to read them. |
 | **D69** | **D56's persistence-identity question gets a written candidate direction, not an implementation — checked and found too large and too speculative to build now, put to the user directly** | Phase 6 Part 5 re-examined D56's claim that "restore open paper positions and strategy/risk state by strategy and mode" (spec bullet 1) is not fully closed while `positions`/`strategy_state`/`order_intents` key their UNIQUE identity on `trading_date`, fragmenting any position held across sessions. Before deciding what to do about it, the actual blast radius was checked rather than assumed: `trading_date` is a mandatory, exact-match parameter on 6+ `ExecutionRepository` methods (`open_positions`, `load_strategy_state`, `save_strategy_state`, `previous_incomplete_session`, and others), every recovery function in `engine_worker.py` (`recover_position`, `recover_daily_risk`, `recover_exit_state`), `PersistedSquareOffAuthority`'s own key, the fixture path in `worker.py`, and `WorkerConfig.trading_date` itself — plus dozens of existing tests asserting on that exact shape. Building a cross-session identity now would mean guessing what "a cycle" operationally means (calendar days? an explicit roll event? adjustment legs?) with no real positional strategy to answer that question — precisely the "inventing Phase 6's answer out of order" trap D56 itself named, just relocated from Phase 5 to now instead of avoided. Put to the user directly (implement now vs. document only); decided: document only. The candidate direction, recorded so a future implementer does not start from zero: introduce `cycle_id` as an **additional** column on the three tables, assigned when a position/cycle opens and held stable until it fully closes, however many `trading_date`s that spans — `trading_date` itself is untouched and keeps its own, independently correct, "state must never leak between days" guarantee for the intraday positions that exist today (migration `0001`'s own stated reason for including it). A positional worker would eventually query "the open cycle for this strategy/mode" via `cycle_id` rather than `trading_date`. Explicitly not built: no migration, no repository method, no test. Revisit only once Phase 9 supplies a real positional strategy whose actual session/rollover/adjustment shape can validate — or invalidate — this direction. See limitation 30 and `runtimes/positional_options/__init__.py`. |
 | **D70** | **A `feed_events` sink may only enqueue, never write — the feed runs on its own thread, and the repository's `sqlite3` connection belongs to the thread that opened it** | Phase 7 Part 1's first version of the health-event wiring had `ReconnectingFeed`'s new `on_health_event` callback call `repository.record_feed_event(...)` directly. `ReconnectingFeed.start()` is driven from a dedicated feed thread (`supervisor.py`'s own module docstring: "a live deployment... enforces the ownership rule... `start()` blocks on a worker thread"), while `ExecutionRepository`'s `Database` connection is opened once, in `run()`, on the supervisor's own thread. `sqlite3.Connection` objects refuse cross-thread use by default (`sqlite3.ProgrammingError: SQLite objects created in a thread can only be used in that same thread`) — caught immediately by `test_the_feeds_health_events_reach_the_repository_once_run_opens_it`, not discovered later or in production. Fixed with the same pattern the supervisor already uses for the opposite direction (a worker's runtime-subscription request travelling *to* the feed thread via `_control_queues`/`_drain_control_queues`): the sink (`self._feed_health_events.put`, a plain `queue.Queue[FeedHealthEvent]`) only enqueues from the feed thread; a new `_drain_feed_health_events`, called from the supervisor's existing 1-second poll loop (the same loop that already drains control queues and checks the stuck-subscription alarm) is the only code that ever calls `repository.record_feed_event`, and it always runs on the thread that opened the connection. A write that raises inside the drain is logged and dropped, the same isolation `SafeNotifier` gives Telegram — a diagnostic row must never be able to interrupt the poll loop. |
+| **D71** | **`SafeNotifier` gained its own generic rate limiter/aggregator; the two hand-rolled per-call-site latches it was meant to replace stay, because both also gate non-notification state** | Phase 7 Part 2's plan called for "replacing, not duplicating, the two hand-rolled latches" (`TradingEngine._entry_blocked is not None`, the supervisor's `_stuck_subscription_alarmed`). Checked directly before touching either: `_block_entries`'s own docstring states the latch is what keeps entries off for the day — "the latch is set first, then announced, so a disabled or throwing notifier cannot turn trading back on" — and the supervisor's latch also gates a forced `DEGRADED` heartbeat beat and an `errors`/`feed_events` row, not only the Telegram send. Deleting either to make room for a purely notification-layer replacement would have changed behaviour outside notifications. Resolved by keeping both exactly as they were and giving `SafeNotifier` its own key-based suppression (`(runtime_id, strategy_id, event_type, message)`, 60s default window) that every call site gets automatically — including every one that never had a latch of its own. In practice the two existing latches make `SafeNotifier`'s aggregation inert at those two sites (the caller never repeats the call) and it is the *only* protection everywhere else. `test_repeated_failures_are_suppressed_not_amplified` replaces `test_repeated_failures_are_counted_not_amplified`, whose old body asserted only that a counter incremented and never verified the "not amplified" the name promised — the Phase 7 Part 1 audit's own finding, closed here. |
+| **D72** | **The notifier sentinel (`NOTIFIER_FROM_SETTINGS`) must be an `Enum` member, not a plain sentinel object — a plain one does not survive the `spawn` pickle round trip with its identity intact** | `run_worker`'s arguments cross the `spawn` boundary through `pickle` (module docstring: "a fresh interpreter... unpickles its arguments"). The first version of this sentinel was a bare `object()`-holding class instance; unpickling it in the child constructs a *new* instance, so `notifier is NOTIFIER_FROM_SETTINGS` silently evaluated `False` inside every spawned worker regardless of what the parent passed, and the un-recognised sentinel value fell straight through to being used *as* a notifier — `AttributeError: '...' object has no attribute 'send'` the moment anything called it. Caught immediately, not in production: the existing supervisor end-to-end suite already spawns real workers through the real `context.Process(target=run_worker, ...)` path, and nine of those tests failed the moment this shipped (`test_undelivered_ticks_do_not_wedge_the_supervisors_exit` and siblings in `test_supervisor.py`/`test_supervisor_signal.py`/`test_mode_separation.py`). Fixed by making the sentinel an `enum.Enum` member — pickle's specifically-documented, guaranteed-identity-preserving singleton mechanism — rather than inventing a custom `__reduce__`. `tests/unit/test_notifier_sentinel.py` adds a direct, minimal regression test (a real `pickle.dumps`/`loads` round trip, plus the negative control: a plain module-level sentinel class demonstrably does *not* survive the same round trip) alongside the indirect coverage the spawning tests already provided. |
+| **D73** | **`TradingEngine.__init__` was silently double-wrapping an already-built `SafeNotifier` in a second one — type-valid (`SafeNotifier` structurally satisfies `Notifier`), functionally wrong** | `worker.py` builds exactly one `SafeNotifier` per process and, on the engine path, hands it straight through (`engine_worker.run_engine(notifier=safe_notifier, ...)` → `TradingEngine(notifier=notifier, ...)`). `TradingEngine.__init__` unconditionally did `self.notifier = SafeNotifier(notifier or NullNotifier())` — wrapping the inner `SafeNotifier` in an outer one. This predates Part 2 and was harmless while `SafeNotifier` had no state worth duplicating; it stopped being harmless the moment Part 2 gave it success/failure counters, an aggregation window and (for the engine path specifically) `deferred=True`/`on_failure` — all of which would have lived on the *inner*, untouched `SafeNotifier`, while `TradingEngine` only ever calls `.send()` on the outer one. Found while designing the deferred-mode wiring, not by a failing test — no existing assertion checked notifier identity or counted double-delivery. Fixed: `TradingEngine.__init__` now checks `isinstance(notifier, SafeNotifier)` and reuses it exactly as given; a bare `Notifier` still gets the fallback wrap, which now defaults `deferred=True` since that branch is reachable from `on_tick` regardless of caller. `test_the_engine_reuses_an_already_built_safenotifier_rather_than_double_wrapping` and `test_a_bare_notifier_is_wrapped_deferred_by_default` cover both branches directly. |
+| **D74** | **`NotificationEvent.rendered()` now runs its own output through the active logging redactor — closing a real gap between what `common/logging/redaction.py`'s docstring claimed ("printed, persisted **or notified**") and what was actually enforced** | `SecretRedactingFilter` is a `logging.Filter`, reachable only via a handler `addFilter()` call — it was never wired anywhere near `TelegramNotifier.send()` (which builds its payload straight from `event.rendered()`, no `logging` call involved) or `record_notification`'s DB write. The specific Telegram guarantee was sound regardless — the bot token is read from `SecretStr` at send time and never stored on `NotificationEvent`, so nothing token-shaped could reach `rendered()` — but the *general* claim was aspirational, and Part 2 gives `rendered()` three new fields plus a real `notifications.message` column to write into, raising the stakes of leaving it that way. `rendered()` now calls `common.logging.active_redactor()` and returns the redacted text when a redactor is active (every production process; `setup_logging()` runs before any notifier is built), unredacted when none is (most unit tests, which never call `setup_logging`) — a real second layer where the docstring already claimed one, not a fix to a live leak. `test_a_known_secret_is_redacted_from_the_rendered_message` and `test_rendering_is_unredacted_when_no_logging_has_been_configured` cover both states. |
 
 #### D22 in detail: the rebuilt premium-candle mapping
 
@@ -4216,6 +4220,30 @@ start/stop/crash/restart tests pass.
     incomplete. Revisit if operators need to query historical auth failures
     from the database rather than the log.
 
+32. **The engine's own `entry`/`exit`/`eod_summary` notifications carry no
+    `correlation_id`, even though `NotificationEvent` now has the field.**
+    `common.engine.positions.FillOutcome`, `OpenPosition` and `Trade` do not
+    persist a correlation ID today — `PositionManager.open()`/`close()` read
+    only `fill_price`/`charges`/`charges_breakdown` off the gateway's
+    `FillOutcome` and discard the rest. `worker.py`'s own notifications
+    (`order_filled`, `square_off_completed`, both on the **fixture** path)
+    already carry one, read straight off `ExecutionResult.correlation_id` — a
+    field that already exists and is already available to `LifecycleGateway.
+    _outcome()` inside `common/engine/gateway.py`, which is what makes this a
+    contained, deliberately-deferred follow-up rather than an unknown one:
+    add `correlation_id: str | None = None` to `FillOutcome`, thread it
+    through `OpenPosition.entry_correlation_id` and `Trade.entry_correlation_
+    id`/`.exit_correlation_id` (both dataclasses already carry several
+    optional trailing fields in exactly this shape — `entry_regime`,
+    `session_tags` — so this is additive, not a redesign), and read it back
+    in `TradingEngine._open`/`_close`. Scoped out of Phase 7 Part 2
+    specifically to keep that part's already-large diff (`SafeNotifier`'s
+    redesign, the entrypoint wiring, two real bugs found and fixed) from
+    growing into a fourth change to the engine's core position-management
+    seam under the same time budget. Revisit as a small, separate, well-
+    contained follow-up whenever correlation-tagged engine-path alerts
+    become a real operational need.
+
 
 ### Operational risk noted during the audit
 
@@ -4450,8 +4478,157 @@ mtime is unchanged at the recorded baseline.
 Phase 2 is complete, both blocks. **Phase 3 is complete** — all five parts, with its
 acceptance gate met in full. **Phase 4 is complete** — all five parts, its one live
 gate item run and passed. **Phase 5 is complete** — see below. **Phase 6 is
-complete** — all five parts, see below. **Phase 7 is in progress — Part 1 of 5
-complete**, see below. Next is **Phase 7 Part 2 — Telegram production wiring**.
+complete** — all five parts, see below. **Phase 7 is in progress — Part 2 of 5
+complete**, see below. Next is **Phase 7 Part 3 — the Streamlit dashboard**.
+
+### Phase 7 — Operations — **Part 2 of 5 complete** (Telegram in production)
+
+Approved plan, verbatim scope: wire the real notifier at the entrypoint (with a
+spawn-boundary comment explaining child notifier construction), move sends off the
+tick thread via a bounded internal queue, add the three missing rendered fields
+(timestamp, correlation/order ID, required action), add rate limiting and repeated-
+error aggregation in `SafeNotifier` replacing the two hand-rolled latches, make
+`record_notification` a real production caller so notification failures persist,
+confirm the redaction guarantee survives every new rendered field, and fill the
+spec's remaining event-category gaps.
+
+**Wiring the real notifier surfaced a fact worth stating up front: this development
+machine's own `.env` carries real, working Telegram credentials.** Every new test in
+this part was written with that specifically in mind — `tests/unit/test_notifier_
+factory.py` constructs `Settings` against an isolated, empty `tmp_path` `.env` with
+explicit `None` overrides (constructor kwargs are pydantic-settings' highest-
+precedence source, ahead of a stray exported shell variable too), and no test
+anywhere calls `Settings()`/`load_settings()` unguarded. This is also *why* `None`
+could not be overloaded to mean "build the production notifier" for a spawned
+worker — see the sentinel/D72 entry below.
+
+**Redaction.** `common/logging/redaction.py`'s own docstring already claimed secrets
+"must never be printed, **persisted or notified**" and that this is "enforced once,
+at the logging boundary" — checked directly rather than taken on faith, and the
+"notified" half was not actually true: `SecretRedactingFilter` is a `logging.Filter`,
+reachable only through a handler, and `TelegramNotifier.send()` builds its payload
+from `NotificationEvent.rendered()` without ever passing through logging at all. The
+existing guarantee for Telegram specifically was sound anyway — the token is read
+from `SecretStr` at send time and never stored on `NotificationEvent`, so nothing
+token-shaped could reach `rendered()` to begin with — but the *general* claim, now
+that `rendered()` carries three new fields and feeds a real `notifications.message`
+column too, was aspirational. `NotificationEvent.rendered()` now calls `common.
+logging.active_redactor()` and runs its output through the same filter before
+returning it — a real second layer where the docstring already claimed one existed,
+not a fix to a live leak. Degrades to unredacted, not to a raise, when no `setup_
+logging()` call has run in the process (most unit tests) — see `test_rendering_is_
+unredacted_when_no_logging_has_been_configured`.
+
+**The two hand-rolled latches, and what "replacing" them actually meant.** Read
+closely before touching anything: `TradingEngine._block_entries`'s `self._entry_
+blocked is not None: return` and the supervisor's `_stuck_subscription_alarmed`
+both gate more than a notification — the first is the actual "entries are blocked"
+state (its own docstring: *"the latch is set first, then announced, so a disabled or
+throwing notifier cannot turn trading back on"*), the second also gates a `DEGRADED`
+heartbeat beat and an `errors`/`feed_events` row, not only the Telegram send. Neither
+could simply be deleted without changing behaviour unrelated to notifications.
+`SafeNotifier` therefore gained its *own* generic rate limiter/aggregator, keyed on
+`(runtime_id, strategy_id, event_type, message)` with a 60s default window — every
+call site gets duplicate-suppression now, not just the two that happened to hand-roll
+it — while both existing latches stay exactly as they were, for the state/DB-write
+reason above. In practice they make `SafeNotifier`'s aggregation inert at those two
+call sites (the caller never repeats the send), and active everywhere else, including
+call sites that never had any latch at all. `test_repeated_failures_are_suppressed_
+not_amplified` replaces `test_repeated_failures_are_counted_not_amplified`, whose old
+body only asserted the counter incremented and never verified the "not amplified"
+its own name promised (Phase 7 Part 1 audit finding, restated here because Part 2 is
+what actually closes it).
+
+**Deferred delivery, and why it is scoped to exactly one `SafeNotifier`.**
+`TradingEngine`'s notifier is reached from `on_tick` — the feed's own callback
+thread — so a synchronous 5s Telegram timeout there stalls tick processing itself.
+`SafeNotifier` gained an opt-in `deferred=True` mode: a bounded `queue.Queue`, a
+dedicated drain thread that performs the real send, and `close()` to drain and flush
+at shutdown. `worker.py`'s own `SafeNotifier` — reached only between `candle_queue.
+get()` calls, never from inside a feed's callback — stays synchronous by contrast,
+which keeps every existing `RecordingNotifier`-based test's "assert on `.events`
+right after the run returns" pattern deterministic and unchanged; the engine path
+sets `deferred = config.engine is not None` at the one construction site both paths
+share. A full deferred queue drops the oldest entry and counts the drop rather than
+blocking the producer (spec 2554's "small internal queue... may" — not Celery, not
+an external broker) — `test_a_full_deferred_queue_drops_the_oldest_and_counts_it_
+never_blocks` proves it under a genuinely slow inner notifier, not a mock.
+
+**Failure persistence without reintroducing Phase 7 Part 1's cross-thread bug.**
+`SafeNotifier` takes an injected `on_failure` callback rather than a repository
+reference directly — the same seam discipline `common.engine` already keeps from
+`common.execution` (`recover_position`, `persist_exit_state`; see D62). For a
+*synchronous* `SafeNotifier` this is safe to call inline (the caller's own thread
+already owns whatever repository the callback touches). For a *deferred* one it is
+not: the drain thread's `sqlite3` connection is not its own, and calling a
+repository-touching callback from that thread would be exactly the bug D70 (Part 1)
+found and fixed for `feed_events`, reintroduced one layer up. Deferred failures are
+therefore appended to an in-memory list under a lock and *pumped* out through
+`on_failure` only from `send()`/`close()` — i.e. only ever on a thread the caller
+already trusts with that repository. `worker.py` and `supervisor.py` both wire
+`on_failure=lambda event, reason: repository.record_notification(...)`; the
+supervisor's, like Part 1's health-event sink, is late-bound via a new
+`SafeNotifier.set_on_failure()` because its own repository does not exist at
+`__init__` time either.
+
+**Correlation IDs: wired where cheap, deliberately not where invasive.**
+`NotificationEvent.correlation_id` is populated at every call site that already had
+one in scope without new plumbing — `worker.py`'s `order_filled` and `square_off_
+completed` (`ExecutionResult.correlation_id`, already a top-level field). The
+*engine's own* `entry`/`exit` notifications (`TradingEngine._open`/`_close`) do not
+carry one: `common.engine.positions.FillOutcome`/`OpenPosition`/`Trade` do not
+persist it today, and threading it through would mean widening three dataclasses and
+`PositionManager.open()`/`close()` — real, contained, additive work, but a second,
+separate change deliberately left out of this part rather than folded in under time
+pressure. `ExecutionResult.correlation_id` already exists and would make that
+follow-up straightforward. See limitation 32.
+
+**Event-category gaps filled**, each reusing an existing detection point rather than
+inventing a new one: authentication (`authenticated`, alongside the `auth_events` row
+Part 1 already writes), runtime-group lifecycle (`runtime_started`/`runtime_stopped`,
+distinct from the existing strategy-level `worker_started`/`worker_stopped`), feed
+lifecycle beyond the two existing alarms (`feed_disconnected`/`feed_recovered`/
+`feed_reconnect_exhausted`, sent from the same thread-safe drain point Part 1 built
+for `feed_events` — deliberately *not* every `connected`/`reconnect_attempted`/
+`resubscribed`, which stay diagnostic-only to avoid exactly the noise spec 2539/2554
+warn against), and a square-off *success* event on the engine path
+(`TradingEngine._handle_square_off`, guarded by the same `_squared_off` latch that
+already makes the method itself idempotent) — the fixture path has had one since
+Phase 1; the engine path had only the failure alarm.
+
+**Two real bugs, found by the fail-first test discipline before either shipped:**
+
+- **D72** — the notifier sentinel (`NOTIFIER_FROM_SETTINGS`) is an `Enum` member, not a
+  plain `object()`, because a plain sentinel does not survive the `spawn` pickle round
+  trip with its identity intact: unpickling constructs a new instance, so `notifier is
+  NOTIFIER_FROM_SETTINGS` silently evaluated `False` inside every spawned worker, and
+  the un-recognised sentinel fell through to being used *as* a notifier —
+  `AttributeError` the moment anything called `.send()` on it. Caught immediately: the
+  existing supervisor end-to-end suite (which spawns real workers through the real
+  code path) failed nine tests the moment this shipped, not later. `Enum` members are
+  the standard library's own pickle-safe singleton. See `tests/unit/test_notifier_
+  sentinel.py` for a direct, minimal regression test alongside that indirect coverage.
+- **D73** — `TradingEngine.__init__` was unconditionally wrapping its `notifier`
+  argument in a fresh `SafeNotifier`, even when `worker.py` had already handed it one
+  (`engine_worker.run_engine` passes `notifier=safe_notifier` straight through). Type-
+  valid — `SafeNotifier` structurally satisfies `Notifier` — but a silent double-wrap:
+  two independent success/failure counters, two independent aggregation windows on the
+  same event, and the *outer* `deferred=True`/`on_failure` this part's own design
+  depends on would have lived on a `SafeNotifier` `TradingEngine` never touches
+  directly. Found while designing the deferred-mode wiring, not by a failing test —
+  `isinstance(notifier, SafeNotifier)` now reuses an already-built one as-is;
+  a bare `Notifier` still gets the fallback wrap, defaulted `deferred=True` since that
+  path is exactly the one reachable from `on_tick`.
+
+**Deliberately not done in Part 2:**
+
+- The dashboard still reads nothing new — Part 3.
+- No PID hardening, no operator commands — Part 4.
+- No retention, no backups — Part 5.
+- `scripts/reconcile` and any reconciliation-category notification — Phase 10
+  throughout the spec, unchanged from Part 1's own scoping note.
+- Correlation IDs on the engine's own `entry`/`exit` notifications — see above and
+  limitation 32.
 
 ### Phase 7 — Operations — **Part 1 of 5 complete** (health snapshot layer)
 

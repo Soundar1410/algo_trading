@@ -168,10 +168,12 @@ def test_mode_separation_survives_a_mixed_paper_and_live_run(
 
     # A human not looking at the database also learns about the block: the
     # errors row above is the persisted record, this is the delivered one.
-    # No production code path in this repository writes the `notifications`
-    # table (repository.record_notification has no caller anywhere outside
-    # tests) — every existing alarm records to `errors` and delivers through
-    # the notifier, and the block follows that same established pattern.
+    # This event is a success — record_notification (Phase 7 Part 2's real
+    # production caller, SafeNotifier's on_failure hook) only fires when
+    # *delivery* fails, and this RecordingNotifier always succeeds. See
+    # tests/integration/test_execution_persistence.py for that path exercised
+    # end-to-end, and common/notifications/base.py's module docstring for why
+    # the callback exists at all.
     blocked_events = [e for e in notifier.events if e.event_type == "live_strategy_blocked"]
     assert len(blocked_events) == 1
     assert blocked_events[0].strategy_id == LIVE_STRATEGY_ID

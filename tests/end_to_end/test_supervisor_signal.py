@@ -223,7 +223,24 @@ def test_a_clean_run_publishes_group_health_and_ends_stopped(supervisor_process,
     stdout, stderr = process.communicate(timeout=CHILD_TIMEOUT)
 
     assert process.returncode == 0, f"non-zero exit\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    assert "NOTIFIED" not in stdout, "a clean shutdown must not raise an alarm"
+    # Phase 7 Part 2: a clean run now legitimately notifies on routine
+    # lifecycle (runtime_started/runtime_stopped, and feed_recovered once the
+    # tape's first tick lands) — "no NOTIFIED line at all" stopped being the
+    # right check the moment those existed to fire. What must still never
+    # appear on a clean run is an *alarm* — the three event types the group's
+    # own alarm methods (_raise_silent_feed_alarm, _check_stuck_subscription,
+    # add_worker's live-gate refusal) are the only things that ever send.
+    alarm_event_types = {
+        "feed_shutdown_unclean",
+        "subscription_not_applied",
+        "live_strategy_blocked",
+    }
+    notified_lines = [line for line in stdout.splitlines() if line.startswith("NOTIFIED")]
+    notified = {line.removeprefix("NOTIFIED ") for line in notified_lines}
+    alarms_fired = notified & alarm_event_types
+    assert not alarms_fired, f"a clean shutdown must not raise an alarm: {alarms_fired}"
+    assert "runtime_started" in notified
+    assert "runtime_stopped" in notified
 
     connection = Database(tmp_path / "operational" / "intraday_options.db").connect()
     states = [

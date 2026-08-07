@@ -148,6 +148,7 @@ def _build_engine(
     *,
     square_off_authority: SquareOffAuthority | None = None,
     expiry: str | None = None,
+    notifier: object | None = None,
 ) -> tuple[TradingEngine, PositionManager]:
     positions = PositionManager(InMemoryGateway(slippage_points=0.0), lots=1)
     engine = TradingEngine(
@@ -168,6 +169,7 @@ def _build_engine(
         position_manager=positions,
         underlying_security_id=UNDERLYING,
         square_off_authority=square_off_authority,
+        notifier=notifier,  # type: ignore[arg-type]
     )
     return engine, positions
 
@@ -396,6 +398,59 @@ def test_repeated_square_off_requests_close_the_position_once() -> None:
 
     assert not runner.is_alive()
     assert len(positions.trades) == 1
+
+
+def test_square_off_completion_sends_exactly_one_notification() -> None:
+    """Phase 7 Part 2: before this, the engine path notified only on *failure*
+    (engine_worker._raise_silent_engine_alarm) — the fixture path's own
+    square_off_completed (worker.py's _maybe_square_off) had no engine-side
+    counterpart at all."""
+    from common.notifications import RecordingNotifier
+
+    feed = _BlockingFeed()
+    recorder = RecordingNotifier()
+    engine, positions = _build_engine(feed, notifier=recorder)
+
+    runner = threading.Thread(target=engine.run, name="engine-run", daemon=True)
+    runner.start()
+    _open_a_position(feed, positions)
+
+    for _ in range(3):  # repeated requests must not repeat the notification either
+        engine.request_square_off("operator")
+    feed.deliver(_tick(CE_CONTRACT, 95.0, _ts(9, 23)))
+    runner.join(timeout=JOIN_TIMEOUT)
+
+    completions = [e for e in recorder.events if e.event_type == "square_off_completed"]
+    assert len(completions) == 1
+    assert "squared off" in completions[0].message
+
+
+def test_the_engine_reuses_an_already_built_safenotifier_rather_than_double_wrapping() -> None:
+    """worker.py builds one SafeNotifier per process and hands it straight
+    through (via engine_worker.run_engine) into this constructor. Wrapping it
+    again would silently double every success/failure count and apply two
+    independent aggregation windows to the same event."""
+    from common.notifications import SafeNotifier
+    from common.notifications.base import NullNotifier
+
+    already_wrapped = SafeNotifier(NullNotifier(), deferred=False)
+    engine, _positions = _build_engine(SimulatedFeed([]), notifier=already_wrapped)
+
+    assert engine.notifier is already_wrapped
+
+
+def test_a_bare_notifier_is_wrapped_deferred_by_default() -> None:
+    """The fallback wrap (no pre-built SafeNotifier supplied) must still
+    protect the tick thread — on_tick is exactly where this notifier's
+    send() is called from."""
+    from common.notifications import SafeNotifier
+    from common.notifications.base import RecordingNotifier
+
+    engine, _positions = _build_engine(SimulatedFeed([]), notifier=RecordingNotifier())
+
+    assert isinstance(engine.notifier, SafeNotifier)
+    assert engine.notifier.deferred is True
+    engine.notifier.close()
 
 
 def test_request_square_off_never_touches_the_feed_from_the_calling_thread() -> None:

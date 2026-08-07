@@ -177,6 +177,19 @@ def test_a_failing_notifier_does_not_stop_trading(worker_config, tick_tape_path,
     conn = Database(database_path).connect()
     assert conn.execute("SELECT COUNT(*) FROM fills").fetchone()[0] == 2
 
+    # Phase 7 Part 2: SafeNotifier.on_failure now persists every failed send,
+    # not just logs it — spec 2556's "persist notification failure" half,
+    # closed alongside the "continue safe runtime operation" half this test
+    # already proved. Every failure carries the same reason, since every
+    # send() from this notifier fails identically.
+    rows = conn.execute(
+        "SELECT delivered, failure_reason, event_type FROM notifications ORDER BY id"
+    ).fetchall()
+    assert len(rows) >= 2, "worker_started and order_filled should both have failed to persist"
+    assert all(r["delivered"] == 0 for r in rows)
+    assert all(r["failure_reason"] == "telegram is down" for r in rows)
+    assert {r["event_type"] for r in rows} >= {"worker_started", "order_filled"}
+
 
 # ------------------------------------------------------------ dashboard
 def test_the_dashboard_tile_renders_from_a_read_only_connection(

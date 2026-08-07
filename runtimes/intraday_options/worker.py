@@ -40,6 +40,7 @@ the very package the boundary exists to keep out.
 
 from __future__ import annotations
 
+import enum
 import os
 import queue as queue_module
 from dataclasses import dataclass, field
@@ -47,12 +48,19 @@ from pathlib import Path
 from typing import Any
 
 from common.broker import Broker, build_broker
+from common.config import load_settings
 from common.config.models import ExecutionMode
 from common.execution import ExecutionRepository, OrderLifecycle
 from common.health import DEFAULT_INTERVAL_SECONDS, HealthState, HeartbeatWriter
 from common.logging import get_logger, setup_logging
 from common.models import Candle, PositionStatus
-from common.notifications import NotificationEvent, Notifier, NullNotifier, SafeNotifier
+from common.notifications import (
+    NotificationEvent,
+    Notifier,
+    NullNotifier,
+    SafeNotifier,
+    build_notifier,
+)
 from common.persistence import Database, MigrationRunner
 from common.process import DuplicateProcessError, worker_lock
 from common.risk import SquareOffPolicy, SquareOffState, SquareOffTrigger
@@ -63,6 +71,52 @@ _log = get_logger(__name__)
 #: Exit code used when another worker already owns this strategy. Distinct from
 #: 1 so a supervisor (or a test) can tell "refused as duplicate" from "crashed".
 EXIT_DUPLICATE = 3
+
+
+class _NotifierSentinel(enum.Enum):
+    """Sentinel for ``notifier=``: build the production notifier here, in the
+    spawned child, from a freshly-loaded :class:`~common.config.Settings`.
+
+    **An ``Enum``, not a plain sentinel object, and that is load-bearing.**
+    ``run_worker``'s arguments cross the ``spawn`` boundary through ``pickle``
+    (module docstring). A plain ``object()`` sentinel does *not* survive that
+    round trip with its identity intact — unpickling constructs a new
+    instance, so ``notifier is NOTIFIER_FROM_SETTINGS`` inside the child
+    silently evaluates ``False`` even when the parent passed exactly this
+    sentinel, and the un-recognised value fell through to being used *as* a
+    notifier (an ``AttributeError`` the moment anything tried to call
+    ``.send()`` on it — caught by ``test_undelivered_ticks_do_not_wedge_the_
+    supervisors_exit`` and several siblings the first time this shipped).
+    ``Enum`` members are the standard-library's own pickle-safe singleton:
+    unpickling one is guaranteed to return the *same* member object, which is
+    exactly the property an identity-checked, cross-process sentinel needs.
+
+    Deliberately **not** the same as leaving ``notifier`` at its ordinary
+    default (``None``, which still means "no notifier — use ``NullNotifier``",
+    unchanged). Overloading ``None`` for this was considered and rejected: this
+    machine's own ``.env`` carries real Telegram credentials, and at least one
+    existing test (``test_walking_skeleton.py``'s duplicate-worker gate) spawns
+    a real child process via exactly ``run_worker(config, feed_queue)`` — bare
+    default, no notifier argument. Had ``None`` triggered settings-based
+    construction, that test would have quietly started making real network
+    calls to Telegram on any machine with credentials configured. Only the
+    supervisor's spawn call passes this sentinel, making "build a real
+    notifier here" an explicit choice by the one caller that actually
+    represents a production run, never an inferred one.
+
+    The child cannot inherit the parent's already-built notifier object across
+    the ``spawn`` boundary regardless (a fresh interpreter re-imports this
+    module), and threading a bot token through the picklable ``WorkerConfig``
+    would move a secret through a channel built for plain values — the OS
+    already hands every spawned child the same environment the parent read
+    ``.env`` from, so asking each process to build its own from ``Settings``
+    is both simpler and safer than passing the credential across.
+    """
+
+    FROM_SETTINGS = enum.auto()
+
+
+NOTIFIER_FROM_SETTINGS = _NotifierSentinel.FROM_SETTINGS
 
 #: How long to wait for a candle before checking shutdown conditions again.
 _QUEUE_POLL_SECONDS = 0.5
@@ -214,7 +268,7 @@ class WorkerOutcome:
 def run_worker(
     config: WorkerConfig,
     candle_queue: Any,
-    notifier: Notifier | None = None,
+    notifier: Notifier | _NotifierSentinel | None = None,
     tick_queue: Any = None,
     control_queue: Any = None,
 ) -> WorkerOutcome:
@@ -223,8 +277,12 @@ def run_worker(
     Args:
         config: picklable worker configuration.
         candle_queue: the bounded queue the hub publishes completed candles to.
-        notifier: optional; defaults to a null channel so a child process never
-            needs credentials.
+        notifier: ``None`` (the default) means a null channel — every existing
+            test relies on this. Pass :data:`NOTIFIER_FROM_SETTINGS` to build a
+            real one from this process's own environment instead — see that
+            sentinel's docstring for why the two are not the same thing. Any
+            other :class:`~common.notifications.base.Notifier` is used as
+            given, exactly as before (a test's ``RecordingNotifier``, say).
         tick_queue: the raw-tick channel, when the supervisor gave this worker one.
             Required by — and only used by — the engine path.
         control_queue: the upstream channel the engine's runtime subscriptions
@@ -232,8 +290,20 @@ def run_worker(
             worker without one can still trade its configured instruments, it just
             cannot ask for new ones, and ``HubTickFeed`` says so loudly.
     """
-    setup_logging(log_dir=config.log_dir, log_file_name=f"{config.strategy_id}.log")
+    settings = load_settings()
+    # settings= registers this worker's own secrets (a Telegram token now
+    # possibly among them) with its own redaction filter. Before this, a
+    # spawned worker's setup_logging call omitted settings entirely — spawn
+    # starts a fresh interpreter, so the parent's registration never carried
+    # over, and this worker's logs relied on pattern redaction alone.
+    setup_logging(
+        log_dir=config.log_dir, log_file_name=f"{config.strategy_id}.log", settings=settings
+    )
     outcome = WorkerOutcome()
+
+    resolved_notifier: Notifier | None = (
+        build_notifier(settings) if notifier is NOTIFIER_FROM_SETTINGS else notifier
+    )
 
     lock = worker_lock(
         runtime_id=config.runtime_id,
@@ -251,7 +321,9 @@ def run_worker(
         return outcome
 
     try:
-        return _run_locked(config, candle_queue, notifier, outcome, tick_queue, control_queue)
+        return _run_locked(
+            config, candle_queue, resolved_notifier, outcome, tick_queue, control_queue
+        )
     finally:
         lock.release()
 
@@ -276,7 +348,34 @@ def _run_locked(
         return outcome
 
     repository = ExecutionRepository(database)
-    safe_notifier = SafeNotifier(notifier or NullNotifier())
+    # Deferred only when the engine is driving: engine.py's on_tick calls
+    # notifier.send() from what would otherwise be this same thread, and a
+    # 5s Telegram timeout there is the tick-thread stall spec 2554's "small
+    # internal queue" exists to prevent. The fixture path's own sends happen
+    # between candle_queue.get() calls, never inside a callback a feed is
+    # waiting on, so it stays synchronous — simpler, and deterministic for
+    # every existing test that asserts on notifications right after a run.
+    deferred = config.engine is not None
+    safe_notifier = SafeNotifier(
+        notifier or NullNotifier(),
+        deferred=deferred,
+        # Safe to touch `repository` from this callback regardless of mode:
+        # the fixture path calls send() only from this thread, and the
+        # engine path's on_tick also runs on this thread (engine_worker.
+        # _drive() docstring: "Run the engine on this thread"). SafeNotifier
+        # itself never calls on_failure from its own drain thread — see its
+        # module docstring.
+        on_failure=lambda event, reason: repository.record_notification(
+            runtime_id=config.runtime_id,
+            strategy_id=event.strategy_id,
+            execution_mode=event.execution_mode,
+            channel=safe_notifier.channel,
+            event_type=event.event_type,
+            message=event.rendered(),
+            delivered=False,
+            failure_reason=reason,
+        ),
+    )
 
     session = repository.open_session(
         runtime_id=config.runtime_id,
@@ -319,6 +418,10 @@ def _run_locked(
                 control_queue=control_queue,
             )
         finally:
+            # Order matters: close() drains any queued deferred sends and can
+            # still call on_failure (repository.record_notification) while
+            # doing so, so the database must still be open when it runs.
+            safe_notifier.close()
             database.close()
 
     strategy = FixtureSignalStrategy(
@@ -430,6 +533,7 @@ def _run_locked(
                             runtime_id=config.runtime_id,
                             strategy_id=config.strategy_id,
                             execution_mode=config.execution_mode,
+                            correlation_id=result.correlation_id,
                         )
                     )
 
@@ -461,6 +565,7 @@ def _run_locked(
         )
         heartbeat.beat(HealthState.FAILED, force=True)
         _log.exception("worker failed strategy_id=%s", config.strategy_id)
+        safe_notifier.close()
         database.close()
         return outcome
 
@@ -476,6 +581,7 @@ def _run_locked(
     )
     repository.close_session(session.id)
     heartbeat.beat(HealthState.STOPPED, force=True)
+    safe_notifier.close()
     database.close()
     return outcome
 
@@ -617,9 +723,11 @@ def _maybe_square_off(
 
     signal = strategy.square_off_signal(candle)
     acted = False
+    correlation_id: str | None = None
     if signal is not None:
         result = lifecycle.handle_signal(signal, trading_date=config.trading_date)
         acted = result.traded
+        correlation_id = result.correlation_id
 
     repository.save_strategy_state(
         runtime_id=config.runtime_id,
@@ -637,6 +745,7 @@ def _maybe_square_off(
             runtime_id=config.runtime_id,
             strategy_id=config.strategy_id,
             execution_mode=config.execution_mode,
+            correlation_id=correlation_id,
         )
     )
     return SquareOffState.COMPLETED, acted

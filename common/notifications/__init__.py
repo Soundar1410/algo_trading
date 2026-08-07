@@ -9,6 +9,7 @@ from .base import (
     RecordingNotifier,
     SafeNotifier,
 )
+from .factory import build_notifier
 from .telegram import TelegramNotifier
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "RecordingNotifier",
     "SafeNotifier",
     "TelegramNotifier",
+    "build_notifier",
 ]
