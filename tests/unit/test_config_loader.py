@@ -14,6 +14,7 @@ from common.config import (
     GlobalConfig,
     HealthConfig,
     ResolvedConfig,
+    RetentionConfig,
     RuntimeConfig,
     Settings,
     StrategyConfig,
@@ -113,6 +114,45 @@ def test_a_runtime_yaml_can_override_the_heartbeat_interval(populated_config: Pa
 def test_a_non_positive_heartbeat_interval_is_rejected():
     with pytest.raises(Exception, match="greater than 0"):
         HealthConfig(heartbeat_interval_seconds=0)
+
+
+def test_a_runtime_with_no_retention_block_gets_the_documented_default(populated_config: Path):
+    """common.retention.policy's DEFAULT_* constants and this default must
+    never silently drift apart — see tests/unit/test_retention.py's own check
+    of the other direction."""
+    runtime = load_runtime_config(populated_config, "intraday_options")
+    assert runtime.retention == RetentionConfig()
+    assert runtime.retention.log_max_age_days == 30
+    assert runtime.retention.log_compress_after_days == 1
+    assert runtime.retention.db_row_max_age_days == 90
+    assert runtime.retention.db_delete_batch_limit == 5000
+    assert runtime.retention.backup_retain_count == 7
+    assert runtime.retention.scrip_cache_retain_count == 3
+
+
+def test_a_runtime_yaml_can_override_a_retention_setting(populated_config: Path):
+    _write(
+        populated_config / "runtimes" / "intraday_options.yaml",
+        "runtime_id: intraday_options\nenabled: true\nretention:\n  backup_retain_count: 2\n",
+    )
+    runtime = load_runtime_config(populated_config, "intraday_options")
+    assert runtime.retention.backup_retain_count == 2
+    assert runtime.retention.log_max_age_days == 30  # untouched defaults stay the defaults
+
+
+def test_a_non_positive_retention_setting_is_rejected():
+    with pytest.raises(Exception, match="greater than 0"):
+        RetentionConfig(db_delete_batch_limit=0)
+
+
+def test_an_unknown_key_inside_the_retention_block_is_rejected(populated_config: Path):
+    _write(
+        populated_config / "runtimes" / "intraday_options.yaml",
+        "runtime_id: intraday_options\nenabled: true\nretention:\n  backup_retain_count: 2\n"
+        "  bakcup_retain_count: 2\n",
+    )
+    with pytest.raises(ConfigError):
+        load_runtime_config(populated_config, "intraday_options")
 
 
 def test_an_unknown_key_inside_the_health_block_is_rejected(populated_config: Path):

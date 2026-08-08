@@ -77,7 +77,9 @@ def main(argv: list[str] | None = None) -> int:
     paths = load_paths(settings=settings)
     paths.ensure_writable_dirs()
     # Installed first: everything below this line is redacted.
-    redactor = setup_logging(log_dir=paths.log_root, settings=settings)
+    redactor = setup_logging(
+        level=settings.algo_log_level, log_dir=paths.log_root, settings=settings
+    )
 
     client_id = _secret(settings.dhan_client_id)
     if not client_id:

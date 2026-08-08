@@ -1,21 +1,29 @@
-"""``runtimes.intraday_options.__main__.build_supervisor``'s strategy filter.
+"""``runtimes.intraday_options.__main__``: strategy filtering and startup order.
 
 Phase 7 Part 4's ``scripts/start_strategy.py`` needs a supervisor that admits
 exactly one strategy while still going through the same admission path an
 unfiltered start does — the spec is explicit that a bare worker is never
 spawned outside a supervisor. ``build_supervisor`` itself had no test before
 Part 4 added ``strategy_ids``; these are the first.
+
+Phase 7 Part 5 added a backup/migrate/retain sequence to ``main`` itself,
+strictly before authentication — the one call site
+``common.retention.backup_database`` and ``common.retention.run_retention``
+are invoked from. ``test_main_backs_up_before_migrating_and_retains_after``
+exercises that ordering directly, stopping short of authentication (no
+credentials are configured, matching every other test in this suite).
 """
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
 
 from common.config import load_paths
 from common.market_data import RecordedFeedAdapter, load_tick_tape
-from runtimes.intraday_options.__main__ import build_supervisor
+from runtimes.intraday_options.__main__ import EXIT_NO_CREDENTIALS, build_supervisor, main
 
 RUNTIME_ID = "intraday_options"
 
@@ -107,3 +115,52 @@ def test_a_filter_matching_nothing_admits_nothing_not_an_error(populated_config,
         strategy_ids=frozenset({"does_not_exist"}),
     )
     assert _admitted_ids(supervisor) == set()
+
+
+def test_main_backs_up_before_migrating_and_retains_after(
+    populated_config: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The pre-credential startup sequence: backup, then migrate, then retain.
+
+    No Dhan credentials are configured (``isolated_env`` already cleared
+    them), so ``main`` returns ``EXIT_NO_CREDENTIALS`` right after this
+    sequence runs — before any network call, exactly where the assertions
+    below need it to stop.
+    """
+    monkeypatch.setenv("PROJECT_ROOT", str(tmp_path))
+    paths = load_paths(tmp_path)
+    db_path = paths.database_path(RUNTIME_ID)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE pre_migration_marker (x INTEGER)")
+    conn.commit()
+    conn.close()
+
+    exit_code = main(["--runtime-id", RUNTIME_ID, "--config-root", str(populated_config)])
+
+    assert exit_code == EXIT_NO_CREDENTIALS
+
+    # Backup ran before migration: the snapshot has only the marker table,
+    # not the real schema migration 0001+ creates.
+    backups = list(paths.backup_root.glob(f"{RUNTIME_ID}_*.db"))
+    assert len(backups) == 1
+    backup_conn = sqlite3.connect(str(backups[0]))
+    try:
+        backup_tables = {
+            row[0]
+            for row in backup_conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+    finally:
+        backup_conn.close()
+    assert backup_tables == {"pre_migration_marker"}
+
+    # Migration then ran against the live database: the real schema exists.
+    live_conn = sqlite3.connect(str(db_path))
+    try:
+        live_tables = {
+            row[0]
+            for row in live_conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+    finally:
+        live_conn.close()
+    assert {"schema_migrations", "runtime_sessions", "errors"} <= live_tables

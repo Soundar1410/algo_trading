@@ -305,7 +305,10 @@ def run_worker(
     # starts a fresh interpreter, so the parent's registration never carried
     # over, and this worker's logs relied on pattern redaction alone.
     setup_logging(
-        log_dir=config.log_dir, log_file_name=f"{config.strategy_id}.log", settings=settings
+        level=settings.algo_log_level,
+        log_dir=config.log_dir,
+        log_file_name=f"{config.strategy_id}.log",
+        settings=settings,
     )
     outcome = WorkerOutcome()
 

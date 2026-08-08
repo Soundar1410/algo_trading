@@ -69,6 +69,28 @@ class HealthConfig(_StrictModel):
     heartbeat_interval_seconds: float = Field(default=10.0, gt=0)
 
 
+class RetentionConfig(_StrictModel):
+    """Storage-growth bounds for one runtime group (Phase 7 Part 5, spec
+    section 12: "Do not allow storage growth to remain unbounded").
+
+    Applied once per controlled startup by
+    :func:`common.retention.run_retention` (plus
+    :func:`common.retention.backup_database`, called separately and earlier,
+    before migration). Every default below must match
+    ``common.retention.policy``'s constant of the same name — the same
+    discipline :class:`HealthConfig` already follows for its heartbeat
+    default against ``common.health.heartbeat.DEFAULT_INTERVAL_SECONDS``; see
+    ``tests/unit/test_config_loader.py``'s check of the other direction.
+    """
+
+    log_max_age_days: int = Field(default=30, gt=0)
+    log_compress_after_days: int = Field(default=1, gt=0)
+    db_row_max_age_days: int = Field(default=90, gt=0)
+    db_delete_batch_limit: int = Field(default=5000, gt=0)
+    backup_retain_count: int = Field(default=7, gt=0)
+    scrip_cache_retain_count: int = Field(default=3, gt=0)
+
+
 class RuntimeConfig(_StrictModel):
     """One strategy group: lifecycle and live permission, never a shared mode."""
 
@@ -78,6 +100,7 @@ class RuntimeConfig(_StrictModel):
     shared_market_feed: bool = True
     database: str | None = None
     health: HealthConfig = Field(default_factory=HealthConfig)
+    retention: RetentionConfig = Field(default_factory=RetentionConfig)
 
     @field_validator("runtime_id")
     @classmethod

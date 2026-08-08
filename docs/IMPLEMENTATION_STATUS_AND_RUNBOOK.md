@@ -7,9 +7,9 @@ the next phase. Updated after every phase.
 
 | | |
 |---|---|
-| **Current phase** | **Phase 7 — Operations, Part 4 of 5 complete** (PID handling and operator commands). PID ownership now discriminates on `psutil.Process.create_time()`, not liveness alone — demonstrated fail-first against unmodified code before the fix, per the plan's own standard (**D76**). Fixing it surfaced two previously-hidden bugs: `multiprocessing.Process(target=run_worker, ...)` was silently discarding every real spawned worker's exit code (**D77**), which unmasked a strategy-id correlation-token collision the parallel-worker test had never actually reached (**D78**) — both fixed. Seven new operator scripts (`status`, `validate_environment`, `stop_runtime`, `stop_strategy`, `square_off --confirm`, `start_runtime`, `start_strategy`) plus `authenticate` (a pure alias for `auth_bootstrap`), an `audit_events` table (migration `0004`), and a file-based square-off request channel (`common/process/square_off_requests.py`) polled by both the fixture and ported-engine worker paths — never a second writer against `positions`. `tests/unit/test_scripts_are_read_only.py` now proves two different things for two tiers: the read-only tier (unchanged Dhan-API-safety checks) and a new control tier (no broker import, no direct write to a trading table). Part 5 (retention and backups) remains. |
-| **Next phase** | Phase 7 Part 5 — retention and backups. |
-| **Last updated** | 7 August 2026 — Phase 7 Part 4 complete, see [Known limitations](#6-known-limitations) |
+| **Current phase** | **Phase 7 — Operations, Part 5 of 5 complete** (retention and backups). **Phase 7 is complete.** `common/retention/` adds a policy module (the five retained tables, and — explicitly, negatively — the four it must never touch) and one entry point, `run_retention()`, called once at controlled startup (`runtimes/intraday_options/__main__.py:main`) — never a cron, never a thread on the trading path. Bounded age-based deletion for `runtime_heartbeats`/`notifications`/`errors`/`feed_events`/`auth_events` runs in one transaction; log compression and age-based deletion layer on top of the existing `RotatingFileHandler` size cap; a pre-migration database backup (SQLite's own online backup API, not a raw file copy) with a configurable retained-backup count runs before migration, at the same call site — backup only, explicitly not the Phase 10 rollback machinery, and the comments in `common/persistence/migrations.py` that used to imply otherwise are corrected (**D80**). `ScripMasterCache.prune()`, unreachable since Phase 4, gets its first real caller. An audit-found bug is fixed along the way: `Settings.algo_log_level` was read from the environment and never once passed to `setup_logging(level=...)` at any of its four call sites, so every process ran at `INFO` regardless of configuration (**D79**). |
+| **Next phase** | Phase 8 — LaunchAgent validation. |
+| **Last updated** | 8 August 2026 — Phase 7 complete, see [Known limitations](#6-known-limitations) |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
 | **Live order placement** | **Not implemented.** Fail-closed. Phase 10 only. |
@@ -27,7 +27,7 @@ the next phase. Updated after every phase.
 | 4 | Candle, indicator and paper-execution foundation | **Complete.** **Part 1 complete** (real contract resolution — closes 17, alarms 15). **Part 2 complete** (indicator layer — closes D21). **Part 3 complete** (continuity, timezone, wall-clock square-off — closes 4 and 7, and a live blocker). **Part 4 complete** (warm-up source and injection — closes 16). **Part 5 complete** (`PaperBroker` realism — closes 5 and D11; the live Full-mode gate item ran 6 August 2026 and passed, closing known limitation 20 along the way). **Phase 4 complete** — all five parts done, its one live gate item proven rather than asserted |
 | 5 | Mixed-mode supervisor and persistence | **Complete** |
 | 6 | Paper recovery and expiry handling | **Complete — all five parts.** **Part 1** (daily risk state across a restart — closes the risk-limit-bypass gap in bullet 1, and finds/fixes **D58**/limitation 22 along the way). **Part 2** (position-management state snapshot/restore — exit-policy state via `BaseExit`/`RiskManager`/`BaseStrategy` snapshot hooks, and stop/target persistence through a widened `RiskManager`/`ExecutionGateway`, fail-open on a bad snapshot, negative-control-tested). **Part 3** (MFE/MAE, square-off attempts, state-version validation and position-gated last-candle idempotency — the rest of §7's "restore at minimum" list). **Part 4** (`force_square_off_before_expiry` composed into the existing `SquareOffAuthority` seam — **D66-D68**; `simulate_exchange_settlement` refused at config load, none of spec section 11's eight settlement-policy items built — limitation 27). **Part 5** (the phase's record: bullets re-checked against what is built, not assumed; D56's persistence-identity gap given a written candidate direction, not an implementation — **D69**, limitation 30). Bullet 2's fixed strikes/basket legs/rolling counters remain blocked on `FixedStrikeEngine`/`MultiLegEngine` — D56/D34, unchanged, not this phase's to close |
-| 7 | Operations | **Part 1 complete** (health snapshot layer — `common/health/snapshot.py`, `auth_events`/`feed_events` writers and producers, configurable heartbeat interval). **Part 2 complete** (Telegram in production — real notifier construction at both entrypoints, deferred delivery, rate limiting/aggregation, `notifications`-table persistence, redacted rendering — D71-D74). **Part 3 complete** (the Streamlit dashboard — Master/Intraday Options/System Health pages plus two honest stubs, reading through `common.health.snapshot` for operational state — D75; addendum adds `effective_live_gate` status to Master, config-sourced, the one deliberate exception to database-only reads). **Part 4 complete** (PID ownership hardened onto `create_time()`, fail-first proven — D76; two previously-hidden bugs found and fixed along the way — D77/D78; seven operator scripts plus `authenticate`, `audit_events` migration `0004`, file-based square-off request channel). Part 5 (retention) not started |
+| 7 | Operations | **Complete — all five parts.** **Part 1** (health snapshot layer — `common/health/snapshot.py`, `auth_events`/`feed_events` writers and producers, configurable heartbeat interval). **Part 2** (Telegram in production — real notifier construction at both entrypoints, deferred delivery, rate limiting/aggregation, `notifications`-table persistence, redacted rendering — D71-D74). **Part 3** (the Streamlit dashboard — Master/Intraday Options/System Health pages plus two honest stubs, reading through `common.health.snapshot` for operational state — D75; addendum adds `effective_live_gate` status to Master, config-sourced, the one deliberate exception to database-only reads). **Part 4** (PID ownership hardened onto `create_time()`, fail-first proven — D76; two previously-hidden bugs found and fixed along the way — D77/D78; seven operator scripts plus `authenticate`, `audit_events` migration `0004`, file-based square-off request channel). **Part 5** (`common/retention/` — bounded age-based DB purge in one transaction, log compression/deletion, pre-migration backup with retained-backup count, one entry point at controlled startup — D80; `ScripMasterCache.prune()` given its first caller; `Settings.algo_log_level` wiring bug found and fixed — D79) |
 | 8 | LaunchAgent validation | Not started |
 | 9 | Real strategies | Not started |
 | 10 | Controlled live readiness | Not started |
@@ -2217,6 +2217,8 @@ guard. See deviation D6.
 | **D76** | **The PID-reuse incident was demonstrated on unmodified code before `common/process/locks.py` was touched, per the plan's fail-first standard — not assumed from reading the code** | `current_owner()` checked liveness alone (`_process_is_alive`, a bare `os.kill(pid, 0)`), and the module's own docstring already (falsely) claimed a command/start-marker check that nothing in the code performed. `test_a_live_process_that_is_not_ours_is_not_an_owner` (`tests/unit/test_process_locks.py`) was added first and run against the unmodified module: it spawns a real, signalable `time.sleep(60)` subprocess (deliberately not `pid: 1` — `_process_is_alive` treats a `PermissionError` from an unsignallable PID as "alive", so a `pid: 1` fixture would exercise the code path without reproducing the actual hazard: SIGTERM to `launchd` fails with `EPERM` and harms nothing), writes its PID into a PID-file fixture claiming the identity `intraday_options.supervisor`, and asserts `current_owner() is None`. Observed failure on unmodified code: `current_owner()` returned a populated `LockOwner(pid=29477, ...)` for the unrelated live process — proof that a PID recycled onto any live, signalable process today reads as a valid owner. Fixed by discriminating on `psutil.Process.create_time()` (exact, kernel-assigned once at process creation; a reused PID cannot share it) rather than the recorded command string, which is unstable in exactly the cases that matter — a `spawn`ed worker's `sys.argv` is a multiprocessing bootstrap line, and a repository move changes every recorded path, so matching on it risked the *inverse* incident (refusing to stop a supervisor that genuinely is ours). The paired over-strictness guard, `test_a_genuinely_live_holder_is_still_recognised`, covers a lock this process actually holds and a spawned child with a multiprocessing-bootstrap-shaped `command` string in its fixture — proving a command mismatch alone no longer matters — and passed both before and after the fix, so the tightened check provably did not swing the other way. `clear_stale_pid_file()` (verified stale cleanup — spec step 6's second clause, previously unimplemented) and `IntradayOptionsSupervisor` acting on `EXIT_DUPLICATE` (previously recorded and never inspected — a refused worker was silently a zero-length run) round out Part 4's PID hardening. See "PID-reuse drill, by hand" in Part 4's own writeup below for the same defect confirmed once more against the real `scripts/stop_runtime.py`. |
 | **D77** | **`multiprocessing.Process(target=run_worker, ...)` discarded every `WorkerOutcome.exit_code` a real spawned worker computed — `worker_process.exitcode` was always 0 regardless — found by Part 4's own new test, not by reading the code for it** | `multiprocessing` calls its `target` and discards the return value; only an uncaught exception or an explicit `sys.exit()` changes a spawned child's real OS exit code, and `run_worker` only ever returned `WorkerOutcome`. `test_a_duplicate_worker_is_reported_not_silent` (`tests/end_to_end/test_supervisor.py`, written to prove the supervisor now acts on `EXIT_DUPLICATE` — see D76) asserted `result.worker_exit_codes["skelfix"] == EXIT_DUPLICATE` against a real spawned duplicate and got `0`. This was not specific to `EXIT_DUPLICATE`: the integrity-check-failure exit path and the per-candle exception handler's `exit_code = 1` in `worker.py` were equally invisible to `worker_exit_codes` through any real `spawn`ed process, every one of them silently reporting success. Fixed with a new `run_worker_process()` wrapper — calls `run_worker()` then `sys.exit(outcome.exit_code)` — used **only** as the `multiprocessing.Process` target; `run_worker()` itself is unchanged, because dozens of existing tests call it directly, in the test's own process, and expect a returned `WorkerOutcome`, not a raised `SystemExit`. `supervisor.py`'s `context.Process(target=...)` now points at `run_worker_process`. |
 | **D78** | **`strategy_token()`'s 4-character truncation lets two different strategy ids collide on the same `correlation_id`, which the parallel-worker test only reached once D77 stopped masking the crash as a clean exit** | Re-running the suite after fixing D77 surfaced a second, previously-hidden failure: `test_two_workers_receive_identical_bars` raised `sqlite3.IntegrityError: UNIQUE constraint failed: order_intents.correlation_id`. `common/execution/correlation.py` truncates a strategy id to 4 characters for the embedded token; `"skelone"` and `"skeltwo"` both truncate to `"skel"`, and since `next_sequence_number` is scoped by the full, untruncated strategy id, both strategies independently compute sequence 1 for their first order — byte-identical `correlation_id` strings. Previously invisible because D77 silently turned the resulting crash (exit code 1) into a reported 0. Not fixed by redesigning the correlation-ID format — too large a change, under time pressure, to a heavily-used, well-tested module — but by refusing the collision at admission time: `strategy_token()` is now a public function (the exact token `build_correlation_id` will embed, explicitly **not** guaranteed unique), and `IntradayOptionsSupervisor.add_worker()` refuses the second strategy whose token collides with an already-admitted one, recording an `errors` row (`component="supervisor.correlation_token_collision"`) and a notification — the same individual-refusal shape the existing live-gate admission check already uses, never crashing the group or corrupting `order_intents`. The triggering test was renamed to non-colliding strategy ids (`alphaskel`/`bravoskel`) to verify its own original intent again; `test_a_worker_whose_correlation_token_collides_is_refused_not_crashed` covers the original colliding pair directly. |
+| **D79** | **`Settings.algo_log_level` was read from the environment since Phase 0 and never once reached `setup_logging(level=...)` — every process has been running at `INFO` regardless of configuration** | Found during the Phase 7 audit, not by a failing test: nothing asserted on the *effective* root logger level, only on redaction and rotation. `setup_logging`'s `level` parameter defaults to `"INFO"` and none of the four production call sites (`runtimes/intraday_options/__main__.py`, `runtimes/intraday_options/worker.py`, `scripts/auth_bootstrap.py`, `scripts/capture_live_tape.py`) passed it — each called `setup_logging(log_dir=..., settings=settings)` and relied on the default, even though `settings.algo_log_level` was sitting unread on the same object one line above. `ALGO_LOG_LEVEL=DEBUG` in `.env` has therefore never changed anything a real process did. Fixed at all four sites: `setup_logging(level=settings.algo_log_level, log_dir=..., settings=settings)`. |
+| **D80** | **`common/persistence/migrations.py` claimed a future destructive migration "arrives with backup and rollback machinery" — Phase 7 Part 5 built the backup half, and the comments needed correcting to stop implying the other half exists too** | Two places said it: the `_DESTRUCTIVE_RE` guard's own comment, and the `MigrationError` message `_reject_destructive` raises when a migration script contains a rejected statement. Part 5's `common.retention.backup_database` now runs before every migration on every controlled startup, so a pre-migration snapshot genuinely exists by the time a migration applies — but nothing restores from it, checks it against a running schema, or replays writes made since it was taken. Left uncorrected, the comment and the error message a future implementer reads right before attempting a destructive migration would overstate what already exists and understate what that migration still needs to bring. Both are rewritten to say precisely that: backup exists (Part 5), rollback does not, and a genuinely destructive migration still needs rollback machinery built and tested before this guard is revisited. |
 
 #### D22 in detail: the rebuilt premium-candle mapping
 
@@ -4534,8 +4536,126 @@ mtime is unchanged at the recorded baseline.
 Phase 2 is complete, both blocks. **Phase 3 is complete** — all five parts, with its
 acceptance gate met in full. **Phase 4 is complete** — all five parts, its one live
 gate item run and passed. **Phase 5 is complete** — see below. **Phase 6 is
-complete** — all five parts, see below. **Phase 7 is in progress — Part 4 of 5
-complete**, see below. Next is **Phase 7 Part 5 — retention and backups**.
+complete** — all five parts, see below. **Phase 7 is complete — all five parts**,
+see below. Next is **Phase 8 — LaunchAgent validation**.
+
+### Phase 7 — Operations — **Part 5 of 5 complete** (retention and backups)
+
+Approved plan, verbatim scope: `common/retention/` with a policy module and a single
+entry point invoked at controlled startup (not a cron, not a trading-path thread); log
+compression and age-based retention on top of the existing size cap; bounded age-based
+deletion for `runtime_heartbeats`/`notifications`/`errors`/`feed_events`/`auth_events`,
+in one transaction, never touching `orders`/`fills`/`positions`/`order_intents`; a
+pre-migration database backup with a configurable retained-backup count (backup only,
+not the Phase 10 rollback machinery); `ScripMasterCache.prune()` given a real caller;
+and an audit-found fix to `Settings.algo_log_level`.
+
+**`common/retention/policy.py`** is the reviewable rule, deliberately separate from
+how it is enforced: `RETAINED_TABLES` (a fixed `dict[str, str]` of table → its
+timestamp column — `runtime_heartbeats.beat_at`, `notifications.created_at`,
+`errors.occurred_at`, `feed_events.occurred_at`, `auth_events.occurred_at`) and
+`NEVER_PURGED_TABLES` (`orders`/`fills`/`positions`/`order_intents`, stated explicitly
+rather than left as "everything not in the allowlist" so a reviewer — and
+`tests/unit/test_retention.py`'s own disjointness check — can see the boundary without
+reading SQL). `common/retention/database.py`'s `purge_old_rows()` deletes past a
+configured age from every table in the allowlist, in one `Database.transaction()` —
+a crash mid-purge must not leave `notifications` trimmed and `errors` untouched,
+silently disagreeing about how far back each table's history goes — and bounds each
+table's delete with a `LIMIT`ed subquery (`DELETE FROM t WHERE id IN (SELECT id FROM t
+WHERE col < ? ORDER BY col LIMIT ?)`) rather than `DELETE ... LIMIT` directly, since
+the stdlib `sqlite3` build this project uses does not enable
+`SQLITE_ENABLE_UPDATE_DELETE_LIMIT`. A database with months of backlog on its first
+run does not hold the write lock for one unbounded delete; each controlled startup
+chips away at the rest.
+
+**`common/retention/logs.py`**'s `sweep_logs()` adds the two axes the existing
+`RotatingFileHandler` size cap (10 MB × 10 backups per log name) does not cover: it
+gzips a rotated backup once it is older than a configurable "compress after" age, and
+deletes anything — compressed or not — past a configurable "max age", using each
+file's mtime (which is exactly when `RotatingFileHandler` stopped writing to it). Only
+rotated backups (`name.log.N` / `name.log.N.gz`) are ever touched; the active file
+(`algo_trading.log`, `io_alpha.log`) is never compressed or deleted, since it is open
+for writing by a live process.
+
+**`common/retention/backup.py`**'s `backup_database()` runs before migration, from the
+same call site retention runs after — see the ordering note below. It uses
+`sqlite3.Connection.backup()`, SQLite's own online backup API, rather than a raw file
+copy, so a WAL-mode database still produces one consistent snapshot file instead of a
+copy that misses whatever is still sitting in a separate `-wal` file. A database that
+does not exist yet (a fresh install, before the first migration ever runs) backs up to
+`None` rather than failing startup. Old snapshots beyond the configured
+`retain_count` are pruned by filename, the same "sort chronologically, drop the
+oldest" trick `ScripMasterCache.prune()` already used.
+
+**Ordering, and why it is one call site rather than one function.** Migration itself
+happens deep inside `IntradayOptionsSupervisor.run()`, which then blocks for the whole
+trading session — driving the feed until it exhausts or a shutdown signal arrives — so
+"backup before migration, sweep after" cannot be one function called once partway
+through a multi-hour blocking call. Both steps instead run explicitly in
+`runtimes/intraday_options/__main__.py:main()`, back to back, strictly before
+authentication and before `build_supervisor()`/`.run()` are ever reached:
+`backup_database()`, then `MigrationRunner(database).run_pending()`, then
+`run_retention()`. `Supervisor.run()` still performs its own (idempotent, replay-safe)
+migration call afterward, unchanged — this was already true before Part 5 for every
+worker process too, and duplicating a no-op replay across process boundaries is an
+existing, accepted property of this migration runner, not a new one. Keeping both new
+calls at this one site, rather than also wiring them into `Supervisor.run()` or
+`worker.py`, is what keeps every existing supervisor/worker test — none of which
+expects a backup file or a retention sweep as a side effect of constructing a
+`Supervisor` directly — unmodified.
+`test_main_backs_up_before_migrating_and_retains_after`
+(`tests/unit/test_intraday_options_main.py`) proves the ordering directly: a database
+seeded with one marker table before `main()` runs backs up to a snapshot containing
+only that table, then the live database ends up with the real migrated schema —
+backup genuinely ran first.
+
+**`ScripMasterCache.prune()`** existed since Phase 4 Part 1 with no caller anywhere
+outside its own tests. `run_retention()` is that caller — it constructs a
+`ScripMasterCache(cache_dir)` and prunes it to `scrip_cache_retain_count` on every
+controlled startup, alongside the database and log sweeps.
+
+**Configuration.** `RuntimeConfig.retention: RetentionConfig` (`common/config/models.py`)
+follows the exact precedent `HealthConfig`/`heartbeat_interval_seconds` set in Part 1:
+six `Field(gt=0)` knobs (`log_max_age_days=30`, `log_compress_after_days=1`,
+`db_row_max_age_days=90`, `db_delete_batch_limit=5000`, `backup_retain_count=7`,
+`scrip_cache_retain_count=3`), each literal duplicated from — and tested against —
+`common/retention/policy.py`'s own `DEFAULT_*` constants, the same "must never
+silently drift apart" discipline `test_config_loader.py` already enforced for the
+heartbeat default. `ProjectPaths.backup_root` (`data/backups/`) is new, added to
+`ensure_writable_dirs()`.
+
+**D80** (see the deviation log): `common/persistence/migrations.py` carried two
+comments claiming that a genuinely destructive migration "arrives with backup and
+rollback machinery" once one is needed. That is no longer accurate on the backup half
+and needs stating precisely rather than left to imply more than Part 5 built: a
+pre-migration backup now exists and runs on every controlled startup, but there is
+still no rollback machinery — nothing restores from a snapshot, checks it against a
+running schema, or replays writes made since it was taken. Both comments, and the
+`MigrationError` message `_reject_destructive` raises, are corrected to say exactly
+that.
+
+**D79** (see the deviation log): the Phase 7 audit found `Settings.algo_log_level` —
+read from the environment since Phase 0, exposed on every `Settings` instance — was
+never once passed to `setup_logging(level=...)` at any of its four production call
+sites (`runtimes/intraday_options/__main__.py`, `runtimes/intraday_options/worker.py`,
+`scripts/auth_bootstrap.py`, `scripts/capture_live_tape.py`). Every process has been
+running at `setup_logging`'s own hardcoded `"INFO"` default regardless of what
+`ALGO_LOG_LEVEL` was actually set to. Fixed at all four call sites.
+
+**Deliberately not done in Part 5:**
+
+- No restore/rollback tooling for a pre-migration backup — backup only, explicitly;
+  see D80 and the migrations-runner docstring. Phase 10's job, if a genuinely
+  destructive migration ever needs it.
+- No cross-runtime coordination for the shared `logs/` directory. `positional_options`
+  has no supervisor yet (D56) — `intraday_options` is the only caller of
+  `run_retention()` today — so two runtime groups sweeping the same log directory with
+  different configured ages is a real but currently unreachable scenario, not one this
+  part had a second runtime to test against.
+- No retention for `option_chain_snapshots` or `paper_fill_quotes` (migration `0003`)
+  or for `audit_events` (migration `0004`) — the plan named five tables, not seven; an
+  operator audit trail being retained forever is the intended behaviour, not an
+  oversight.
 
 ### Phase 7 — Operations — **Part 4 of 5 complete** (PID handling and operator commands)
 

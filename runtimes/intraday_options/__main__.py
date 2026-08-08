@@ -27,6 +27,7 @@ from pathlib import Path
 from common.authentication import AuthBootstrap, AuthCredentials, AuthError
 from common.config import (
     ProjectPaths,
+    RuntimeConfig,
     Settings,
     discover_enabled_strategies,
     effective_live_gate,
@@ -38,6 +39,8 @@ from common.config.secrets import read_secret
 from common.logging import get_logger, setup_logging
 from common.market_data.adapter import MarketFeedAdapter
 from common.notifications import build_notifier
+from common.persistence import Database, MigrationRunner
+from common.retention import backup_database, run_retention
 from common.utils.timeutils import local_date_in, now_ist
 
 from .config_adapter import build_worker_config
@@ -50,6 +53,19 @@ EXIT_FAILED = 1
 EXIT_NO_CREDENTIALS = 2
 EXIT_RUNTIME_DISABLED = 3
 EXIT_STRATEGY_NOT_FOUND = 4
+
+
+def _database_path(paths: ProjectPaths, runtime_cfg: RuntimeConfig, runtime_id: str) -> Path:
+    """Where this runtime group's operational database lives.
+
+    ``runtime_cfg.database`` (relative to the project root) when the runtime
+    YAML sets one, else the conventional ``data/operational/<runtime_id>.db``
+    — the same choice :func:`main` and :func:`build_supervisor` both need, so
+    it lives here once rather than as two copies that could drift.
+    """
+    if runtime_cfg.database:
+        return paths.project_root / runtime_cfg.database
+    return paths.database_path(runtime_id)
 
 
 def build_supervisor(
@@ -80,11 +96,7 @@ def build_supervisor(
     settings = settings if settings is not None else load_settings()
     trading_date = trading_date or local_date_in(now_ist()).isoformat()
     runtime_cfg = load_runtime_config(config_root, runtime_id)
-    database_path = (
-        paths.project_root / runtime_cfg.database
-        if runtime_cfg.database
-        else paths.database_path(runtime_id)
-    )
+    database_path = _database_path(paths, runtime_cfg, runtime_id)
 
     supervisor = IntradayOptionsSupervisor(
         SupervisorConfig(
@@ -145,7 +157,9 @@ def main(argv: list[str] | None = None) -> int:
     settings = load_settings()
     paths = load_paths(settings=settings)
     paths.ensure_writable_dirs()
-    redactor = setup_logging(log_dir=paths.log_root, settings=settings)
+    redactor = setup_logging(
+        level=settings.algo_log_level, log_dir=paths.log_root, settings=settings
+    )
 
     runtime_cfg = load_runtime_config(args.config_root, args.runtime_id)
     if not runtime_cfg.enabled:
@@ -166,6 +180,35 @@ def main(argv: list[str] | None = None) -> int:
                 f"runtimes/{args.runtime_id}.yaml (enabled: {sorted(enabled_ids) or ['none']})."
             )
             return EXIT_STRATEGY_NOT_FOUND
+
+    # Backup, migrate, retain — in that order, once, here. This is the
+    # controlled-startup entry point (spec section 12): never a cron, never a
+    # thread on the trading path, and strictly before authentication or any
+    # worker exists, so storage housekeeping cannot race a trading write.
+    # build_supervisor() below re-opens this same database and re-runs
+    # migration (a no-op replay — see MigrationRunner._apply_one) because it
+    # is also called directly by tests without going through main(); doing
+    # the backup and the retention sweep only here, rather than there too,
+    # is what keeps them at exactly one call site.
+    database_path = _database_path(paths, runtime_cfg, args.runtime_id)
+    database = Database(database_path)
+    backup_database(
+        database.path,
+        paths.backup_root,
+        retain_count=runtime_cfg.retention.backup_retain_count,
+    )
+    MigrationRunner(database).run_pending()
+    run_retention(
+        database=database,
+        log_dir=paths.log_root,
+        cache_dir=paths.cache_root,
+        log_max_age_days=runtime_cfg.retention.log_max_age_days,
+        log_compress_after_days=runtime_cfg.retention.log_compress_after_days,
+        db_row_max_age_days=runtime_cfg.retention.db_row_max_age_days,
+        db_delete_batch_limit=runtime_cfg.retention.db_delete_batch_limit,
+        scrip_cache_retain_count=runtime_cfg.retention.scrip_cache_retain_count,
+    )
+    database.close()
 
     client_id = read_secret(settings.dhan_client_id)
     if not client_id:

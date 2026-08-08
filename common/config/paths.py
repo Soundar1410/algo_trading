@@ -99,6 +99,12 @@ class ProjectPaths:
         return self.data_root / "cache"
 
     @property
+    def backup_root(self) -> Path:
+        """Pre-migration database snapshots (Phase 7 Part 5). Never raw
+        caches or PID files — spec section 12 excludes both explicitly."""
+        return self.data_root / "backups"
+
+    @property
     def reference_root(self) -> Path:
         return self.data_root / "reference"
 
@@ -133,6 +139,7 @@ class ProjectPaths:
             self.cache_root,
             self.pid_root,
             self.lock_root,
+            self.backup_root,
         ):
             path.mkdir(parents=True, exist_ok=True)
 

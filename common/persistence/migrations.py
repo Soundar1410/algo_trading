@@ -67,9 +67,15 @@ class Migration:
 #: Statements that make a migration non-replayable. The runner's crash-safety
 #: rests on every script being a no-op on re-run, so these are rejected rather
 #: than trusted to be used carefully. This is a *guard*, not the destructive
-#: migration tooling the spec defers to the controlled-live phase — when a
-#: genuinely destructive migration is first needed, it arrives with backup and
-#: rollback machinery and this list is revisited then.
+#: migration tooling the spec defers to the controlled-live phase.
+#:
+#: Phase 7 Part 5 added :func:`common.retention.backup_database`, called
+#: before this runner on every controlled startup — so a pre-migration
+#: snapshot now exists by the time a migration runs. That is *backup only*.
+#: There is still no rollback machinery: nothing here restores from that
+#: snapshot, verifies it against a running schema, or replays writes made
+#: since it was taken. A genuinely destructive migration still needs that
+#: built and tested before this list is revisited.
 _DESTRUCTIVE_RE = re.compile(
     r"(?im)^\s*(DROP\s+(TABLE|INDEX|VIEW|TRIGGER)|DELETE\s+FROM|TRUNCATE|"
     r"ALTER\s+TABLE\s+\S+\s+DROP)\b"
@@ -87,8 +93,10 @@ def _reject_destructive(migration: Migration, script: str) -> None:
     if _DESTRUCTIVE_RE.search(script):
         raise MigrationError(
             f"Migration {migration.path.name} contains a destructive statement. "
-            "Migrations must be additive and re-runnable; destructive changes are "
-            "deferred to the controlled-live phase, with backup and rollback."
+            "Migrations must be additive and re-runnable; a destructive change is "
+            "deferred to the controlled-live phase, which must bring rollback "
+            "machinery with it — a pre-migration backup alone (Phase 7 Part 5) is "
+            "not enough to safely run one."
         )
     if _NON_IDEMPOTENT_CREATE_RE.search(script):
         raise MigrationError(
