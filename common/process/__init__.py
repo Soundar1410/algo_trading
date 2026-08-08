@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .legacy_guard import LegacySystemStatus, legacy_system_status
+from .legacy_guard import LaunchdLabelState, LegacySystemStatus, legacy_system_status
 from .locks import (
     DuplicateProcessError,
     ProcessLock,
@@ -21,6 +21,7 @@ from .square_off_requests import (
 __all__ = [
     "SHUTDOWN_SIGNALS",
     "DuplicateProcessError",
+    "LaunchdLabelState",
     "LegacySystemStatus",
     "ProcessLock",
     "SquareOffRequest",

@@ -41,15 +41,26 @@ def _stub_preflight(monkeypatch: pytest.MonkeyPatch, *, passes: bool) -> None:
 
 
 class _CountingSupervisor:
-    """Returns each code in `codes` in turn, then repeats the last forever."""
+    """Returns each code in `codes` in turn, then repeats the last forever.
 
-    def __init__(self, codes: list[int]) -> None:
+    An entry may also be a `BaseException` instance, in which case it is
+    raised instead of returned — used to exercise both the caught-and-retried
+    path (a plain `Exception`) and the deliberately-never-caught path (a
+    `SystemExit`), without a real bug inside the supervisor. Checked as
+    `BaseException`, not `Exception`, precisely because `SystemExit` is not
+    an `Exception` subclass and must still be raised, not returned as if it
+    were a bogus exit code.
+    """
+
+    def __init__(self, codes: list[int | BaseException]) -> None:
         self._codes = codes
         self.calls = 0
 
     def __call__(self, argv: list[str]) -> int:
         code = self._codes[min(self.calls, len(self._codes) - 1)]
         self.calls += 1
+        if isinstance(code, BaseException):
+            raise code
         return code
 
 
@@ -137,6 +148,98 @@ def test_a_retryable_code_that_recovers_stops_retrying_immediately(
 
     assert result == sl.supervisor_main.EXIT_OK
     assert supervisor.calls == 2
+
+
+def test_an_unexpected_exception_is_retried_like_a_transient_failure(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The fail-first case: run against unmodified `supervised_launch.py` and
+    this raises `ValueError` straight out of `sl.run(...)` uncaught — no
+    retry, no `errors` row, the whole bounded-restart mechanism bypassed.
+    With the fix, an unexpected exception is treated exactly like a
+    retryable exit code."""
+    _stub_preflight(monkeypatch, passes=True)
+    supervisor = _CountingSupervisor([ValueError("transient bug"), sl.supervisor_main.EXIT_OK])
+    monkeypatch.setattr(sl.supervisor_main, "main", supervisor)
+
+    result = sl.run(
+        runtime_id="intraday_options",
+        config_root=Path("config"),
+        max_attempts=3,
+        backoff_seconds=0.0,
+    )
+
+    assert result == sl.supervisor_main.EXIT_OK
+    assert supervisor.calls == 2
+
+
+def test_an_exception_on_every_attempt_gives_up_after_max_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _stub_preflight(monkeypatch, passes=True)
+    supervisor = _CountingSupervisor([RuntimeError("always broken")])
+    monkeypatch.setattr(sl.supervisor_main, "main", supervisor)
+
+    result = sl.run(
+        runtime_id="intraday_options",
+        config_root=Path("config"),
+        max_attempts=3,
+        backoff_seconds=0.0,
+    )
+
+    assert result == sl.EXIT_GAVE_UP
+    assert supervisor.calls == 3
+
+
+def test_a_system_exit_is_never_caught_or_retried(monkeypatch: pytest.MonkeyPatch):
+    """`except Exception`, never `except BaseException` — a deliberate
+    `SystemExit` (or `KeyboardInterrupt`) must propagate untouched, not be
+    miscategorized as a transient failure worth retrying."""
+    _stub_preflight(monkeypatch, passes=True)
+    supervisor = _CountingSupervisor([SystemExit(2)])
+    monkeypatch.setattr(sl.supervisor_main, "main", supervisor)
+
+    with pytest.raises(SystemExit):
+        sl.run(
+            runtime_id="intraday_options",
+            config_root=Path("config"),
+            max_attempts=3,
+            backoff_seconds=0.0,
+        )
+
+    assert supervisor.calls == 1
+
+
+@pytest.mark.real_audit
+def test_an_exception_attempt_is_recorded_with_its_type_and_message(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.setenv("PROJECT_ROOT", str(tmp_path))
+    _stub_preflight(monkeypatch, passes=True)
+    supervisor = _CountingSupervisor([ValueError("boom, distinctly")])
+    monkeypatch.setattr(sl.supervisor_main, "main", supervisor)
+
+    result = sl.run(
+        runtime_id="intraday_options",
+        config_root=Path("config"),
+        max_attempts=1,
+        backoff_seconds=0.0,
+    )
+    assert result == sl.EXIT_GAVE_UP
+
+    paths = load_paths(tmp_path)
+    conn = connect_readonly(paths.database_path("intraday_options"))
+    try:
+        rows = conn.execute(
+            "SELECT severity, message FROM errors "
+            "WHERE component = 'supervised_launch' ORDER BY id"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert [row[0] for row in rows] == ["WARNING", "ERROR"]
+    assert all("exception=ValueError: boom, distinctly" in row[1] for row in rows)
+    assert "attempt 1/1" in rows[0][1]
 
 
 def test_a_single_max_attempt_never_sleeps(monkeypatch: pytest.MonkeyPatch):

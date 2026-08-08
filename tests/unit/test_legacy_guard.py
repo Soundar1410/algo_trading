@@ -16,6 +16,7 @@ Two kinds of test, deliberately kept apart:
 from __future__ import annotations
 
 import plistlib
+import subprocess
 
 import psutil
 import pytest
@@ -24,6 +25,7 @@ from common.process import legacy_guard
 from common.process.legacy_guard import (
     LEGACY_LAUNCHD_LABEL,
     LEGACY_LAUNCHD_PLIST_PATH,
+    LaunchdLabelState,
     LegacySystemStatus,
     legacy_system_status,
 )
@@ -64,8 +66,9 @@ def test_a_loaded_label_is_detected(monkeypatch: pytest.MonkeyPatch):
 
     status = legacy_system_status()
 
-    assert status.launchd_label_loaded is True
+    assert status.launchd_state is LaunchdLabelState.ACTIVE
     assert status.active is True
+    assert status.undetermined is False
     assert LEGACY_LAUNCHD_LABEL in status.launchd_detail
 
 
@@ -75,7 +78,7 @@ def test_an_unloaded_label_is_not_detected(monkeypatch: pytest.MonkeyPatch):
 
     status = legacy_system_status()
 
-    assert status.launchd_label_loaded is False
+    assert status.launchd_state is LaunchdLabelState.INACTIVE
 
 
 def test_launchctl_unavailable_is_reported_not_raised(monkeypatch: pytest.MonkeyPatch):
@@ -87,8 +90,50 @@ def test_launchctl_unavailable_is_reported_not_raised(monkeypatch: pytest.Monkey
 
     status = legacy_system_status()
 
-    assert status.launchd_label_loaded is False
+    assert status.launchd_state is LaunchdLabelState.UNKNOWN
     assert "unavailable" in status.launchd_detail
+
+
+# =============================================== synthetic: tri-state fail-closed
+def test_an_undetermined_launchd_check_with_no_process_refuses(monkeypatch: pytest.MonkeyPatch):
+    """The exact defect this fix closes: `launchctl` errors, no process is
+    independently found either — the state genuinely cannot be determined,
+    and that must refuse (`active`), not be silently treated as absent."""
+
+    def _raise(*args: object, **kwargs: object) -> None:
+        raise subprocess.TimeoutExpired(cmd="launchctl", timeout=5.0)
+
+    monkeypatch.setattr(legacy_guard.subprocess, "run", _raise)
+    _no_legacy_processes(monkeypatch)
+
+    status = legacy_system_status()
+
+    assert status.launchd_state is LaunchdLabelState.UNKNOWN
+    assert status.active is True
+    assert status.undetermined is True
+
+
+def test_an_undetermined_launchd_check_is_not_undetermined_if_a_process_is_found(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """`undetermined` means "no positive evidence either way" — a detected
+    process answers the question even while launchd's own signal is unknown,
+    so this must still refuse, but as a genuine detection, not an unknown."""
+
+    def _raise(*args: object, **kwargs: object) -> None:
+        raise FileNotFoundError("no launchctl on this machine")
+
+    monkeypatch.setattr(legacy_guard.subprocess, "run", _raise)
+    fake = _FakeProcess(
+        {"pid": 7, "exe": "/Volumes/Trading/Trading_Automation/bin/x", "cmdline": []}
+    )
+    monkeypatch.setattr(legacy_guard.psutil, "process_iter", lambda *a, **k: [fake])
+
+    status = legacy_system_status()
+
+    assert status.launchd_state is LaunchdLabelState.UNKNOWN
+    assert status.active is True
+    assert status.undetermined is False
 
 
 # ======================================================= synthetic: process

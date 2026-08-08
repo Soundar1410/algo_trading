@@ -150,9 +150,22 @@ def _check_disk_space(project_root: Path, problems: list[str], warnings: list[st
 
 
 def _check_legacy_system(problems: list[str]) -> None:
-    """Spec section 12/16: never run the legacy and new systems together."""
+    """Spec section 12/16: never run the legacy and new systems together.
+
+    Fail-closed: an undetermined ``launchctl`` check (unavailable, errored,
+    timed out) is reported as its own problem, distinct from a confirmed
+    detection — never printed as "OK: not detected", and never told to
+    "unload it first" when nothing was actually confirmed to unload.
+    """
     status = legacy_system_status()
-    if status.active:
+    if status.undetermined:
+        problems.append(
+            f"the legacy Trading_Automation system's state could not be determined "
+            f"({status.describe()}) — a check that cannot be verified is treated as "
+            "active, not as absent; resolve why launchctl could not be queried, then "
+            "retry"
+        )
+    elif status.active:
         problems.append(
             f"the legacy Trading_Automation system appears active ({status.describe()}) "
             "— unload it first: launchctl bootout gui/$(id -u)/"

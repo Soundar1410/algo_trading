@@ -28,6 +28,16 @@ times. Exit codes split into two groups:
   plist sets, is what finally recovers from a transient outage that outlasts
   every in-process retry.
 
+An **unexpected exception** raised out of :func:`supervisor_main.main` itself
+(a bug, not a classified exit code) is caught and folded into the same
+retryable path rather than left to escape ``run()`` — the whole reason this
+module exists is to bound restarts in-process instead of leaning on
+``launchd``'s own uncapped ``KeepAlive``, and an uncaught exception would
+silently defeat exactly that. Only :class:`Exception` is caught, never
+:class:`BaseException` — a deliberate ``SystemExit`` or ``KeyboardInterrupt``
+propagates untouched, exactly like today, and is never miscategorized as a
+transient failure worth retrying.
+
 Every attempt and its classification is written to the ``errors`` table
 through ``ExecutionRepository.record_error`` — not ``record_audit_event``:
 that table's ``action`` column is a closed vocabulary enforced by a ``CHECK``
@@ -101,21 +111,35 @@ def _record_attempt(
     exit_code: int,
     severity: str,
     terminal: bool,
+    exception: Exception | None = None,
 ) -> None:
-    """One ``errors`` row per attempt — the only write this module performs."""
+    """One ``errors`` row per attempt — the only write this module performs.
+
+    ``exception`` is set only when this attempt raised instead of returning a
+    classified exit code — its type and message are folded into ``message``
+    so the exception is visible from the audit trail itself, not just the
+    application log's traceback (see ``_log.exception`` at the call site).
+    """
     settings = load_settings()
     paths = load_paths(settings=settings)
     repository = open_audit_repository(paths.database_path(runtime_id))
+    if exception is not None:
+        message = (
+            f"attempt {attempt}/{max_attempts}: exception={type(exception).__name__}: "
+            f"{exception} (retryable)"
+        )
+    else:
+        message = (
+            f"attempt {attempt}/{max_attempts}: exit_code={exit_code} "
+            f"({'terminal' if terminal else 'retryable'})"
+        )
     repository.record_error(
         runtime_id=runtime_id,
         strategy_id=None,
         execution_mode=None,
         severity=severity,
         component="supervised_launch",
-        message=(
-            f"attempt {attempt}/{max_attempts}: exit_code={exit_code} "
-            f"({'terminal' if terminal else 'retryable'})"
-        ),
+        message=message,
     )
 
 
@@ -131,13 +155,27 @@ def run(
         return EXIT_PREFLIGHT_FAILED
 
     exit_code = supervisor_main.EXIT_FAILED
+    last_exception: Exception | None = None
     for attempt in range(1, max_attempts + 1):
         _log.info("supervised launch attempt %d/%d for %s", attempt, max_attempts, runtime_id)
-        exit_code = supervisor_main.main(
-            ["--runtime-id", runtime_id, "--config-root", str(config_root)]
-        )
+        last_exception = None
+        try:
+            exit_code = supervisor_main.main(
+                ["--runtime-id", runtime_id, "--config-root", str(config_root)]
+            )
+        except Exception as exc:  # intentionally broad — see module docstring
+            # Deliberately not `except BaseException`: SystemExit/KeyboardInterrupt
+            # must keep propagating untouched, never be folded into this retry path.
+            last_exception = exc
+            exit_code = supervisor_main.EXIT_FAILED
+            _log.exception(
+                "supervised launch attempt %d/%d for %s raised an unexpected exception",
+                attempt,
+                max_attempts,
+                runtime_id,
+            )
 
-        if exit_code in TERMINAL_EXIT_CODES:
+        if last_exception is None and exit_code in TERMINAL_EXIT_CODES:
             severity = "INFO" if exit_code == supervisor_main.EXIT_OK else "WARNING"
             _record_attempt(
                 runtime_id=runtime_id,
@@ -156,6 +194,7 @@ def run(
             exit_code=exit_code,
             severity="WARNING",
             terminal=False,
+            exception=last_exception,
         )
         if attempt < max_attempts:
             _log.warning(
@@ -176,6 +215,7 @@ def run(
         exit_code=exit_code,
         severity="ERROR",
         terminal=True,
+        exception=last_exception,
     )
     return EXIT_GAVE_UP
 

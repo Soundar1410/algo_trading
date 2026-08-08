@@ -35,7 +35,7 @@ import pytest
 
 from common.config import load_paths
 from common.market_data import RecordedFeedAdapter, load_tick_tape
-from common.process.legacy_guard import LegacySystemStatus
+from common.process.legacy_guard import LaunchdLabelState, LegacySystemStatus
 from runtimes.intraday_options.__main__ import (
     EXIT_LEGACY_SYSTEM_ACTIVE,
     EXIT_NO_CREDENTIALS,
@@ -46,7 +46,7 @@ from runtimes.intraday_options.__main__ import (
 RUNTIME_ID = "intraday_options"
 
 _INACTIVE_LEGACY_STATUS = LegacySystemStatus(
-    launchd_label_loaded=False,
+    launchd_state=LaunchdLabelState.INACTIVE,
     launchd_detail="stubbed inactive for this test file",
     process_running=False,
     process_detail="stubbed inactive for this test file",
@@ -162,7 +162,7 @@ def test_main_refuses_when_the_legacy_system_is_active(
     ``_legacy_system_inactive`` the other way."""
     monkeypatch.setenv("PROJECT_ROOT", str(tmp_path))
     active_status = LegacySystemStatus(
-        launchd_label_loaded=True,
+        launchd_state=LaunchdLabelState.ACTIVE,
         launchd_detail="label 'com.soundarraj.tradingautomation.starttrading' is loaded",
         process_running=False,
         process_detail="no live process found",
@@ -178,6 +178,38 @@ def test_main_refuses_when_the_legacy_system_is_active(
     paths = load_paths(tmp_path)
     assert not any(paths.backup_root.glob(f"{RUNTIME_ID}_*.db"))
     assert not paths.database_path(RUNTIME_ID).is_file()
+
+
+def test_main_refuses_when_the_legacy_system_state_is_undetermined(
+    populated_config: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    """The fail-closed half of the same gate: a launchd check that could not
+    be determined (``launchctl`` unavailable/errored/timed out) must refuse
+    exactly like a confirmed detection — never be treated as "not detected" —
+    and the operator message must say so, not falsely claim a detection."""
+    monkeypatch.setenv("PROJECT_ROOT", str(tmp_path))
+    undetermined_status = LegacySystemStatus(
+        launchd_state=LaunchdLabelState.UNKNOWN,
+        launchd_detail="launchctl unavailable (FileNotFoundError('no launchctl'))",
+        process_running=False,
+        process_detail="no live process found",
+    )
+    monkeypatch.setattr(
+        "runtimes.intraday_options.__main__.legacy_system_status", lambda: undetermined_status
+    )
+
+    exit_code = main(["--runtime-id", RUNTIME_ID, "--config-root", str(populated_config)])
+
+    assert exit_code == EXIT_LEGACY_SYSTEM_ACTIVE
+    paths = load_paths(tmp_path)
+    assert not any(paths.backup_root.glob(f"{RUNTIME_ID}_*.db"))
+    assert not paths.database_path(RUNTIME_ID).is_file()
+    printed = capsys.readouterr().out
+    assert "could not be determined" in printed
+    assert "appears to be active" not in printed
 
 
 def test_main_backs_up_before_migrating_and_retains_after(

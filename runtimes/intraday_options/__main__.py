@@ -189,12 +189,20 @@ def main(argv: list[str] | None = None) -> int:
     # system that cannot be determined either way is not "not detected".
     legacy_status = legacy_system_status()
     if legacy_status.active:
-        print(
-            "Refusing to start: the legacy Trading_Automation system appears to be "
-            f"active ({legacy_status.describe()}). The old and new systems must never "
-            f"run together. Unload the legacy LaunchAgent first:\n"
-            "  launchctl bootout gui/$(id -u)/com.soundarraj.tradingautomation.starttrading"
-        )
+        if legacy_status.undetermined:
+            print(
+                "Refusing to start: the legacy Trading_Automation system's state could "
+                f"not be determined ({legacy_status.describe()}). A check that cannot be "
+                "verified is treated as active, not as absent. Resolve why launchctl "
+                "could not be queried, then retry."
+            )
+        else:
+            print(
+                "Refusing to start: the legacy Trading_Automation system appears to be "
+                f"active ({legacy_status.describe()}). The old and new systems must never "
+                f"run together. Unload the legacy LaunchAgent first:\n"
+                "  launchctl bootout gui/$(id -u)/com.soundarraj.tradingautomation.starttrading"
+            )
         return EXIT_LEGACY_SYSTEM_ACTIVE
 
     if args.strategy_id is not None:
