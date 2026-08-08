@@ -22,6 +22,7 @@ from common.config import Settings, load_settings
 from common.config.paths import ProjectPaths, ProjectRootError, load_paths
 from common.config.secrets import read_secret
 from common.persistence import DatabaseError, connect_readonly
+from common.process import legacy_system_status
 from common.utils.timeutils import now_ist
 
 EXIT_OK = 0
@@ -69,6 +70,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  UTC : {time.strftime('%Y-%m-%d %H:%M:%S %Z', time.gmtime())}")
     print(f"  IST : {now_ist().isoformat()}")
     print("  (no network time source consulted here — confirm against a trusted clock by hand)")
+
+    print("Legacy system")
+    _check_legacy_system(problems)
 
     print("Credentials")
     _check_credentials(settings, problems, warnings)
@@ -143,6 +147,19 @@ def _check_disk_space(project_root: Path, problems: list[str], warnings: list[st
         problems.append(f"low disk space: {message} (below {_MIN_FREE_DISK_GB:.1f} GB)")
     else:
         print(f"  OK: {message}")
+
+
+def _check_legacy_system(problems: list[str]) -> None:
+    """Spec section 12/16: never run the legacy and new systems together."""
+    status = legacy_system_status()
+    if status.active:
+        problems.append(
+            f"the legacy Trading_Automation system appears active ({status.describe()}) "
+            "— unload it first: launchctl bootout gui/$(id -u)/"
+            "com.soundarraj.tradingautomation.starttrading"
+        )
+    else:
+        print("  OK: legacy Trading_Automation system not detected")
 
 
 def _check_credentials(settings: Settings, problems: list[str], warnings: list[str]) -> None:

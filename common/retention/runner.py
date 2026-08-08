@@ -26,7 +26,7 @@ from common.market_data.scrip_master import ScripMasterCache
 from common.persistence import Database
 
 from .database import purge_old_rows
-from .logs import LogRetentionReport, sweep_logs
+from .logs import LogRetentionReport, rotate_launchd_logs, sweep_logs
 
 _log = get_logger(__name__)
 
@@ -37,6 +37,9 @@ class RetentionReport:
 
     rows_deleted: dict[str, int] = field(default_factory=dict)
     logs: LogRetentionReport = field(default_factory=LogRetentionReport)
+    #: Empty (never touched) when the caller passes no ``launchd_log_dir`` —
+    #: e.g. every existing test that predates Phase 8's launchd rotation.
+    launchd_logs: LogRetentionReport = field(default_factory=LogRetentionReport)
     scrip_masters_pruned: int = 0
 
 
@@ -50,6 +53,7 @@ def run_retention(
     db_row_max_age_days: int,
     db_delete_batch_limit: int,
     scrip_cache_retain_count: int,
+    launchd_log_dir: Path | None = None,
     now: datetime | None = None,
 ) -> RetentionReport:
     """Run every sweep once: old rows, old logs, old scrip-master copies.
@@ -63,6 +67,15 @@ def run_retention(
     :meth:`~common.market_data.scrip_master.ScripMasterCache.prune` existed
     since Phase 4 with no caller anywhere outside its own tests; this is that
     caller.
+
+    ``launchd_log_dir``, when given (Phase 8), is rotated with
+    :func:`~common.retention.logs.rotate_launchd_logs` — a rename step
+    ``sweep_logs`` cannot substitute for, since it deliberately never touches
+    an unrotated, potentially-still-open file — and then swept with the same
+    ``log_max_age_days``/``log_compress_after_days`` policy as ``log_dir``,
+    reusing the one retention policy rather than inventing a second. Omitted
+    (``None``) keeps this call a no-op, so every pre-Phase-8 caller is
+    unaffected.
     """
     reference = now if now is not None else datetime.now(UTC)
 
@@ -78,14 +91,37 @@ def run_retention(
         compress_after_days=log_compress_after_days,
         now=reference,
     )
+
+    launchd_logs_report = LogRetentionReport()
+    if launchd_log_dir is not None:
+        # Rotate first: sweep_logs only ever manages a *rotated* backup, and
+        # launchd's own captured file is permanently unrotated until this
+        # renames it. See rotate_launchd_logs's own docstring for why this
+        # is safe to do unconditionally, every run.
+        rotate_launchd_logs(launchd_log_dir, now=reference)
+        launchd_logs_report = sweep_logs(
+            launchd_log_dir,
+            max_age_days=log_max_age_days,
+            compress_after_days=log_compress_after_days,
+            now=reference,
+        )
+
     pruned = ScripMasterCache(cache_dir).prune(keep=scrip_cache_retain_count)
 
     _log.info(
         "retention sweep complete: %d table(s) had rows purged, %d log(s) compressed, "
-        "%d log(s) deleted, %d scrip master(s) pruned",
+        "%d log(s) deleted, %d launchd log(s) compressed, %d launchd log(s) deleted, "
+        "%d scrip master(s) pruned",
         len(rows_deleted),
         len(logs_report.compressed),
         len(logs_report.deleted),
+        len(launchd_logs_report.compressed),
+        len(launchd_logs_report.deleted),
         pruned,
     )
-    return RetentionReport(rows_deleted=rows_deleted, logs=logs_report, scrip_masters_pruned=pruned)
+    return RetentionReport(
+        rows_deleted=rows_deleted,
+        logs=logs_report,
+        launchd_logs=launchd_logs_report,
+        scrip_masters_pruned=pruned,
+    )

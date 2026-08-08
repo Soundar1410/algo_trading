@@ -40,6 +40,7 @@ from common.logging import get_logger, setup_logging
 from common.market_data.adapter import MarketFeedAdapter
 from common.notifications import build_notifier
 from common.persistence import Database, MigrationRunner
+from common.process import legacy_system_status
 from common.retention import backup_database, run_retention
 from common.utils.timeutils import local_date_in, now_ist
 
@@ -53,6 +54,19 @@ EXIT_FAILED = 1
 EXIT_NO_CREDENTIALS = 2
 EXIT_RUNTIME_DISABLED = 3
 EXIT_STRATEGY_NOT_FOUND = 4
+#: Phase 8's "old-system exclusion" gate: the legacy Trading_Automation system
+#: (LaunchAgent label or process) was detected active. See
+#: common.process.legacy_guard for what is checked and why.
+EXIT_LEGACY_SYSTEM_ACTIVE = 5
+#: A shutdown signal ended this run (operator stop, or a future emergency
+#: path) rather than the feed finishing on its own. The supervised launcher
+#: (orchestration/process_control/supervised_launch.py) treats this as
+#: terminal — spec section 12: "no restart loop after a deliberate safety
+#: shutdown." Scope: this covers the operator-stop path only. The daily-loss
+#: halt and kill switch (common.engine.daily_guard) latch per worker inside
+#: the engine and do not end this supervisor run — see the Phase 8 runbook
+#: entry for why that is a deliberately separate, later decision.
+EXIT_SAFETY_SHUTDOWN = 6
 
 
 def _database_path(paths: ProjectPaths, runtime_cfg: RuntimeConfig, runtime_id: str) -> Path:
@@ -169,6 +183,20 @@ def main(argv: list[str] | None = None) -> int:
         )
         return EXIT_RUNTIME_DISABLED
 
+    # Checked before anything that touches disk or the network: spec section
+    # 12/16's "do not start legacy and new trading systems together," and
+    # Phase 8's own "old-system exclusion" gate test. Fail-closed — a legacy
+    # system that cannot be determined either way is not "not detected".
+    legacy_status = legacy_system_status()
+    if legacy_status.active:
+        print(
+            "Refusing to start: the legacy Trading_Automation system appears to be "
+            f"active ({legacy_status.describe()}). The old and new systems must never "
+            f"run together. Unload the legacy LaunchAgent first:\n"
+            "  launchctl bootout gui/$(id -u)/com.soundarraj.tradingautomation.starttrading"
+        )
+        return EXIT_LEGACY_SYSTEM_ACTIVE
+
     if args.strategy_id is not None:
         # Checked before authenticating: a typo'd strategy id should not cost
         # a Dhan auth request against the ~1-per-2-minute limit.
@@ -207,6 +235,11 @@ def main(argv: list[str] | None = None) -> int:
         db_row_max_age_days=runtime_cfg.retention.db_row_max_age_days,
         db_delete_batch_limit=runtime_cfg.retention.db_delete_batch_limit,
         scrip_cache_retain_count=runtime_cfg.retention.scrip_cache_retain_count,
+        # Phase 8: the same directory orchestration/launchd/generate_plists.py
+        # points every plist's StandardOutPath/StandardErrorPath at. launchd
+        # never rotates these itself; rotate_launchd_logs (inside
+        # run_retention) is what makes them eligible for the sweep above.
+        launchd_log_dir=paths.log_root / "launchd",
     )
     database.close()
 
@@ -262,6 +295,11 @@ def main(argv: list[str] | None = None) -> int:
         result.workers_started,
         result.candles_published,
     )
+    # A signal (operator stop) ended this run deliberately, as opposed to the
+    # feed finishing on its own — the supervised launcher must not treat this
+    # as a crash to retry. See EXIT_SAFETY_SHUTDOWN's own docstring for scope.
+    if result.stopped_by_signal:
+        return EXIT_SAFETY_SHUTDOWN
     return EXIT_OK
 
 

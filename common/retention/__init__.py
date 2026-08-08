@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from .backup import backup_database
 from .database import purge_old_rows
-from .logs import LogRetentionReport, sweep_logs
+from .logs import LogRetentionReport, rotate_launchd_logs, sweep_logs
 from .policy import NEVER_PURGED_TABLES, RETAINED_TABLES
 from .runner import RetentionReport, run_retention
 
@@ -28,6 +28,7 @@ __all__ = [
     "RetentionReport",
     "backup_database",
     "purge_old_rows",
+    "rotate_launchd_logs",
     "run_retention",
     "sweep_logs",
 ]

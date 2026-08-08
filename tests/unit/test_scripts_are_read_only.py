@@ -28,7 +28,16 @@ supervisor's own writes are covered by every test in
 ``tests/end_to_end/test_supervisor.py`` and ``tests/end_to_end/test_walking_
 skeleton.py``.
 
-Do not delete either tier's assertions when this file next changes — narrow
+Phase 8 added ``start_dashboard.py`` to the read-only tier (execs
+``streamlit``, no trading write of any kind — it does not even open a
+database connection) and ``orchestration/process_control/`` as a third,
+narrower tier: **launcher scripts**, swept by the same broker-import and
+trading-table checks as the control tier, but never proven "no SQL of its
+own" against the same table list, because ``supervised_launch.py`` does write
+directly — to ``errors``, never a trading table (see its own module
+docstring for why that table, not ``audit_events``).
+
+Do not delete any tier's assertions when this file next changes — narrow
 them further if a new script needs it, but a script that stops being checked
 here is a safety property that stopped being proven.
 """
@@ -45,6 +54,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = REPO_ROOT / "scripts"
 SCRIPT_FILES = sorted(SCRIPTS.glob("*.py"))
+LAUNCHER_DIR = REPO_ROOT / "orchestration" / "process_control"
+LAUNCHER_FILES = sorted(LAUNCHER_DIR.glob("*.py"))
 
 #: Touches the network (Dhan's REST/WebSocket surface) or nothing at all;
 #: never signals a process, never asks a worker to act.
@@ -52,8 +63,19 @@ READ_ONLY_SCRIPTS = {
     "auth_bootstrap.py",
     "authenticate.py",
     "capture_live_tape.py",
+    "start_dashboard.py",
     "status.py",
     "validate_environment.py",
+}
+
+#: Phase 8's launcher tier: wraps a supervisor entrypoint with a bounded
+#: retry, writing only to ``errors`` (see ``supervised_launch.py``'s own
+#: docstring for why that table, not ``audit_events``). Swept like the
+#: control tier, but not by "no SQL of its own" — it does write, just never
+#: to a trading table.
+LAUNCHER_SCRIPTS = {
+    "__init__.py",
+    "supervised_launch.py",
 }
 
 #: Signals a process, writes a request file a worker polls, or starts one —
@@ -92,6 +114,11 @@ def test_the_scripts_directory_is_what_we_think_it_is():
     names = {path.name for path in SCRIPT_FILES}
     assert names == READ_ONLY_SCRIPTS | CONTROL_SCRIPTS
     assert READ_ONLY_SCRIPTS.isdisjoint(CONTROL_SCRIPTS), "a script must belong to exactly one tier"
+
+
+def test_the_launcher_directory_is_what_we_think_it_is():
+    names = {path.name for path in LAUNCHER_FILES}
+    assert names == LAUNCHER_SCRIPTS
 
 
 # ============================================================== read-only tier
@@ -199,6 +226,18 @@ def test_the_capture_script_labels_every_frame_kind():
     assert _label_for({}) == "unknown"
 
 
+def test_start_dashboard_refuses_cleanly_when_the_venv_has_no_streamlit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """No `os.execv` (and so no real streamlit process) when the interpreter
+    it would exec does not exist — proven by letting the real check run
+    against a tmp_path with no `.venv` at all, rather than mocking it away."""
+    monkeypatch.setenv("PROJECT_ROOT", str(tmp_path))
+    from scripts.start_dashboard import main
+
+    assert main([]) == 1
+
+
 def test_authenticate_is_a_pure_alias_for_auth_bootstrap():
     """The spec names this command ``scripts/authenticate``; it must not drift
     from ``auth_bootstrap.py``, which keeps its own name and its own tests."""
@@ -297,3 +336,28 @@ def test_square_off_refuses_without_confirm_and_writes_nothing(
     assert main(["--strategy-id", "some_strategy"]) == EXIT_NOT_CONFIRMED
     # Nothing written at all — not the request file, not the database.
     assert not (tmp_path / "data").exists()
+
+
+# =============================================================== launcher tier
+@pytest.mark.parametrize("script", LAUNCHER_FILES, ids=lambda p: p.name)
+def test_no_launcher_script_imports_a_broker(script: Path):
+    assert _broker_imports(script) == set(), f"{script.name} imports a broker"
+
+
+@pytest.mark.parametrize("script", LAUNCHER_FILES, ids=lambda p: p.name)
+def test_no_launcher_script_writes_a_trading_table(script: Path):
+    """Same forbidden-table sweep as the control tier. `supervised_launch.py`
+    does write — to `errors` — which is deliberately not in this list."""
+    source = script.read_text(encoding="utf-8")
+    code_only = "\n".join(
+        line.split("#", 1)[0] for line in source.splitlines() if not line.strip().startswith("#")
+    )
+    docstring_text = "\n".join(_string_literals(script))
+
+    for table in FORBIDDEN_TRADING_TABLES:
+        pattern = re.compile(
+            rf"\b(INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+{re.escape(table)}\b", re.IGNORECASE
+        )
+        match = pattern.search(code_only)
+        in_code = bool(match) and match.group(0) not in docstring_text
+        assert not in_code, f"{script.name} writes directly to {table!r}"

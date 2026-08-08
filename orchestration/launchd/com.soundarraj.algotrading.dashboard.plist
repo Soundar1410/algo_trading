@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PROJECT_ROOT</key>
+		<string>/Volumes/Trading/algo_trading</string>
+	</dict>
+	<key>KeepAlive</key>
+	<false/>
+	<key>Label</key>
+	<string>com.soundarraj.algotrading.dashboard</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Volumes/Trading/algo_trading/.venv/bin/python</string>
+		<string>-m</string>
+		<string>scripts.start_dashboard</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Volumes/Trading/algo_trading/logs/launchd/dashboard.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/Volumes/Trading/algo_trading/logs/launchd/dashboard.out.log</string>
+	<key>WorkingDirectory</key>
+	<string>/Volumes/Trading/algo_trading</string>
+</dict>
+</plist>

@@ -12,6 +12,18 @@ strictly before authentication — the one call site
 are invoked from. ``test_main_backs_up_before_migrating_and_retains_after``
 exercises that ordering directly, stopping short of authentication (no
 credentials are configured, matching every other test in this suite).
+
+Phase 8 added a legacy-system check even earlier than that (spec section
+12/16's "old-system exclusion"). ``isolated_env`` (``tests/conftest.py``)
+clears every ``DHAN_*``/``TELEGRAM_*``/``PROJECT_ROOT`` variable so no test
+here depends on the operator's local ``.env`` — this file's own
+``_legacy_system_inactive`` autouse fixture does the equivalent for the
+legacy check: without it, every test below would depend on whether the real
+legacy LaunchAgent happens to be loaded on whichever machine runs the suite
+(it was, on the machine this fixture was added from — see
+``test_legacy_guard.py``'s real-machine tests for that check on purpose).
+``test_main_refuses_when_the_legacy_system_is_active`` is the one test that
+turns the stub the other way, to prove the refusal itself.
 """
 
 from __future__ import annotations
@@ -23,9 +35,34 @@ import pytest
 
 from common.config import load_paths
 from common.market_data import RecordedFeedAdapter, load_tick_tape
-from runtimes.intraday_options.__main__ import EXIT_NO_CREDENTIALS, build_supervisor, main
+from common.process.legacy_guard import LegacySystemStatus
+from runtimes.intraday_options.__main__ import (
+    EXIT_LEGACY_SYSTEM_ACTIVE,
+    EXIT_NO_CREDENTIALS,
+    build_supervisor,
+    main,
+)
 
 RUNTIME_ID = "intraday_options"
+
+_INACTIVE_LEGACY_STATUS = LegacySystemStatus(
+    launchd_label_loaded=False,
+    launchd_detail="stubbed inactive for this test file",
+    process_running=False,
+    process_detail="stubbed inactive for this test file",
+)
+
+
+@pytest.fixture(autouse=True)
+def _legacy_system_inactive(monkeypatch: pytest.MonkeyPatch) -> None:
+    """This file's tests are about strategy filtering and startup order, not
+    the legacy check — stub it inactive so none of them depend on whether
+    the real legacy LaunchAgent happens to be loaded on the machine running
+    the suite. See the module docstring."""
+    monkeypatch.setattr(
+        "runtimes.intraday_options.__main__.legacy_system_status",
+        lambda: _INACTIVE_LEGACY_STATUS,
+    )
 
 GLOBAL_YAML = """
 global:
@@ -115,6 +152,32 @@ def test_a_filter_matching_nothing_admits_nothing_not_an_error(populated_config,
         strategy_ids=frozenset({"does_not_exist"}),
     )
     assert _admitted_ids(supervisor) == set()
+
+
+def test_main_refuses_when_the_legacy_system_is_active(
+    populated_config: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Spec section 12/16's "old-system exclusion," checked before backup,
+    migration or any network call — the one test in this file that turns
+    ``_legacy_system_inactive`` the other way."""
+    monkeypatch.setenv("PROJECT_ROOT", str(tmp_path))
+    active_status = LegacySystemStatus(
+        launchd_label_loaded=True,
+        launchd_detail="label 'com.soundarraj.tradingautomation.starttrading' is loaded",
+        process_running=False,
+        process_detail="no live process found",
+    )
+    monkeypatch.setattr(
+        "runtimes.intraday_options.__main__.legacy_system_status", lambda: active_status
+    )
+
+    exit_code = main(["--runtime-id", RUNTIME_ID, "--config-root", str(populated_config)])
+
+    assert exit_code == EXIT_LEGACY_SYSTEM_ACTIVE
+    # Refused before backup ever ran — nothing written to disk at all.
+    paths = load_paths(tmp_path)
+    assert not any(paths.backup_root.glob(f"{RUNTIME_ID}_*.db"))
+    assert not paths.database_path(RUNTIME_ID).is_file()
 
 
 def test_main_backs_up_before_migrating_and_retains_after(

@@ -32,7 +32,7 @@ from common.retention import backup
 from common.retention import database as retention_database
 from common.retention.backup import backup_database
 from common.retention.database import purge_old_rows
-from common.retention.logs import sweep_logs
+from common.retention.logs import rotate_launchd_logs, sweep_logs
 from common.retention.policy import NEVER_PURGED_TABLES, RETAINED_TABLES
 from common.retention.runner import run_retention
 
@@ -400,6 +400,145 @@ def test_sweep_logs_on_a_missing_directory_is_a_harmless_no_op(tmp_path: Path):
     assert report.deleted == ()
 
 
+# ------------------------------------------------------- launchd log rotation
+#
+# Phase 8 gave every LaunchAgent its own StandardOutPath/StandardErrorPath,
+# and every production setup_logging() call site leaves console=True (its own
+# default) — so those files are a full second copy of the whole application
+# log stream, and launchd itself never rotates or truncates them. The first
+# test below is the fail-first proof that the gap is real: sweep_logs alone,
+# unmodified, is a no-op against a launchd-shaped file however old it gets.
+def test_a_launchd_style_file_accumulates_unbounded_without_rotation(tmp_path: Path):
+    """The gap `rotate_launchd_logs` exists to close, demonstrated first.
+
+    A `launchd`-captured file never gains a numeric suffix on its own — it is
+    permanently shaped like sweep_logs's "active file" (`RotatingFileHandler`'s
+    own convention, which sweep_logs deliberately never touches; see its
+    module docstring). Confirmed here directly: even 400 days old, unrotated,
+    it survives sweep_logs untouched, exactly as it would after a year of a
+    LaunchAgent nobody rotated.
+    """
+    launchd_dir = tmp_path / "logs" / "launchd"
+    launchd_dir.mkdir(parents=True)
+    unrotated = launchd_dir / "intraday_options.out.log"
+    _touch(unrotated, mtime=NOW - timedelta(days=400))
+
+    report = sweep_logs(launchd_dir, max_age_days=30, compress_after_days=1, now=NOW)
+
+    assert unrotated.is_file()
+    assert report.compressed == ()
+    assert report.deleted == ()
+
+
+def test_rotation_then_sweep_makes_the_launchd_log_visible_to_retention(tmp_path: Path):
+    """The gap closed: the same 400-day-old file, rotated first, is deleted
+    by the exact same sweep_logs call the previous test proved was a no-op
+    against it unrotated."""
+    launchd_dir = tmp_path / "logs" / "launchd"
+    launchd_dir.mkdir(parents=True)
+    unrotated = launchd_dir / "intraday_options.out.log"
+    _touch(unrotated, mtime=NOW - timedelta(days=400))
+
+    rotate_launchd_logs(launchd_dir, now=NOW)
+    report = sweep_logs(launchd_dir, max_age_days=30, compress_after_days=1, now=NOW)
+
+    assert not unrotated.exists()
+    assert len(report.deleted) == 1
+    assert report.deleted[0].name.startswith("intraday_options.out.log.")
+
+
+def test_a_freshly_rotated_file_is_never_touched_by_the_same_runs_sweep(tmp_path: Path):
+    """The same-run safety invariant `rotate_launchd_logs`'s own docstring
+    claims: RetentionConfig's day-granularity minimums (`gt=0`) mean a file
+    renamed moments ago can never satisfy either cutoff in the very call that
+    follows it — which is what makes it safe to rotate a file `launchd` (or,
+    in this run, the current process) may still be actively writing to."""
+    launchd_dir = tmp_path / "logs" / "launchd"
+    launchd_dir.mkdir(parents=True)
+    fresh = launchd_dir / "intraday_options.out.log"
+    _touch(fresh, mtime=NOW)  # mtime "now" - exactly what a live file looks like
+
+    rotate_launchd_logs(launchd_dir, now=NOW)
+    report = sweep_logs(launchd_dir, max_age_days=30, compress_after_days=1, now=NOW)
+
+    rotated = list(launchd_dir.iterdir())
+    assert len(rotated) == 1
+    assert rotated[0].name.startswith("intraday_options.out.log.")
+    assert rotated[0].read_text(encoding="utf-8") == "log line\n"
+    assert report.compressed == ()
+    assert report.deleted == ()
+
+
+def test_rotate_launchd_logs_renames_both_streams_to_a_sweepable_shape(tmp_path: Path):
+    launchd_dir = tmp_path / "logs" / "launchd"
+    launchd_dir.mkdir(parents=True)
+    out_log = launchd_dir / "intraday_options.out.log"
+    err_log = launchd_dir / "intraday_options.err.log"
+    out_log.write_text("stdout\n", encoding="utf-8")
+    err_log.write_text("stderr\n", encoding="utf-8")
+
+    rotated = rotate_launchd_logs(launchd_dir, now=NOW)
+
+    assert not out_log.exists()
+    assert not err_log.exists()
+    assert {path.name.rsplit(".", 1)[0] for path in rotated} == {
+        "intraday_options.out.log",
+        "intraday_options.err.log",
+    }
+    for path in rotated:
+        assert path.name.rsplit(".", 1)[1].isdigit()
+
+
+def test_rotate_launchd_logs_skips_empty_files(tmp_path: Path):
+    """An idle day (nothing captured) must not manufacture an empty backup
+    on every single startup."""
+    launchd_dir = tmp_path / "logs" / "launchd"
+    launchd_dir.mkdir(parents=True)
+    empty = launchd_dir / "intraday_options.out.log"
+    empty.touch()
+
+    rotated = rotate_launchd_logs(launchd_dir, now=NOW)
+
+    assert rotated == ()
+    assert empty.is_file()
+
+
+def test_rotate_launchd_logs_leaves_an_already_rotated_file_alone(tmp_path: Path):
+    launchd_dir = tmp_path / "logs" / "launchd"
+    launchd_dir.mkdir(parents=True)
+    already_rotated = launchd_dir / "intraday_options.out.log.1700000000"
+    already_rotated.write_text("old backup\n", encoding="utf-8")
+
+    rotated = rotate_launchd_logs(launchd_dir, now=NOW)
+
+    assert rotated == ()
+    assert already_rotated.is_file()
+
+
+def test_rotate_launchd_logs_disambiguates_a_same_second_collision(tmp_path: Path):
+    """Two controlled startups inside the same wall-clock second (manual
+    testing, mainly) must never make the second rotation overwrite the
+    first."""
+    launchd_dir = tmp_path / "logs" / "launchd"
+    launchd_dir.mkdir(parents=True)
+    canonical = launchd_dir / "intraday_options.out.log"
+    canonical.write_text("first run\n", encoding="utf-8")
+
+    first = rotate_launchd_logs(launchd_dir, now=NOW)
+    # A fresh canonical file, as launchd would create on the next start —
+    # here standing in for a second run within the same clock second.
+    canonical.write_text("second run\n", encoding="utf-8")
+    second = rotate_launchd_logs(launchd_dir, now=NOW)
+
+    assert first != second
+    assert first[0].read_text(encoding="utf-8") == "first run\n"
+    assert second[0].read_text(encoding="utf-8") == "second run\n"
+
+
+def test_rotate_launchd_logs_on_a_missing_directory_is_a_harmless_no_op(tmp_path: Path):
+    assert rotate_launchd_logs(tmp_path / "does_not_exist", now=NOW) == ()
+
+
 # ------------------------------------------------------------------- backup
 def _make_sqlite_db(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -487,3 +626,47 @@ def test_run_retention_orchestrates_all_three_sweeps(tmp_path: Path, migrated_db
     assert report.logs.deleted == (log_dir / "algo_trading.log.9",)
     assert report.scrip_masters_pruned == 2
     assert len(list(cache_dir.glob("dhan_scrip_master_*.csv"))) == 2
+    # No launchd_log_dir was passed: the fourth, optional sweep is a no-op,
+    # not an error — every pre-Phase-8 caller of run_retention is unaffected.
+    assert report.launchd_logs.compressed == ()
+    assert report.launchd_logs.deleted == ()
+
+
+def test_run_retention_also_rotates_and_sweeps_launchd_logs(
+    tmp_path: Path, migrated_db: Database
+):
+    """The fourth sweep, opted into via `launchd_log_dir` — Phase 8. A file
+    old enough to be deleted outright, unrotated exactly as `launchd` would
+    leave it, is gone by the time `run_retention` returns; nothing about the
+    other three sweeps changes."""
+    session_id = _seed_session(migrated_db)
+    _seed_retained_tables(migrated_db, session_id=session_id, occurred_at=OLD.isoformat())
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(exist_ok=True)
+    launchd_dir = log_dir / "launchd"
+    launchd_dir.mkdir()
+    old_launchd_log = launchd_dir / "intraday_options.out.log"
+    _touch(old_launchd_log, mtime=NOW - timedelta(days=400))
+
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir(exist_ok=True)
+
+    report = run_retention(
+        database=migrated_db,
+        log_dir=log_dir,
+        cache_dir=cache_dir,
+        log_max_age_days=30,
+        log_compress_after_days=1,
+        db_row_max_age_days=90,
+        db_delete_batch_limit=5000,
+        scrip_cache_retain_count=2,
+        launchd_log_dir=launchd_dir,
+        now=NOW,
+    )
+
+    assert not old_launchd_log.exists()
+    assert len(report.launchd_logs.deleted) == 1
+    assert report.launchd_logs.deleted[0].name.startswith("intraday_options.out.log.")
+    # Unrelated to the other three sweeps, still exercised in the same call.
+    assert report.rows_deleted == {table: 1 for table in RETAINED_TABLES}

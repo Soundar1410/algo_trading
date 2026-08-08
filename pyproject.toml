@@ -45,6 +45,9 @@ dependencies = [
 # `python -m runtimes.intraday_options`. Both keep working; this is a
 # convenience alias installed with the package.
 algo-intraday-options = "runtimes.intraday_options.__main__:main"
+# Phase 8: same convenience alias for the dashboard, matching the plist
+# generator's own `-m scripts.start_dashboard` target.
+algo-dashboard = "scripts.start_dashboard:main"
 
 [project.optional-dependencies]
 # NOT installed by default: py_lets_be_rational can be awkward to build on some
@@ -68,6 +71,9 @@ include = ["common*"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-q"
+markers = [
+    "real_audit: exercises the real errors-table rows supervised_launch writes (not mocked)",
+]
 
 [tool.ruff]
 line-length = 100

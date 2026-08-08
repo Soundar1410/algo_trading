@@ -7,9 +7,9 @@ the next phase. Updated after every phase.
 
 | | |
 |---|---|
-| **Current phase** | **Phase 7 — Operations, Part 5 of 5 complete** (retention and backups). **Phase 7 is complete.** `common/retention/` adds a policy module (the five retained tables, and — explicitly, negatively — the four it must never touch) and one entry point, `run_retention()`, called once at controlled startup (`runtimes/intraday_options/__main__.py:main`) — never a cron, never a thread on the trading path. Bounded age-based deletion for `runtime_heartbeats`/`notifications`/`errors`/`feed_events`/`auth_events` runs in one transaction; log compression and age-based deletion layer on top of the existing `RotatingFileHandler` size cap; a pre-migration database backup (SQLite's own online backup API, not a raw file copy) with a configurable retained-backup count runs before migration, at the same call site — backup only, explicitly not the Phase 10 rollback machinery, and the comments in `common/persistence/migrations.py` that used to imply otherwise are corrected (**D80**). `ScripMasterCache.prune()`, unreachable since Phase 4, gets its first real caller. An audit-found bug is fixed along the way: `Settings.algo_log_level` was read from the environment and never once passed to `setup_logging(level=...)` at any of its four call sites, so every process ran at `INFO` regardless of configuration (**D79**). |
-| **Next phase** | Phase 8 — LaunchAgent validation. |
-| **Last updated** | 8 August 2026 — Phase 7 complete, see [Known limitations](#6-known-limitations) |
+| **Current phase** | **Phase 8 — LaunchAgent validation. Complete.** Plists authored and validated, not loaded — `orchestration/launchd/generate_plists.py` generates three (auth, `intraday_options`, dashboard; `positional_options`/`intraday_stocks` have no entrypoint to point at yet, D56/D34), each with absolute paths, the project `.venv` interpreter, an explicit `WorkingDirectory`, independent `stdout`/`stderr` logs and `KeepAlive: false`. `orchestration/process_control/supervised_launch.py` is the bounded-restart wrapper every plist actually points at (`launchd`'s own `KeepAlive` cannot bound a retry count). `common/process/legacy_guard.py` adds the "old-system exclusion" gate — and found the legacy `Trading_Automation` LaunchAgent genuinely loaded and its `weekly_strategies` process genuinely running on this machine during the audit, live evidence that the check needed to exist (**D81**). All six of the phase's own manual gate tests (start/stop/crash/restart/duplicate-worker/old-system exclusion) were run by hand against real OS processes and real signals and are transcribed below, not merely asserted. **Same-phase addendum**: limitation 34 (`launchd`'s own captured logs growing unbounded, outside the retention sweep) was reconsidered once traced — every production `setup_logging()` call leaves `console=True`, so those files are a full duplicate of the whole log stream, not a trickle — and closed with `common.retention.logs.rotate_launchd_logs`, its rename-safety verified on this project's real Darwin target before being relied on (**D83**). |
+| **Next phase** | Phase 9 — Real strategies. |
+| **Last updated** | 8 August 2026 — Phase 8 complete, see [Known limitations](#6-known-limitations) |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
 | **Live order placement** | **Not implemented.** Fail-closed. Phase 10 only. |
@@ -28,7 +28,7 @@ the next phase. Updated after every phase.
 | 5 | Mixed-mode supervisor and persistence | **Complete** |
 | 6 | Paper recovery and expiry handling | **Complete — all five parts.** **Part 1** (daily risk state across a restart — closes the risk-limit-bypass gap in bullet 1, and finds/fixes **D58**/limitation 22 along the way). **Part 2** (position-management state snapshot/restore — exit-policy state via `BaseExit`/`RiskManager`/`BaseStrategy` snapshot hooks, and stop/target persistence through a widened `RiskManager`/`ExecutionGateway`, fail-open on a bad snapshot, negative-control-tested). **Part 3** (MFE/MAE, square-off attempts, state-version validation and position-gated last-candle idempotency — the rest of §7's "restore at minimum" list). **Part 4** (`force_square_off_before_expiry` composed into the existing `SquareOffAuthority` seam — **D66-D68**; `simulate_exchange_settlement` refused at config load, none of spec section 11's eight settlement-policy items built — limitation 27). **Part 5** (the phase's record: bullets re-checked against what is built, not assumed; D56's persistence-identity gap given a written candidate direction, not an implementation — **D69**, limitation 30). Bullet 2's fixed strikes/basket legs/rolling counters remain blocked on `FixedStrikeEngine`/`MultiLegEngine` — D56/D34, unchanged, not this phase's to close |
 | 7 | Operations | **Complete — all five parts.** **Part 1** (health snapshot layer — `common/health/snapshot.py`, `auth_events`/`feed_events` writers and producers, configurable heartbeat interval). **Part 2** (Telegram in production — real notifier construction at both entrypoints, deferred delivery, rate limiting/aggregation, `notifications`-table persistence, redacted rendering — D71-D74). **Part 3** (the Streamlit dashboard — Master/Intraday Options/System Health pages plus two honest stubs, reading through `common.health.snapshot` for operational state — D75; addendum adds `effective_live_gate` status to Master, config-sourced, the one deliberate exception to database-only reads). **Part 4** (PID ownership hardened onto `create_time()`, fail-first proven — D76; two previously-hidden bugs found and fixed along the way — D77/D78; seven operator scripts plus `authenticate`, `audit_events` migration `0004`, file-based square-off request channel). **Part 5** (`common/retention/` — bounded age-based DB purge in one transaction, log compression/deletion, pre-migration backup with retained-backup count, one entry point at controlled startup — D80; `ScripMasterCache.prune()` given its first caller; `Settings.algo_log_level` wiring bug found and fixed — D79) |
-| 8 | LaunchAgent validation | Not started |
+| 8 | LaunchAgent validation | **Complete** |
 | 9 | Real strategies | Not started |
 | 10 | Controlled live readiness | Not started |
 
@@ -2219,6 +2219,9 @@ guard. See deviation D6.
 | **D78** | **`strategy_token()`'s 4-character truncation lets two different strategy ids collide on the same `correlation_id`, which the parallel-worker test only reached once D77 stopped masking the crash as a clean exit** | Re-running the suite after fixing D77 surfaced a second, previously-hidden failure: `test_two_workers_receive_identical_bars` raised `sqlite3.IntegrityError: UNIQUE constraint failed: order_intents.correlation_id`. `common/execution/correlation.py` truncates a strategy id to 4 characters for the embedded token; `"skelone"` and `"skeltwo"` both truncate to `"skel"`, and since `next_sequence_number` is scoped by the full, untruncated strategy id, both strategies independently compute sequence 1 for their first order — byte-identical `correlation_id` strings. Previously invisible because D77 silently turned the resulting crash (exit code 1) into a reported 0. Not fixed by redesigning the correlation-ID format — too large a change, under time pressure, to a heavily-used, well-tested module — but by refusing the collision at admission time: `strategy_token()` is now a public function (the exact token `build_correlation_id` will embed, explicitly **not** guaranteed unique), and `IntradayOptionsSupervisor.add_worker()` refuses the second strategy whose token collides with an already-admitted one, recording an `errors` row (`component="supervisor.correlation_token_collision"`) and a notification — the same individual-refusal shape the existing live-gate admission check already uses, never crashing the group or corrupting `order_intents`. The triggering test was renamed to non-colliding strategy ids (`alphaskel`/`bravoskel`) to verify its own original intent again; `test_a_worker_whose_correlation_token_collides_is_refused_not_crashed` covers the original colliding pair directly. |
 | **D79** | **`Settings.algo_log_level` was read from the environment since Phase 0 and never once reached `setup_logging(level=...)` — every process has been running at `INFO` regardless of configuration** | Found during the Phase 7 audit, not by a failing test: nothing asserted on the *effective* root logger level, only on redaction and rotation. `setup_logging`'s `level` parameter defaults to `"INFO"` and none of the four production call sites (`runtimes/intraday_options/__main__.py`, `runtimes/intraday_options/worker.py`, `scripts/auth_bootstrap.py`, `scripts/capture_live_tape.py`) passed it — each called `setup_logging(log_dir=..., settings=settings)` and relied on the default, even though `settings.algo_log_level` was sitting unread on the same object one line above. `ALGO_LOG_LEVEL=DEBUG` in `.env` has therefore never changed anything a real process did. Fixed at all four sites: `setup_logging(level=settings.algo_log_level, log_dir=..., settings=settings)`. |
 | **D80** | **`common/persistence/migrations.py` claimed a future destructive migration "arrives with backup and rollback machinery" — Phase 7 Part 5 built the backup half, and the comments needed correcting to stop implying the other half exists too** | Two places said it: the `_DESTRUCTIVE_RE` guard's own comment, and the `MigrationError` message `_reject_destructive` raises when a migration script contains a rejected statement. Part 5's `common.retention.backup_database` now runs before every migration on every controlled startup, so a pre-migration snapshot genuinely exists by the time a migration applies — but nothing restores from it, checks it against a running schema, or replays writes made since it was taken. Left uncorrected, the comment and the error message a future implementer reads right before attempting a destructive migration would overstate what already exists and understate what that migration still needs to bring. Both are rewritten to say precisely that: backup exists (Part 5), rollback does not, and a genuinely destructive migration still needs rollback machinery built and tested before this guard is revisited. |
+| **D81** | **The legacy-system guard was proven against the real, currently-active legacy installation on this machine, not a synthetic stand-in — and the plan's own "Legacy exclusion" decision was to detect and document, never to unload it from inside this session** | `common/process/legacy_guard.py` was run for real, unmocked, during this phase and found both signals genuinely positive: `launchctl list com.soundarraj.tradingautomation.starttrading` returned 0 (loaded), and a live `weekly_strategies` process was found under `/Volumes/Trading/Trading_Automation` by a real `psutil.process_iter` scan — independently corroborating the runbook's own Phase 0 audit note that this component was "paper-mode only" and still running. `tests/unit/test_legacy_guard.py` keeps two tiers apart on purpose: synthetic fixtures (portable, run in CI) prove the matching logic — including the trap a naive `/Volumes/Trading/` mount-root prefix would fall into, since this repository lives on the same mount — and a pair of real-machine tests read the *actual* installed plist with `plistlib` and assert the module's `LEGACY_LAUNCHD_LABEL` constant equals its real `Label` byte for byte, skipping (not failing) on a machine without that plist. The matching pre-existing-test hazard this surfaced: `tests/unit/test_intraday_options_main.py`'s suite would otherwise depend on whatever the legacy system happens to be doing on whichever machine runs it — fixed with its own autouse `_legacy_system_inactive` stub, the same shape `isolated_env` already gives `.env`. |
+| **D82** | **`supervised_launch.py` writes to `errors`, not `audit_events` — a schema constraint, checked before writing the test that would have hit it** | The natural first instinct was `ExecutionRepository.record_audit_event`, matching every other operator-facing script. `audit_events.action` (migration 0004) has a closed vocabulary enforced by a `CHECK` baked directly into its `CREATE TABLE IF NOT EXISTS`, and the migration runner is additive-only — it rejects `DROP`, which any standard SQLite `CHECK`-widening rebuild (rename, recreate, copy, drop the old table) needs. Widening that vocabulary for one new action would need a real migration this phase does not otherwise call for. Reconsidered from the semantics, not just the schema: a launch attempt is an automated lifecycle event, not an operator issuing a live-impacting command with confirmation — exactly what `errors` (unconstrained `component`/`severity`) already models for `IntradayOptionsSupervisor`'s own lifecycle events (`component="supervisor.correlation_token_collision"`). Severity follows spec section 14's own table: `INFO` for a clean stop, `WARNING` per retryable attempt or deliberate refusal, `ERROR` once every attempt is exhausted. `tests/unit/test_supervised_launch.py::test_errors_rows_are_written_for_each_attempt_and_the_final_give_up` reads the real rows back rather than trusting the call was made. |
+| **D83** | **`rotate_launchd_logs` renames a file `launchd` (or the current process) may still hold open — verified safe on this project's actual target platform, not assumed from POSIX documentation, before it was built on that assumption** | Limitation 34 was reopened mid-Phase-8 once the actual volume was traced: every production `setup_logging()` call leaves `console=True`, so `launchd`'s captured `stdout`/`stderr` files are a full, unbounded second copy of the whole application log stream, not a handful of incidental lines. Closing it needs a rename step ahead of `sweep_logs`, but a rename against a file the currently-running process might still be writing to is exactly the kind of "should be fine per the spec" claim this codebase does not accept without checking (the same standard **D76** held `create_time()` to). Checked directly, on this machine, before any production code depended on it: `os.open` a file append-mode (mirroring how `launchd`'s `posix_spawn` file actions redirect `StandardOutPath`), `os.rename` the path out from under that open descriptor, write more through the *original* handle, then `os.open` a fresh handle at the now-vacant canonical path — confirmed on Darwin 25.6.0 arm64 that the renamed inode receives every byte written both before and after the rename, and the canonical path gets a genuinely empty file, never the renamed one's contents. This is what makes `rotate_launchd_logs` safe to run unconditionally, every controlled startup, even mid-way through a `launchd`-owned file's active lifetime. The second half of the safety argument — that a file renamed moments ago can never be compressed or deleted by the `sweep_logs` call that immediately follows it in the same `run_retention` call — rests on `RetentionConfig.log_max_age_days`/`.log_compress_after_days` both being declared `gt=0` (a one-day floor), pinned directly by `test_a_freshly_rotated_file_is_never_touched_by_the_same_runs_sweep` rather than left as an inference from the two `Field` declarations. The gap itself was demonstrated before the fix, not assumed: `test_a_launchd_style_file_accumulates_unbounded_without_rotation` proves `sweep_logs` alone is a permanent no-op against an unrotated file however old it gets, and `test_rotation_then_sweep_makes_the_launchd_log_visible_to_retention` proves the identical file, rotated first, is deleted by that same call. |
 
 #### D22 in detail: the rebuilt premium-candle mapping
 
@@ -3635,8 +3638,13 @@ start/stop/crash/restart tests pass.
     attempts rather than relying on a safe number — one request per rejection,
     zero during the cooldown — and no figure is quoted here because none has been
     verified.
-12. **No LaunchAgents, no supervised launch entry point, no reconciliation.**
-    Phases 7, 8 and 10.
+12. **~~No LaunchAgents, no supervised launch entry point, no reconciliation.~~
+    PARTIALLY CLOSED** (Phase 8). `orchestration/launchd/` has three
+    generated, validated `.plist` files and `orchestration/process_control/
+    supervised_launch.py` is the bounded-restart entry point every one of
+    them points at. **Still open, deliberately**: no plist is loaded
+    (Phase 9's job — see the Phase 8 writeup's own decisions), and
+    reconciliation remains Phase 10's, unchanged.
 13. **A live feed can go silent and unclosable, and nothing will force it shut.**
     Introduced by the Phase 3 Part 1 design, deliberately: the alternative is a
     shutdown path that can itself hang. A connected feed delivering *no frames*
@@ -4302,6 +4310,48 @@ start/stop/crash/restart tests pass.
     contained follow-up whenever correlation-tagged engine-path alerts
     become a real operational need.
 
+33. **`EXIT_SAFETY_SHUTDOWN` covers the operator-stop path only — a tripped
+    kill switch does not end the supervisor run.** Introduced by Phase 8,
+    deliberately scoped: `main()` returns the new exit code when
+    `SupervisorResult.stopped_by_signal` is true, so `supervised_launch.py`
+    treats a genuine `SIGTERM` as terminal rather than retryable. The daily
+    loss halt and kill switch (`common/engine/daily_guard.py`) are a
+    different mechanism entirely — they latch new entries off *inside the
+    engine, per worker* (`DailyRiskGuard.halted`) and the supervisor keeps
+    running to session end regardless, returning its ordinary `EXIT_OK`.
+    Under a loaded `KeepAlive`-style plist that would mean a halted worker's
+    process still restarts clean the next scheduled window, which is
+    probably the right behaviour for a *daily* halt (a new trading date
+    should get a fresh chance) but is untested and unexamined for the
+    all-strategies emergency kill switch, which is meant to stay down.
+    Deliberately not built this phase: making a tripped kill switch end the
+    whole supervisor run is a behaviour change to the trading path, not a
+    LaunchAgent-validation concern, and belongs with Phase 9 once a real
+    strategy gives the question a concrete shape.
+
+34. **~~`launchd`'s own `stdout`/`stderr` streams (`logs/launchd/*.log`) sit
+    outside the log retention sweep.~~ CLOSED**, same-phase — reconsidered
+    once the actual volume was traced rather than assumed negligible: every
+    production `setup_logging()` call site leaves `console=True` (its own
+    default), so these files are not a handful of incidental `print()` lines
+    but a full second copy of the entire application log stream, growing
+    forever since `launchd` never rotates or truncates what it appends to.
+    `common.retention.logs.rotate_launchd_logs` is the missing rename step —
+    `sweep_logs` itself is deliberately untouched, since it must never treat
+    an unrotated, potentially-still-open file as a safe-to-compress backup
+    (its own docstring's rule). `run_retention` now takes an optional
+    `launchd_log_dir`, rotates it first, then sweeps it with the same
+    `log_max_age_days`/`log_compress_after_days` policy as the main log
+    directory; `runtimes/intraday_options/__main__.py:main` passes
+    `paths.log_root / "launchd"` at the one existing controlled-startup call
+    site, no new one. See **D83** for why renaming a file `launchd` may still
+    hold open is safe (verified on this project's actual target platform,
+    not assumed from POSIX documentation) and for the day-granularity
+    argument that a same-run sweep can never touch what this step just
+    rotated. `newsyslog`/`/etc/newsyslog.d` remains out of scope, as before —
+    this is a userspace fix within the repository's own writable directory,
+    not a system-level configuration change.
+
 
 ### Operational risk noted during the audit
 
@@ -4310,8 +4360,22 @@ The **legacy `Trading_Automation` system was running during the audit** — its
 live. The spec requires preventing simultaneous execution of the old and new
 systems. Nothing in this repository goes near it (verified again this phase: its
 newest source+config mtime is unchanged across 1010 files — see the recorded
-baseline below), but this must be settled **before any new runtime is started
-against live data** and again before LaunchAgents in Phase 8.
+baseline below).
+
+**Settled in Phase 8 (D81), not merely re-checked.** The read-only mtime
+comparison above proves this repository never *writes* near the legacy
+system; it says nothing about whether the two could ever *run*
+simultaneously, which is the spec's actual requirement and Phase 8's own
+gate test 6. `common.process.legacy_guard.legacy_system_status()` checks
+that directly — and, run for real during this phase, found the legacy
+LaunchAgent (`com.soundarraj.tradingautomation.starttrading`) genuinely
+loaded and its `weekly_strategies` component genuinely running. Both
+`scripts/validate_environment.py` and `runtimes/intraday_options/__main__.py`
+now refuse to start while either signal is positive, naming the exact
+`launchctl bootout` command. **Still open**: the legacy agent itself was not
+unloaded from inside this session — that is the operator's own action on
+their own machine, by this phase's own decision (see the Phase 8 writeup
+above), and remains a precondition for Phase 9 loading any plist.
 
 #### Recorded baseline: `Trading_Automation` newest source+config mtime
 
@@ -4537,7 +4601,153 @@ Phase 2 is complete, both blocks. **Phase 3 is complete** — all five parts, wi
 acceptance gate met in full. **Phase 4 is complete** — all five parts, its one live
 gate item run and passed. **Phase 5 is complete** — see below. **Phase 6 is
 complete** — all five parts, see below. **Phase 7 is complete — all five parts**,
-see below. Next is **Phase 8 — LaunchAgent validation**.
+see below. **Phase 8 is complete**, see below. Next is **Phase 9 — Real
+strategies**.
+
+### Phase 8 — LaunchAgent validation — **Complete**
+
+Approved plan, verbatim scope: spec section 12's LaunchAgent design (absolute
+paths, the project `.venv` interpreter, an explicit working directory, an
+environment-file path, independent `stdout`/`stderr` logs, a bounded restart
+policy, no restart loop after a deliberate safety shutdown, start only when
+the runtime is enabled, never run the legacy and new systems together) —
+gated on the phase's own one sentence: "Enable LaunchAgents only after manual
+supervisor/worker start, stop, crash, restart, duplicate-worker and
+old-system exclusion tests pass." Three decisions were made before building
+anything (recorded in the plan, not re-litigated here): author and validate
+every plist but load none of them (`intraday_options.yaml` stays
+`enabled: false`; Phase 9 loads them); guard the legacy system in code and
+document the unload command, but do not run it — the operator's own machine,
+the operator's own call; no per-worker respawn inside the supervisor —
+`launchd`'s own bounded restart of the whole process is the recovery path
+for a crashed worker, not new concurrency logic on the trading path.
+
+**`common/process/legacy_guard.py`** is the "old-system exclusion" gate.
+Two independent signals, because either alone can miss it: `launchctl list
+<label>` for whether the legacy LaunchAgent is *loaded* (queued to run, even
+with nothing currently alive), and a `psutil.process_iter` scan for any live
+process whose executable or command line sits under the legacy project root
+(`/Volumes/Trading/Trading_Automation`, matched by `Path.is_relative_to` —
+never the shared `/Volumes/Trading` mount root this repository also lives
+on, which would flag this codebase's own processes as the thing it is
+detecting). This was not a theoretical check written against a description:
+running it for real, on this machine, during this phase, found the legacy
+agent's label (`com.soundarraj.tradingautomation.starttrading` — note the
+filename of its plist, `...controller.plist`, does not match its own
+`Label`; `launchctl` keys on the label) genuinely loaded, and its
+`weekly_strategies` component genuinely running as a live process, both
+confirmed independently by `launchctl` and by `ps`. Wired into
+`scripts/validate_environment.py` (a new problem, not a warning) and into
+`runtimes/intraday_options/__main__.py:main` — checked immediately after the
+`enabled: false` gate, before backup, migration or any network call, and
+before `--strategy-id` validation, returning a new `EXIT_LEGACY_SYSTEM_
+ACTIVE = 5` (**D81**).
+
+**`orchestration/process_control/supervised_launch.py`** is what every
+runtime LaunchAgent's `ProgramArguments` actually points at, never
+`runtimes.intraday_options.__main__` directly — `launchd`'s own `KeepAlive`
+has no attempt cap, only a pacing `ThrottleInterval`. It runs
+`scripts.validate_environment` once as a preflight, then the real supervisor
+entrypoint, and classifies every exit code: `EXIT_OK`, `EXIT_RUNTIME_
+DISABLED`, `EXIT_STRATEGY_NOT_FOUND`, `EXIT_LEGACY_SYSTEM_ACTIVE` and the new
+`EXIT_SAFETY_SHUTDOWN` are terminal — stop immediately, whatever the code;
+`EXIT_FAILED`/`EXIT_NO_CREDENTIALS` are retried up to `--max-attempts` (default
+3) with a fixed backoff, then this process itself exits non-zero. Every
+attempt is written to `errors` (`component="supervised_launch"`), not
+`audit_events` — that table's `action` column is a closed vocabulary
+enforced by a `CHECK` baked into `CREATE TABLE` (migration 0004), and the
+additive-only migration runner cannot widen it without a real schema
+migration, since it rejects `DROP` and any SQLite `CHECK`-widening rebuild
+needs one; a launch attempt is also an automated lifecycle event, not an
+operator-issued command, which is exactly what `errors` already models for
+`IntradayOptionsSupervisor`'s own lifecycle events (**D82**).
+
+**`runtimes/intraday_options/__main__.py`** gains `EXIT_SAFETY_SHUTDOWN = 6`:
+`main()` now returns it when `SupervisorResult.stopped_by_signal` is true —
+an operator's `SIGTERM` ended the run deliberately, and `supervised_launch.py`
+treats this as terminal, satisfying spec section 12's "no restart loop after
+a deliberate safety shutdown." **Scope, stated rather than implied**: this
+covers the operator-stop path only. The daily-loss halt and kill switch
+(`common/engine/daily_guard.py`) latch new entries off *per worker, inside
+the engine* — they do not end the supervisor run, so a tripped kill switch
+is not currently reachable through this exit code. Making it so is a
+behaviour change to the trading path that belongs with Phase 9's real
+strategies, not LaunchAgent validation; see limitation 33.
+
+**`orchestration/launchd/generate_plists.py`** is the one place that knows
+the project root, the `.venv` interpreter path and the log directory — the
+three committed `.plist` files under the same directory are its output,
+never hand-edited, and `tests/unit/test_launchd_plists.py`'s drift guard
+fails if they and a fresh generation ever disagree. Only the trading-runtime
+plist wraps its program in `caffeinate -i -s` (spec section 13's sleep
+prevention), scoped to that process's own lifetime — the auth bootstrap
+runs for seconds and the dashboard has no runtime-hours requirement of its
+own. `scripts/start_dashboard.py` (`algo-dashboard` console alias) gives the
+dashboard plist something to point at — `streamlit run dashboards/app.py`
+had no non-interactive entrypoint before this phase.
+
+**`common/retention/logs.py::rotate_launchd_logs`** — a same-phase addendum,
+not deferred. `logs/launchd/*.log`'s volume was initially assumed small
+enough to leave for a later pass; reconsidered once actually traced —
+`console=True` is every production `setup_logging()` call site's own
+default, so these files duplicate the entire application log stream, and
+`launchd` never rotates or truncates what it appends to. `sweep_logs` cannot
+help unmodified — it only ever manages a *rotated* backup, by design, never
+an unrotated file a live process might still hold open — so this adds the
+missing rename step, run once per controlled startup immediately before
+`sweep_logs` is pointed at the same directory, folded into `run_retention`
+via a new optional `launchd_log_dir` parameter (`RetentionReport` gains a
+matching `launchd_logs` field; omitting the parameter is a no-op, so every
+pre-existing caller is unaffected). The one property that had to be checked
+rather than assumed — renaming a path out from under a file descriptor
+`launchd` (or the very process performing the rename) may still be actively
+writing to — was verified directly on this project's own Darwin target
+before any code relied on it, and the fail-first pair
+(`test_a_launchd_style_file_accumulates_unbounded_without_rotation` /
+`test_rotation_then_sweep_makes_the_launchd_log_visible_to_retention`)
+demonstrates the gap and its closure with the same file. See **D83**.
+
+**The six manual gate tests — run by hand, real processes, real signals.**
+The spec sanctions a fake/recorded feed for exactly this kind of test (§3,
+"Use a fake/recorded feed in normal automated tests and an opt-in live-feed
+smoke test during market hours"), so tests 2–5 reused the real-process/
+real-signal harness Phase 3 Part 1 already built for its own SIGTERM proof
+(`tests/end_to_end/supervisor_signal_child.py`) rather than inventing a
+second one, run directly from a shell rather than through `pytest`:
+
+| # | Test | How | Result |
+|---|---|---|---|
+| 1 | **start** | `python -m runtimes.intraday_options` against the real repo, real `config/runtimes/intraday_options.yaml` (`enabled: false`) | `runtimes/intraday_options.yaml has enabled: false — nothing to start.` → exit `3` |
+| 2 | **stop** | Real supervisor process (`supervisor_signal_child.py`) reached `READY`, then a real `kill -TERM` from a second shell | `RESULT {"stopped_by_signal": true, "clean_feed_shutdown": true, "worker_exit_codes": {"skelfix": 0}, ...}` — orderly, in order, on the right thread |
+| 3 | **crash** | Same, but `kill -9` (uncatchable) instead | Process gone instantly; its PID file was left behind on disk, genuinely orphaned — the exact hazard **D76** hardened `common/process/locks.py` against |
+| 4 | **restart** | A fresh process pointed at the same lock/PID directory, once after test 2's clean stop and once after test 3's crash | Both reached `READY` — no stale-lock refusal either way; the crash case specifically proves `clear_stale_pid_file()`'s pre-acquire sweep against a real orphaned file, not just a fixture |
+| 5 | **duplicate-worker** | A second real process started against the *same* lock identity while the first (from test 2) was still alive | Refused immediately: `DuplicateProcessError: Refusing to start: another process already holds 'intraday_options.supervisor' held by pid ... since ...` — the first process untouched |
+| 6 | **old-system exclusion** | `scripts.validate_environment` and `runtimes.intraday_options.__main__:main`, both against the real, currently-active legacy system | Both refused: `PROBLEM: the legacy Trading_Automation system appears active (...)` / exit `5` (`EXIT_LEGACY_SYSTEM_ACTIVE`), naming the exact `launchctl bootout` command |
+
+No plist was loaded to produce this evidence — every row above is a direct
+process invocation. `launchctl list | grep algotrading` stays empty at the
+end of this phase, by design (see the decisions above).
+
+**Deviation from spec section 12's five-plist list.** Only three plists
+exist: `positional_options` has no supervisor to point at (a placeholder
+package, D56) and `intraday_stocks` does not exist at all (D34). A plist
+naming an absent entrypoint would fail on its very first load, which is a
+worse failure mode than a documented, deliberate absence — both are one-line
+additions to `orchestration/launchd/generate_plists.py`'s `PLIST_SPECS` the
+day either runtime gets a real entrypoint.
+
+**What Phase 8 deliberately did NOT deliver.** No plist loaded or
+`launchctl bootstrap`'d — Phase 9. `intraday_options.yaml` stays
+`enabled: false`. The legacy LaunchAgent was found, not unloaded — the
+operator's own action, with the exact command surfaced in every refusal
+message this phase adds. Per-worker respawn inside the supervisor — a
+crashed worker is still detected and its exit code still recorded
+(`Result.worker_exit_codes`, unchanged since Phase 3), but nothing restarts
+it mid-session; recovery is the whole-process restart `launchd` (via
+`supervised_launch.py`) already provides. Static public IP validation stays
+Phase 10 (spec's own placement, spec:2954). A tripped kill switch does not
+end the supervisor run — see `EXIT_SAFETY_SHUTDOWN`'s scope note above and
+limitation 33.
 
 ### Phase 7 — Operations — **Part 5 of 5 complete** (retention and backups)
 
