@@ -348,6 +348,11 @@ class TradingEngine:
         self._stopped.clear()
         self._start_day()
         self._warm_up()
+        # Phase 9: tell the strategy warm-up is over, whatever it did (real
+        # replay, cold start, or opted out) — see BaseStrategy.on_warmup_complete.
+        # After _warm_up() and before the first live tick, so a day-scoped
+        # detector reset here can never see a warm-up candle nor miss a live one.
+        self.strategy.on_warmup_complete()
         self.feed.on_tick(self.on_tick)
         self._reporter.start()
         log.info(

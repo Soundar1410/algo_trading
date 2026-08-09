@@ -196,6 +196,30 @@ class BaseStrategy(ABC):
         start, so strategies that haven't opted in are unaffected."""
         return None
 
+    def on_warmup_complete(self) -> None:
+        """Called once, after :class:`~common.engine.engine.TradingEngine` has
+        finished replaying (or attempting to replay) today's warm-up candles,
+        and before the first live candle. Phase 9.
+
+        Warm-up replays closed candles through :meth:`on_candle` itself — there
+        is no separate "replay mode" — so any indicator holds correct state
+        afterwards, but a *day-scoped detector* built on top of an indicator
+        (e.g. :class:`~common.indicators.ema.ConfirmedCrossover`, which latches
+        "confirmed side" and must not treat a trend inherited from a prior
+        session as today's fresh signal) would otherwise come out of warm-up
+        already primed with yesterday's side. This hook is where such a
+        strategy resets *only* that day-scoped detector, leaving the indicator
+        itself (session-spanning, intentionally warmed) untouched.
+
+        Called unconditionally — whether warm-up replayed real history, ran
+        cold (no manager/history available), or was skipped entirely
+        (:meth:`warmup_spec` returned ``None``) — so a strategy's hook body
+        does not need to know which case it is in; resetting an
+        already-fresh detector is a harmless no-op. Default: no-op, for every
+        strategy that has no such detector.
+        """
+        return None
+
     @property
     @abstractmethod
     def option_selection(self) -> OptionSelection:

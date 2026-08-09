@@ -105,8 +105,11 @@ def test_execution_mode_is_carried_through(tmp_path: Path):
     assert worker.execution_mode is ExecutionMode.LIVE
 
 
-def test_engine_is_always_none_regardless_of_strategy_engine_kind(tmp_path: Path):
-    """Phase 9 boundary: no real strategy exists yet to build an EngineWorkerConfig for."""
+def test_engine_is_none_without_a_strategy_ref_regardless_of_engine_kind(tmp_path: Path):
+    """EngineKind alone is not the discriminator (Phase 9): every strategy,
+    fixture included, defaults ``engine: trading_engine`` — see
+    config_adapter.py's module docstring. Only ``parameters.strategy_ref``
+    (absent here) switches on the ported-engine path."""
     cfg = _cfg(engine=EngineKind.MULTI_LEG_ENGINE)
     worker = _build(cfg, tmp_path)
     assert worker.engine is None

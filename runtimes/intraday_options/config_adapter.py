@@ -5,22 +5,35 @@ load_resolved_config` has existed since Phase 0, but nothing outside a test
 ever called it, and nothing turned its result into the ``WorkerConfig`` the
 supervisor spawns children from. This module is that adapter.
 
-**Deliberately fixture-path only.** ``WorkerConfig.engine`` is left ``None`` on
-every strategy this module builds, regardless of ``StrategyConfig.engine``.
-Populating :class:`~runtimes.intraday_options.worker.EngineWorkerConfig` needs
-per-strategy engine parameters (``strategy_ref``, ``timeframe``, ``strike_step``,
-...) that no real strategy exists yet to supply — CLAUDE.md is explicit that real
-strategies are Phase 9's job, and synthesising engine parameters now would
-produce exactly the "untested code that merely looks finished" the runbook's
-D34 already declined to do for ``EquityScripMaster``. When Phase 9 lands a real
-strategy, this module (or Phase 9's own adapter) grows the branch that builds
-``EngineWorkerConfig`` from ``StrategyConfig.parameters``.
+**Two paths, one discriminator.** Until Phase 9 this module was fixture-path
+only: ``WorkerConfig.engine`` was left ``None`` on every strategy it built,
+because populating :class:`~runtimes.intraday_options.worker.EngineWorkerConfig`
+needs per-strategy engine parameters (``strategy_ref``, ``timeframe``,
+``strike_step``, ...) that no real strategy existed yet to supply — CLAUDE.md
+was explicit that real strategies are Phase 9's job.
+
+Phase 9 lands the first one (``ema_cross_9_21_buy``), so this grows the
+branch: a strategy's ``parameters.strategy_ref`` (a dotted
+``"package.module:ClassName"``, exactly the form
+:func:`~runtimes.intraday_options.engine_worker.load_strategy` resolves) is
+the discriminator. Present -> build a real
+:class:`~runtimes.intraday_options.worker.EngineWorkerConfig` and drive the
+ported ``TradingEngine``. Absent -> the Phase 1 fixture path, unchanged, so
+``skeleton_fixture.yaml`` and every other fixture config keep behaving exactly
+as before. One discriminator rather than reading ``StrategyConfig.engine``
+(``EngineKind``): that field already defaults to ``TRADING_ENGINE`` on *every*
+strategy, fixture included, so it does not distinguish "wants the ported
+engine" from "happens to carry the single-leg engine's default label".
 
 Kept out of :mod:`runtimes.intraday_options.worker` on purpose: that module's
 own docstring documents a measured import-time budget for the spawned child
 (``test_worker_import_boundary.py`` enforces it), and this adapter — pydantic
 models, YAML-derived dicts — is an entrypoint-side concern the child never
-needs.
+needs. ``EngineWorkerConfig`` itself is safe to import here at module level:
+it is defined in ``worker.py``, deliberately carries no ``common.engine``-owned
+type (``test_the_engine_config_carries_no_engine_owned_type`` pins that), and
+this adapter only ever *constructs* one — it never imports ``common.engine`` or
+``runtimes.intraday_options.engine_worker`` itself.
 """
 
 from __future__ import annotations
@@ -32,10 +45,10 @@ from typing import Any
 from common.config import ConfigError, ResolvedConfig, StrategyConfig, fingerprint
 from common.risk import SquareOffPolicy
 
-from .worker import WorkerConfig
+from .worker import EngineWorkerConfig, WorkerConfig
 
-#: Required keys in ``strategy.parameters`` — the fixture path cannot subscribe
-#: to a feed or size an order without them, and a missing key here is a
+#: Required keys in ``strategy.parameters`` — neither path can subscribe to a
+#: feed or size an order without them, and a missing key here is a
 #: misconfigured strategy file, not a value worth defaulting.
 _REQUIRED_PARAMETERS = ("instrument", "security_id")
 
@@ -120,6 +133,80 @@ def build_worker_config(
         cost_rates=dict(parameters.get("cost_rates", {})),
         square_off_policy=_square_off_policy(cfg.strategy),
         config_fingerprint=fingerprint(cfg),
-        engine=None,  # Phase 9 boundary — see module docstring.
+        engine=(
+            _build_engine_worker_config(cfg.strategy, parameters)
+            if "strategy_ref" in parameters
+            else None
+        ),
         heartbeat_interval_seconds=cfg.runtime.health.heartbeat_interval_seconds,
+    )
+
+
+def _build_engine_worker_config(
+    strategy: StrategyConfig, parameters: dict[str, Any]
+) -> EngineWorkerConfig:
+    """Build the ported engine's configuration from ``strategy.parameters``.
+
+    Every field here is read defensively (``.get`` with the same default
+    :class:`~runtimes.intraday_options.worker.EngineWorkerConfig` itself would
+    use), except ``strategy_ref`` — already guaranteed present by this
+    function's only caller — and ``strategy_kwargs``, which travels through
+    verbatim: it is the strategy's own constructor's keyword arguments (e.g.
+    ``ema_fast``/``lots_per_trade``/... for ``ema_cross_9_21_buy``), and this
+    adapter has no business re-deriving or renaming them.
+    """
+    strategy_id = strategy.strategy_id
+    strategy_ref = str(parameters["strategy_ref"])
+    if not strategy_ref.strip() or ":" not in strategy_ref:
+        raise ConfigError(
+            f"strategies/{strategy_id}.yaml parameters.strategy_ref must be "
+            f"'package.module:ClassName', got {strategy_ref!r}"
+        )
+    daily_max_loss_pct = parameters.get("daily_max_loss_pct")
+    strategy_kwargs = dict(parameters.get("strategy_kwargs") or {})
+    return EngineWorkerConfig(
+        strategy_ref=strategy_ref,
+        strategy_kwargs=strategy_kwargs,
+        timeframe=str(parameters.get("timeframe", "5m")),
+        underlying_instrument=str(parameters.get("underlying_instrument", "")),
+        # lots_per_trade has exactly ONE configured home: strategy_kwargs,
+        # because that is also what the strategy's own constructor reads (see
+        # EmaCross9x21BuyStrategy._pick / .quantity_lots) — a second,
+        # independently-configured copy at parameters top level is exactly
+        # the kind of drift CLAUDE.md's dhanhq-pin rule and this adapter's own
+        # square-off-time reasoning both refuse elsewhere. Top-level
+        # parameters.lots_per_trade/.lots is accepted only as a fallback, for
+        # a future strategy whose constructor does not nest sizing under
+        # strategy_kwargs.
+        lots=int(
+            strategy_kwargs.get(
+                "lots_per_trade", parameters.get("lots_per_trade", parameters.get("lots", 1))
+            )
+        ),
+        strike_step=int(parameters.get("strike_step", 50)),
+        lot_size=int(parameters.get("lot_size", 50)),
+        expiry=parameters.get("expiry"),
+        contract_resolver=str(parameters.get("contract_resolver", "simulated")),
+        scrip_master_cache_dir=str(parameters.get("scrip_master_cache_dir", "")),
+        index_security_id=str(parameters.get("index_security_id", "")),
+        index_segment=str(parameters.get("index_segment", "")),
+        fno_segment=str(parameters.get("fno_segment", "")),
+        # Spec section 6.4 / 12.1: capital_base * daily_max_loss_pct% is the
+        # ABSOLUTE rupee daily_max_loss, evaluated on live MTM (realised + open
+        # unrealised) every tick. That conversion and the per-tick evaluation
+        # both already live in TradingEngine._build_daily_guard /
+        # _on_option_tick (common.engine.daily_guard.DailyRiskGuard) — this
+        # adapter only ever passes the two config numbers through unmultiplied.
+        starting_capital=float(parameters.get("capital_base", 100_000.0)),
+        max_daily_loss_percent=(
+            None if daily_max_loss_pct is None else float(daily_max_loss_pct)
+        ),
+        regime_enabled=bool(parameters.get("regime_enabled", False)),
+        warmup_from_history=bool(parameters.get("warmup_from_history", True)),
+        warmup_source=str(parameters.get("warmup_source", "none")),
+        warmup_max_lookback_sessions=int(parameters.get("warmup_max_lookback_sessions", 3)),
+        parameters=dict(parameters),
+        session_start_time=str(strategy.risk.get("entry_start", "09:15")),
+        holidays=tuple(parameters.get("holidays", ())),
+        feed_poll_seconds=float(parameters.get("feed_poll_seconds", 0.5)),
     )

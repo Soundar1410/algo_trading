@@ -64,6 +64,12 @@ class CombinedCandleExit(BaseExit):
         self.trail_fired: bool = False
         self._highest_close: float | None = None
         self._lowest_close: float | None = None
+        # Phase 9 (ema_cross_9_21_buy spec section 6.1, "Premium candle-gap
+        # behaviour"). Set by on_gap() when the engine detects a skipped
+        # premium-candle bucket; consumed (and cleared) by the very next
+        # should_exit() call, which is exactly the one candle whose "previous
+        # candle" would sit on the far side of the hole.
+        self._suppress_momentum_once: bool = False
 
     def reset(self) -> None:
         self._momentum.reset()
@@ -72,6 +78,56 @@ class CombinedCandleExit(BaseExit):
         self.trail_fired = False
         self._highest_close = None
         self._lowest_close = None
+        self._suppress_momentum_once = False
+
+    def on_gap(self) -> None:
+        """Suppress the momentum leg for exactly the next :meth:`should_exit` call.
+
+        Called when the traded option's premium-candle stream skipped one or
+        more buckets (the engine's ``on_option_candle_gap`` path). The first
+        post-gap candle's "previous candle" would sit on the far side of the
+        hole, so a momentum-break comparison against it would manufacture an
+        exit the market never showed — this suppresses exactly that one
+        comparison. The best-close trail (``_extreme``/``_highest_close``/
+        ``_lowest_close``/``_activated``) is deliberately untouched: a data
+        hole does not undo favourable progress the position already made.
+        """
+        self._suppress_momentum_once = True
+
+    def snapshot(self) -> dict[str, Any]:
+        """Restart-recoverable state: the best-close extreme/activation (via the
+        trail child) plus this engine's own highest/lowest completed close.
+
+        The momentum leg's "previous candle" reference is deliberately **not**
+        captured here — it lives in the caller's ``candle_history``, not in
+        this engine, and a restart already re-primes it the same way a gap
+        does (see the engine's own ``_adopt_recovered_position`` comment: "its
+        history is gone with the process that built it, so the first exit
+        needing consecutive bars re-primes"). ``{}`` when nothing has been
+        observed yet, matching :class:`~common.exit.base.BaseExit`'s
+        "nothing worth persisting" convention.
+        """
+        data: dict[str, Any] = {}
+        if self._highest_close is not None:
+            data["highest_close"] = self._highest_close
+        if self._lowest_close is not None:
+            data["lowest_close"] = self._lowest_close
+        trail_snapshot = self._trail.snapshot()
+        if trail_snapshot:
+            data["trail"] = trail_snapshot
+        return data
+
+    def restore(self, data: dict[str, Any]) -> None:
+        """Reapply a previous :meth:`snapshot`. Never raises on foreign/malformed data."""
+        highest = data.get("highest_close")
+        if isinstance(highest, int | float):
+            self._highest_close = float(highest)
+        lowest = data.get("lowest_close")
+        if isinstance(lowest, int | float):
+            self._lowest_close = float(lowest)
+        trail_snapshot = data.get("trail")
+        if isinstance(trail_snapshot, dict):
+            self._trail.restore(trail_snapshot)
 
     @property
     def extreme_close(self) -> float | None:
@@ -134,10 +190,15 @@ class CombinedCandleExit(BaseExit):
         )
         self._lowest_close = close if self._lowest_close is None else min(self._lowest_close, close)
         # Evaluate both every call so the trail's extreme keeps tracking even
-        # when only momentum fires (and vice versa).
-        self.momentum_fired = self._momentum.should_exit(
-            position, candle, candle_history, indicators, strategy_config, timestamp=timestamp
-        )
+        # when only momentum fires (and vice versa). The one exception is the
+        # candle immediately after a premium-data gap: see on_gap().
+        if self._suppress_momentum_once:
+            self.momentum_fired = False
+            self._suppress_momentum_once = False
+        else:
+            self.momentum_fired = self._momentum.should_exit(
+                position, candle, candle_history, indicators, strategy_config, timestamp=timestamp
+            )
         self.trail_fired = self._trail.should_exit(
             position, candle, candle_history, indicators, strategy_config, timestamp=timestamp
         )

@@ -38,7 +38,8 @@ from .models import (
 from .positions import ExecutionGateway, FillOutcome, InMemoryGateway, PositionManager
 from .regime import RegimeLabel, RegimeTagger, SessionTag, build_regime_tagger
 from .reporting import DailySummary, EngineReporter, NullReporter, summarise
-from .risk import RiskManager, opt_float, register_risk_manager
+from .risk import RiskManager, get_risk_manager, opt_float, register_risk_manager
+from .risk_managers import HardStopRiskManager
 from .selection import (
     OptionChainResolver,
     OptionSelector,
@@ -78,6 +79,7 @@ __all__ = [
     "ExitReason",
     "FillOutcome",
     "GatewayExecutionError",
+    "HardStopRiskManager",
     "HubTickFeed",
     "InMemoryGateway",
     "LifecycleGateway",
@@ -111,6 +113,7 @@ __all__ = [
     "UnsupportedStateVersion",
     "available_strategies",
     "build_regime_tagger",
+    "get_risk_manager",
     "get_strategy",
     "merge_payload",
     "opt_float",

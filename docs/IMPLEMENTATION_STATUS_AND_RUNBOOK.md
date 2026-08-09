@@ -7,9 +7,9 @@ the next phase. Updated after every phase.
 
 | | |
 |---|---|
-| **Current phase** | **Phase 8 — LaunchAgent validation. Complete.** Plists authored and validated, not loaded — `orchestration/launchd/generate_plists.py` generates three (auth, `intraday_options`, dashboard; `positional_options`/`intraday_stocks` have no entrypoint to point at yet, D56/D34), each with absolute paths, the project `.venv` interpreter, an explicit `WorkingDirectory`, independent `stdout`/`stderr` logs and `KeepAlive: false`. `orchestration/process_control/supervised_launch.py` is the bounded-restart wrapper every plist actually points at (`launchd`'s own `KeepAlive` cannot bound a retry count). `common/process/legacy_guard.py` adds the "old-system exclusion" gate — and found the legacy `Trading_Automation` LaunchAgent genuinely loaded and its `weekly_strategies` process genuinely running on this machine during the audit, live evidence that the check needed to exist (**D81**). All six of the phase's own manual gate tests (start/stop/crash/restart/duplicate-worker/old-system exclusion) were run by hand against real OS processes and real signals and are transcribed below, not merely asserted. **Same-phase addendum**: limitation 34 (`launchd`'s own captured logs growing unbounded, outside the retention sweep) was reconsidered once traced — every production `setup_logging()` call leaves `console=True`, so those files are a full duplicate of the whole log stream, not a trickle — and closed with `common.retention.logs.rotate_launchd_logs`, its rename-safety verified on this project's real Darwin target before being relied on (**D83**). **Second same-phase addendum**: two defects raised for independent verification, not assumed correct going in, were both confirmed against the actual code and both fixed — `supervised_launch.py::run()` had no exception handling around the supervisor call at all, so an unexpected exception escaped the bounded-restart mechanism entirely rather than being retried (**D84**); `legacy_guard.py` collapsed "launchd unavailable/errored/timed out" into the same value as "confirmed not loaded," contradicting the "Fail-closed" comment already sitting at its own call site (**D85**). Neither reopens an existing limitation — both are new findings, closed within this same phase. |
-| **Next phase** | Phase 9 — Real strategies. |
-| **Last updated** | 8 August 2026 — Phase 8 complete, see [Known limitations](#6-known-limitations) |
+| **Current phase** | **Phase 9 — Real strategies. Complete.** `ema_cross_9_21_buy` — NIFTY 5-minute EMA(9)/EMA(21) crossover, ATM weekly CE/PE, BUY-only, intraday — is the first and only real strategy this phase delivers, fully integrated through the ported `TradingEngine`: live Dhan market data → EMA 9/21 signal → ATM weekly contract resolution (scrip master, never hardcoded) → paper execution → persistence → dashboard/reporting/Telegram, PAPER only. The blocking capital-base decision (spec §12.1) was resolved with the operator rather than guessed: ₹10,00,000, giving a ₹30,000 daily-MTM loss cap. Three small, generic common-layer additions, none EMA-specific: `BaseStrategy.on_warmup_complete()` (a day-scoped detector reset seam, called once after warm-up and before the first live candle); `CombinedCandleExit.on_gap()` + `.snapshot()`/`.restore()` (the exit engine had neither before this phase); `common.engine.risk_managers.HardStopRiskManager` (`hard_stop`, the first concrete `RiskManager`, disabled by default). `runtimes/intraday_options/config_adapter.py`'s own long-standing "Phase 9 boundary" (`WorkerConfig.engine` always `None`) is closed, discriminated on `parameters.strategy_ref` rather than `EngineKind` — the Phase 1 fixture path is unchanged. 66 new/updated tests (35 unit + 17 integration + 14 config-adapter), every fresh-crossover/exit/risk/timing property proven against hand-verified `EMA`/`ConfirmedCrossover`/`CombinedCandleExit` sequences, not asserted from memory. Full detail: [section 8](#8-next-phase). |
+| **Next phase** | Phase 10 — controlled live enablement. Not started. |
+| **Last updated** | 9 August 2026 — Phase 9 complete, see [section 8](#8-next-phase) |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
 | **Live order placement** | **Not implemented.** Fail-closed. Phase 10 only. |
@@ -4603,8 +4603,197 @@ Phase 2 is complete, both blocks. **Phase 3 is complete** — all five parts, wi
 acceptance gate met in full. **Phase 4 is complete** — all five parts, its one live
 gate item run and passed. **Phase 5 is complete** — see below. **Phase 6 is
 complete** — all five parts, see below. **Phase 7 is complete — all five parts**,
-see below. **Phase 8 is complete**, see below. Next is **Phase 9 — Real
-strategies**.
+see below. **Phase 8 is complete**, see below. **Phase 9 is complete** — the first
+(and, per CLAUDE.md, only) real strategy, `ema_cross_9_21_buy`, is fully
+integrated end to end through the ported engine, paper only — see below. Next is
+**Phase 10 — controlled live enablement**, not yet started.
+
+### Phase 9 — Real strategies — **Complete**
+
+Scope, exactly as approved: implement `ema_cross_9_21_buy` — NIFTY 5-minute
+EMA(9)/EMA(21) crossover, ATM weekly CE/PE, BUY-only, intraday — as the single
+Phase 9 acceptance strategy, reusing the preserved engine end to end, PAPER
+only. It is the **first and only** real strategy this phase delivers; no other
+strategy exists in this repository. Full functional/design spec:
+`strategies/intraday_options/ema_cross_9_21_buy/ema_cross_9_21_buy_spec.md`.
+
+**Blocking decision resolved with the operator (spec section 12.1).** The 3%
+daily-loss cap's capital base was not derivable from the repository (no
+existing authoritative value; `EngineConfig.starting_capital`'s ₹1,00,000 is a
+generic engine default, not a strategy-specific one) — asked rather than
+guessed, per CLAUDE.md and the approved brief. Answer: **₹10,00,000**, so
+`daily_max_loss` = 3% × ₹10,00,000 = **₹30,000**, evaluated on live MTM
+(realised so far + the open position's unrealised P&L) on every option tick.
+`config/strategies/ema_cross_9_21_buy.yaml`'s `parameters.capital_base` /
+`.daily_max_loss_pct` carry this; the %→₹ conversion and the per-tick
+evaluation are not strategy code at all — both already lived in
+`TradingEngine._build_daily_guard` / `_on_option_tick`
+(`common.engine.daily_guard.DailyRiskGuard`) before this phase.
+
+**Architecture reused without duplication** — confirmed by inspection before
+writing anything, per the approved brief's own gate: `common.engine.strategy.
+BaseStrategy` + `@register_strategy`; `common.indicators.ema.EMA` +
+`ConfirmedCrossover`; `common.exit.combined_candle_exit.CombinedCandleExit`
+(`momentum_low_or_highest_close`); `common.engine.daily_guard.DailyRiskGuard`
+(fully engine-wired already — the strategy touches none of it);
+`common.engine.selection.OptionSelector` + `common.market_data.scrip_master`
+(lot size and weekly expiry resolved from the exchange at runtime — never
+hardcoded); `common.engine.session.MarketSession` /
+`common.engine.square_off` (entry window, cutoff, mandatory 15:15 square-off
+— all engine-owned; the strategy never checks a clock); the Phase 6 Part 2
+restart-recoverable exit-state snapshot seam
+(`exit_state_snapshot`/`restore_exit_state`).
+
+**New common-layer components — small, generic, none EMA-specific:**
+
+- `BaseStrategy.on_warmup_complete()` (`common/engine/strategy.py`) — a
+  no-op-by-default lifecycle hook, called once by `TradingEngine.run()`
+  immediately after `_warm_up()` and before the first live tick. Needed
+  because `_start_day()` calls `strategy.reset()` *before* warm-up replay,
+  and replay drives indicator updates through the same `on_candle()` a live
+  candle uses — so a day-scoped detector built on an indicator (here,
+  `ConfirmedCrossover`, which latches "confirmed side") would otherwise come
+  out of warm-up already primed with yesterday's trend. This strategy's
+  `on_warmup_complete()` resets *only* the crossover detector, leaving the
+  (session-spanning, intentionally warmed) EMAs untouched — the one invariant
+  the spec's "fresh intraday crossover" requirement reduces to. No
+  EMA-specific branch exists in the engine; the hook is generic.
+- `CombinedCandleExit.on_gap()` + `.snapshot()`/`.restore()`
+  (`common/exit/combined_candle_exit.py`) — the exit engine had no gap hook
+  and no restart snapshot at all before this phase (verified against
+  `tests/unit/test_exit_engines.py`, which covers `trailing`/`highest_close`/
+  `consecutive_reversal` but not this one). `on_gap()` suppresses the
+  momentum leg for exactly the next `should_exit()` call (the first premium
+  candle after a skipped bucket cannot compare across the hole) while leaving
+  the best-close trail's extreme/activation untouched; `.snapshot()`/
+  `.restore()` persist that trail state (delegating to the child
+  `HighestCloseExit`'s own snapshot) for restart recovery, exactly mirroring
+  every other exit engine's Phase 6 Part 2 contract.
+- `common.engine.risk_managers.HardStopRiskManager` (`hard_stop`) — the first
+  concrete `RiskManager` this repository ships (the ABC + registry existed
+  since Phase 3 Part 2b-i with "arrives with Phase 9" as its own docstring's
+  words). Minimal by design (spec section 7): a disabled-by-default
+  catastrophic backstop behind the premium-candle exit, nothing else — no
+  `sl_lock_trail`, no target/lock/trail framework. **Deviation from the
+  spec's own config sketch, recorded rather than silently diverging**: the
+  spec names this threshold `catastrophic_stop_pct` (a percentage of
+  premium). That cannot be computed honestly under the existing `RiskManager`
+  contract — `on_pnl(pnl)` receives only absolute rupee P&L, and
+  `new_position(lots, entry_price=...)` deliberately withholds `lot_size`/
+  `quantity` (its own docstring: "lots scales per-lot thresholds"), because
+  `lot_size` is exchange-resolved at runtime and CLAUDE.md forbids
+  hardcoding it. Recovering a price percentage from a rupee P&L needs
+  quantity; inventing one would either hardcode a lot size or require
+  widening `RiskManager.new_position`'s signature for every registered *and*
+  every test-double risk manager. So `HardStopRiskManager` instead follows
+  the contract's own documented idiom: `catastrophic_stop_rupees_per_lot`, an
+  absolute rupee floor scaled by the position's own `lots`. Shipped disabled
+  (`none`) per the approved brief ("catastrophic stop remains disabled unless
+  explicitly configured"); §12.5 (whether/at what level to enable it) was an
+  explicitly open spec decision, not a blocking one, and stays open.
+
+**Runtime wiring — the "Phase 9 boundary" `config_adapter.py` recorded for
+itself is now closed.** Before this phase, `runtimes/intraday_options/
+config_adapter.py::build_worker_config` always left `WorkerConfig.engine`
+`None` — its own docstring: "no real strategy exists yet to supply
+[engine parameters]". It now builds a real `EngineWorkerConfig` whenever
+`parameters.strategy_ref` (a dotted `"package.module:ClassName"`) is present
+— not `StrategyConfig.engine` (`EngineKind`), which already defaults to
+`TRADING_ENGINE` on *every* strategy, fixture included, and so cannot
+distinguish "wants the ported engine" from "carries the single-leg engine's
+default label". Absent `strategy_ref`, the Phase 1 fixture path is
+byte-for-byte unchanged (`skeleton_fixture.yaml` and every other existing
+config keep behaving exactly as before — proven by the untouched
+`test_config_adapter.py` suite still passing, plus its one updated
+docstring). `lots_per_trade` has exactly one configured home
+(`parameters.strategy_kwargs.lots_per_trade`) — it drives both the
+strategy's own `quantity_lots` property *and* `EngineWorkerConfig.lots`,
+which is what `PositionManager` (and therefore
+`OpenPosition.quantity = lots * contract.lot_size`) actually sizes every
+order from. **Worth recording for whoever writes the next real strategy**:
+`BaseStrategy.quantity_lots` is declared abstract and every engine strategy
+must implement it, but nothing in `TradingEngine` itself ever reads it —
+`PositionManager._lots` (set once, at construction, from
+`EngineWorkerConfig.lots`) is the actual sizing source. That split predates
+this phase; `config_adapter.py`'s single `strategy_kwargs.lots_per_trade`
+source keeps the two from drifting apart for this strategy, but it is a
+pre-existing architecture quirk, not something this phase changed.
+
+**Files created:** `strategies/intraday_options/ema_cross_9_21_buy/
+{__init__.py,strategy.py}` (the `EmaCross9x21BuyStrategy` `BaseStrategy`
+subclass); `common/engine/risk_managers.py`; `config/strategies/
+ema_cross_9_21_buy.yaml`; `tests/unit/test_ema_cross_9_21_buy_strategy.py`
+(35 tests); `tests/integration/test_ema_cross_9_21_buy_engine.py` (17 tests,
+a real `TradingEngine` over a real `SimulatedFeed`, no monkeypatching);
+`tests/unit/test_config_adapter_engine_branch.py` (14 tests).
+
+**Files modified:** `common/engine/strategy.py` (`on_warmup_complete` hook);
+`common/engine/engine.py` (one call site); `common/engine/__init__.py`
+(exports `HardStopRiskManager`/`get_risk_manager`, registers `hard_stop` on
+import); `common/exit/combined_candle_exit.py` (gap-notify + snapshot/
+restore); `runtimes/intraday_options/config_adapter.py` (the engine branch);
+`tests/unit/test_config_adapter.py` (one docstring updated to describe the
+real discriminator — its assertion is unchanged and still passes).
+
+**Fresh-crossover verification (spec section 4.3, the headline requirement)
+— all PASS**, proven with hand-verified `EMA`/`ConfirmedCrossover` sequences
+(not asserted from memory — computed against the real classes before being
+hard-coded): previous-day bullish continuation → NO entry (the EMAs carry
+their exact value across `on_warmup_complete()` unchanged — asserted by
+equality — while the detector resets); previous-day bearish continuation →
+NO entry; a genuine intraday flip after either → CE or PE BUY respectively;
+same-direction continuation never re-signals.
+
+**Exit verification — all PASS:** momentum break fires pre-+4% (isolated:
+trail never arms); +4% move activates the best-close trail (exact boundary,
+`move_pct >= 4.0`); an 8% retracement fires the trail in isolation (momentum
+does not co-fire, by construction of the candle wick); the first premium
+candle after a gap cannot fire momentum from before the hole
+(`CombinedCandleExit.on_gap()`), while the best-close extreme and activation
+both survive the gap untouched, and momentum resumes normally on the next
+candle; every actual close clears all premium-exit state
+(`exit_state_snapshot() == {}`) and a second trade never inherits the
+first's extreme/activation; a stray option tick for a closed contract cannot
+book a second exit; a restart of the *same* open trade restores the exact
+persisted extreme/activation via `restore_exit_state`.
+
+**Risk verification — all PASS:** live-MTM daily cap trips mid-trade from an
+*open* position's unrealised loss alone (`check_open_mtm`, before any
+realised close), latches off every later entry for the day (proven against
+the same tape that would otherwise reverse PE→CE→PE); a restarted process
+carries forward a previously-realised loss (`DailyRiskRecovery`) rather than
+re-zeroing, and trips from the correct remaining headroom; one position at a
+time is structurally enforced (`PositionManager.open` raises on a second
+open — proven live, not just asserted); the entry cutoff and the mandatory
+15:15 square-off both hold; a reversal signal arriving after 14:45 closes
+the open leg but never opens the opposite one (`can_enter()` gates the
+re-entry half only — proven with an exact hand-computed tick timestamp,
+14:56, past the 14:45 cutoff).
+
+**Quality gates:** `pytest` — full suite green (one unrelated, pre-existing,
+environment-load-sensitive timing test,
+`test_retention.py::test_purge_is_dramatically_faster_with_the_index_than_
+without`, occasionally falls just under its 5×-speedup assertion when run
+concurrently with heavy CPU load elsewhere on the machine; confirmed to pass
+cleanly in isolation both before and after this phase's changes, and
+`common/retention/` is untouched by this phase — not a regression, not
+modified to make it pass). `ruff check` — clean on every file this phase
+touched or added. `mypy` (bare `python -m mypy`, honouring
+`pyproject.toml`'s `packages =` — not path arguments, which conflict with it)
+— `Success: no issues found in 157 source files`.
+
+**Safety, explicitly confirmed:** paper execution only
+(`InMemoryGateway`/`PaperBroker` — no network client exists on this path);
+`mode: paper`, `live_approved: false` in the shipped config, and
+`effective_live_gate()` refuses it directly (proven by test); no real Dhan
+order was submitted at any point building or testing this phase; no
+LaunchAgent was loaded (`config/runtimes/intraday_options.yaml` stays
+`enabled: false`, unchanged by this phase — the strategy config itself is
+`enabled: true`, ready for an operator to turn the runtime on, but nothing in
+this phase does that); the legacy `Trading_Automation` system was not
+started, read, or written to; every Phase 0–8 test still passes unchanged.
+
+**PHASE 9 COMPLETE. READY FOR PAPER FORWARD TESTING. PHASE 10 NOT STARTED.**
 
 ### Phase 8 — LaunchAgent validation — **Complete**
 
@@ -4729,6 +4918,37 @@ second one, run directly from a shell rather than through `pytest`:
 No plist was loaded to produce this evidence — every row above is a direct
 process invocation. `launchctl list | grep algotrading` stays empty at the
 end of this phase, by design (see the decisions above).
+
+**Real Telegram messages with no `data/operational/` or `logs/` trail are
+expected from this harness, not a bug.** `supervisor_signal_child.py` takes
+a `work_dir` argument and roots its lock/PID/log directory *and* its
+`SupervisorConfig.database_path` there (`main()`, near the top) — never
+under the project's real `data/operational/` or `logs/`. Run it by hand with
+`RecordingNotifier()` swapped for a real one (`build_notifier(settings)` /
+`NOTIFIER_FROM_SETTINGS`, same as production resolves it), and every
+`worker_started`/`order_filled`/`worker_stopped` event still reaches
+Telegram for real — `common.notifications.factory` only cares whether
+`.env` has credentials, not where `work_dir` points — while the SQLite
+database and per-worker log land wherever `work_dir` was pointed, which a
+scratch invocation typically never checks in and often deletes afterward.
+Contrast this with `runtimes.intraday_options.__main__.main()` (and
+`supervised_launch.py`, which calls that same function): its fixed order is
+`setup_logging` → `enabled`/legacy gates → **open `Database(database_path)`,
+back it up, migrate it, retain it** → authenticate → *only then*
+`build_notifier(settings)` inside `build_supervisor()`. `Database.connect()`
+(`common/persistence/database.py`) creates the `.db` file on `sqlite3.connect`
+itself, before a single row is written, so by the time that entrypoint could
+ever reach code capable of sending a Telegram message, the durable database
+trail already exists at the real project path — there is no ordering under
+which the production entrypoint sends a real notification without one. So:
+a real Telegram message with a real durable trail under `data/operational/`
+means the production entrypoint ran; a real Telegram message with **no**
+trail there means a test-shaped harness ran by hand with a real notifier and
+a scratch `work_dir` — both are legitimate, and the absence of a trail is
+diagnostic of *which one happened*, not evidence that anything malfunctioned.
+(Traced in full against a real incident of exactly this shape, 8 August
+2026 — see the operator's own investigation notes; no code change resulted,
+since both entrypoints behaved exactly as designed.)
 
 **Deviation from spec section 12's five-plist list.** Only three plists
 exist: `positional_options` has no supervisor to point at (a placeholder
