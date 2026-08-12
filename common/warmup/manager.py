@@ -29,7 +29,6 @@ call site.
 
 from __future__ import annotations
 
-import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -41,7 +40,11 @@ from common.logging import get_logger
 from common.utils.timeutils import local_date_in
 
 from .requirements import StrategyWarmupSpec
-from .session_buckets import is_applicable_session_bucket, session_bucket_starts
+from .session_buckets import (
+    is_applicable_session_bucket,
+    session_bucket_count,
+    session_bucket_starts,
+)
 from .source import WarmupSource
 
 if TYPE_CHECKING:
@@ -183,15 +186,21 @@ class WarmupManager:
         starts = [c.start_at for c in candles]
 
         inapplicable = [
-            s for s in starts if not is_applicable_session_bucket(session, s, timeframe_minutes)
+            c
+            for c in candles
+            if not is_applicable_session_bucket(
+                session, c.start_at, c.end_at, timeframe_minutes
+            )
         ]
         if inapplicable:
+            example = inapplicable[0]
             return WarmupResult(
                 "PARTIAL",
                 replayed,
                 f"{base_detail}; {len(inapplicable)} replayed candle(s) fall outside "
-                f"the session boundary or off the production bucket grid (e.g. "
-                f"{inapplicable[0]:%Y-%m-%d %H:%M})",
+                f"the session boundary, have the wrong end_at, or are off the "
+                f"production bucket grid (e.g. {example.start_at:%Y-%m-%d %H:%M} "
+                f"to {example.end_at:%Y-%m-%d %H:%M})",
             )
 
         if starts != sorted(starts) or len(starts) != len(set(starts)):
@@ -258,18 +267,15 @@ class WarmupManager:
     ) -> int:
         """How many prior trading sessions to fetch to satisfy ``spec.min_bars``.
 
-        One session at the strategy timeframe usually holds far more bars than
-        any trend/MA indicator needs, so this is ``1`` in practice — but it
-        scales up (capped by ``max_lookback_sessions``) for a long-period
-        indicator. Reads ``session.start``/``.square_off`` as configured
-        time-of-day bounds, not as an instant being resolved, so this is not
-        subject to the timezone-conversion rule (D40) that governs comparing a
-        caller-supplied ``datetime`` against those bounds.
+        Uses the same midnight-anchored, full-interval bucket grid as production
+        aggregation and completeness verification. Raw session-duration division
+        overcounts non-aligned timeframes: 09:15-15:20 contains five complete 1h
+        buckets (10:00 through 14:00), not six.
         """
-        start_m = session.start.hour * 60 + session.start.minute
-        end_m = session.square_off.hour * 60 + session.square_off.minute
-        per_session = max(1, (end_m - start_m) // max(1, timeframe_minutes))
-        need = max(1, math.ceil(spec.min_bars / per_session))
+        per_session = session_bucket_count(session, timeframe_minutes)
+        if per_session == 0:
+            return self._max_lookback_sessions
+        need = max(1, (spec.min_bars + per_session - 1) // per_session)
         return min(need, self._max_lookback_sessions)
 
     def _required_latest_boundary(

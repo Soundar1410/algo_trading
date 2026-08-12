@@ -290,6 +290,6 @@ def fetch_warmup_candles_range(
     return [
         c
         for c in aggregated
-        if is_applicable_session_bucket(session, c.start_at, timeframe_minutes)
+        if is_applicable_session_bucket(session, c.start_at, c.end_at, timeframe_minutes)
         and c.start_at < current_bucket
     ]
