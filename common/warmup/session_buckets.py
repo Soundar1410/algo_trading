@@ -35,9 +35,47 @@ from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
 
-from common.candles.aggregator import floor_to_interval
 from common.engine.session import MarketSession
 from common.utils.timeutils import combine, local_date_in
+
+
+def _session_bucket_offsets(session: MarketSession, interval_minutes: int) -> range:
+    """Midnight-relative starts whose full interval fits the session.
+
+    The integer grid is the wall-clock equivalent of ``floor_to_interval``'s
+    midnight anchor. Keeping it here lets both the dated timestamp builder and
+    the calendar-independent capacity calculation use exactly the same rule.
+    """
+    if interval_minutes <= 0:
+        raise ValueError("interval_minutes must be positive")
+
+    interval_seconds = interval_minutes * 60
+    start_seconds = (
+        session.start.hour * 3600 + session.start.minute * 60 + session.start.second
+    )
+    end_seconds = (
+        session.square_off.hour * 3600
+        + session.square_off.minute * 60
+        + session.square_off.second
+    )
+    first_start = (
+        (start_seconds + interval_seconds - 1) // interval_seconds
+    ) * interval_seconds
+    latest_start = end_seconds - interval_seconds
+    if first_start > latest_start:
+        return range(0)
+    return range(first_start, latest_start + 1, interval_seconds)
+
+
+def session_bucket_count(session: MarketSession, interval_minutes: int) -> int:
+    """Number of canonical full-interval buckets in one trading session.
+
+    This deliberately does not take a date: it is capacity arithmetic used to
+    decide how many prior sessions the history fetch must request. Holiday and
+    weekend selection remains the calendar's responsibility when those sessions
+    are actually walked.
+    """
+    return len(_session_bucket_offsets(session, interval_minutes))
 
 
 def session_bucket_starts(
@@ -65,30 +103,31 @@ def session_bucket_starts(
     """
     if not session.is_trading_day(combine(day, time(0, 0), session.timezone)):
         return []
-    tz = session.timezone
-    interval = timedelta(minutes=interval_minutes)
-    day_start = combine(day, session.start, tz)
-    day_end = combine(day, session.square_off, tz)
-    cursor = floor_to_interval(day_start, interval_minutes * 60)
-    buckets: list[datetime] = []
-    while cursor < day_end:
-        if cursor >= day_start and cursor + interval <= day_end:
-            buckets.append(cursor)
-        cursor += interval
-    return buckets
+    midnight = combine(day, time(0, 0), session.timezone)
+    return [
+        midnight + timedelta(seconds=offset)
+        for offset in _session_bucket_offsets(session, interval_minutes)
+    ]
 
 
 def is_applicable_session_bucket(
-    session: MarketSession, start_at: datetime, interval_minutes: int
+    session: MarketSession,
+    start_at: datetime,
+    end_at: datetime,
+    interval_minutes: int,
 ) -> bool:
-    """True iff ``start_at`` is exactly one of :func:`session_bucket_starts`'
-    entries for its own trading day.
+    """True iff a candle exactly occupies one canonical session bucket.
 
     Rejects a candle that production aggregation could never have actually
     produced: off the ``floor_to_interval`` grid, on a non-trading day, or
     with an interval that starts before the session opens or extends past
-    its close. Used to keep such a candle from ever being able to
-    contribute to a trusted ``WARMED`` result.
+    its close. The candle's declared ``end_at`` must also be exactly one
+    configured interval after ``start_at``; validating only the start would
+    silently trust truncated or overlong provider candles.
     """
     day = local_date_in(start_at, session.timezone)
-    return start_at in session_bucket_starts(session, day, interval_minutes)
+    expected_end = start_at + timedelta(minutes=interval_minutes)
+    return (
+        end_at == expected_end
+        and start_at in session_bucket_starts(session, day, interval_minutes)
+    )

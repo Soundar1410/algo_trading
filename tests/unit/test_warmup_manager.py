@@ -50,7 +50,13 @@ def _session(
     )
 
 
-def _candle(start_at: datetime, *, close: float = 100.0) -> Candle:
+def _candle(
+    start_at: datetime,
+    *,
+    close: float = 100.0,
+    timeframe_minutes: int = 5,
+    end_at: datetime | None = None,
+) -> Candle:
     return Candle(
         security_id="13",
         instrument="NIFTY",
@@ -60,7 +66,7 @@ def _candle(start_at: datetime, *, close: float = 100.0) -> Candle:
         close=close,
         volume=0,
         start_at=start_at,
-        end_at=start_at + timedelta(minutes=5),
+        end_at=end_at or start_at + timedelta(minutes=timeframe_minutes),
         tick_count=0,
         last_tick_at=start_at,
     )
@@ -573,7 +579,7 @@ def test_a_valid_1_hour_replay_uses_the_production_grid_and_is_warmed() -> None:
     (floor_to_interval) grid's real bucket starts are 10:00, 11:00, ... --
     not the old session.start-anchored 09:15, 10:15, .... A replay using
     the real grid must be able to reach WARMED."""
-    candles = [_candle(_utc(h, 0)) for h in (10, 11, 12)]
+    candles = [_candle(_utc(h, 0), timeframe_minutes=60) for h in (10, 11, 12)]
     fetch = _CallCountingFetch(result=candles)
     manager = WarmupManager(fetch)
     spec = StrategyWarmupSpec(min_bars=3)
@@ -594,7 +600,10 @@ def test_a_terminal_bucket_extending_past_square_off_is_never_warmed() -> None:
     aggregation could never actually produce it. Its presence must never
     let a WARMED result through, even though 15:15 < 15:20 (the old,
     start-only check would have accepted it)."""
-    candles = [_candle(_utc(h, m)) for h, m in ((14, 30), (14, 45), (15, 0), (15, 15))]
+    candles = [
+        _candle(_utc(h, m), timeframe_minutes=15)
+        for h, m in ((14, 30), (14, 45), (15, 0), (15, 15))
+    ]
     fetch = _CallCountingFetch(result=candles)
     manager = WarmupManager(fetch)
     spec = StrategyWarmupSpec(min_bars=4)
@@ -627,7 +636,8 @@ def test_real_historical_aggregation_output_agrees_with_the_managers_expectation
     historical_candles = [
         c
         for c in aggregated
-        if is_applicable_session_bucket(session, c.start_at, 5) and c.start_at < _utc(9, 45)
+        if is_applicable_session_bucket(session, c.start_at, c.end_at, 5)
+        and c.start_at < _utc(9, 45)
     ]
 
     fetch = _CallCountingFetch(result=historical_candles)
@@ -636,6 +646,66 @@ def test_real_historical_aggregation_output_agrees_with_the_managers_expectation
     result = manager.warm(
         lambda c: None, _SOURCE, spec, session=session, timeframe_minutes=5, now=now
     )
+    assert result.status == "WARMED"
+
+
+@pytest.mark.parametrize("declared_minutes", [5, 90])
+def test_wrong_end_at_never_returns_warmed(declared_minutes: int) -> None:
+    """A valid start grid is insufficient: every candle must declare exactly
+    the configured 60-minute interval before its state can be trusted."""
+    candles = [
+        _candle(_utc(hour, 0), timeframe_minutes=60)
+        for hour in (10, 11, 12)
+    ]
+    bad = candles[1]
+    candles[1] = _candle(
+        bad.start_at,
+        timeframe_minutes=60,
+        end_at=bad.start_at + timedelta(minutes=declared_minutes),
+    )
+    manager = WarmupManager(_CallCountingFetch(result=candles))
+
+    result = manager.warm(
+        lambda c: None,
+        _SOURCE,
+        StrategyWarmupSpec(min_bars=3),
+        session=_session(timezone="UTC"),
+        timeframe_minutes=60,
+        now=_utc(13, 5),
+    )
+
+    assert result.status == "PARTIAL"
+    assert "wrong end_at" in result.detail
+
+
+def test_one_hour_market_open_requests_two_sessions_for_six_bars_and_warms() -> None:
+    """The canonical 09:15-15:20 grid contains five complete 1h buckets.
+    Six required bars therefore need two prior sessions at market open; the
+    old raw-duration division incorrectly requested one session."""
+    received: dict[str, int] = {}
+    thursday_tail = _candle(
+        _utc(14, 0, day=30, month=7), timeframe_minutes=60
+    )
+    friday = [
+        _candle(_utc(hour, 0, day=31, month=7), timeframe_minutes=60)
+        for hour in (10, 11, 12, 13, 14)
+    ]
+
+    def _fetch(source, *, session, timeframe_minutes, lookback_sessions, now=None):
+        received["lookback_sessions"] = lookback_sessions
+        return [thursday_tail, *friday] if lookback_sessions >= 2 else friday
+
+    manager = WarmupManager(_fetch, max_lookback_sessions=2)
+    result = manager.warm(
+        lambda c: None,
+        _SOURCE,
+        StrategyWarmupSpec(min_bars=6),
+        session=_session(timezone="UTC"),
+        timeframe_minutes=60,
+        now=_utc(9, 10),
+    )
+
+    assert received["lookback_sessions"] == 2
     assert result.status == "WARMED"
 
 
