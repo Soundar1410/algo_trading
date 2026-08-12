@@ -37,7 +37,7 @@ from common.engine.models import (
 )
 from common.engine.positions import InMemoryGateway, PositionManager
 from common.engine.selection import OptionSelector, SimulatedOptionChainResolver
-from common.models import Tick
+from common.models import Candle, Tick
 from strategies.intraday_options.ema_cross_9_21_buy.strategy import EmaCross9x21BuyStrategy
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -70,6 +70,23 @@ def _underlying_ticks(closes: Sequence[float], *, start: datetime) -> list[Tick]
     ]
     ticks.append(_tick(UNDERLYING, closes[-1], start + timedelta(minutes=5 * len(closes) + 1)))
     return ticks
+
+
+def _today_history_candles(closes: Sequence[float], *, start: datetime) -> list[Candle]:
+    """5-minute ``Candle`` objects for ``TradingEngine(history_provider=...)``
+    -- the no-warm-up-manager, today's-own-candles fallback that is the
+    actual mid-session-restart mechanism (``TradingEngine._warm_up``)."""
+    out = []
+    for i, c in enumerate(closes):
+        s = start + timedelta(minutes=5 * i)
+        out.append(
+            Candle(
+                security_id=UNDERLYING, instrument=UNDERLYING,
+                open=c, high=c, low=c, close=c, volume=0,
+                start_at=s, end_at=s + timedelta(minutes=5),
+            )
+        )
+    return out
 
 
 def _insert_fill(ticks: list[Tick], after_index: int, security_id: str, price: float) -> None:
@@ -405,6 +422,84 @@ def test_restart_restores_daily_risk_state_and_the_cap_trips_from_the_carried_ov
 
     assert len(positions.trades) == 1
     assert positions.trades[0].exit_reason is ExitReason.DAILY_LOSS_LIMIT
+
+
+# ------------------------------------------------ 14b. mid-session restart (real engine)
+#
+# Scenario B, the genuine bug fix, proven end to end through a real
+# TradingEngine (not just the strategy in isolation): the no-warm-up-manager
+# "today's-history" fallback (engine.py's own docstring: "this is the
+# mid-session-restart mechanism") replays today's own candles through
+# ~10:55; a genuine flip on the very first live candle after that must fire
+# immediately. Also proves the new completeness check (spec section 4.4:
+# "verify it actually reached the required candle") is wired correctly at
+# the engine level, both at the exact trust boundary and against a stale
+# reconstruction.
+def test_mid_session_restart_preserves_warmed_context_and_flips_on_the_first_live_candle():
+    """Boundary-exact positive case: history_provider's last candle ends
+    EXACTLY at the trust boundary (10:55, with clock pinned at 10:56 --
+    inside the still-forming 10:55-11:00 bucket, so current_bucket == 10:55)
+    -- this must land on the trusted side (>=), not be incorrectly excluded.
+    The first live candle (10:55-11:00, closing bullish) then fires CE
+    immediately."""
+    history = _today_history_candles(
+        [100.0, 100.0, 100.0, 90.0, 80.0, 70.0], start=_dt(10, 25)
+    )  # last candle: 10:50-10:55 -- ends exactly on the trust boundary
+    ticks = _underlying_ticks([90.0], start=_dt(10, 55))
+    _insert_fill(ticks, 1, CE_CONTRACT, 60.0)  # fills the entry once the candle closes
+
+    strategy = EmaCross9x21BuyStrategy(ema_fast=2, ema_slow=3, lots_per_trade=1)
+    positions = PositionManager(InMemoryGateway(slippage_points=0.0), lots=1)
+    engine = TradingEngine(
+        EngineConfig(timeframe="5m", session=_session(), warmup_from_history=True),
+        feed=SimulatedFeed(ticks),
+        option_selector=OptionSelector(
+            SimulatedOptionChainResolver("NIFTY", lot_size=LOT_SIZE), strike_step=50
+        ),
+        strategy=strategy,
+        position_manager=positions,
+        underlying_security_id=UNDERLYING,
+        history_provider=lambda: history,
+        clock=lambda: _dt(10, 56),
+    )
+    engine.run()
+
+    assert positions.trades or positions.has_position()
+    opened = positions.trades[0] if positions.trades else positions.positions[0]
+    assert opened.contract.option_type is OptionType.CE
+
+
+def test_mid_session_restart_with_a_stale_history_provider_does_not_trust_the_context():
+    """Negative counterpart: history_provider returns a real (non-empty,
+    non-raising) but STALE reconstruction -- it stops at 10:25, well short
+    of the pinned "now" (10:56, i.e. coverage through 10:55 is required).
+    The completeness check must reject this and clear the crossover instead
+    of trusting it, so the first live candle (10:55-11:00, closing bullish)
+    must NOT enter even though it would flip a trusted bearish context."""
+    history = _today_history_candles(
+        [100.0, 100.0, 100.0, 90.0, 80.0, 70.0], start=_dt(9, 55)
+    )  # last candle: 10:20-10:25 -- a 30-minute gap before "now"
+    ticks = _underlying_ticks([90.0], start=_dt(10, 55))
+    _insert_fill(ticks, 1, CE_CONTRACT, 60.0)  # would fill IF an entry (wrongly) fired
+
+    strategy = EmaCross9x21BuyStrategy(ema_fast=2, ema_slow=3, lots_per_trade=1)
+    positions = PositionManager(InMemoryGateway(slippage_points=0.0), lots=1)
+    engine = TradingEngine(
+        EngineConfig(timeframe="5m", session=_session(), warmup_from_history=True),
+        feed=SimulatedFeed(ticks),
+        option_selector=OptionSelector(
+            SimulatedOptionChainResolver("NIFTY", lot_size=LOT_SIZE), strike_step=50
+        ),
+        strategy=strategy,
+        position_manager=positions,
+        underlying_security_id=UNDERLYING,
+        history_provider=lambda: history,
+        clock=lambda: _dt(10, 56),
+    )
+    engine.run()
+
+    assert positions.trades == []
+    assert not positions.has_position()
 
 
 # --------------------------------------------------- 15. stray ticks after close

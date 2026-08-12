@@ -196,27 +196,37 @@ class BaseStrategy(ABC):
         start, so strategies that haven't opted in are unaffected."""
         return None
 
-    def on_warmup_complete(self) -> None:
+    def on_warmup_complete(self, *, context_trusted: bool = True) -> None:
         """Called once, after :class:`~common.engine.engine.TradingEngine` has
         finished replaying (or attempting to replay) today's warm-up candles,
-        and before the first live candle. Phase 9.
+        and before the first live candle. Phase 9 (Rev 3 fresh-crossover fix).
 
         Warm-up replays closed candles through :meth:`on_candle` itself — there
         is no separate "replay mode" — so any indicator holds correct state
-        afterwards, but a *day-scoped detector* built on top of an indicator
-        (e.g. :class:`~common.indicators.ema.ConfirmedCrossover`, which latches
-        "confirmed side" and must not treat a trend inherited from a prior
-        session as today's fresh signal) would otherwise come out of warm-up
-        already primed with yesterday's side. This hook is where such a
-        strategy resets *only* that day-scoped detector, leaving the indicator
-        itself (session-spanning, intentionally warmed) untouched.
+        afterwards. A *day-scoped detector* built on top of an indicator (e.g.
+        :class:`~common.indicators.ema.ConfirmedCrossover`, which latches a
+        "confirmed side") must decide whether that just-replayed relationship
+        is trustworthy enough to serve as today's crossover context: a
+        strategy whose spec says a verified, complete replay's relationship
+        should be *preserved* into live processing (so a genuine current-day
+        closed-candle flip against it is a real entry) keeps it when
+        ``context_trusted`` is ``True``; one that must not trust an
+        unverified relationship (no replay at all, or a partial/stale/failed/
+        skipped one) clears its detector instead when it is ``False``,
+        letting the detector's own "first observation after a reset is
+        context-only" behaviour re-establish context safely from the first
+        live candle. See ``ema_cross_9_21_buy_spec.md`` sections 4.3/4.4/11
+        for the concrete rule this default parameter exists to serve.
 
         Called unconditionally — whether warm-up replayed real history, ran
         cold (no manager/history available), or was skipped entirely
         (:meth:`warmup_spec` returned ``None``) — so a strategy's hook body
-        does not need to know which case it is in; resetting an
-        already-fresh detector is a harmless no-op. Default: no-op, for every
-        strategy that has no such detector.
+        does not need to know which case it is in beyond ``context_trusted``.
+        ``context_trusted`` reflects :meth:`~common.engine.engine.
+        TradingEngine._warm_up`'s own assessment of whether *this call*, if it
+        replayed anything, replayed a genuinely complete relationship — not
+        whether a replay happened at all. Default: no-op, for every strategy
+        that has no such detector (the argument is then simply ignored).
         """
         return None
 

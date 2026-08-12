@@ -158,13 +158,15 @@ class EmaCross9x21BuyStrategy(BaseStrategy):
     def reset(self) -> None:
         """Start of each trading day (``TradingEngine._start_day``).
 
-        Resets the crossover detector — spec section 4.3's invariant — but
-        deliberately *not* the EMAs: they are ``SESSION_SPANNING``
-        (:meth:`warmup_spec`) and carry state across the overnight gap on
-        purpose. Warm-up replay (which runs after this, through
-        :meth:`on_candle` like any other candle) can re-prime the crossover
-        from yesterday's relationship; :meth:`on_warmup_complete` resets it a
-        second time for exactly that reason.
+        Clears the crossover detector's stale in-memory state — left over
+        from the previous process/day — but deliberately *not* the EMAs:
+        they are ``SESSION_SPANNING`` (:meth:`warmup_spec`) and carry state
+        across the overnight gap on purpose. Warm-up replay (which runs
+        after this, through :meth:`on_candle` like any other candle)
+        reconstructs the crossover's context; :meth:`on_warmup_complete`
+        then decides whether that reconstruction is trustworthy enough to
+        keep as today's context (spec section 4.3/4.4/11) — it is not
+        cleared unconditionally a second time.
         """
         self._crossover.reset()
         self._candles_seen = 0
@@ -175,16 +177,24 @@ class EmaCross9x21BuyStrategy(BaseStrategy):
         self._prev_premium_candle = None
         self._last_position = None
 
-    def on_warmup_complete(self) -> None:
+    def on_warmup_complete(self, *, context_trusted: bool = True) -> None:
         """Warm-up (if any ran) has fed today's opening EMA state through
         :meth:`on_candle`, which may have left the crossover detector
-        confirmed on yesterday's side. Reset it now — EMAs untouched — so the
-        first live candle only establishes context (spec section 4.3's
-        headline "fresh intraday crossover" requirement). A no-op when
-        warm-up never touched the detector (cold start, or no warm-up at
-        all): resetting an already-fresh detector changes nothing.
+        confirmed on some relationship — yesterday's close, or today's own
+        candles replayed so far. Rev 3 (spec section 4.3/4.4): that
+        relationship is *preserved* as crossover context when it is
+        trustworthy (``context_trusted``, computed by
+        :meth:`~common.engine.engine.TradingEngine._warm_up` from whether the
+        replay it ran, if any, was verified-complete) — a subsequent
+        current-day closed candle can then flip it into a real entry. It is
+        *cleared* when it is not (no usable warm-up, or a
+        partial/stale/failed/skipped replay), so the detector's own "first
+        observation after a reset is context-only" rule re-establishes
+        context safely from the first live candle instead of trusting an
+        unverified one. EMAs are untouched either way.
         """
-        self._crossover.reset()
+        if not context_trusted:
+            self._crossover.reset()
 
     def status(self) -> str:
         def _value(ema: EMA) -> float | None:

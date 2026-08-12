@@ -62,6 +62,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
+from common.candles.aggregator import floor_to_interval
 from common.candles.builder import CandleBuilder, to_ohlc
 from common.indicators.base import OHLC
 from common.logging import get_logger
@@ -265,6 +266,11 @@ class TradingEngine:
         # Set when a required historical warm-up did not return WARMED. Entry side
         # only, day-latched, cleared solely by _start_day.
         self._entry_blocked: str | None = None
+        # Whether _warm_up() established a verified-complete crossover-context
+        # replay this run — forwarded to strategy.on_warmup_complete() so a
+        # day-scoped detector (e.g. ConfirmedCrossover) knows whether to keep
+        # or discard what it was just fed. Rev 3 fresh-crossover fix (Phase 9).
+        self._warmup_context_trusted: bool = False
 
         # Market Regime Engine: observes the underlying candles (the same ones the
         # strategy sees) and tags each trade with the detected regime. A no-op null
@@ -348,11 +354,14 @@ class TradingEngine:
         self._stopped.clear()
         self._start_day()
         self._warm_up()
-        # Phase 9: tell the strategy warm-up is over, whatever it did (real
-        # replay, cold start, or opted out) — see BaseStrategy.on_warmup_complete.
-        # After _warm_up() and before the first live tick, so a day-scoped
+        # Phase 9 (Rev 3 fresh-crossover fix): tell the strategy warm-up is
+        # over, whatever it did (real replay, cold start, or opted out), and
+        # whether whatever it replayed is trustworthy enough to keep as
+        # crossover context — see BaseStrategy.on_warmup_complete and
+        # _warm_up()'s own self._warmup_context_trusted assignments. After
+        # _warm_up() and before the first live tick, so a day-scoped
         # detector reset here can never see a warm-up candle nor miss a live one.
-        self.strategy.on_warmup_complete()
+        self.strategy.on_warmup_complete(context_trusted=self._warmup_context_trusted)
         self.feed.on_tick(self.on_tick)
         self._reporter.start()
         log.info(
@@ -440,6 +449,17 @@ class TradingEngine:
             log.info("%s indicator warm-up: %s — %s", self.label, result.status, result.detail)
             if spec.entry_blocked_by(result.status):
                 self._block_entries(f"required warm-up returned {result.status} — {result.detail}")
+            # Rev 3 fresh-crossover fix (spec section 4.4): only a verified-
+            # complete replay is trustworthy crossover context. WARMED is the
+            # only status where the fetch succeeded *and* every replayed
+            # candle succeeded — fetch_warmup_candles_range already excludes
+            # the still-forming bucket and raises (-> COLD_START) on any
+            # transport/parse failure, so WARMED alone already proves coverage
+            # reached the latest required completed candle; every other
+            # status means either nothing was replayed (untouched detector,
+            # so clearing it is a harmless no-op) or replay aborted partway
+            # (an untrustworthy partial relationship that must be cleared).
+            self._warmup_context_trusted = result.status == "WARMED"
             return
 
         # Below here: no warm-up manager -> the today's-history fallback. It is
@@ -486,6 +506,32 @@ class TradingEngine:
             last.start_at.strftime("%H:%M"),
             self.strategy.status(),
         )
+
+        # Rev 3 fresh-crossover fix (spec section 4.4): unlike the manager
+        # path, nothing above verifies this replay actually reached the
+        # latest completed candle before now -- a `history_provider` that
+        # silently returns a stale/truncated list would otherwise look
+        # identical to a genuinely current one. Enforce the same boundary
+        # fetch_warmup_candles_range already applies (candle.start_at <
+        # current_bucket, i.e. a fully-covering replay's last candle ends
+        # exactly at current_bucket): only trust the replayed crossover
+        # context when it does. Uses self._now() (the engine's own
+        # injectable clock), not wall-clock time, so this stays deterministic
+        # under test -- a test driving this path must pass a matching
+        # clock=... .
+        interval_minutes = parse_timeframe_minutes(self.cfg.timeframe)
+        current_bucket = floor_to_interval(self._now(), interval_minutes * 60)
+        if last.end_at >= current_bucket:
+            self._warmup_context_trusted = True
+        else:
+            log.info(
+                "%s: today's-history fallback stopped short of the latest "
+                "completed candle (last candle ends %s, required through %s) "
+                "-- crossover context left untrusted",
+                self.label,
+                last.end_at,
+                current_bucket,
+            )
 
     @property
     def entries_blocked(self) -> str | None:

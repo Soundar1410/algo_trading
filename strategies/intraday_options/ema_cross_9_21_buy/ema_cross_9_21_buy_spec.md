@@ -5,12 +5,12 @@
 | Field | Value |
 |---|---|
 | Strategy id | `ema_cross_9_21_buy` |
-| Delivers | Phase 9 (first real strategy) + Phase 10 (live enablement) |
+| Delivers | Phase 9 — first real strategy, paper mode. Phase 10 (live enablement) is explicitly deferred; this document's design anticipates it (see §10's `live_approved: false`) but does not authorize implementing it. |
 | Engine | `trading_engine` (`common.engine.engine.TradingEngine`) |
 | Strategy contract | `common.engine.strategy.BaseStrategy` |
 | Mode at delivery | `paper` (live gate fail-closed; see §10) |
 | Status | Draft — open decisions in §12 must be closed before implementation |
-| Revision | Rev 2 — MTM daily cap, scrip-master sizing, 09:15 start, premium gap handling, per-trade exit reset |
+| Revision | Rev 3.1 — clarified §4.3 (reset-vs-context wording no longer reads as contradicting §11's day-start reset), tightened §11's warm-up description to avoid implying full re-replay into an already-warm EMA (verified against actual engine `_warm_up()`: no double-counting bug found, but added explicit verification/test requirement), added a precise "valid/complete" warm-up definition to §4.4, and removed Phase-10-in-scope wording from the metadata table and §1 (Phase 9 only; Phase 10 explicitly deferred). No behavioural requirement changed in this pass — Rev 3's acceptance matrix and cold-start rule are unchanged. |
 
 > This document is a requirement + design spec, not the code. It records the
 > behaviour the strategy must exhibit, the decisions already made, the decisions
@@ -23,9 +23,13 @@
 ## 1. Purpose & Scope
 
 Build **one** complete, end-to-end intraday options strategy on the preserved
-engine so that Phases 9 and 10 exercise the entire pipeline — signal generation,
-option selection, order submission (paper), per-position and day-level risk,
-square-off, and the live gate — through a single, well-understood strategy.
+engine, implemented and forward-tested in **paper mode (Phase 9)**, so the
+pipeline — signal generation, option selection, order submission (paper),
+per-position and day-level risk, square-off — is exercised through a single,
+well-understood strategy before **Phase 10** (live enablement) is even
+considered. Phase 10 is a separate, later decision, not part of this
+document's implementation scope — the design here anticipates it (the live
+gate stays fail-closed throughout, §10) but does not authorize building it.
 
 Additional strategies are explicitly **out of scope** until this one is complete
 end to end (see §15). The 9/21 EMA crossover is chosen because it is simple to
@@ -115,60 +119,138 @@ confirmed bullish crossover, `-1` only on a newly confirmed bearish crossover, a
 - `confirmation_candles` — consecutive closed candles the new side must hold.
   Default **1** (act on the closing candle of the cross).
 
-### 4.3 Intraday Fresh-Crossover Rule *(headline requirement)*
+### 4.3 Intraday Fresh-Crossover Rule *(headline requirement — revised, Rev 3)*
 
-The strategy is **strictly intraday**. A trade is allowed **only** when a fresh
-9/21 crossover occurs **during the current trading day**. A crossover
-*relationship* inherited from the previous day must never, on its own, produce an
-entry at the open.
+> **Rev 3 change:** this section previously required the first current-day
+> candle to always be context-only, never an entry. That has been revised.
+> The most recent completed EMA relationship — including one carried over
+> from the previous session — may serve as **crossover context**. What must
+> never happen is an entry produced by that context alone. An entry requires
+> a **current-day closed candle** to be the one that actually changes the
+> side. See the acceptance matrix below; the last two rows (mid-session
+> restart) were always required and are unchanged by this revision.
+
+The strategy is **strictly intraday** in the sense that follows, not in the
+stronger sense of "must observe two flips within the session before acting."
 
 **Required behaviour**
 
-1. Previous-day EMA state may be used **only** for indicator warm-up / calculation
-   continuity. It must **not** create an entry at market open.
-2. At the start of each trading day, **crossover-detection state is reset** so the
-   strategy waits for a *new* current-day relationship flip.
-3. A valid **CE** entry occurs only after EMA9 first moves to/below EMA21 and
-   *subsequently* produces a fresh bullish crossover **within the same session**.
-   The mirror holds for **PE** (a fresh bearish crossover within the session).
+1. The most recently completed EMA relationship — whether it was established
+   by yesterday's close, by today's own candles during warm-up replay, or by
+   a live candle earlier today — is available as **context** by the time live
+   processing begins, reconstructed after any lifecycle reset if needed (§11).
+   Context alone **never** produces an entry.
+2. A valid entry is produced only when a **newly completed current-day closed
+   candle** changes the EMA9/EMA21 relationship relative to that context to the
+   opposite side. Bullish flip ⇒ CE. Bearish flip ⇒ PE.
+3. Continuation — a newly completed candle whose relationship matches the
+   existing context — produces **no entry**, regardless of whether that context
+   came from yesterday or from earlier today.
+4. There is still no intrabar execution. Everything is evaluated on **completed**
+   5-minute candles only; a crossover occurring intra-candle (e.g. at 09:17) is
+   not actionable until the candle it occurred in closes (e.g. 09:20).
 
-**Design mapping — the single invariant to protect**
+**Design mapping — the corrected invariant**
 
-`ConfirmedCrossover` already encodes the anti-stale behaviour: the **first** spread
-it sees after a reset only *establishes context* and returns `None` — it never
-emits an entry. Therefore the rule reduces to one invariant:
+The previous (Rev 2) design leaned on `ConfirmedCrossover`'s native behaviour,
+where the first spread it sees after a reset is always context-only. That is no
+longer the desired behaviour for market open specifically. The corrected
+invariant is:
 
-> **The `ConfirmedCrossover` must be un-initialised at the first current-day
-> candle, while the EMAs remain warm.**
+> **The most recent legitimate relationship must be available when live
+> processing begins.** A lifecycle reset (e.g. the day-start `reset()`, §11) may
+> clear the detector's in-memory state — that is correct and expected. But that
+> relationship must then be reconstructed or explicitly reseeded from valid
+> context (via warm-up, or an already-warm in-process EMA on a continuously
+> running process) before the first live candle is evaluated. If it cannot be
+> reconstructed, §4.4's cold-start behaviour applies instead. Only a subsequent
+> *current-day, closed-candle* observation can turn that (reconstructed or
+> preserved) context into an entry.
 
 Concretely:
 
-- In `reset()` (the engine calls this at the start of each trading day), call
-  `crossover.reset()`. **Do not reset the EMAs.**
-- Warm-up may feed the EMAs but must **not** leave the crossover detector
-  initialised with yesterday's side. Two acceptable implementations: (a) do not
-  run warm-up candles through the detector at all; or (b) run them, then call
-  `crossover.reset()` after warm-up and before the first live candle. Either way,
-  the detector's first *current-day* update is context-only.
+- The day-start `reset()` clearing the detector is fine — see §11 for the full
+  lifecycle. What must **not** happen is the relationship staying lost after that
+  reset, with nothing reconstructing it before the first live candle. The
+  entry-eligibility gate is on the *context itself being missing*, not on
+  whether a reset call happened.
+- The first candle evaluated on a new day (whether its "before" state is
+  yesterday's close or today's own warm-up) **can** produce an entry if it
+  flips the reconstructed relationship, and **cannot** if it continues it.
+- Mid-session restart follows the identical rule: today's own warmed
+  relationship (e.g. from replay through 10:55) is context; the first live
+  candle after restart (e.g. 11:00–11:05) can enter on a flip.
 
-**Worked example (must hold in tests)**
+**Acceptance matrix (must hold in tests)**
+
+| Context (most recent completed relationship) | First newly-completed candle | Required outcome |
+|---|---|---|
+| Bearish (e.g. yesterday's close, or earlier today) | Bullish | **CE BUY** |
+| Bullish (e.g. yesterday's close, or earlier today) | Bearish | **PE BUY** |
+| Bullish | Bullish | **No entry** (continuation) |
+| Bearish | Bearish | **No entry** (continuation) |
+| Today's warmed context bearish (e.g. as of 10:55, mid-session restart) | Bullish (e.g. 11:00–11:05) | **CE BUY** |
+| Today's warmed context bullish (e.g. as of 10:55, mid-session restart) | Bearish (e.g. 11:00–11:05) | **PE BUY** |
+
+No intrabar entries in any row — every "newly-completed candle" above means a
+**closed** 5-minute candle.
+
+### 4.4 Cold-start / unavailable-context rule
+
+Rev 3 permits the most recently completed EMA relationship to serve as context
+**only when that relationship has actually been established from valid completed
+candles.** The strategy must never fabricate or assume context that wasn't
+actually observed.
+
+**What counts as "valid" / "complete" context.** Valid context requires
+coverage through the latest fully completed 5-minute candle immediately before
+live handoff, per the exchange trading calendar. A warm-up call simply
+*returning* (not raising) does not by itself prove that coverage is complete —
+verify it actually reached the required candle. Partial, stale, skipped,
+failed, or otherwise unverifiable coverage must leave the crossover context
+**untrusted**: any relationship a detector update produced from such a replay
+must be treated as not established, and cleared/ignored before live processing
+begins. In that situation the first EMA-ready live candle establishes context
+only, exactly as in the no-warm-up-at-all case below.
+
+**Required behaviour**
+
+- If startup has **no usable historical context** — e.g. the warm-up manager is
+  unavailable, or the process genuinely cold-starts with no prior data — the
+  first live candle that makes the 21-EMA ready establishes context **only**. It
+  produces **no entry**, regardless of which side that first relationship happens
+  to land on. A later completed candle that genuinely flips *that* established
+  relationship signals normally.
+- If warm-up runs but **fails before reaching the latest required completed
+  candle** (a partial/stale result), do not treat whatever partial relationship
+  it produced as equivalent to "the immediately preceding completed market
+  context." Inspect the warm-up result/lifecycle and **fail conservatively** —
+  treat it the same as no usable context — rather than inventing or trusting an
+  incomplete relationship.
+- This rule does **not** change the ordinary Rev 3 case where valid, complete
+  prior history genuinely is available: yesterday closes bearish, warm-up
+  successfully reconstructs that bearish relationship, the 09:20 candle closes
+  bullish ⇒ **CE BUY**, exactly as in the acceptance matrix above.
+
+**Worked example**
 
 | Situation | Required outcome |
 |---|---|
-| Prev day closes `EMA9 > EMA21`; new day opens `EMA9 > EMA21` | **No CE entry** — continuation is not a signal |
-| Intraday: `EMA9` falls to/below `EMA21`, then crosses back above | **CE entry** on the confirmed bullish flip |
-| Prev day closes `EMA9 < EMA21`; new day opens `EMA9 < EMA21` | **No PE entry** |
-| Intraday: fresh bearish crossover | **PE entry** on the confirmed bearish flip |
+| No usable warm-up/context; 09:15–09:20 is the first EMA-ready candle | Establish context only — **no entry** |
+| Same cold start; a later candle genuinely flips that established context | **CE/PE**, normally |
+| Warm-up partial/failed before the latest required candle | Treat as no usable context — **fail conservatively**, do not fabricate |
+| Warm-up complete and valid (ordinary case) | Acceptance matrix above applies unchanged |
 
-### 4.4 Warm-up & session continuity
+### 4.5 Warm-up & session continuity
 
 The strategy opts into warm-up via `warmup_spec()`
 (`StrategyWarmupSpec.from_indicators([...])`) so the two EMAs are seeded from prior
 sessions. Note the warm-up **manager** that replays history is a market-data
 concern and may not be injected; with no manager the engine cold-starts and
-`StrategyWarmupSpec.entry_blocked_by` gates entries on the cold seed. Behaviour
-must be correct in both cases — warmed and cold. When cold, no entry may fire
-until the 21-EMA is genuinely ready (≥ 21 closed 5-minute candles).
+`StrategyWarmupSpec.entry_blocked_by` gates entries on the cold seed. See §4.4 for
+the required behaviour in that case — no entry may fire until the 21-EMA is
+genuinely ready, and the first ready candle establishes context only, never an
+entry.
 
 ---
 
@@ -176,12 +258,16 @@ until the 21-EMA is genuinely ready (≥ 21 closed 5-minute candles).
 
 An entry is emitted (`SignalAction.ENTER`) when **all** hold:
 
-1. A **fresh** current-day confirmed crossover occurred (§4.3): `+1` ⇒ CE, `-1` ⇒ PE.
+1. A **fresh** crossover occurred, per the acceptance matrix in §4.3: the most
+   recently completed relationship (context — may be from the prior session,
+   warm-up, or an earlier live candle today) differs from the newly completed
+   current-day closed candle. `+1` ⇒ CE, `-1` ⇒ PE.
 2. The current time is **within the entry window 09:15 → 14:45** (inclusive start at
-   session open, no new entries after the cutoff). In practice the first 5-minute
-   candle closes at 09:20 and is context-only under §4.3, so the earliest possible
-   fill is later than 09:15; the explicit start simply bars any pre-open action and
-   bounds the window.
+   session open, no new entries after the cutoff). The 09:15–09:20 candle **can**
+   produce an entry on its 09:20 close if it flips the relationship (§4.3, Rev 3);
+   it produces no entry if it continues the existing relationship. The explicit
+   09:15 start bars any pre-open action and bounds the window; it does not by
+   itself delay the earliest possible entry beyond the first candle close.
 3. **No position is open** (one-at-a-time), **or** the open position is on the
    opposite side and is being reversed (§9).
 4. The day-level guard is **not halted** (loss cap / kill switch not tripped, §6.4).
@@ -243,11 +329,11 @@ exit must:
   `_lowest_close` and the activation flag (`_activated`) are **kept**, because the
   trail measures favourable progress since entry and a data hole does not undo it.
 
-This is the premium-side counterpart to the underlying `on_candle_gap` (§4.4), which
-for this strategy is a no-op (EMAs are session-spanning and decay a hole out; no
-`SESSION_LOCAL` indicator is used). `CombinedCandleExit` has no gap hook today, so this
-is **new work**: add a gap-notify that sets a one-candle momentum-suppress flag while
-leaving trail state untouched.
+This is the premium-side counterpart to the underlying `on_candle_gap` (see §4.1),
+which for this strategy is a no-op (EMAs are `SESSION_SPANNING` and decay a hole
+out; no `SESSION_LOCAL` indicator is used). `CombinedCandleExit` has no gap hook
+today, so this is **new work**: add a gap-notify that sets a one-candle
+momentum-suppress flag while leaving trail state untouched.
 
 **Per-trade state reset (required).** All position-specific premium-exit state must be
 cleared on **every** position close, so nothing leaks into the next trade: the trail
@@ -470,6 +556,33 @@ paper_execution:
 | Warm-up | `common.warmup.requirements.StrategyWarmupSpec` | wire |
 | Signal payload | `StrategySignal(action, option_type, side, …)` | produce |
 
+**Crossover lifecycle ordering (Rev 3).** The day-start `reset()` that clears
+stale in-memory detector state (left over from the previous process/day) is
+still correct and should **not** be removed — it's the "clear stale state" step
+below. The corrected lifecycle is:
+
+1. Day start: `reset()` clears stale `ConfirmedCrossover` state. EMA state is
+   **not** cleared by this reset — EMAs are `SESSION_SPANNING` (§4.1) and, on a
+   continuously running process, may already be warm from prior processing.
+2. Warm-up reconstructs the crossover context needed for the first live candle.
+   What this actually replays depends on what's missing: on a fresh process
+   with no EMA state, it needs enough history to make the EMAs ready plus
+   today's candles so far; on a continuously running process whose EMAs are
+   already warm, it only needs *today's own new candles it hasn't seen yet* —
+   **not** a re-replay of history already baked into the existing EMA state.
+   Verify against the actual `_warm_up()` implementation which of these applies
+   in each case, and confirm no candle is ever fed to an EMA instance twice
+   (double-counting a candle would corrupt the average). Add a test for this
+   specifically if the current implementation doesn't already cover it.
+3. The reconstructed relationship is **preserved** into live processing as
+   context — it is not discarded a second time. If the current implementation
+   resets the detector again in a post-warm-up completion hook, that second
+   reset is what conflicts with Rev 3 and needs to change; the day-start reset
+   in step 1 does not.
+4. If step 2 produces no usable relationship (no warm-up manager, or a
+   partial/failed warm-up), no context exists — see §4.4. The first live
+   EMA-ready candle establishes context only, never an entry.
+
 **Contract choice is settled by the spec:** premium candles, option selection, and
 a per-position risk policy exist **only** on `BaseStrategy` (not the lighter
 worker-seam `Strategy` protocol). Implement the strategy as a `BaseStrategy`
@@ -512,14 +625,18 @@ activation.
 
 ## 13. Edge Cases & Behavioural Notes
 
-- **First current-day candle is never an entry** — it establishes crossover context
-  (§4.3). Earliest possible fire is after a genuine intraday flip.
-- **Cold start:** no entry until the 21-EMA is ready (≥ 21 bars). Warmed start:
-  ready from the first candle, but still gated by the fresh-crossover rule.
+- **First current-day candle CAN be an entry (Rev 3)** — if it flips the
+  relationship relative to the most recent completed context (which may be from
+  the prior session or from today's warm-up), per §4.3's acceptance matrix. It
+  produces no entry only if it continues that relationship.
+- **Cold start:** no entry until the 21-EMA is ready (≥ 21 bars), regardless of
+  what §4.3 would otherwise allow — indicator readiness gates entry independently
+  of crossover context.
 - **Momentum leg needs history:** it cannot fire on the first premium candle after
   entry (no prior premium candle to compare); earliest is the second.
-- **No entry before 09:15 or after 14:45**; earliest realistic fill is after 09:20
-  (first candle closes) and is later still because that candle is context-only.
+- **No entry before 09:15 or after 14:45.** The earliest realistic fill is at the
+  09:20 close of the first candle, and only if that candle flips the relationship
+  (§4.3); a continuation candle produces no entry regardless of session start.
 - **Reversal after 14:45:** exit-only (§9).
 - **Daily cap tripped mid-trade:** because the cap is on live MTM, an open position
   whose unrealised loss pushes `realised + open` past −3% trips the halt and squares
@@ -539,8 +656,15 @@ activation.
 
 ## 14. Testing Considerations
 
-- **Fresh-crossover rule:** the four rows of the §4.3 table, plus the reset
-  invariant (warm EMAs + un-initialised detector at day open ⇒ no open-bar entry).
+- **Fresh-crossover rule (Rev 3):** all six rows of the §4.3 acceptance matrix —
+  the four market-open rows (context from prior session or earlier today, flip
+  vs. continuation) and the two mid-session-restart rows (today's warmed context,
+  flip on the first post-restart candle). Assert no intrabar entries in any case.
+- **Cold-start / unavailable-context rule (§4.4):** no usable warm-up/context ⇒
+  the first EMA-ready live candle establishes context only ⇒ **no entry**, on
+  either side. A later genuinely-flipping candle after that ⇒ CE/PE normally.
+  Also cover the partial/failed-warm-up case: treated identically to no context,
+  never trusted as a real prior relationship.
 - **Reversal:** CE→PE and PE→CE, including the premium-exit-first case (opposite
   cross becomes a fresh entry) and the after-14:45 exit-only case.
 - **Exit priority:** construct candles/ticks where two mechanisms fire together and

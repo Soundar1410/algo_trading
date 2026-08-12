@@ -39,6 +39,7 @@ from common.engine.models import (
 )
 from common.engine.strategy import available_strategies, get_strategy
 from common.indicators.base import OHLC
+from common.indicators.ema import EMA
 from strategies.intraday_options.ema_cross_9_21_buy.strategy import EmaCross9x21BuyStrategy
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -146,29 +147,29 @@ def test_no_entry_before_both_emas_are_ready():
 
 
 # ------------------------------------------------ 4/5. fresh-crossover invariant
-def test_previous_day_bullish_continuation_does_not_produce_ce():
-    """Verified sequence: warm-up ends confirmed-bullish; EMAs carry the value
-    across on_warmup_complete() unchanged; the first live candle continuing the
-    same bullish relationship establishes context only."""
+#
+# Rev 3 (spec section 4.3): the most recently completed relationship survives
+# on_warmup_complete(context_trusted=True) as crossover context -- it is no
+# longer wiped a second time. An entry requires a genuine current-day closed
+# candle to flip *against* that context; a candle that merely continues it
+# produces no entry. These four tests are acceptance-matrix rows 1-4.
+def test_context_bullish_continuation_does_not_produce_ce():
+    """Row 3: context bullish, next closed candle still bullish -> NO ENTRY."""
     strategy = _strategy()
     strategy.reset()
-    # Warm-up replay: signals are deliberately discarded by the ENGINE
-    # (TradingEngine._warm_up's own docstring), not by the strategy -- the
-    # cold-start flip at 110 legitimately fires here, exactly as it would for
-    # a strategy starting fresh mid-trend. Only what happens AFTER
-    # on_warmup_complete() is the invariant under test.
     for i, c in enumerate((100.0, 100.0, 100.0, 110.0, 120.0, 130.0)):
         strategy.on_candle(_candle(c), _ts(i))
     assert strategy._crossover.confirmed_label == "bullish"
     fast_before = strategy._ema_fast.state.value
     slow_before = strategy._ema_slow.state.value
 
-    strategy.on_warmup_complete()
+    strategy.on_warmup_complete(context_trusted=True)
 
-    # EMAs untouched by the post-warmup reset -- only the detector resets.
+    # EMAs untouched, and -- Rev 3 -- the context itself is now PRESERVED,
+    # not reset a second time.
     assert strategy._ema_fast.state.value == fast_before
     assert strategy._ema_slow.state.value == slow_before
-    assert strategy._crossover.confirmed_side is None
+    assert strategy._crossover.confirmed_side == 1
 
     # Today opens still bullish (135 continues the trend): NO entry.
     assert strategy.on_candle(_candle(135.0), _ts(100)) is None
@@ -176,14 +177,16 @@ def test_previous_day_bullish_continuation_does_not_produce_ce():
     assert strategy.on_candle(_candle(145.0), _ts(102)) is None
 
 
-def test_previous_day_bearish_continuation_does_not_produce_pe():
+def test_context_bearish_continuation_does_not_produce_pe():
+    """Row 4: context bearish, next closed candle still bearish -> NO ENTRY."""
     strategy = _strategy()
     strategy.reset()
     for i, c in enumerate((100.0, 100.0, 100.0, 90.0, 80.0, 70.0)):
         strategy.on_candle(_candle(c), _ts(i))  # warm-up: signals discarded by the engine
     assert strategy._crossover.confirmed_label == "bearish"
 
-    strategy.on_warmup_complete()
+    strategy.on_warmup_complete(context_trusted=True)
+    assert strategy._crossover.confirmed_side == -1  # preserved, not reset
 
     # Today opens still bearish (65 continues the trend): NO entry.
     assert strategy.on_candle(_candle(65.0), _ts(100)) is None
@@ -191,45 +194,111 @@ def test_previous_day_bearish_continuation_does_not_produce_pe():
     assert strategy.on_candle(_candle(55.0), _ts(102)) is None
 
 
-def test_fresh_intraday_bullish_cross_after_bearish_warmup_produces_ce_buy():
+def test_context_bearish_first_live_candle_bullish_produces_ce_buy():
+    """Row 1: context bearish, the very FIRST live candle after
+    on_warmup_complete(context_trusted=True) flips bullish -> CE BUY
+    immediately -- no continuation candles needed first. This is the Rev 3
+    headline behaviour (previously impossible: the old unconditional second
+    reset made the first post-warmup candle context-only no matter what)."""
     strategy = _strategy()
     strategy.reset()
     for i, c in enumerate((100.0, 100.0, 100.0, 90.0, 80.0, 70.0)):
         strategy.on_candle(_candle(c), _ts(i))
-    strategy.on_warmup_complete()
+    assert strategy._crossover.confirmed_label == "bearish"
+    strategy.on_warmup_complete(context_trusted=True)
 
-    assert strategy.on_candle(_candle(65.0), _ts(100)) is None  # continuation: context only
-    assert strategy.on_candle(_candle(60.0), _ts(101)) is None
-    assert strategy.on_candle(_candle(55.0), _ts(102)) is None
-    signal = strategy.on_candle(_candle(70.0), _ts(103))  # genuine flip
+    signal = strategy.on_candle(_candle(90.0), _ts(100))  # genuine flip, first live candle
     assert signal is not None
     assert signal.action is SignalAction.ENTER
     assert signal.option_type is OptionType.CE
     assert signal.side is OrderSide.BUY
 
 
-def test_fresh_intraday_bearish_cross_after_bullish_warmup_produces_pe_buy():
+def test_context_bullish_first_live_candle_bearish_produces_pe_buy():
+    """Row 2: mirror of the above -- context bullish, first live candle
+    flips bearish -> PE BUY immediately."""
     strategy = _strategy()
     strategy.reset()
     for i, c in enumerate((100.0, 100.0, 100.0, 110.0, 120.0, 130.0)):
         strategy.on_candle(_candle(c), _ts(i))
-    strategy.on_warmup_complete()
+    assert strategy._crossover.confirmed_label == "bullish"
+    strategy.on_warmup_complete(context_trusted=True)
 
-    assert strategy.on_candle(_candle(135.0), _ts(100)) is None
-    assert strategy.on_candle(_candle(140.0), _ts(101)) is None
-    assert strategy.on_candle(_candle(145.0), _ts(102)) is None
-    signal = strategy.on_candle(_candle(130.0), _ts(103))  # genuine flip down
+    signal = strategy.on_candle(_candle(110.0), _ts(100))  # genuine flip, first live candle
+    assert signal is not None
+    assert signal.action is SignalAction.ENTER
+    assert signal.option_type is OptionType.PE
+    assert signal.side is OrderSide.BUY
+
+
+# --------------------------------------------- 4b/5b. mid-session restart
+#
+# Acceptance-matrix rows 5/6 (spec section 4.3, mid-session restart --
+# scenario B, the genuine bug fix). Mechanically identical to rows 1/2 above
+# (ConfirmedCrossover has no notion of calendar days -- context is context,
+# whatever its source), documented separately because it was previously
+# broken for a different reason: before this fix, EVERY post-warmup first
+# candle was context-only, whether the context came from yesterday's close
+# or from today's own restart replay.
+def test_mid_session_restart_warmed_bearish_context_first_live_candle_bullish_produces_ce_buy():
+    """Row 5: today's own warmed context (established purely from today's
+    candles replayed through ~10:55, not yesterday's close) is bearish; the
+    first live candle after the restart (~11:00-11:05) flips bullish -> CE
+    BUY on that very first live candle."""
+    strategy = _strategy()
+    strategy.reset()
+    for i, c in enumerate((100.0, 100.0, 100.0, 90.0, 80.0, 70.0)):
+        strategy.on_candle(_candle(c), _ts(i))  # today's own candles, replayed through 10:55
+    strategy.on_warmup_complete(context_trusted=True)
+
+    signal = strategy.on_candle(_candle(90.0), _ts(100))  # 11:00-11:05, genuine flip
+    assert signal is not None
+    assert signal.option_type is OptionType.CE
+    assert signal.side is OrderSide.BUY
+
+
+def test_mid_session_restart_warmed_bullish_context_first_live_candle_bearish_produces_pe_buy():
+    """Row 6: mirror of the above."""
+    strategy = _strategy()
+    strategy.reset()
+    for i, c in enumerate((100.0, 100.0, 100.0, 110.0, 120.0, 130.0)):
+        strategy.on_candle(_candle(c), _ts(i))
+    strategy.on_warmup_complete(context_trusted=True)
+
+    signal = strategy.on_candle(_candle(110.0), _ts(100))
     assert signal is not None
     assert signal.option_type is OptionType.PE
     assert signal.side is OrderSide.BUY
 
 
 # ------------------------------------------------------- 6/7. same-day fresh cross
-def test_a_genuinely_fresh_intraday_cross_with_no_warmup_produces_a_signal():
-    """Cold start (no warm-up at all): the first ready candle only establishes
-    context (regardless of its sign); the first real flip after that signals."""
+#
+# Spec section 4.4, cold-start / unavailable-context rule: when no legitimate
+# context exists, context must never be fabricated -- both rows required.
+def test_cold_start_no_context_first_ready_candle_establishes_context_only():
+    """Row 1: no usable warm-up/context at all (on_warmup_complete's
+    context_trusted=False, harmless no-op here since the detector is already
+    fresh) -- the first candle that makes ema_slow ready establishes context
+    ONLY, regardless of which side that first relationship lands on (here,
+    bearish)."""
     strategy = _strategy()
     strategy.reset()
+    strategy.on_warmup_complete(context_trusted=False)  # nothing was replayed; nothing to trust
+    assert strategy.on_candle(_candle(100.0), _ts(0)) is None
+    assert strategy.on_candle(_candle(100.0), _ts(1)) is None
+    # ema_slow (period 3) becomes ready here; spread is already non-flat
+    # (bearish), yet this still produces NO entry -- context only.
+    assert strategy.on_candle(_candle(90.0), _ts(2)) is None
+    assert strategy._crossover.confirmed_label == "bearish"
+
+
+def test_a_genuinely_fresh_intraday_cross_with_no_warmup_produces_a_signal():
+    """Row 2: cold start (no warm-up at all): the first ready candle only
+    establishes context (regardless of its sign); the first real flip after
+    that signals normally."""
+    strategy = _strategy()
+    strategy.reset()
+    strategy.on_warmup_complete(context_trusted=False)
     seq = [100.0, 100.0, 100.0, 90.0, 80.0, 70.0, 80.0, 90.0, 100.0]
     signals = [strategy.on_candle(_candle(c), _ts(i)) for i, c in enumerate(seq)]
     fired = [(c, s.option_type) for c, s in zip(seq, signals, strict=True) if s is not None]
@@ -242,6 +311,65 @@ def test_same_direction_continuation_does_not_repeatedly_signal():
     seq = [100.0, 100.0, 100.0, 90.0, 80.0, 70.0, 80.0]  # stays bearish after the flip
     signals = [strategy.on_candle(_candle(c), _ts(i)) for i, c in enumerate(seq)]
     assert sum(1 for s in signals if s is not None) == 1  # only the flip at 90
+
+
+# --------------------------------------------------- 7b. lifecycle (spec section 11)
+def test_day_start_reset_clears_stale_crossover_state_but_not_ema():
+    """The day-start reset() itself (stale in-memory state from a previous
+    process/day) is unchanged by this fix and must keep working: it clears
+    the crossover detector but never the EMAs (SESSION_SPANNING)."""
+    strategy = _strategy()
+    strategy.reset()
+    for i, c in enumerate((100.0, 100.0, 100.0, 90.0, 80.0, 70.0)):
+        strategy.on_candle(_candle(c), _ts(i))
+    assert strategy._crossover.confirmed_side is not None
+    fast_before = strategy._ema_fast.state.value
+    slow_before = strategy._ema_slow.state.value
+
+    strategy.reset()  # simulates a fresh process's day-start reset
+
+    assert strategy._crossover.confirmed_side is None
+    assert strategy._crossover.candidate_side is None
+    assert strategy._ema_fast.state.value == fast_before
+    assert strategy._ema_slow.state.value == slow_before
+
+
+def test_multi_day_continuous_run_never_double_feeds_the_ema():
+    """Spec section 11: on a continuously running process the EMAs are never
+    reset at a day boundary, and warm-up should only ever feed a
+    continuously-warm EMA the candles it has not already seen. Simulate two
+    day boundaries on one strategy instance and confirm the EMA's final value
+    matches an independently-computed EMA fed the exact same combined
+    sequence exactly once -- proving no candle was ever double-applied."""
+    strategy = _strategy()
+
+    # Day 1: day-start reset, then candles flow through on_candle (whether
+    # warm-up or live, both call on_candle identically).
+    strategy.reset()
+    day1_closes = [100.0, 100.0, 100.0, 90.0, 80.0, 70.0]
+    for i, c in enumerate(day1_closes):
+        strategy.on_candle(_candle(c), _ts(i))
+    strategy.on_warmup_complete(context_trusted=False)  # cold start day 1; irrelevant here
+    count_after_day1 = strategy._ema_slow._count
+    assert count_after_day1 == len(day1_closes)
+
+    # Day 2: day-start reset clears the crossover but leaves the EMA alone.
+    strategy.reset()
+    assert strategy._ema_slow._count == count_after_day1
+    assert strategy._ema_fast.state.value is not None  # still warm, not reset to None
+
+    # A correctly-scoped day-2 warm-up/live feed supplies ONLY day 2's own
+    # new candles -- never day 1's again.
+    day2_new_closes = [65.0, 60.0]
+    for i, c in enumerate(day2_new_closes):
+        strategy.on_candle(_candle(c), _ts(100 + i))
+
+    assert strategy._ema_slow._count == count_after_day1 + len(day2_new_closes)
+
+    expected = EMA(strategy._ema_slow.period)
+    for c in day1_closes + day2_new_closes:
+        expected.update(_candle(c))
+    assert strategy._ema_slow.state.value == expected.state.value
 
 
 # ------------------------------------------------------------ 8. closed candles
