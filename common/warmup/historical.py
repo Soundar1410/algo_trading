@@ -52,7 +52,9 @@ from typing import TYPE_CHECKING, Any
 from common.candles.aggregator import floor_to_interval
 from common.engine.session import MarketSession
 from common.models import Candle
-from common.utils.timeutils import combine, get_tz, local_time_in, now_tz
+from common.utils.timeutils import combine, get_tz, now_tz
+
+from .session_buckets import is_applicable_session_bucket
 
 if TYPE_CHECKING:
     from common.market_data.dhan_historical import DhanHistoricalDataClient
@@ -279,12 +281,15 @@ def fetch_warmup_candles_range(
 
     # Drop the still-forming current bucket (and anything at/after it), and
     # anything outside the session window, so warm-up and the live feed never
-    # double-count or gap at the boundary. Resolved through local_time_in
-    # rather than a raw .time() comparison -- D40.
+    # double-count or gap at the boundary. is_applicable_session_bucket is the
+    # same shared check WarmupManager's own completeness verification uses --
+    # it checks the candle's *full interval* against [session.start,
+    # session.square_off), not just its start (a start-only check would admit
+    # a terminal bucket like 15:15-15:30 when square_off is 15:20).
     current_bucket = floor_to_interval(current, timeframe_minutes * 60)
     return [
         c
         for c in aggregated
-        if session.start <= local_time_in(c.start_at, tz_name) < session.square_off
+        if is_applicable_session_bucket(session, c.start_at, timeframe_minutes)
         and c.start_at < current_bucket
     ]

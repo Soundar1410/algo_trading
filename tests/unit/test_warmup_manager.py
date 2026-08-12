@@ -454,13 +454,18 @@ def test_post_market_startup_caps_the_required_boundary_at_todays_final_bucket()
     assert result.status == "WARMED"
 
 
-def test_a_gap_outside_the_required_suffix_does_not_prevent_warmed() -> None:
-    """min_bars=3 only needs today's own [09:15,09:20,09:25]; the extra
-    Friday candles carry a gap (09:15 then 09:30, skipping 09:20/09:25) but
-    are outside the required window and must never be inspected."""
+def test_a_gap_outside_the_required_suffix_is_no_longer_ignored() -> None:
+    """Correction (Rev 3.1 follow-up): this test previously asserted WARMED
+    here, on the theory that only the final min_bars window is inspected.
+    That was the bug -- the extra Friday candles (09:15 then 09:30, skipping
+    09:20/09:25) still get replayed into the indicator even though they're
+    outside the required window, so a gap among them must not be silently
+    ignored when deciding whether the result is trusted. min_bars=3 only
+    NEEDS today's own [09:15,09:20,09:25], but the whole replayed sequence
+    is now validated, not just what's strictly required."""
     candles = [
         _candle(_utc(9, 15, day=31, month=7)),
-        _candle(_utc(9, 30, day=31, month=7)),
+        _candle(_utc(9, 30, day=31, month=7)),  # gap: skips 09:20/09:25 that Friday
         _candle(_utc(9, 15)),
         _candle(_utc(9, 20)),
         _candle(_utc(9, 25)),
@@ -475,6 +480,161 @@ def test_a_gap_outside_the_required_suffix_does_not_prevent_warmed() -> None:
         session=_session(timezone="UTC"),
         timeframe_minutes=5,
         now=_utc(9, 32),
+    )
+    assert result.status == "PARTIAL"
+    assert result.status != "WARMED"
+    # The candles were still replayed (indicator state isn't un-fed) -- only
+    # the trust decision changed.
+    assert result.candles_replayed == len(candles)
+
+
+def test_a_duplicate_outside_the_required_suffix_is_not_warmed() -> None:
+    """A duplicate earlier in today's own session, before the strictly
+    required min_bars=3 window, must still be caught."""
+    candles = [
+        _candle(_utc(9, 15)),
+        _candle(_utc(9, 15)),  # duplicate, outside the required [09:35,09:40,09:45] window
+        _candle(_utc(9, 20)),
+        _candle(_utc(9, 25)),
+        _candle(_utc(9, 30)),
+        _candle(_utc(9, 35)),
+        _candle(_utc(9, 40)),
+        _candle(_utc(9, 45)),
+    ]
+    fetch = _CallCountingFetch(result=candles)
+    manager = WarmupManager(fetch)
+    spec = StrategyWarmupSpec(min_bars=3)
+    result = manager.warm(
+        lambda c: None,
+        _SOURCE,
+        spec,
+        session=_session(timezone="UTC"),
+        timeframe_minutes=5,
+        now=_utc(9, 52),
+    )
+    assert result.status == "PARTIAL"
+
+
+def test_out_of_order_candles_outside_the_required_suffix_are_not_warmed() -> None:
+    """09:20 and 09:15 swapped, well before the strictly required
+    min_bars=3 window ([09:35,09:40,09:45]) -- still caught."""
+    candles = [
+        _candle(_utc(9, 20)),
+        _candle(_utc(9, 15)),
+        _candle(_utc(9, 25)),
+        _candle(_utc(9, 30)),
+        _candle(_utc(9, 35)),
+        _candle(_utc(9, 40)),
+        _candle(_utc(9, 45)),
+    ]
+    fetch = _CallCountingFetch(result=candles)
+    manager = WarmupManager(fetch)
+    spec = StrategyWarmupSpec(min_bars=3)
+    result = manager.warm(
+        lambda c: None,
+        _SOURCE,
+        spec,
+        session=_session(timezone="UTC"),
+        timeframe_minutes=5,
+        now=_utc(9, 52),
+    )
+    assert result.status == "PARTIAL"
+
+
+def test_a_gap_earlier_in_todays_own_session_is_not_warmed_even_with_a_complete_tail() -> None:
+    """A provider that omits part of the CURRENT session (09:20-09:30 is
+    missing) while still returning a complete, contiguous recent suffix
+    ([09:35,09:40,09:45], satisfying min_bars=3 on its own) must still be
+    caught -- the gap earlier in today's session was still replayed into
+    the indicator."""
+    candles = [
+        _candle(_utc(9, 15)),
+        # gap: 09:20, 09:25, 09:30 missing
+        _candle(_utc(9, 35)),
+        _candle(_utc(9, 40)),
+        _candle(_utc(9, 45)),
+    ]
+    fetch = _CallCountingFetch(result=candles)
+    manager = WarmupManager(fetch)
+    spec = StrategyWarmupSpec(min_bars=3)
+    result = manager.warm(
+        lambda c: None,
+        _SOURCE,
+        spec,
+        session=_session(timezone="UTC"),
+        timeframe_minutes=5,
+        now=_utc(9, 52),
+    )
+    assert result.status == "PARTIAL"
+
+
+def test_a_valid_1_hour_replay_uses_the_production_grid_and_is_warmed() -> None:
+    """1-hour timeframe on a 09:15-15:20 session: the production
+    (floor_to_interval) grid's real bucket starts are 10:00, 11:00, ... --
+    not the old session.start-anchored 09:15, 10:15, .... A replay using
+    the real grid must be able to reach WARMED."""
+    candles = [_candle(_utc(h, 0)) for h in (10, 11, 12)]
+    fetch = _CallCountingFetch(result=candles)
+    manager = WarmupManager(fetch)
+    spec = StrategyWarmupSpec(min_bars=3)
+    result = manager.warm(
+        lambda c: None,
+        _SOURCE,
+        spec,
+        session=_session(timezone="UTC"),
+        timeframe_minutes=60,
+        now=_utc(13, 5),
+    )
+    assert result.status == "WARMED"
+
+
+def test_a_terminal_bucket_extending_past_square_off_is_never_warmed() -> None:
+    """15-minute timeframe, square_off=15:20: a candle starting at 15:15
+    would extend to 15:30, past the configured close -- production
+    aggregation could never actually produce it. Its presence must never
+    let a WARMED result through, even though 15:15 < 15:20 (the old,
+    start-only check would have accepted it)."""
+    candles = [_candle(_utc(h, m)) for h, m in ((14, 30), (14, 45), (15, 0), (15, 15))]
+    fetch = _CallCountingFetch(result=candles)
+    manager = WarmupManager(fetch)
+    spec = StrategyWarmupSpec(min_bars=4)
+    result = manager.warm(
+        lambda c: None,
+        _SOURCE,
+        spec,
+        session=_session(timezone="UTC"),
+        timeframe_minutes=15,
+        now=_utc(15, 22),
+    )
+    assert result.status != "WARMED"
+    assert result.status == "PARTIAL"
+
+
+def test_real_historical_aggregation_output_agrees_with_the_managers_expectations() -> None:
+    """Not hand-picked timestamps: candles produced by the actual
+    aggregate_candles() + the shared is_applicable_session_bucket filter
+    (the same pipeline fetch_warmup_candles_range uses) must be accepted as
+    WARMED by the manager -- proving the two paths haven't drifted apart."""
+    from common.warmup.historical import aggregate_candles
+    from common.warmup.session_buckets import is_applicable_session_bucket
+
+    session = _session(timezone="UTC")
+    now = _utc(9, 47)
+    # Raw 1-minute candles spanning 09:15-09:45 (30 of them), as a real
+    # intraday fetch would return before aggregation.
+    one_min = [_candle(_utc(9, 15) + timedelta(minutes=i), close=100.0 + i) for i in range(30)]
+    aggregated = aggregate_candles(one_min, 5, security_id="13", instrument="NIFTY")
+    historical_candles = [
+        c
+        for c in aggregated
+        if is_applicable_session_bucket(session, c.start_at, 5) and c.start_at < _utc(9, 45)
+    ]
+
+    fetch = _CallCountingFetch(result=historical_candles)
+    manager = WarmupManager(fetch)
+    spec = StrategyWarmupSpec(min_bars=6)
+    result = manager.warm(
+        lambda c: None, _SOURCE, spec, session=session, timeframe_minutes=5, now=now
     )
     assert result.status == "WARMED"
 

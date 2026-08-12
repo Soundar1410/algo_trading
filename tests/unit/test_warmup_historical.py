@@ -305,6 +305,40 @@ def test_fetch_warmup_candles_range_excludes_the_forming_bucket() -> None:
     assert all(c.start_at < datetime(2026, 8, 3, 9, 25, tzinfo=_TZ) for c in result)
 
 
+def test_fetch_warmup_candles_range_excludes_a_terminal_bucket_past_square_off() -> None:
+    """15-minute timeframe, square_off=15:20: a candle starting at 15:15
+    would cover 15:15-15:30 -- past the configured close -- so production
+    aggregation could never actually produce a genuine one there. `now` is
+    well past 15:30 so the *old* start-only filter (15:15 < 15:20, and
+    15:15 well before the still-forming cutoff) would have wrongly admitted
+    it; the shared is_applicable_session_bucket check must exclude it
+    regardless."""
+    session = _session()
+    now = datetime(2026, 8, 3, 15, 35, tzinfo=_TZ)
+    minutes = ["15:00", "15:15"]
+    payload = {
+        "open": [100.0, 101.0],
+        "high": [101.0, 102.0],
+        "low": [99.0, 100.0],
+        "close": [100.5, 101.5],
+        "volume": [10, 10],
+        "timestamp": _timestamps_for("2026-08-03", minutes),
+    }
+    client = _StubClient(payload)
+    result = fetch_warmup_candles_range(
+        client,
+        security_id="13",
+        exchange_segment="IDX_I",
+        instrument_type="INDEX",
+        session=session,
+        timeframe_minutes=15,
+        now=now,
+    )
+    starts = [c.start_at for c in result]
+    assert datetime(2026, 8, 3, 15, 0, tzinfo=_TZ) in starts
+    assert datetime(2026, 8, 3, 15, 15, tzinfo=_TZ) not in starts
+
+
 def test_fetch_warmup_candles_range_builds_full_datetime_from_and_to() -> None:
     """Fail-first target for the reference's own bug: from_at/to_at must reach
     the client as full datetimes, not bare dates/strings.

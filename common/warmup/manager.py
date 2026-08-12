@@ -38,9 +38,10 @@ from typing import TYPE_CHECKING, Any
 from common.candles.aggregator import floor_to_interval
 from common.engine.session import MarketSession
 from common.logging import get_logger
-from common.utils.timeutils import combine, local_date_in
+from common.utils.timeutils import local_date_in
 
 from .requirements import StrategyWarmupSpec
+from .session_buckets import is_applicable_session_bucket, session_bucket_starts
 from .source import WarmupSource
 
 if TYPE_CHECKING:
@@ -173,26 +174,84 @@ class WarmupManager:
                 f"{spec.min_bars} bucket(s)",
             )
 
-        window_start, window_end = expected[0], expected[-1]
-        raw_recent = [c.start_at for c in candles if window_start <= c.start_at <= window_end]
-        ordered = raw_recent == sorted(raw_recent)
-        no_duplicates = len(raw_recent) == len(set(raw_recent))
-        exact_coverage = set(raw_recent) == set(expected)
-        if not (ordered and no_duplicates and exact_coverage):
+        # No candle may influence a *trusted* (WARMED) result unless the whole
+        # replayed sequence -- not just the final min_bars window -- has been
+        # validated. Every fetched candle is already replayed above (the
+        # indicator is warmed with as much genuine history as was returned,
+        # deliberately more than the bare min_bars minimum when available);
+        # what changed is that none of it is exempt from validation anymore.
+        starts = [c.start_at for c in candles]
+
+        inapplicable = [
+            s for s in starts if not is_applicable_session_bucket(session, s, timeframe_minutes)
+        ]
+        if inapplicable:
             return WarmupResult(
                 "PARTIAL",
                 replayed,
-                f"{base_detail}; warm-up coverage incomplete, stale, gapped, "
-                f"duplicated or misordered: expected {len(expected)} bucket(s) "
-                f"through {window_end:%Y-%m-%d %H:%M}, got {sorted(set(raw_recent))}",
+                f"{base_detail}; {len(inapplicable)} replayed candle(s) fall outside "
+                f"the session boundary or off the production bucket grid (e.g. "
+                f"{inapplicable[0]:%Y-%m-%d %H:%M})",
+            )
+
+        if starts != sorted(starts) or len(starts) != len(set(starts)):
+            return WarmupResult(
+                "PARTIAL",
+                replayed,
+                f"{base_detail}; replayed candles are out of order or duplicated",
+            )
+
+        if self._has_internal_gaps(candles, session, timeframe_minutes):
+            return WarmupResult(
+                "PARTIAL",
+                replayed,
+                f"{base_detail}; a replayed trading day's candles have a missing "
+                f"in-session bucket",
+            )
+
+        window_start, window_end = expected[0], expected[-1]
+        raw_recent = {s for s in starts if window_start <= s <= window_end}
+        if raw_recent != set(expected):
+            return WarmupResult(
+                "PARTIAL",
+                replayed,
+                f"{base_detail}; warm-up coverage incomplete or stale: expected "
+                f"{len(expected)} bucket(s) through {window_end:%Y-%m-%d %H:%M}, "
+                f"got {sorted(raw_recent)}",
             )
 
         return WarmupResult(
             "WARMED",
             replayed,
             f"{base_detail}; verified {len(expected)} required bucket(s) through "
-            f"{window_end:%Y-%m-%d %H:%M}",
+            f"{window_end:%Y-%m-%d %H:%M}, {len(candles)} total candle(s) validated",
         )
+
+    @staticmethod
+    def _has_internal_gaps(
+        candles: list[Candle], session: MarketSession, timeframe_minutes: int
+    ) -> bool:
+        """True if any trading day represented in ``candles`` has a missing
+        bucket between its own first- and last-present candle.
+
+        Grouping by trading day (rather than checking the flat list for
+        uniform spacing) is what keeps a legitimate overnight/weekend/
+        configured-holiday transition invisible to this check — it only ever
+        compares candles *within* the same day, never across a day boundary,
+        so crossing one is never mistaken for a missing bucket.
+        """
+        interval = timedelta(minutes=timeframe_minutes)
+        by_day: dict[date, list[datetime]] = {}
+        for c in candles:
+            by_day.setdefault(local_date_in(c.start_at, session.timezone), []).append(
+                c.start_at
+            )
+        for day_starts in by_day.values():
+            day_starts.sort()
+            for i in range(1, len(day_starts)):
+                if day_starts[i] - day_starts[i - 1] != interval:
+                    return True
+        return False
 
     def _lookback_sessions(
         self, spec: StrategyWarmupSpec, session: MarketSession, timeframe_minutes: int
@@ -212,27 +271,6 @@ class WarmupManager:
         per_session = max(1, (end_m - start_m) // max(1, timeframe_minutes))
         need = max(1, math.ceil(spec.min_bars / per_session))
         return min(need, self._max_lookback_sessions)
-
-    @staticmethod
-    def _session_day_buckets(
-        session: MarketSession, day: date, timeframe_minutes: int
-    ) -> list[datetime]:
-        """All bucket-start timestamps for one trading day's full session,
-        ascending: ``[session.start, session.square_off)``, stepped by
-        ``timeframe_minutes`` — the same upper bound :meth:`_lookback_sessions`
-        already measures against (``square_off``, not ``end``). Pure arithmetic
-        over the session's configured time-of-day bounds; does not itself ask
-        whether ``day`` is a trading day.
-        """
-        interval = timedelta(minutes=timeframe_minutes)
-        start_dt = combine(day, session.start, session.timezone)
-        end_dt = combine(day, session.square_off, session.timezone)
-        buckets: list[datetime] = []
-        cursor = start_dt
-        while cursor + interval <= end_dt:
-            buckets.append(cursor)
-            cursor += interval
-        return buckets
 
     def _required_latest_boundary(
         self, session: MarketSession, timeframe_minutes: int, now: datetime
@@ -264,13 +302,13 @@ class WarmupManager:
         current_bucket = floor_to_interval(now, timeframe_minutes * 60)
 
         if session.is_trading_day(now):
-            day_buckets = self._session_day_buckets(session, today, timeframe_minutes)
+            day_buckets = session_bucket_starts(session, today, timeframe_minutes)
             if day_buckets and current_bucket - interval >= day_buckets[0]:
                 required_latest = min(current_bucket - interval, day_buckets[-1])
                 return today, required_latest
 
         prior_day = session.prior_trading_day(today, 1)
-        prior_buckets = self._session_day_buckets(session, prior_day, timeframe_minutes)
+        prior_buckets = session_bucket_starts(session, prior_day, timeframe_minutes)
         return prior_day, prior_buckets[-1]
 
     def _expected_recent_buckets(
@@ -302,7 +340,7 @@ class WarmupManager:
         )
         accumulated = [
             b
-            for b in self._session_day_buckets(session, required_day, timeframe_minutes)
+            for b in session_bucket_starts(session, required_day, timeframe_minutes)
             if b <= required_latest
         ]
 
@@ -312,9 +350,7 @@ class WarmupManager:
             if prior_sessions_walked >= self._max_lookback_sessions:
                 return None
             day = session.prior_trading_day(day, 1)
-            accumulated = (
-                self._session_day_buckets(session, day, timeframe_minutes) + accumulated
-            )
+            accumulated = session_bucket_starts(session, day, timeframe_minutes) + accumulated
             prior_sessions_walked += 1
 
         return accumulated[-spec.min_bars :]
