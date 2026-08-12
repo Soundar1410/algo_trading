@@ -208,27 +208,15 @@ def aggregate_candles(
 def _prior_trading_day(session: MarketSession, day: date, sessions_back: int) -> date:
     """The trading date ``sessions_back`` sessions before ``day`` (exclusive).
 
-    ``sessions_back == 1`` -> the previous trading day, skipping weekends and
-    configured holidays. Bounded so a long holiday run can't loop forever.
-
-    Adapted from the reference, which calls ``session.is_trading_day(day: date)``
-    directly. This repository's ``MarketSession.is_trading_day`` takes a
-    ``datetime`` and reads only the date half internally (via
-    :func:`~common.utils.timeutils.local_date_in`) — so a timezone-aware
-    midnight, built through :func:`~common.utils.timeutils.combine`, is what's
-    passed, keeping this on the D40-safe path rather than reimplementing a
-    comparison.
+    Delegates to :meth:`~common.engine.session.MarketSession.prior_trading_day`
+    — the calendar walk-back now lives on the class that owns the
+    weekend/holiday rules, since :mod:`common.warmup.manager` needs the same
+    primitive for its own completeness check and must not reach into this
+    module's private helper for it. Kept here, under the original name and
+    signature, purely so every existing caller/test in this module continues
+    to work unchanged.
     """
-    d = day
-    remaining = max(1, sessions_back)
-    for _ in range(sessions_back * 5 + 14):  # generous upper bound on calendar hops
-        d = d - timedelta(days=1)
-        probe = combine(d, time(0, 0), session.timezone)
-        if session.is_trading_day(probe):
-            remaining -= 1
-            if remaining == 0:
-                break
-    return d
+    return session.prior_trading_day(day, sessions_back)
 
 
 def fetch_warmup_candles_range(

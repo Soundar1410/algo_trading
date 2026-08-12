@@ -177,7 +177,7 @@ class EmaCross9x21BuyStrategy(BaseStrategy):
         self._prev_premium_candle = None
         self._last_position = None
 
-    def on_warmup_complete(self, *, context_trusted: bool = True) -> None:
+    def on_warmup_complete(self, *, context_trusted: bool = False) -> None:
         """Warm-up (if any ran) has fed today's opening EMA state through
         :meth:`on_candle`, which may have left the crossover detector
         confirmed on some relationship — yesterday's close, or today's own
@@ -192,6 +192,10 @@ class EmaCross9x21BuyStrategy(BaseStrategy):
         observation after a reset is context-only" rule re-establishes
         context safely from the first live candle instead of trusting an
         unverified one. EMAs are untouched either way.
+
+        Default ``False`` (fail-conservative): an omitted argument clears
+        the detector, exactly like an untrusted replay would. The engine's
+        production call site always passes an explicit computed value.
         """
         if not context_trusted:
             self._crossover.reset()

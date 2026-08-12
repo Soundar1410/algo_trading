@@ -31,9 +31,22 @@ from common.warmup.requirements import StrategyWarmupSpec
 from common.warmup.source import WarmupSource
 
 
-def _session(*, start="09:15", end="15:15", square_off="15:20", holidays=()) -> MarketSession:
+def _session(
+    *,
+    start="09:15",
+    end="15:15",
+    square_off="15:20",
+    holidays=(),
+    timezone="Asia/Kolkata",
+) -> MarketSession:
     return MarketSession(
-        SessionConfig(start_time=start, end_time=end, square_off_time=square_off, holidays=holidays)
+        SessionConfig(
+            timezone=timezone,
+            start_time=start,
+            end_time=end,
+            square_off_time=square_off,
+            holidays=holidays,
+        )
     )
 
 
@@ -134,6 +147,10 @@ def test_none_fetch_result_is_cold_start() -> None:
 
 
 def test_successful_replay_reports_the_last_candles_start_at() -> None:
+    # 2026-08-03 is a real Monday (verified) -- a UTC-timezone session keeps
+    # the arithmetic trivial (no IST-offset reasoning) while still exercising
+    # the real completeness check: these 3 candles are exactly the 3 most
+    # recent completed 5-minute buckets as of `now`, so this stays WARMED.
     candles = [
         _candle(datetime(2026, 8, 3, 9, 15, tzinfo=UTC)),
         _candle(datetime(2026, 8, 3, 9, 20, tzinfo=UTC)),
@@ -143,7 +160,10 @@ def test_successful_replay_reports_the_last_candles_start_at() -> None:
     manager = WarmupManager(fetch)
     spec = StrategyWarmupSpec(min_bars=3)
     seen: list[Candle] = []
-    result = manager.warm(seen.append, _SOURCE, spec, session=_session(), timeframe_minutes=5)
+    now = datetime(2026, 8, 3, 9, 32, tzinfo=UTC)
+    result = manager.warm(
+        seen.append, _SOURCE, spec, session=_session(timezone="UTC"), timeframe_minutes=5, now=now
+    )
     assert result.status == "WARMED"
     assert result.candles_replayed == 3
     assert seen == candles
@@ -221,6 +241,258 @@ def test_lookback_sessions_scales_with_min_bars(min_bars: int, expected_lookback
     manager.warm(lambda c: None, _SOURCE, spec, session=_session(), timeframe_minutes=5)
     # Recover the lookback the manager computed by inspecting what it passed in.
     assert manager._lookback_sessions(spec, _session(), 5) == expected_lookback
+
+
+# ----------------------------------------------------------------------------
+# Completeness verification (Rev 3.1 implementation-gap fix). `WARMED` must
+# require genuinely valid, recent, ordered, duplicate-free coverage -- not
+# merely "fetch+replay didn't raise". All of these use a UTC-timezone session
+# so bucket arithmetic needs no IST-offset reasoning; every date below was
+# verified against the real 2026 calendar (2026-08-03 is a Monday,
+# 2026-07-31 the Friday before it, 2026-08-04/05 the following Tue/Wed).
+#
+# Base scenario for the PARTIAL family (cases 1-5): Monday 2026-08-03,
+# 5-minute timeframe, min_bars=5, now=09:47:00 -- current_bucket=09:45, so
+# required_latest=09:40 and the required suffix is exactly
+# [09:15, 09:20, 09:25, 09:30, 09:35, 09:40][-5:] == [09:20,09:25,09:30,09:35,09:40].
+def _utc(hour: int, minute: int, *, day: int = 3, month: int = 8) -> datetime:
+    return datetime(2026, month, day, hour, minute, tzinfo=UTC)
+
+
+def _partial_case(candles: list[Candle]) -> WarmupResult:
+    fetch = _CallCountingFetch(result=candles)
+    manager = WarmupManager(fetch)
+    spec = StrategyWarmupSpec(min_bars=5)
+    return manager.warm(
+        lambda c: None,
+        _SOURCE,
+        spec,
+        session=_session(timezone="UTC"),
+        timeframe_minutes=5,
+        now=_utc(9, 47),
+    )
+
+
+def test_stale_replay_that_does_not_reach_the_required_boundary_is_partial() -> None:
+    """Non-empty, ordered, gap-free replay -- but it stops at 09:35, short of
+    the 09:40 the handoff time requires."""
+    candles = [_candle(_utc(h, m)) for h, m in ((9, 15), (9, 20), (9, 25), (9, 30), (9, 35))]
+    result = _partial_case(candles)
+    assert result.status == "PARTIAL"
+    assert result.status != "WARMED"
+
+
+def test_fewer_candles_than_min_bars_is_partial() -> None:
+    candles = [_candle(_utc(h, m)) for h, m in ((9, 20), (9, 25), (9, 30))]
+    result = _partial_case(candles)
+    assert result.status == "PARTIAL"
+    assert result.status != "WARMED"
+
+
+def test_a_missing_in_session_bucket_in_the_recent_suffix_is_partial() -> None:
+    """Count (5) and final recency (09:40) both look right -- but 09:25 is
+    missing from the middle, replaced by an out-of-window 09:15."""
+    candles = [_candle(_utc(h, m)) for h, m in ((9, 15), (9, 20), (9, 30), (9, 35), (9, 40))]
+    result = _partial_case(candles)
+    assert result.status == "PARTIAL"
+    assert result.status != "WARMED"
+
+
+def test_a_duplicate_bucket_in_the_recent_suffix_is_partial() -> None:
+    candles = [
+        _candle(_utc(h, m)) for h, m in ((9, 20), (9, 20), (9, 25), (9, 30), (9, 35), (9, 40))
+    ]
+    result = _partial_case(candles)
+    assert result.status == "PARTIAL"
+    assert result.status != "WARMED"
+
+
+def test_an_out_of_order_recent_suffix_is_partial() -> None:
+    candles = [_candle(_utc(h, m)) for h, m in ((9, 20), (9, 30), (9, 25), (9, 35), (9, 40))]
+    result = _partial_case(candles)
+    assert result.status == "PARTIAL"
+    assert result.status != "WARMED"
+
+
+def test_a_legitimate_weekend_gap_is_warmed() -> None:
+    """Monday 09:22 -- exactly 1 completed bucket today (09:15) -- plus
+    min_bars=5 walks back across the weekend to Friday 2026-07-31's last 4
+    buckets. max_lookback_sessions=1 (default) is exactly enough: 1 prior
+    session beyond the current/boundary day."""
+    candles = [
+        _candle(_utc(15, 0, day=31, month=7)),
+        _candle(_utc(15, 5, day=31, month=7)),
+        _candle(_utc(15, 10, day=31, month=7)),
+        _candle(_utc(15, 15, day=31, month=7)),
+        _candle(_utc(9, 15)),
+    ]
+    fetch = _CallCountingFetch(result=candles)
+    manager = WarmupManager(fetch)
+    spec = StrategyWarmupSpec(min_bars=5)
+    result = manager.warm(
+        lambda c: None,
+        _SOURCE,
+        spec,
+        session=_session(timezone="UTC"),
+        timeframe_minutes=5,
+        now=_utc(9, 22),
+    )
+    assert result.status == "WARMED"
+
+
+def test_a_legitimate_configured_holiday_gap_is_warmed() -> None:
+    """Kept separate from the weekend case. Wednesday 2026-08-05, 09:22 (1
+    completed bucket today); Tuesday 2026-08-04 is a configured holiday, so
+    min_bars=5 must walk past it to Monday 2026-08-03's last 4 buckets --
+    still just 1 *additional* prior session, so max_lookback_sessions=1
+    (default) suffices."""
+    candles = [
+        _candle(_utc(15, 0)),  # Monday 2026-08-03 (default day/month)
+        _candle(_utc(15, 5)),
+        _candle(_utc(15, 10)),
+        _candle(_utc(15, 15)),
+        _candle(_utc(9, 15, day=5)),  # Wednesday 2026-08-05
+    ]
+    fetch = _CallCountingFetch(result=candles)
+    manager = WarmupManager(fetch)
+    spec = StrategyWarmupSpec(min_bars=5)
+    result = manager.warm(
+        lambda c: None,
+        _SOURCE,
+        spec,
+        session=_session(timezone="UTC", holidays=("2026-08-04",)),
+        timeframe_minutes=5,
+        now=_utc(9, 22, day=5),
+    )
+    assert result.status == "WARMED"
+
+
+def test_current_day_plus_exactly_one_prior_session_is_warmed_with_the_default_budget() -> None:
+    """Isolates the budget semantics from any gap-skip logic: plain adjacent
+    weekdays (Tuesday following Monday directly, no weekend/holiday
+    involved). max_lookback_sessions=1 (default) must be enough for
+    "current day + one prior session" -- the budget counts prior sessions
+    only, not the current/boundary day itself."""
+    candles = [
+        _candle(_utc(15, 0)),  # Monday 2026-08-03
+        _candle(_utc(15, 5)),
+        _candle(_utc(15, 10)),
+        _candle(_utc(15, 15)),
+        _candle(_utc(9, 15, day=4)),  # Tuesday 2026-08-04
+    ]
+    fetch = _CallCountingFetch(result=candles)
+    manager = WarmupManager(fetch)
+    spec = StrategyWarmupSpec(min_bars=5)
+    result = manager.warm(
+        lambda c: None,
+        _SOURCE,
+        spec,
+        session=_session(timezone="UTC"),
+        timeframe_minutes=5,
+        now=_utc(9, 22, day=4),
+    )
+    assert result.status == "WARMED"
+
+
+def test_valid_market_open_coverage_ending_at_the_previous_sessions_close_is_warmed() -> None:
+    """09:10 -- before session.start (09:15) -- so today has 0 completed
+    candles; valid coverage legitimately ends at Friday 2026-07-31's final
+    completed bucket instead of forcing a cold start at the open."""
+    candles = [
+        _candle(_utc(15, 5, day=31, month=7)),
+        _candle(_utc(15, 10, day=31, month=7)),
+        _candle(_utc(15, 15, day=31, month=7)),
+    ]
+    fetch = _CallCountingFetch(result=candles)
+    manager = WarmupManager(fetch)
+    spec = StrategyWarmupSpec(min_bars=3)
+    result = manager.warm(
+        lambda c: None,
+        _SOURCE,
+        spec,
+        session=_session(timezone="UTC"),
+        timeframe_minutes=5,
+        now=_utc(9, 10),
+    )
+    assert result.status == "WARMED"
+
+
+def test_valid_mid_session_coverage_reaching_todays_latest_completed_bucket_is_warmed() -> None:
+    candles = [_candle(_utc(h, m)) for h, m in ((9, 15), (9, 20), (9, 25), (9, 30))]
+    fetch = _CallCountingFetch(result=candles)
+    manager = WarmupManager(fetch)
+    spec = StrategyWarmupSpec(min_bars=4)
+    result = manager.warm(
+        lambda c: None,
+        _SOURCE,
+        spec,
+        session=_session(timezone="UTC"),
+        timeframe_minutes=5,
+        now=_utc(9, 37),
+    )
+    assert result.status == "WARMED"
+
+
+def test_post_market_startup_caps_the_required_boundary_at_todays_final_bucket() -> None:
+    """16:00 -- well after square_off (15:20) -- must never expect an
+    out-of-session bucket like 15:55. The required boundary is capped at
+    today's actual final session bucket (15:15); without the cap this would
+    be permanently unsatisfiable, since no real candle could ever match a
+    timestamp that was never a valid bucket."""
+    candles = [_candle(_utc(h, m)) for h, m in ((15, 5), (15, 10), (15, 15))]
+    fetch = _CallCountingFetch(result=candles)
+    manager = WarmupManager(fetch)
+    spec = StrategyWarmupSpec(min_bars=3)
+    result = manager.warm(
+        lambda c: None,
+        _SOURCE,
+        spec,
+        session=_session(timezone="UTC"),
+        timeframe_minutes=5,
+        now=_utc(16, 0),
+    )
+    assert result.status == "WARMED"
+
+
+def test_a_gap_outside_the_required_suffix_does_not_prevent_warmed() -> None:
+    """min_bars=3 only needs today's own [09:15,09:20,09:25]; the extra
+    Friday candles carry a gap (09:15 then 09:30, skipping 09:20/09:25) but
+    are outside the required window and must never be inspected."""
+    candles = [
+        _candle(_utc(9, 15, day=31, month=7)),
+        _candle(_utc(9, 30, day=31, month=7)),
+        _candle(_utc(9, 15)),
+        _candle(_utc(9, 20)),
+        _candle(_utc(9, 25)),
+    ]
+    fetch = _CallCountingFetch(result=candles)
+    manager = WarmupManager(fetch)
+    spec = StrategyWarmupSpec(min_bars=3)
+    result = manager.warm(
+        lambda c: None,
+        _SOURCE,
+        spec,
+        session=_session(timezone="UTC"),
+        timeframe_minutes=5,
+        now=_utc(9, 32),
+    )
+    assert result.status == "WARMED"
+
+
+def test_missing_now_is_never_warmed_even_with_otherwise_complete_candles() -> None:
+    """Reuses the mid-session-valid case's candles/spec but omits `now` --
+    must not return WARMED, even though replay still happens (indicators
+    still get warmed; only trust is withheld)."""
+    candles = [_candle(_utc(h, m)) for h, m in ((9, 15), (9, 20), (9, 25), (9, 30))]
+    fetch = _CallCountingFetch(result=candles)
+    manager = WarmupManager(fetch)
+    spec = StrategyWarmupSpec(min_bars=4)
+    result = manager.warm(
+        lambda c: None, _SOURCE, spec, session=_session(timezone="UTC"), timeframe_minutes=5
+    )
+    assert result.status != "WARMED"
+    assert result.status == "PARTIAL"
+    assert result.candles_replayed == len(candles)
 
 
 def test_lookback_sessions_is_capped_by_max_lookback_sessions() -> None:

@@ -25,6 +25,7 @@ construction entirely and traded with only a log warning.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -50,6 +51,14 @@ _SOURCE = WarmupSource(security_id="13", exchange_segment="IDX_I", instrument_ty
 
 def _ts(hour: int, minute: int, second: int = 0) -> datetime:
     return datetime(2026, 7, 16, hour, minute, second, tzinfo=IST)
+
+
+def _prior_day_ts(hour: int, minute: int) -> datetime:
+    """2026-07-15 (Wednesday) -- the real trading day immediately before the
+    live tape's own day (2026-07-16, Thursday); verified against the
+    calendar. Used for warm-up candles that must legitimately satisfy
+    WarmupManager's completeness check (Rev 3.1 fix)."""
+    return datetime(2026, 7, 15, hour, minute, tzinfo=IST)
 
 
 def _tick(security_id: str, price: float, ts: datetime) -> Tick:
@@ -90,8 +99,10 @@ def _build_engine(
     *,
     warmup_manager: WarmupManager | None = None,
     warmup_source: WarmupSource | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> tuple[TradingEngine, PositionManager]:
     positions = PositionManager(InMemoryGateway(slippage_points=0.0), lots=1)
+    kwargs = {} if clock is None else {"clock": clock}
     engine = TradingEngine(
         EngineConfig(
             timeframe="5m",
@@ -111,40 +122,57 @@ def _build_engine(
         underlying_security_id=UNDERLYING,
         warmup_manager=warmup_manager,
         warmup_source=warmup_source,
+        **kwargs,
     )
     return engine, positions
 
 
+def _warmed_warmup_candles() -> list[Candle]:
+    """The prior trading day's (2026-07-15, Wednesday) last 10 real session
+    buckets, 14:30 through 15:15 -- exactly the coverage
+    ``WarmupManager.warm()`` requires (Rev 3.1 completeness check) for
+    ``EngineFixtureStrategy``'s hardcoded ``min_bars=10`` when the live tape
+    starts right at 2026-07-16's session open (09:15, 0 completed buckets
+    that day yet -- the legitimate market-open/previous-session case)."""
+    minutes = [
+        (14, 30), (14, 35), (14, 40), (14, 45), (14, 50),
+        (14, 55), (15, 0), (15, 5), (15, 10), (15, 15),
+    ]  # fmt: skip
+    return [_warmup_candle(_prior_day_ts(h, m), 23950.0 + i) for i, (h, m) in enumerate(minutes)]
+
+
 def test_warmup_replay_seeds_the_strategy_before_the_first_live_candle() -> None:
-    """Two warm-up candles are replayed; the live tape supplies a third. The
-    strategy is configured to enter only on the *third* on_candle call
-    overall -- if warm-up genuinely flowed through on_candle before the live
-    tick did, that third call is the live one and a real trade results. If
-    warm-up did nothing, the live tape's own first candle would be call #1,
-    entry_candles={3} would never match, and nothing would trade.
+    """Ten warm-up candles (the real coverage WarmupManager now requires) are
+    replayed; the live tape supplies an eleventh. The strategy is configured
+    to enter only on the *eleventh* on_candle call overall -- if warm-up
+    genuinely flowed through on_candle before the live tick did, that
+    eleventh call is the live one and a real trade results. If warm-up did
+    nothing, the live tape's own first candle would be call #1,
+    entry_candles={11} would never match, and nothing would trade.
     """
-    warmup_candles = [
-        _warmup_candle(_ts(9, 0), 23950.0),
-        _warmup_candle(_ts(9, 5), 23980.0),
-    ]
+    warmup_candles = _warmed_warmup_candles()
 
     def _fetch(source: object, **kwargs: object) -> list[Candle]:
         assert source is _SOURCE
         return warmup_candles
 
     manager = WarmupManager(_fetch)
-    strategy = EngineFixtureStrategy(enter_on_candle=3, continuity_required=True)
+    strategy = EngineFixtureStrategy(enter_on_candle=11, continuity_required=True)
     engine, positions = _build_engine(
-        _entry_tape(), strategy, warmup_manager=manager, warmup_source=_SOURCE
+        _entry_tape(),
+        strategy,
+        warmup_manager=manager,
+        warmup_source=_SOURCE,
+        clock=lambda: _ts(9, 15, 0),
     )
     engine.run()
 
-    assert strategy.candles_seen == 3  # 2 replayed + 1 live
+    assert strategy.candles_seen == 11  # 10 replayed + 1 live
     # A replay signal is discarded by construction (the sink never reaches the
     # engine's order path) -- proven here by there being no trade/position
     # opened at a warm-up candle's timestamp, only (if any) at the live one.
     assert engine._entry_blocked is None
-    # The live candle (call #3) is a real ENTER that reached the order path.
+    # The live candle (call #11) is a real ENTER that reached the order path.
     assert engine._pending is not None or positions.has_position()
 
 
@@ -174,20 +202,24 @@ def test_a_fetch_failure_degrades_to_cold_start_and_blocks_the_first_live_entry(
 
 def test_warmed_status_permits_entries() -> None:
     """A successful WARMED replay does not block the live entry that follows."""
-    warmup_candles = [_warmup_candle(_ts(9, 0), 23950.0)]
+    warmup_candles = _warmed_warmup_candles()
 
     def _fetch(source: object, **kwargs: object) -> list[Candle]:
         return warmup_candles
 
     manager = WarmupManager(_fetch)
-    strategy = EngineFixtureStrategy(enter_on_candle=2, continuity_required=True)
+    strategy = EngineFixtureStrategy(enter_on_candle=11, continuity_required=True)
     engine, positions = _build_engine(
-        _entry_tape(), strategy, warmup_manager=manager, warmup_source=_SOURCE
+        _entry_tape(),
+        strategy,
+        warmup_manager=manager,
+        warmup_source=_SOURCE,
+        clock=lambda: _ts(9, 15, 0),
     )
     engine.run()
 
     assert engine._entry_blocked is None
-    assert strategy.candles_seen == 2  # 1 replayed + 1 live
+    assert strategy.candles_seen == 11  # 10 replayed + 1 live
     assert engine._pending is not None or positions.has_position()
 
 
@@ -211,3 +243,87 @@ def test_no_manager_or_source_now_refuses_construction() -> None:
     strategy = EngineFixtureStrategy(enter_on_candle=1, continuity_required=True)
     with pytest.raises(InvalidWarmupConfig, match="no warmup_manager was supplied"):
         _build_engine(_entry_tape(), strategy)
+
+
+# --------------------------------------------- Rev 3.1 implementation-gap fixes
+def test_warm_up_passes_the_engines_own_injectable_clock_as_now() -> None:
+    """WarmupManager.warm() needs a deterministic `now` to verify recency/
+    completeness, and it must come from the engine's own injectable clock
+    (self._now()), not real wall-clock time -- proven by pinning the clock
+    and checking the manager actually received that exact value."""
+    received: dict[str, object] = {}
+    pinned_now = _ts(9, 15, 0)
+
+    def _fetch(source: object, **kwargs: object) -> list[Candle]:
+        received.update(kwargs)
+        return []
+
+    manager = WarmupManager(_fetch)
+    strategy = EngineFixtureStrategy(enter_on_candle=1, continuity_required=True)
+    engine, _positions = _build_engine(
+        _entry_tape(),
+        strategy,
+        warmup_manager=manager,
+        warmup_source=_SOURCE,
+        clock=lambda: pinned_now,
+    )
+    engine.run()
+
+    assert received["now"] == pinned_now
+
+
+def test_warmup_context_trust_does_not_leak_between_runs_or_days() -> None:
+    """_start_day() must clear _warmup_context_trusted unconditionally,
+    before _warm_up() runs -- so a previous run/day's trusted state can
+    never leak into a run whose warm-up this time fails, is stale, or is
+    incomplete."""
+
+    class _SwitchableFetch:
+        def __init__(self) -> None:
+            self.mode = "warmed"
+
+        def __call__(self, source: object, **kwargs: object) -> list[Candle]:
+            if self.mode == "warmed":
+                return _warmed_warmup_candles()
+            raise RuntimeError("stale/failed provider")
+
+    fetch = _SwitchableFetch()
+    manager = WarmupManager(fetch)
+    strategy = EngineFixtureStrategy(enter_on_candle=1, continuity_required=True)
+    positions = PositionManager(InMemoryGateway(slippage_points=0.0), lots=1)
+    engine = TradingEngine(
+        EngineConfig(
+            timeframe="5m",
+            session=SessionConfig(
+                timezone="Asia/Kolkata",
+                start_time="09:15",
+                end_time="15:15",
+                square_off_time="15:20",
+            ),
+        ),
+        feed=SimulatedFeed([]),
+        option_selector=OptionSelector(
+            SimulatedOptionChainResolver("NIFTY", lot_size=LOT_SIZE), strike_step=50
+        ),
+        strategy=strategy,
+        position_manager=positions,
+        underlying_security_id=UNDERLYING,
+        warmup_manager=manager,
+        warmup_source=_SOURCE,
+        clock=lambda: _ts(9, 15, 0),
+    )
+
+    # Run 1 / day 1: a genuinely WARMED replay establishes trust.
+    engine._start_day()
+    engine._warm_up()
+    assert engine._warmup_context_trusted is True
+
+    # Run 2 / day 2 on the same engine instance: the provider now fails.
+    fetch.mode = "failing"
+    engine._start_day()
+    # The reset itself -- not merely the new outcome -- is what clears trust:
+    # this must already be False here, before the second _warm_up() call.
+    assert engine._warmup_context_trusted is False
+
+    engine._warm_up()
+    assert engine._warmup_context_trusted is False

@@ -22,6 +22,7 @@ can be independently controlled in the same walk.
 
 from __future__ import annotations
 
+import inspect
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -37,7 +38,7 @@ from common.engine.models import (
     SignalAction,
     Trade,
 )
-from common.engine.strategy import available_strategies, get_strategy
+from common.engine.strategy import BaseStrategy, available_strategies, get_strategy
 from common.indicators.base import OHLC
 from common.indicators.ema import EMA
 from strategies.intraday_options.ema_cross_9_21_buy.strategy import EmaCross9x21BuyStrategy
@@ -370,6 +371,30 @@ def test_multi_day_continuous_run_never_double_feeds_the_ema():
     for c in day1_closes + day2_new_closes:
         expected.update(_candle(c))
     assert strategy._ema_slow.state.value == expected.state.value
+
+
+# --------------------------------------------- 7b. fail-conservative hook default
+def test_base_strategy_on_warmup_complete_default_is_fail_conservative():
+    """The BaseStrategy contract itself, not just this strategy's override:
+    an omitted context_trusted argument must default to untrusted, never
+    silently certify unverified data as trusted."""
+    sig = inspect.signature(BaseStrategy.on_warmup_complete)
+    assert sig.parameters["context_trusted"].default is False
+
+
+def test_on_warmup_complete_default_is_fail_conservative_clears_unverified_context():
+    """Strategy has detector context from an unverified replay; calling
+    on_warmup_complete() with no context_trusted argument must default to
+    False and clear it -- not silently trust it."""
+    strategy = _strategy()
+    strategy.reset()
+    for i, c in enumerate((100.0, 100.0, 100.0, 90.0, 80.0, 70.0)):
+        strategy.on_candle(_candle(c), _ts(i))
+    assert strategy._crossover.confirmed_side is not None
+
+    strategy.on_warmup_complete()  # no context_trusted passed
+
+    assert strategy._crossover.confirmed_side is None
 
 
 # ------------------------------------------------------------ 8. closed candles

@@ -41,9 +41,9 @@ configured times cannot drift apart.
 
 from __future__ import annotations
 
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 
-from common.utils.timeutils import local_date_in, local_time_in, now_tz, parse_hhmm
+from common.utils.timeutils import combine, local_date_in, local_time_in, now_tz, parse_hhmm
 
 from .config import SessionConfig
 
@@ -134,6 +134,33 @@ class MarketSession:
 
     def _is_trading_day(self, day: date) -> bool:
         return day.weekday() < 5 and day.isoformat() not in self._holidays
+
+    def prior_trading_day(self, day: date, sessions_back: int) -> date:
+        """The trading date ``sessions_back`` sessions before ``day`` (exclusive).
+
+        ``sessions_back == 1`` -> the previous trading day, skipping weekends
+        and configured holidays. Bounded so a long holiday run can't loop
+        forever. The shared calendar-walk primitive: any caller that needs
+        "N trading days before this one" (warm-up history range, warm-up
+        completeness verification) goes through this rather than
+        reimplementing weekend/holiday rules against :meth:`is_trading_day`
+        itself. Originally lived as a module-private free function in
+        :mod:`common.warmup.historical` (``_prior_trading_day``, which now
+        delegates here) — moved onto the class that already owns the
+        calendar rules, so a second consumer outside that module (the
+        warm-up manager's own completeness check) doesn't have to reach into
+        another module's private helper for a rule it doesn't own.
+        """
+        d = day
+        remaining = max(1, sessions_back)
+        for _ in range(sessions_back * 5 + 14):  # generous upper bound on calendar hops
+            d = d - timedelta(days=1)
+            probe = combine(d, time(0, 0), self._tz)
+            if self.is_trading_day(probe):
+                remaining -= 1
+                if remaining == 0:
+                    break
+        return d
 
     def __repr__(self) -> str:  # pragma: no cover - debug aid
         return (

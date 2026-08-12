@@ -445,20 +445,26 @@ class TradingEngine:
                 spec,
                 session=self.session,
                 timeframe_minutes=interval,
+                # The engine's own injectable clock, not wall-clock time --
+                # WarmupManager.warm() needs a deterministic `now` to verify
+                # recency/completeness (a missing `now` cannot be WARMED, by
+                # design) and this is what makes that check reproducible
+                # under test, matching the fallback path's own clock use below.
+                now=self._now(),
             )
             log.info("%s indicator warm-up: %s — %s", self.label, result.status, result.detail)
             if spec.entry_blocked_by(result.status):
                 self._block_entries(f"required warm-up returned {result.status} — {result.detail}")
             # Rev 3 fresh-crossover fix (spec section 4.4): only a verified-
-            # complete replay is trustworthy crossover context. WARMED is the
-            # only status where the fetch succeeded *and* every replayed
-            # candle succeeded — fetch_warmup_candles_range already excludes
-            # the still-forming bucket and raises (-> COLD_START) on any
-            # transport/parse failure, so WARMED alone already proves coverage
-            # reached the latest required completed candle; every other
-            # status means either nothing was replayed (untouched detector,
-            # so clearing it is a harmless no-op) or replay aborted partway
-            # (an untrustworthy partial relationship that must be cleared).
+            # complete replay is trustworthy crossover context. WarmupManager
+            # itself now verifies count/recency/gaps/duplicates/order against
+            # the trading calendar before ever returning WARMED (Rev 3.1
+            # implementation-gap fix — WARMED used to mean only "fetch+replay
+            # didn't raise", not "genuinely complete"); every other status
+            # means either nothing was replayed (untouched detector, so
+            # clearing it is a harmless no-op) or the replay was partial/
+            # stale/gapped/duplicated/misordered (an untrustworthy
+            # relationship that must be cleared).
             self._warmup_context_trusted = result.status == "WARMED"
             return
 
@@ -566,6 +572,11 @@ class TradingEngine:
 
     def _start_day(self) -> None:
         """Fresh state each day, ignoring prior signals/positions."""
+        # First, unconditionally: a previous run/day's trusted warm-up
+        # context must never leak into this one, whose own _warm_up() (which
+        # runs right after this) hasn't executed yet and may fail, be stale,
+        # or be incomplete. Rev 3.1 implementation-gap fix.
+        self._warmup_context_trusted = False
         self.strategy.reset()
         self.strategy.risk_manager.reset()
         self.candles.reset()

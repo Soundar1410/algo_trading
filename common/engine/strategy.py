@@ -196,7 +196,7 @@ class BaseStrategy(ABC):
         start, so strategies that haven't opted in are unaffected."""
         return None
 
-    def on_warmup_complete(self, *, context_trusted: bool = True) -> None:
+    def on_warmup_complete(self, *, context_trusted: bool = False) -> None:
         """Called once, after :class:`~common.engine.engine.TradingEngine` has
         finished replaying (or attempting to replay) today's warm-up candles,
         and before the first live candle. Phase 9 (Rev 3 fresh-crossover fix).
@@ -227,6 +227,12 @@ class BaseStrategy(ABC):
         replayed anything, replayed a genuinely complete relationship — not
         whether a replay happened at all. Default: no-op, for every strategy
         that has no such detector (the argument is then simply ignored).
+
+        The default is ``False`` (fail-conservative), not ``True``: an
+        omitted argument must never silently certify unverified data as
+        trusted. Production's sole caller (``TradingEngine.run()``) always
+        passes an explicit computed value; this default only protects a
+        future or test caller that forgets to.
         """
         return None
 
