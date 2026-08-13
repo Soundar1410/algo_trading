@@ -27,7 +27,7 @@ jobs:
       - name: Mypy
         run: mypy common strategies runtimes dashboards scripts
       - name: Tests
-        run: pytest
+        run: python -m pytest
       - name: Build wheel
         run: python -m pip wheel --no-deps --wheel-dir dist .
       - name: Verify wheel contains runtime entrypoint packages and migrations
