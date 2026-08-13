@@ -166,17 +166,47 @@ def test_paper_to_live_is_rejected_with_a_prior_day_open_position(tmp_path: Path
 
 
 # ---------------------------------------------------------- live -> paper
-def test_live_to_paper_is_allowed_with_no_live_history_at_all(tmp_path: Path):
+def test_live_to_paper_is_allowed_with_no_live_history_after_broker_proves_empty(
+    tmp_path: Path,
+):
     repository = _repository(tmp_path)
     decision = check_mode_transition_safety(
         repository,
         strategy_id="st01",
         runtime_id="intraday_options",
         new_mode=ExecutionMode.PAPER,
-        broker=None,
-        reconciliation_runner=None,
+        broker=_FakeBroker(),
+        reconciliation_runner=ReconciliationRunner(repository.database),
     )
     assert decision.allowed
+
+
+def test_empty_local_database_does_not_hide_broker_only_exposure(tmp_path: Path):
+    from common.broker.base import BrokerPosition
+
+    repository = _repository(tmp_path)
+    broker = _FakeBroker(
+        positions=(
+            BrokerPosition(
+                security_id="sec-missing-locally",
+                quantity=75,
+                average_price=190.0,
+                product_type="INTRADAY",
+            ),
+        )
+    )
+
+    decision = check_mode_transition_safety(
+        repository,
+        strategy_id="st01",
+        runtime_id="intraday_options",
+        new_mode=ExecutionMode.PAPER,
+        broker=broker,
+        reconciliation_runner=ReconciliationRunner(repository.database),
+    )
+
+    assert not decision.allowed
+    assert "could not prove the account empty" in decision.reason
 
 
 def test_live_to_paper_with_live_history_but_no_broker_wired_is_refused(tmp_path: Path):

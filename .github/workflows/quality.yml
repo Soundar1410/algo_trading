@@ -1,0 +1,54 @@
+name: quality
+
+on:
+  push:
+    branches: [main, phase-10-controlled-live]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install
+        run: python -m pip install --upgrade pip && python -m pip install -e '.[dev]'
+      - name: Confirm committed live gates are closed
+        run: python -m scripts.assert_no_live_config_committed
+      - name: Ruff
+        run: ruff check .
+      - name: Mypy
+        run: mypy common strategies runtimes dashboards scripts
+      - name: Tests
+        run: pytest
+      - name: Build wheel
+        run: python -m pip wheel --no-deps --wheel-dir dist .
+      - name: Verify wheel contains runtime entrypoint packages and migrations
+        run: |
+          python - <<'PY'
+          import zipfile
+          from pathlib import Path
+
+          wheel = next(Path("dist").glob("algo_trading-*.whl"))
+          with zipfile.ZipFile(wheel) as archive:
+              names = set(archive.namelist())
+          required = {
+              "runtimes/intraday_options/__main__.py",
+              "strategies/intraday_options/ema_cross_9_21_buy/strategy.py",
+              "scripts/start_dashboard.py",
+              "orchestration/process_control/supervised_launch.py",
+              "common/persistence/migrations/versions/0001_walking_skeleton.sql",
+              "common/persistence/migrations/account_versions/0001_account_shared_foundation.sql",
+              "common/persistence/migrations/account_versions/0002_account_emergency_controls.sql",
+          }
+          missing = sorted(required - names)
+          if missing:
+              raise SystemExit(f"wheel is missing required files: {missing}")
+          PY

@@ -468,6 +468,16 @@ def test_a_hand_edited_applied_migration_is_refused_at_startup(db: Database, ver
         MigrationRunner(db, versions_dir=versions).run_pending()
 
 
+def test_a_deleted_checksummed_migration_is_refused_at_startup(
+    db: Database, versions: Path
+):
+    MigrationRunner(db, versions_dir=versions).run_pending()
+    (versions / "0001_runtime_sessions.sql").unlink()
+
+    with pytest.raises(MigrationError, match="has no corresponding file"):
+        MigrationRunner(db, versions_dir=versions).run_pending()
+
+
 def test_checksum_bootstrap_refuses_when_the_original_file_is_gone(
     db: Database, versions: Path, tmp_path: Path
 ):

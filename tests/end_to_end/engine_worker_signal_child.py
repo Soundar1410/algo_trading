@@ -109,6 +109,10 @@ def _announce_when_open(database_path: Path, stop: threading.Event) -> None:
             finally:
                 connection.close()
             if row and row[0]:
+                # Do not announce on the exact fill boundary. Let the genuinely
+                # live-shaped stream advance beyond its three setup ticks so the
+                # parent test also proves the engine remained active afterward.
+                time.sleep(0.05)
                 print("READY", flush=True)
                 return
         except sqlite3.Error:

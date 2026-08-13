@@ -316,13 +316,12 @@ class MigrationRunner:
             version = str(row["version"])
             migration = on_disk.get(version)
             if migration is None:
-                # Deliberately not an error here: a versions_dir scoped to a
-                # subset of history (as many tests do) legitimately omits
-                # earlier files. discover_migrations() would already have
-                # refused a genuinely missing *pending* migration's gap; a
-                # recorded-but-not-discoverable version is only a problem if
-                # we were about to trust its checksum, which we are not.
-                continue
+                raise MigrationError(
+                    f"Applied migration version {version!r} ({row['name']}) has no "
+                    f"corresponding file in {self._versions_dir}. Refusing to start: "
+                    "deleting applied migration history defeats checksum verification. "
+                    "Restore the original migration file."
+                )
             if migration.checksum != row["checksum"]:
                 raise MigrationError(
                     f"Migration {version} ({row['name']}) has changed since it was applied: "

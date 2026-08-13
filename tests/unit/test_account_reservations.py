@@ -58,6 +58,18 @@ def _reserve(
     return gate.check_and_reserve(**kwargs)
 
 
+def _insert_open_position(tmp_path: Path, *, account_key: str = "acct1") -> None:
+    database = open_account_shared_database(tmp_path / "dhan_account_shared.db")
+    with database.transaction() as conn:
+        conn.execute(
+            "INSERT INTO live_open_positions "
+            "(account_key, runtime_id, strategy_id, security_id, quantity, average_price, "
+            "deployed_capital, opened_at, updated_at) VALUES "
+            "(?, 'intraday_options', 'st01', 'sec1', 75, 190, 14250, ?, ?)",
+            (account_key, NOW.isoformat(), NOW.isoformat()),
+        )
+
+
 # ------------------------------------------------------------ check-and-reserve
 def test_a_reservation_within_limits_succeeds(tmp_path: Path):
     gate = _gate(tmp_path)
@@ -153,6 +165,90 @@ def test_no_configured_limit_never_blocks(tmp_path: Path):
     gate = _gate(tmp_path)
     decision = _reserve(gate, projected_capital=10_000_000.0)
     assert decision.allowed
+
+
+def test_current_account_loss_latches_entry_block_and_emergency_exit(tmp_path: Path):
+    gate = _gate(tmp_path)
+    _insert_open_position(tmp_path)
+
+    evaluation = gate.record_mtm_and_evaluate(
+        account_key="acct1",
+        runtime_id="intraday_options",
+        strategy_id="st01",
+        trading_date="2026-08-13",
+        security_id="sec1",
+        unrealised_pnl=-5_001.0,
+        as_of=NOW,
+        max_daily_loss=5_000.0,
+        max_mtm_age_seconds=60.0,
+    )
+
+    assert not evaluation.decision.allowed
+    assert evaluation.emergency_exit_requested
+    assert evaluation.newly_latched
+    assert gate.emergency_exit_reason(
+        account_key="acct1", trading_date="2026-08-13"
+    ) is not None
+    blocked = _reserve(gate, correlation_id="l_io_st01_20260813_0002")
+    assert not blocked.allowed
+    assert "daily loss limit" in (blocked.reason or "")
+
+
+def test_account_emergency_latch_survives_gate_reconstruction_but_not_a_new_day(
+    tmp_path: Path,
+):
+    gate = _gate(tmp_path)
+    _insert_open_position(tmp_path)
+    gate.record_mtm_and_evaluate(
+        account_key="acct1",
+        runtime_id="intraday_options",
+        strategy_id="st01",
+        trading_date="2026-08-13",
+        security_id="sec1",
+        unrealised_pnl=-6_000.0,
+        as_of=NOW,
+        max_daily_loss=5_000.0,
+        max_mtm_age_seconds=60.0,
+    )
+
+    reconstructed = AccountReservationGate(
+        open_account_shared_database(tmp_path / "dhan_account_shared.db")
+    )
+    same_day = _reserve(
+        reconstructed,
+        correlation_id="l_io_st01_20260813_0002",
+    )
+    next_day = _reserve(
+        reconstructed,
+        correlation_id="l_io_st01_20260814_0001",
+        trading_date="2026-08-14",
+    )
+
+    assert not same_day.allowed
+    assert next_day.allowed
+
+
+def test_stale_mtm_blocks_decision_without_requesting_unproven_liquidation(
+    tmp_path: Path,
+):
+    gate = _gate(tmp_path)
+    _insert_open_position(tmp_path)
+
+    evaluation = gate.record_mtm_and_evaluate(
+        account_key="acct1",
+        runtime_id="intraday_options",
+        strategy_id="st01",
+        trading_date="2026-08-13",
+        security_id="sec1",
+        unrealised_pnl=-10_000.0,
+        as_of=NOW,
+        max_daily_loss=5_000.0,
+        max_mtm_age_seconds=-1.0,
+    )
+
+    assert not evaluation.decision.allowed
+    assert not evaluation.emergency_exit_requested
+    assert gate.emergency_exit_reason(account_key="acct1", trading_date="2026-08-13") is None
 
 
 def test_risk_reducing_exit_is_reserved_even_when_entry_state_is_untrusted(tmp_path: Path):

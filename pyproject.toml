@@ -70,7 +70,10 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["common*"]
+include = ["common*", "strategies*", "runtimes*", "dashboards*", "scripts*", "orchestration*"]
+
+[tool.setuptools.package-data]
+common = ["persistence/migrations/**/*.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

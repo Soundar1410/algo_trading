@@ -17,6 +17,7 @@ import pytest
 from orchestration.launchd.generate_plists import LABEL_PREFIX, PLIST_SPECS, generate_all
 
 LAUNCHD_DIR = Path(__file__).resolve().parents[2] / "orchestration" / "launchd"
+COMMITTED_PROJECT_ROOT = Path("/Volumes/Trading/algo_trading")
 
 
 def _committed_plists() -> dict[str, dict[str, object]]:
@@ -32,7 +33,9 @@ def test_the_committed_plists_match_a_fresh_generation():
     """The drift guard: what's on disk is exactly what the generator would
     write today. Byte-for-byte, the same check `generate_plists.py --check`
     performs."""
-    fresh = generate_all()
+    # Committed LaunchAgents intentionally target the operator's stable Mac
+    # mount, not whichever temporary checkout happens to run CI.
+    fresh = generate_all(COMMITTED_PROJECT_ROOT)
     for filename, content in fresh.items():
         committed = LAUNCHD_DIR / filename
         assert committed.is_file(), f"{filename} has never been generated"
@@ -90,6 +93,10 @@ def test_the_interpreter_is_this_projects_own_venv(filename, document):
 
 
 @pytest.mark.parametrize("filename,document", list(_committed_plists().items()))
+@pytest.mark.skipif(
+    not (COMMITTED_PROJECT_ROOT / "pyproject.toml").is_file(),
+    reason="operator-Mac mount validation requires /Volumes/Trading/algo_trading",
+)
 def test_working_directory_is_the_project_root(filename, document):
     working_directory = Path(document["WorkingDirectory"])
     assert (working_directory / "pyproject.toml").is_file(), (

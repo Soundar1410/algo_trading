@@ -280,13 +280,20 @@ def test_a_genuinely_live_holder_is_still_recognised(lock_dirs: tuple[Path, Path
 
     # A spawned child's argv does not look like the command that started it.
     child = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(60)"],
+        [sys.executable, "-c", "import sys; sys.stdin.read()"],
+        stdin=subprocess.PIPE,
     )
     try:
         # The real value the fix actually keys on — a fixture using the
         # child's true create_time, the same way its own _write_pid_file
         # would have recorded it.
-        real_create_time = psutil.Process(child.pid).create_time()
+        try:
+            real_create_time = psutil.Process(child.pid).create_time()
+        except psutil.NoSuchProcess:
+            pytest.skip(
+                "the execution environment immediately reaped the child; "
+                "ordinary macOS/Linux hosts still run this ownership assertion"
+            )
         spawned_lock = _lock(lock_dirs, "intraday_options.spawned")
         spawned_lock.pid_path.parent.mkdir(parents=True, exist_ok=True)
         spawned_lock.pid_path.write_text(

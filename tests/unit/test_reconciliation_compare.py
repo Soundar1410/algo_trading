@@ -78,6 +78,21 @@ def test_duplicate_local_correlation_id_is_flagged_critical():
     assert mismatches[0].is_critical
 
 
+def test_duplicate_broker_correlation_id_is_flagged_before_matching():
+    local = [LocalOrderState(correlation_id="c1", status=OrderStatus.FILLED)]
+    broker = [
+        _order("c1", OrderStatus.FILLED, "b1"),
+        _order("c1", OrderStatus.ACKNOWLEDGED, "b2"),
+    ]
+
+    mismatches = compare_orders(local, broker)
+
+    assert len(mismatches) == 1
+    assert mismatches[0].category == "DUPLICATE_CORRELATION"
+    assert mismatches[0].is_critical
+    assert "2 broker rows" in mismatches[0].detail
+
+
 # ---------------------------------------------------------------- positions
 def _local_position(**overrides) -> LocalPositionState:
     base = dict(

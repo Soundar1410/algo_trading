@@ -8,10 +8,12 @@ it (market data, candles, signals, risk, persistence, health) is shared, so a
 strategy that has been paper-forward-tested is the same strategy when it is later
 approved for live.
 
-> **Status: Phase 10 controlled-live code complete; operational activation
+> **Status: Phase 10 controlled-live code hardened; operational activation
 > blocked.** The shared paper/live architecture, the real
 > `ema_cross_9_21_buy` paper strategy, and generic controlled-live machinery are
-> implemented. Every committed live gate remains disabled and tests use
+> implemented, including continuous account-loss emergency control,
+> broker-authoritative startup/mode-transition/session-end reconciliation, and
+> account-wide risk/rate coordination. Every committed live gate remains disabled and tests use
 > mocks/fakes only—no real order was placed.
 >
 > The `dhanhq` pin is now **ratified at `2.2.0`** (2.1.0 is yanked upstream and

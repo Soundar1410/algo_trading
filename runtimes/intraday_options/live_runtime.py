@@ -9,7 +9,7 @@ seams and never contact Dhan.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -25,6 +25,7 @@ from common.broker import (
     LiveOrderRateLimiter,
     build_broker,
 )
+from common.broker.dhan_live import DhanLiveBroker, DhanOrderClient
 from common.broker.dhan_preflight import run_configured_live_preflight
 from common.broker.live_preflight import (
     LivePreflightOutcome,
@@ -36,9 +37,10 @@ from common.broker.live_rate_limiter import rule_for
 from common.broker.order_update_consumer import DhanOrderUpdateStream, OrderUpdateInbox
 from common.broker.paper import InstrumentRulesLookup
 from common.config import ResolvedConfig, Settings, fingerprint
-from common.config.models import ExecutionMode, RateLimitCallClass
+from common.config.models import ExecutionMode, RateLimitCallClass, RateLimitRule
 from common.config.secrets import read_secret
 from common.execution import ExecutionRepository, LiveAccountRiskLimits
+from common.logging import active_redactor
 from common.market_data.dhan import build_dhan_order_client
 from common.persistence import (
     Database,
@@ -68,15 +70,217 @@ class LiveRuntimeContext:
     account_database: Database
     account_live_lock: FileLock
     order_update_stream: DhanOrderUpdateStream
+    repository: ExecutionRepository
+    runtime_id: str
+    strategy_id: str
+    _closed: bool = field(default=False, init=False, repr=False)
+
+    def reconcile_final(self) -> None:
+        """Require a fresh, broker-flat snapshot before a live session is clean."""
+        local_orders, local_positions = _local_snapshot(
+            self.repository, strategy_id=self.strategy_id
+        )
+        result = ReconciliationRunner(self.repository.database).run(
+            runtime_id=self.runtime_id,
+            strategy_id=self.strategy_id,
+            broker=self.broker,
+            local_orders=local_orders,
+            local_positions=local_positions,
+            # The persisted vocabulary predates this call site; a session-end
+            # check is the runtime's scheduled reconciliation boundary.
+            trigger="scheduled",
+        )
+        if result.status != "completed":
+            raise LiveExecutionBlocked(
+                f"final broker reconciliation failed: {result.error_message or 'unknown error'}"
+            )
+        if result.critical_mismatch_count:
+            raise LiveExecutionBlocked(
+                "final broker reconciliation found "
+                f"{result.critical_mismatch_count} critical mismatch(es)"
+            )
+        snapshot = result.broker_snapshot
+        if snapshot is None:
+            raise LiveExecutionBlocked("final broker reconciliation produced no snapshot")
+        pending = [order for order in snapshot.orders if not order.status.is_terminal]
+        open_positions = [position for position in snapshot.positions if position.quantity != 0]
+        if pending or open_positions:
+            raise LiveExecutionBlocked(
+                "final broker state is not flat: "
+                f"{len(pending)} pending/UNKNOWN order(s), "
+                f"{len(open_positions)} open position(s)"
+            )
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        reconciliation_error: Exception | None = None
         try:
-            self.order_update_stream.stop()
+            self.reconcile_final()
+        except Exception as exc:
+            reconciliation_error = exc
+            now = datetime.now(UTC).isoformat()
+            with self.account_database.transaction(immediate=True) as conn:
+                conn.execute(
+                    "UPDATE live_account_state_provenance SET reconciliation_status = 'failed', "
+                    "last_reconciled_at = ? WHERE account_key = ?",
+                    (now, self.account_key),
+                )
         finally:
             try:
-                self.account_database.close()
+                self.order_update_stream.stop()
             finally:
-                self.account_live_lock.release()
+                try:
+                    self.account_database.close()
+                finally:
+                    self.account_live_lock.release()
+        if reconciliation_error is not None:
+            raise reconciliation_error
+
+
+class _TransitionReadGuard:
+    """Rate-limit transition reconciliation without authorising order writes."""
+
+    def __init__(
+        self,
+        database: Database,
+        *,
+        account_key: str,
+        rules: tuple[Any, ...],
+    ) -> None:
+        self._limiter = LiveOrderRateLimiter(database)
+        self._account_key = account_key
+        self._rules = rules
+
+    def before_call(
+        self, call_class: RateLimitCallClass, *, risk_reducing: bool = False
+    ) -> None:
+        del risk_reducing
+        if call_class is not RateLimitCallClass.READ:
+            raise LiveExecutionBlocked(
+                "mode-transition broker is read-only and cannot place/modify/cancel orders"
+            )
+        rule = rule_for(self._rules, RateLimitCallClass.READ)
+        if rule is None:
+            raise LiveExecutionBlocked("no READ rate-limit rule configured for mode transition")
+        decision = self._limiter.reserve(
+            account_key=self._account_key,
+            call_class=RateLimitCallClass.READ,
+            rule=rule,
+            now=datetime.now(UTC),
+        )
+        if not decision.allowed:
+            raise LiveExecutionBlocked(decision.reason or "READ rate limit reached")
+
+
+@dataclass
+class TransitionReconciliationBroker(DhanLiveBroker):
+    """A Dhan broker whose only production purpose is a fresh transition read."""
+
+    transition_database: Database | None = None
+
+    def close(self) -> None:
+        if self.transition_database is not None:
+            self.transition_database.close()
+
+
+def build_transition_reconciliation_broker(
+    cfg: ResolvedConfig,
+    *,
+    settings: Settings,
+    client_id: str,
+    account_database_path: Path,
+    order_client: DhanOrderClient,
+) -> TransitionReconciliationBroker:
+    """Build the broker-authoritative, read-only mode-transition dependency.
+
+    This path intentionally does not require a live approval: it cannot submit
+    an order, and disabling or demoting a formerly-live strategy must remain
+    possible while all order-placement gates are closed.  Reads still consume
+    the shared account-wide READ budget.
+    """
+    pepper = read_secret(settings.account_identity_pepper)
+    if not pepper:
+        raise LiveExecutionBlocked(
+            "ACCOUNT_IDENTITY_PEPPER is required to rate-limit transition reconciliation"
+        )
+    database = open_account_shared_database(account_database_path)
+    try:
+        migrate_account_shared_database(database)
+        rules = cfg.runtime.live_preflight.rate_limits.rules
+        if rule_for(rules, RateLimitCallClass.READ) is None:
+            # Paper-only configurations are intentionally allowed to omit all
+            # live-order limits. Transition reconciliation is read-only but must
+            # still have a conservative shared budget rather than unlimited
+            # access or an inability to prove the broker flat.
+            rules = (
+                *rules,
+                RateLimitRule(
+                    call_class=RateLimitCallClass.READ,
+                    limit=1,
+                    window_seconds=1,
+                ),
+            )
+        guard = _TransitionReadGuard(
+            database,
+            account_key=derive_account_key(client_id, pepper),
+            rules=rules,
+        )
+        return TransitionReconciliationBroker(
+            client=order_client,
+            exchange_segment="NSE_FNO",
+            product_type="INTRADAY",
+            call_guard=guard,
+            instrument_rules=lambda _security_id: None,
+            max_quantity_lots=0,
+            transition_database=database,
+        )
+    except Exception:
+        database.close()
+        raise
+
+
+def account_shared_strategy_has_live_history(
+    *,
+    account_database_path: Path,
+    client_id: str,
+    account_identity_pepper: str,
+    strategy_id: str,
+) -> bool:
+    """Use the durable account ledger when the runtime DB may be missing/wrong.
+
+    A brand-new paper strategy must not be blocked by another strategy's live
+    broker exposure. Conversely, a strategy that has ever reached the shared
+    live ledger still requires a broker-authoritative transition even if its
+    per-runtime operational database was replaced.
+    """
+    database = open_account_shared_database(account_database_path)
+    try:
+        migrate_account_shared_database(database)
+        account_key = derive_account_key(client_id, account_identity_pepper)
+        row = database.connect().execute(
+            "SELECT 1 FROM live_risk_reservations WHERE account_key = ? "
+            "AND strategy_id = ? LIMIT 1",
+            (account_key, strategy_id),
+        ).fetchone()
+        if row is not None:
+            return True
+        row = database.connect().execute(
+            "SELECT 1 FROM live_open_positions WHERE account_key = ? "
+            "AND strategy_id = ? LIMIT 1",
+            (account_key, strategy_id),
+        ).fetchone()
+        if row is not None:
+            return True
+        row = database.connect().execute(
+            "SELECT 1 FROM live_realised_pnl_events WHERE account_key = ? "
+            "AND strategy_id = ? LIMIT 1",
+            (account_key, strategy_id),
+        ).fetchone()
+        return row is not None
+    finally:
+        database.close()
 
 
 def _acquire_account_live_lock(lock_dir: Path, account_key: str) -> FileLock:
@@ -133,9 +337,9 @@ def _local_snapshot(
             quantity=position.quantity,
             average_price=position.average_price,
             product_type="INTRADAY",
-            status="OPEN",
+            status=position.status.value,
         )
-        for position in repository.open_positions_all_dates(
+        for position in repository.positions_all_dates(
             strategy_id=strategy_id, execution_mode=ExecutionMode.LIVE
         )
     ]
@@ -171,6 +375,7 @@ def prepare_live_runtime(
         raise LiveExecutionBlocked(
             "live worker requires DHAN_CLIENT_ID and ACCOUNT_IDENTITY_PEPPER"
         )
+    redactor = active_redactor()
     bootstrap = AuthBootstrap(
         AuthCredentials(
             client_id=client_id,
@@ -179,6 +384,11 @@ def prepare_live_runtime(
             access_token=read_secret(settings.dhan_access_token),
         ),
         cache_dir=config.token_cache_dir,
+        on_token_minted=(
+            (lambda minted_token: redactor.add_secrets([minted_token]))
+            if redactor is not None
+            else None
+        ),
     )
     token, _ = bootstrap.get_token()
     order_client = build_dhan_order_client(client_id=client_id, access_token=token)
@@ -329,6 +539,9 @@ def prepare_live_runtime(
         account_database=account_database,
         account_live_lock=account_live_lock,
         order_update_stream=order_update_stream,
+        repository=repository,
+        runtime_id=config.runtime_id,
+        strategy_id=config.strategy_id,
     )
 
 
@@ -399,6 +612,8 @@ def parent_live_preflight_passed(
 __all__ = [
     "LiveRuntimeContext",
     "_acquire_account_live_lock",
+    "account_shared_strategy_has_live_history",
+    "build_transition_reconciliation_broker",
     "parent_live_preflight_passed",
     "prepare_live_runtime",
 ]

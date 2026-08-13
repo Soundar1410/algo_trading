@@ -109,11 +109,42 @@ def compare_orders(
     mismatches: list[Mismatch] = []
 
     local_by_id: dict[str, list[LocalOrderState]] = {}
-    for order in local_orders:
-        local_by_id.setdefault(order.correlation_id, []).append(order)
-    broker_by_id = {o.correlation_id: o for o in broker_orders}
+    for local_order in local_orders:
+        local_by_id.setdefault(local_order.correlation_id, []).append(local_order)
+    broker_groups: dict[str, list[Order]] = {}
+    for broker_order in broker_orders:
+        broker_groups.setdefault(broker_order.correlation_id, []).append(broker_order)
+
+    duplicate_broker_ids = {
+        correlation_id for correlation_id, orders in broker_groups.items() if len(orders) > 1
+    }
+    for correlation_id in sorted(duplicate_broker_ids):
+        broker_duplicates = broker_groups[correlation_id]
+        mismatches.append(
+            Mismatch(
+                category="DUPLICATE_CORRELATION",
+                is_critical=True,
+                correlation_id=correlation_id,
+                broker_order_id=broker_duplicates[0].broker_order_id,
+                detail=(
+                    f"{len(broker_duplicates)} broker rows share correlation_id "
+                    f"{correlation_id!r}"
+                ),
+            )
+        )
+
+    # Only unique broker identities may participate in ordinary matching.
+    # A duplicate is already a critical ambiguity and choosing one row would
+    # manufacture an authoritative status that the broker snapshot did not have.
+    broker_by_id = {
+        correlation_id: orders[0]
+        for correlation_id, orders in broker_groups.items()
+        if correlation_id not in duplicate_broker_ids
+    }
 
     for correlation_id, locals_ in local_by_id.items():
+        if correlation_id in duplicate_broker_ids:
+            continue
         if len(locals_) > 1:
             mismatches.append(
                 Mismatch(
@@ -178,6 +209,7 @@ def compare_positions(
     """
     mismatches: list[Mismatch] = []
     local_open = {p.security_id: p for p in local_positions if p.status == "OPEN"}
+    local_closed = {p.security_id: p for p in local_positions if p.status == "CLOSED"}
     broker_by_id = {p.security_id: p for p in broker_positions if p.quantity != 0}
 
     all_ids = set(local_open) | set(broker_by_id)
@@ -198,6 +230,20 @@ def compare_positions(
             continue
 
         if local is None and broker is not None:
+            if security_id in local_closed:
+                mismatches.append(
+                    Mismatch(
+                        category="LOCAL_CLOSED_BROKER_OPEN",
+                        is_critical=True,
+                        security_id=security_id,
+                        broker_quantity=broker.quantity,
+                        detail=(
+                            "local position is recorded CLOSED but the broker still "
+                            "reports it open"
+                        ),
+                    )
+                )
+                continue
             mismatches.append(
                 Mismatch(
                     category="BROKER_ONLY",
@@ -269,17 +315,4 @@ def compare_positions(
 
     # LOCAL_CLOSED_BROKER_OPEN: a local position that is *recorded* (any
     # trading date) as CLOSED, but the broker still reports it open.
-    local_closed = {p.security_id: p for p in local_positions if p.status == "CLOSED"}
-    for security_id, broker in broker_by_id.items():
-        if security_id in local_closed and security_id not in local_open:
-            mismatches.append(
-                Mismatch(
-                    category="LOCAL_CLOSED_BROKER_OPEN",
-                    is_critical=True,
-                    security_id=security_id,
-                    broker_quantity=broker.quantity,
-                    detail="local position is recorded CLOSED but the broker still reports it open",
-                )
-            )
-
     return mismatches

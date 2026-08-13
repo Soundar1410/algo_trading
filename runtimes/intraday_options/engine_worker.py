@@ -743,6 +743,18 @@ def _build(
             "here may differ from the hub's, so trading on them is not safe"
         )
 
+    def _account_emergency_poll() -> None:
+        """Re-honour a restart-safe account emergency request on a quiet feed."""
+        if live_context is None or not holder:
+            return
+        reason = live_context.reservation_gate.emergency_exit_reason(
+            account_key=live_context.account_key,
+            trading_date=config.trading_date,
+        )
+        if reason is not None:
+            holder[0].block_entries(reason)
+            holder[0].request_square_off(reason)
+
     warmup_manager, warmup_source = build_warmup_manager(config, engine_config)
 
     # Phase 6 Part 4: the session's own resolved expiry, if one exists.
@@ -781,6 +793,7 @@ def _build(
         on_poll=_combined_poll(
             _wall_clock_square_off(holder, square_off_authority, trading_date=config.trading_date),
             _operator_requested_square_off(holder, square_off_request_file),
+            _account_emergency_poll,
         ),
         poll_seconds=engine_config.feed_poll_seconds,
         idle_timeout_seconds=config.idle_timeout_seconds,
@@ -833,14 +846,40 @@ def _build(
     def _publish_account_mtm(position: OpenPosition, as_of: datetime) -> None:
         if live_context is None:  # pragma: no cover - callback is live-only
             return
-        live_context.reservation_gate.record_mtm(
+        evaluation = live_context.reservation_gate.record_mtm_and_evaluate(
             account_key=live_context.account_key,
             runtime_id=config.runtime_id,
             strategy_id=config.strategy_id,
+            trading_date=config.trading_date,
             security_id=position.contract.security_id,
             unrealised_pnl=position.unrealised_pnl,
             as_of=as_of,
+            max_daily_loss=live_context.risk_limits.max_daily_loss,
+            max_mtm_age_seconds=live_context.risk_limits.max_mtm_age_seconds,
         )
+        if not evaluation.emergency_exit_requested:
+            return
+        reason = evaluation.decision.reason or "account daily loss limit hit"
+        holder[0].block_entries(reason)
+        holder[0].request_square_off(reason)
+        if evaluation.newly_latched:
+            repository.record_error(
+                runtime_id=config.runtime_id,
+                strategy_id=config.strategy_id,
+                execution_mode=config.execution_mode,
+                severity="CRITICAL",
+                component="account_risk",
+                message=f"account emergency exit requested: {reason}",
+            )
+            notifier.send(
+                NotificationEvent(
+                    event_type="risk_blocked",
+                    message=f"Account emergency square-off: {reason}",
+                    runtime_id=config.runtime_id,
+                    strategy_id=config.strategy_id,
+                    execution_mode=config.execution_mode,
+                )
+            )
 
     engine = TradingEngine(
         cfg,

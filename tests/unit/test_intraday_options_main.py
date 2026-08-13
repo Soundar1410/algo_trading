@@ -130,6 +130,8 @@ def test_real_entrypoint_supplies_the_production_live_preflight_callback():
     source = inspect.getsource(runtime_main.main)
     assert "live_preflight_passed_for=" in source
     assert "parent_live_preflight_passed" in source
+    assert "live_broker_factory=" in source
+    assert "build_transition_reconciliation_broker" in source
 
 
 def test_disabled_strategy_is_checked_as_a_disable_transition(

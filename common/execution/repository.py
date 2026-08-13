@@ -710,6 +710,30 @@ class ExecutionRepository:
         )
         return [_row_to_position(row) for row in rows]
 
+    def positions_all_dates(
+        self, *, strategy_id: str, execution_mode: ExecutionMode
+    ) -> list[Position]:
+        """Every position row for reconciliation, including CLOSED history.
+
+        Broker-authoritative reconciliation must distinguish "the broker has
+        exposure we have never seen" from "the broker still has exposure that
+        local state says was closed".  Supplying only open rows makes the latter
+        classification unreachable and silently downgrades it to BROKER_ONLY.
+        """
+        rows = (
+            self._db.connect()
+            .execute(
+                """
+            SELECT * FROM positions
+            WHERE strategy_id = ? AND execution_mode = ?
+            ORDER BY trading_date, id
+            """,
+                (strategy_id, execution_mode.value),
+            )
+            .fetchall()
+        )
+        return [_row_to_position(row) for row in rows]
+
     def closed_position_count(
         self, *, strategy_id: str, execution_mode: ExecutionMode, trading_date: str
     ) -> int:

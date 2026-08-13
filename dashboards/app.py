@@ -601,7 +601,7 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
     st.title("algo_trading")
     st.caption(
         "Read-only. Paper forward testing on live market data. "
-        "Live order placement is not implemented."
+        "Controlled-live code exists but every committed live gate is disabled."
     )
 
     paths = load_paths()

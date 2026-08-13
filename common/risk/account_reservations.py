@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 
 from common.persistence.database import Database
 from common.risk.account_risk import (
+    AccountRiskDecision,
     account_daily_pnl_from_connection,
     check_account_daily_loss,
 )
@@ -82,6 +83,15 @@ class ReservationDecision:
 
     def __bool__(self) -> bool:
         return self.allowed
+
+
+@dataclass(frozen=True, slots=True)
+class AccountRiskEvaluation:
+    """Result of publishing MTM and enforcing the account daily-loss policy."""
+
+    decision: AccountRiskDecision
+    emergency_exit_requested: bool
+    newly_latched: bool
 
 
 class AccountReservationGate:
@@ -154,6 +164,17 @@ class AccountReservationGate:
                     ),
                 )
                 return ReservationDecision(True)
+
+            control = conn.execute(
+                "SELECT entries_blocked, reason FROM live_account_controls "
+                "WHERE account_key = ? AND trading_date = ?",
+                (account_key, trading_date),
+            ).fetchone()
+            if control is not None and bool(control["entries_blocked"]):
+                return ReservationDecision(
+                    False,
+                    str(control["reason"] or "account-wide new-entry kill switch is latched"),
+                )
 
             if require_reconciled_provenance:
                 provenance = conn.execute(
@@ -432,3 +453,100 @@ class AccountReservationGate:
                     as_of.isoformat(),
                 ),
             )
+
+    def record_mtm_and_evaluate(
+        self,
+        *,
+        account_key: str,
+        runtime_id: str,
+        strategy_id: str,
+        trading_date: str,
+        security_id: str,
+        unrealised_pnl: float,
+        as_of: datetime,
+        max_daily_loss: float | None,
+        max_mtm_age_seconds: float | None,
+    ) -> AccountRiskEvaluation:
+        """Publish MTM and atomically latch an account-loss emergency exit.
+
+        A stale mark blocks new entries through the ordinary snapshot check but
+        does not force liquidation: staleness alone is not evidence that the
+        account has breached its loss limit.  A current realised+unrealised loss
+        at or beyond ``max_daily_loss`` latches both entry blocking and emergency
+        exit for the rest of the trading day.  Restarts cannot clear the latch.
+        """
+        with self._db.transaction(immediate=True) as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM live_open_positions WHERE account_key = ? "
+                "AND runtime_id = ? AND strategy_id = ? AND security_id = ?",
+                (account_key, runtime_id, strategy_id, security_id),
+            ).fetchone()
+            if exists is not None:
+                conn.execute(
+                    "INSERT INTO live_position_mtm "
+                    "(account_key, runtime_id, strategy_id, security_id, unrealised_pnl, as_of) "
+                    "VALUES (?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT (account_key, runtime_id, strategy_id, security_id) "
+                    "DO UPDATE SET unrealised_pnl = excluded.unrealised_pnl, "
+                    "as_of = excluded.as_of",
+                    (
+                        account_key,
+                        runtime_id,
+                        strategy_id,
+                        security_id,
+                        unrealised_pnl,
+                        as_of.isoformat(),
+                    ),
+                )
+
+            snapshot = account_daily_pnl_from_connection(
+                conn,
+                account_key=account_key,
+                trading_date=trading_date,
+                now=as_of,
+                max_mtm_age_seconds=max_mtm_age_seconds,
+            )
+            decision = check_account_daily_loss(snapshot, max_daily_loss=max_daily_loss)
+            loss_breached = bool(
+                max_daily_loss is not None
+                and not snapshot.mtm_stale
+                and snapshot.daily_pnl <= -max_daily_loss
+            )
+            if not loss_breached:
+                return AccountRiskEvaluation(
+                    decision=decision,
+                    emergency_exit_requested=False,
+                    newly_latched=False,
+                )
+
+            existing_control = conn.execute(
+                "SELECT emergency_exit_requested FROM live_account_controls "
+                "WHERE account_key = ? AND trading_date = ?",
+                (account_key, trading_date),
+            ).fetchone()
+            newly_latched = existing_control is None or not bool(
+                existing_control["emergency_exit_requested"]
+            )
+            reason = decision.reason or "account daily loss limit hit"
+            conn.execute(
+                "INSERT INTO live_account_controls "
+                "(account_key, trading_date, entries_blocked, emergency_exit_requested, "
+                "reason, updated_at) VALUES (?, ?, 1, 1, ?, ?) "
+                "ON CONFLICT (account_key, trading_date) DO UPDATE SET "
+                "entries_blocked = 1, emergency_exit_requested = 1, "
+                "reason = excluded.reason, updated_at = excluded.updated_at",
+                (account_key, trading_date, reason, as_of.isoformat()),
+            )
+            return AccountRiskEvaluation(
+                decision=decision,
+                emergency_exit_requested=True,
+                newly_latched=newly_latched,
+            )
+
+    def emergency_exit_reason(self, *, account_key: str, trading_date: str) -> str | None:
+        row = self._db.connect().execute(
+            "SELECT reason FROM live_account_controls WHERE account_key = ? "
+            "AND trading_date = ? AND emergency_exit_requested = 1",
+            (account_key, trading_date),
+        ).fetchone()
+        return str(row["reason"] or "account emergency exit requested") if row else None

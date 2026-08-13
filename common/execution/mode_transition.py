@@ -184,9 +184,11 @@ def _check_live_to_paper_or_disabled(
             quantity=p.quantity,
             average_price=p.average_price,
             product_type="",
-            status="OPEN",
+            status=p.status.value,
         )
-        for p in open_live
+        for p in repository.positions_all_dates(
+            strategy_id=strategy_id, execution_mode=ExecutionMode.LIVE
+        )
     ]
 
     result = reconciliation_runner.run(

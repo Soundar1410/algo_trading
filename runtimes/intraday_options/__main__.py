@@ -98,7 +98,7 @@ def build_supervisor(
     settings: Settings | None = None,
     trading_date: str | None = None,
     strategy_ids: frozenset[str] | None = None,
-    live_broker_factory: Callable[[ResolvedConfig], Broker] | None = None,
+    live_broker_factory: Callable[[ResolvedConfig], Broker | None] | None = None,
     live_preflight_passed_for: Callable[[ResolvedConfig], bool] | None = None,
 ) -> IntradayOptionsSupervisor:
     """Discover this runtime's enabled strategies, admit them, build the group.
@@ -168,16 +168,21 @@ def build_supervisor(
             broker_for_check = (
                 live_broker_factory(cfg) if live_broker_factory is not None else None
             )
-            transition_decision = check_mode_transition_safety(
-                repository,
-                strategy_id=cfg.strategy.strategy_id,
-                runtime_id=runtime_id,
-                new_mode=cfg.strategy.mode if cfg.strategy.enabled else None,
-                broker=broker_for_check,
-                reconciliation_runner=(
-                    reconciliation_runner if broker_for_check is not None else None
-                ),
-            )
+            try:
+                transition_decision = check_mode_transition_safety(
+                    repository,
+                    strategy_id=cfg.strategy.strategy_id,
+                    runtime_id=runtime_id,
+                    new_mode=cfg.strategy.mode if cfg.strategy.enabled else None,
+                    broker=broker_for_check,
+                    reconciliation_runner=(
+                        reconciliation_runner if broker_for_check is not None else None
+                    ),
+                )
+            finally:
+                close_broker = getattr(broker_for_check, "close", None)
+                if callable(close_broker):
+                    close_broker()
             if not transition_decision.allowed:
                 _log.error(
                     "refusing to admit strategy_id=%s this session: mode transition to "
@@ -366,10 +371,38 @@ def main(argv: list[str] | None = None) -> int:
     # scripts/capture_live_tape.py uses for the same reason.
     from common.market_data.dhan import DhanMarketFeedAdapter, build_dhan_order_client
 
-    from .live_runtime import parent_live_preflight_passed
+    from .live_runtime import (
+        account_shared_strategy_has_live_history,
+        build_transition_reconciliation_broker,
+        parent_live_preflight_passed,
+    )
 
     adapter = DhanMarketFeedAdapter(client_id=client_id, access_token=token)
     order_client = build_dhan_order_client(client_id=client_id, access_token=token)
+
+    account_identity_pepper = read_secret(settings.account_identity_pepper)
+    transition_broker_factory = (
+        (
+            lambda cfg: (
+                build_transition_reconciliation_broker(
+                    cfg,
+                    settings=settings,
+                    client_id=client_id,
+                    account_database_path=paths.account_shared_database_path,
+                    order_client=order_client,
+                )
+                if account_shared_strategy_has_live_history(
+                    account_database_path=paths.account_shared_database_path,
+                    client_id=client_id,
+                    account_identity_pepper=account_identity_pepper,
+                    strategy_id=cfg.strategy.strategy_id,
+                )
+                else None
+            )
+        )
+        if account_identity_pepper
+        else None
+    )
 
     supervisor = build_supervisor(
         runtime_id=args.runtime_id,
@@ -386,6 +419,7 @@ def main(argv: list[str] | None = None) -> int:
             account_database_path=paths.account_shared_database_path,
             order_client=order_client,
         ),
+        live_broker_factory=transition_broker_factory,
     )
     # Recorded here rather than inside AuthBootstrap: get_token() ran before
     # this runtime's database (and therefore auth_events) existed — see

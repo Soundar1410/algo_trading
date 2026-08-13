@@ -5,6 +5,7 @@ from __future__ import annotations
 from .account_reservations import (
     ACTIVE_STATES,
     AccountReservationGate,
+    AccountRiskEvaluation,
     IllegalReservationTransition,
     ReservationDecision,
 )
@@ -21,6 +22,7 @@ __all__ = [
     "AccountExposureSnapshot",
     "AccountReservationGate",
     "AccountRiskDecision",
+    "AccountRiskEvaluation",
     "ExpiryPolicy",
     "IllegalReservationTransition",
     "ReservationDecision",
