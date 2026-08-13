@@ -81,6 +81,7 @@ from common.engine.models import (
     OptionContract,
     OptionType,
     OrderSide,
+    UnmanageablePositionState,
 )
 from common.engine.positions import PositionManager
 from common.engine.reporting_bindings import HeartbeatEngineReporter, RepositoryReportWriter
@@ -180,14 +181,27 @@ def recover_position(
     day — so the outcome of any inconsistency is "manage nothing new", never "trade
     alongside something unknown".
     """
-    positions = repository.open_positions(
+    positions = repository.open_positions_all_dates(
         strategy_id=config.strategy_id,
         execution_mode=config.execution_mode,
-        trading_date=config.trading_date,
     )
     if not positions:
         return None
+    if len(positions) != 1:
+        message = (
+            f"restart handoff found {len(positions)} open positions across trading dates; "
+            "this engine can safely manage exactly one"
+        )
+        _record_recovery_failure(config, repository, message)
+        raise UnmanageablePositionState(message)
     position = positions[0]
+    if position.trading_date != config.trading_date:
+        message = (
+            f"unexpected carry-forward intraday position {position.security_id} from "
+            f"{position.trading_date}; current trading date is {config.trading_date}"
+        )
+        _record_recovery_failure(config, repository, message)
+        raise UnmanageablePositionState(message)
 
     try:
         payload = read_payload(
@@ -514,17 +528,32 @@ def run_engine(
             live_close()
             live_close = None
     except Exception as exc:
+        cleanup_error: Exception | None = None
         if live_close is not None:
-            live_close()
+            try:
+                live_close()
+            except Exception as close_exc:
+                cleanup_error = close_exc
+                repository.record_error(
+                    runtime_id=config.runtime_id,
+                    strategy_id=config.strategy_id,
+                    execution_mode=config.execution_mode,
+                    severity="CRITICAL",
+                    component="engine.live_cleanup",
+                    message=str(close_exc),
+                    context=f"primary engine failure: {exc}",
+                )
         outcome.exit_code = 1
         outcome.error = str(exc)
+        if cleanup_error is not None:
+            outcome.error += f"; live cleanup also failed: {cleanup_error}"
         repository.record_error(
             runtime_id=config.runtime_id,
             strategy_id=config.strategy_id,
             execution_mode=config.execution_mode,
             severity="CRITICAL",
             component="engine",
-            message=str(exc),
+            message=outcome.error,
         )
         heartbeat.beat(HealthState.FAILED, force=True)
         log.exception("engine worker failed strategy_id=%s", config.strategy_id)

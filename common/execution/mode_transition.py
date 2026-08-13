@@ -168,7 +168,12 @@ def _check_live_to_paper_or_disabled(
         strategy_id=strategy_id, execution_mode=ExecutionMode.LIVE
     )
     local_orders = [
-        LocalOrderState(correlation_id=row["correlation_id"], status=OrderStatus(row["status"]))
+        LocalOrderState(
+            correlation_id=row["correlation_id"],
+            status=OrderStatus(row["status"]),
+            broker_order_id=row["broker_order_id"],
+            filled_quantity=int(row["filled_quantity"]),
+        )
         for row in all_local_orders
     ]
     local_orders.extend(

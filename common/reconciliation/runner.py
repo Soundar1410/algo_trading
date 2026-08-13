@@ -17,6 +17,7 @@ import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from common.broker.base import Broker
 from common.logging import get_logger, redact_for_persistence
@@ -29,7 +30,11 @@ from .compare import (
     compare_orders,
     compare_positions,
 )
+from .recovery import RecoveryResolution, load_local_reconciliation_state, recover_broker_evidence
 from .snapshot import BrokerSnapshot, fetch_broker_snapshot
+
+if TYPE_CHECKING:
+    from common.execution.repository import ExecutionRepository
 
 log = get_logger(__name__)
 
@@ -53,10 +58,15 @@ class ReconciliationResult:
 
 class ReconciliationRunner:
     def __init__(
-        self, database: Database, *, price_tolerance: float = DEFAULT_PRICE_TOLERANCE
+        self,
+        database: Database,
+        *,
+        price_tolerance: float = DEFAULT_PRICE_TOLERANCE,
+        recovery_repository: ExecutionRepository | None = None,
     ) -> None:
         self._db = database
         self._price_tolerance = price_tolerance
+        self._recovery_repository = recovery_repository
 
     def run(
         self,
@@ -87,11 +97,54 @@ class ReconciliationRunner:
                 broker_snapshot=None,
             )
 
+        recovery_mismatches: list[Mismatch] = []
+        resolutions: tuple[RecoveryResolution, ...] = ()
+        if self._recovery_repository is not None:
+            if strategy_id is None:
+                self._fail_run(
+                    run_id,
+                    error_message="broker-evidence recovery requires a strategy_id",
+                    now=datetime.now(UTC),
+                )
+                return ReconciliationResult(
+                    run_id=run_id,
+                    status="failed",
+                    critical_mismatch_count=0,
+                    entries_blocked=True,
+                    mismatches=(),
+                    error_message="broker-evidence recovery requires a strategy_id",
+                    broker_snapshot=broker_snapshot,
+                )
+            try:
+                recovery = recover_broker_evidence(
+                    self._recovery_repository,
+                    runtime_id=runtime_id,
+                    strategy_id=strategy_id,
+                    snapshot=broker_snapshot,
+                )
+            except Exception as exc:
+                log.exception("reconciliation run %d failed to apply broker evidence", run_id)
+                self._fail_run(run_id, error_message=str(exc), now=datetime.now(UTC))
+                return ReconciliationResult(
+                    run_id=run_id,
+                    status="failed",
+                    critical_mismatch_count=0,
+                    entries_blocked=True,
+                    mismatches=(),
+                    error_message=str(exc),
+                    broker_snapshot=broker_snapshot,
+                )
+            recovery_mismatches.extend(recovery.mismatches)
+            resolutions = recovery.resolutions
+            local_orders, local_positions = load_local_reconciliation_state(
+                self._recovery_repository, strategy_id=strategy_id
+            )
+
         order_mismatches = compare_orders(local_orders, broker_snapshot.orders)
         position_mismatches = compare_positions(
             local_positions, broker_snapshot.positions, price_tolerance=self._price_tolerance
         )
-        mismatches = [*order_mismatches, *position_mismatches]
+        mismatches = [*recovery_mismatches, *order_mismatches, *position_mismatches]
         critical_count = sum(1 for m in mismatches if m.is_critical)
         entries_blocked = critical_count > 0
 
@@ -101,6 +154,13 @@ class ReconciliationRunner:
             runtime_id=runtime_id,
             strategy_id=strategy_id or "",
             mismatches=mismatches,
+            now=now,
+        )
+        self._persist_resolutions(
+            run_id=run_id,
+            runtime_id=runtime_id,
+            strategy_id=strategy_id or "",
+            resolutions=resolutions,
             now=now,
         )
         self._complete_run(
@@ -211,6 +271,40 @@ class ReconciliationRunner:
                     ),
                 )
 
+    def _persist_resolutions(
+        self,
+        *,
+        run_id: int,
+        runtime_id: str,
+        strategy_id: str,
+        resolutions: Sequence[RecoveryResolution],
+        now: datetime,
+    ) -> None:
+        if not resolutions:
+            return
+        with self._db.transaction() as conn:
+            for resolution in resolutions:
+                conn.execute(
+                    "INSERT INTO reconciliation_mismatches "
+                    "(run_id, runtime_id, strategy_id, execution_mode, category, is_critical, "
+                    "correlation_id, broker_order_id, detail, resolution_action, "
+                    "resolution_reason, resolved_at, detected_at) "
+                    "VALUES (?, ?, ?, 'live', ?, 0, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        run_id,
+                        runtime_id,
+                        strategy_id,
+                        resolution.category,
+                        resolution.correlation_id,
+                        resolution.broker_order_id,
+                        redact_for_persistence(resolution.reason),
+                        resolution.action,
+                        redact_for_persistence(resolution.reason),
+                        now.isoformat(),
+                        now.isoformat(),
+                    ),
+                )
+
     # ---------------------------------------------------------------- queries
     def latest_run(self, *, runtime_id: str, strategy_id: str | None) -> sqlite3.Row | None:
         conn = self._db.connect()
@@ -229,11 +323,13 @@ class ReconciliationRunner:
             ).fetchone()
         return row
 
-    def open_critical_mismatches(
-        self, *, runtime_id: str, strategy_id: str
-    ) -> list[sqlite3.Row]:
-        return self._db.connect().execute(
-            "SELECT * FROM reconciliation_mismatches WHERE runtime_id = ? AND strategy_id = ? "
-            "AND is_critical = 1 AND resolved_at IS NULL ORDER BY detected_at DESC",
-            (runtime_id, strategy_id),
-        ).fetchall()
+    def open_critical_mismatches(self, *, runtime_id: str, strategy_id: str) -> list[sqlite3.Row]:
+        return (
+            self._db.connect()
+            .execute(
+                "SELECT * FROM reconciliation_mismatches WHERE runtime_id = ? AND strategy_id = ? "
+                "AND is_critical = 1 AND resolved_at IS NULL ORDER BY detected_at DESC",
+                (runtime_id, strategy_id),
+            )
+            .fetchall()
+        )

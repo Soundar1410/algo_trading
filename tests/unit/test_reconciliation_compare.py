@@ -191,17 +191,53 @@ def test_local_closed_broker_open_is_critical():
     assert critical[0].is_critical
 
 
+def test_duplicate_local_open_positions_fail_closed_instead_of_last_row_wins():
+    local = [_local_position(quantity=75), _local_position(quantity=75)]
+    mismatches = compare_positions(local, [_broker_position(quantity=75)], price_tolerance=0.5)
+    assert len(mismatches) == 1
+    assert mismatches[0].category == "QUANTITY_MISMATCH"
+    assert mismatches[0].is_critical
+    assert "2 local OPEN row(s)" in mismatches[0].detail
+
+
+def test_duplicate_broker_positions_fail_closed_regardless_of_row_order():
+    first = _broker_position(quantity=75)
+    second = _broker_position(quantity=130)
+    forward = compare_positions([_local_position()], [first, second], price_tolerance=0.5)
+    reverse = compare_positions([_local_position()], [second, first], price_tolerance=0.5)
+    assert [(m.category, m.is_critical, m.broker_quantity) for m in forward] == [
+        ("QUANTITY_MISMATCH", True, 205)
+    ]
+    assert [(m.category, m.is_critical, m.broker_quantity) for m in reverse] == [
+        ("QUANTITY_MISMATCH", True, 205)
+    ]
+
+
+def test_same_security_under_two_broker_products_is_ambiguous_and_blocks():
+    mismatches = compare_positions(
+        [_local_position()],
+        [_broker_position(product_type="INTRADAY"), _broker_position(product_type="MARGIN")],
+        price_tolerance=0.5,
+    )
+    assert len(mismatches) == 1
+    assert mismatches[0].category == "QUANTITY_MISMATCH"
+    assert mismatches[0].is_critical
+
+
 def test_critical_categories_match_the_spec_list():
-    assert frozenset(
-        {
-            "BROKER_ONLY",
-            "QUANTITY_MISMATCH",
-            "SIDE_MISMATCH",
-            "UNKNOWN_ORDER",
-            "LOCAL_CLOSED_BROKER_OPEN",
-            "DUPLICATE_CORRELATION",
-        }
-    ) == CRITICAL_CATEGORIES
+    assert (
+        frozenset(
+            {
+                "BROKER_ONLY",
+                "QUANTITY_MISMATCH",
+                "SIDE_MISMATCH",
+                "UNKNOWN_ORDER",
+                "LOCAL_CLOSED_BROKER_OPEN",
+                "DUPLICATE_CORRELATION",
+            }
+        )
+        == CRITICAL_CATEGORIES
+    )
 
 
 def test_unknown_category_is_rejected_at_construction():

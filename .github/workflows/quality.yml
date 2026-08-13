@@ -19,7 +19,11 @@ jobs:
           python-version: "3.11"
           cache: pip
       - name: Install
-        run: python -m pip install --upgrade pip && python -m pip install -e '.[dev]'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.lock
+          python -m pip install -e . --no-deps
+          python -m pip check
       - name: Confirm committed live gates are closed
         run: python -m scripts.assert_no_live_config_committed
       - name: Ruff
@@ -47,6 +51,7 @@ jobs:
               "common/persistence/migrations/versions/0001_walking_skeleton.sql",
               "common/persistence/migrations/account_versions/0001_account_shared_foundation.sql",
               "common/persistence/migrations/account_versions/0002_account_emergency_controls.sql",
+              "common/persistence/migrations/account_versions/0003_live_confirmation_audit.sql",
           }
           missing = sorted(required - names)
           if missing:

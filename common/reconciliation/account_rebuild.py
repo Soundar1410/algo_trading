@@ -31,6 +31,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from filelock import FileLock, Timeout
 
@@ -40,6 +41,9 @@ from common.persistence.database import Database
 
 from .compare import LocalOrderState, LocalPositionState
 from .runner import ReconciliationRunner
+
+if TYPE_CHECKING:
+    from common.execution.repository import ExecutionRepository
 
 log = get_logger(__name__)
 
@@ -64,6 +68,7 @@ class RuntimeGroupSnapshot:
     local_orders: Sequence[LocalOrderState]
     local_positions: Sequence[LocalPositionState]
     reconciliation_runner: ReconciliationRunner
+    repository: ExecutionRepository | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,10 +82,14 @@ def get_provenance(database: Database, *, account_key: str) -> str:
     """The account-shared database's own honesty check: a fresh/empty file
     has no provenance row at all, which must read as ``never_reconciled``
     (blocking), never as an implicit "nothing to reconcile"."""
-    row = database.connect().execute(
-        "SELECT reconciliation_status FROM live_account_state_provenance WHERE account_key = ?",
-        (account_key,),
-    ).fetchone()
+    row = (
+        database.connect()
+        .execute(
+            "SELECT reconciliation_status FROM live_account_state_provenance WHERE account_key = ?",
+            (account_key,),
+        )
+        .fetchone()
+    )
     if row is None:
         return ProvenanceStatus.NEVER_RECONCILED
     return str(row["reconciliation_status"])
@@ -119,6 +128,19 @@ def rebuild_account_shared_state(
                 f"lock at {lock_path} — another process is probably rebuilding it"
             ),
         )
+    except Exception as exc:
+        log.exception("account rebuild failed for account_key=%s", account_key)
+        try:
+            _mark_provenance(
+                account_database, account_key=account_key, status=ProvenanceStatus.FAILED
+            )
+        except Exception:
+            log.exception("could not persist failed account-rebuild provenance")
+        return AccountRebuildResult(
+            status="failed",
+            critical_mismatch_total=0,
+            error_message=str(exc),
+        )
 
 
 def _rebuild_locked(
@@ -128,9 +150,7 @@ def _rebuild_locked(
     runtime_groups: Sequence[RuntimeGroupSnapshot],
 ) -> AccountRebuildResult:
     if not runtime_groups:
-        _mark_provenance(
-            account_database, account_key=account_key, status=ProvenanceStatus.FAILED
-        )
+        _mark_provenance(account_database, account_key=account_key, status=ProvenanceStatus.FAILED)
         return AccountRebuildResult(
             status="failed",
             critical_mismatch_total=0,
@@ -139,6 +159,7 @@ def _rebuild_locked(
 
     total_critical = 0
     rebuilt_positions: list[tuple[RuntimeGroupSnapshot, BrokerPosition]] = []
+    rebuilt_pnl_events: list[tuple[str, str, str, str, float, str]] = []
     for group in runtime_groups:
         result = group.reconciliation_runner.run(
             runtime_id=group.runtime_id,
@@ -204,9 +225,16 @@ def _rebuild_locked(
                     "non-terminal broker order(s)"
                 ),
             )
+        effective_local_positions = group.local_positions
+        if group.repository is not None:
+            from .recovery import load_local_reconciliation_state
+
+            _, effective_local_positions = load_local_reconciliation_state(
+                group.repository, strategy_id=group.strategy_id
+            )
         local_security_ids = {
             position.security_id
-            for position in group.local_positions
+            for position in effective_local_positions
             if position.status == "OPEN" and position.quantity != 0
         }
         rebuilt_positions.extend(
@@ -214,15 +242,14 @@ def _rebuild_locked(
             for position in snapshot.positions
             if position.security_id in local_security_ids and position.quantity != 0
         )
+        if group.repository is not None:
+            rebuilt_pnl_events.extend(_realised_pnl_events(group))
 
     now = datetime.now(UTC).isoformat()
     with account_database.transaction(immediate=True) as conn:
-        conn.execute(
-            "DELETE FROM live_open_positions WHERE account_key = ?", (account_key,)
-        )
-        conn.execute(
-            "DELETE FROM live_position_mtm WHERE account_key = ?", (account_key,)
-        )
+        conn.execute("DELETE FROM live_open_positions WHERE account_key = ?", (account_key,))
+        conn.execute("DELETE FROM live_position_mtm WHERE account_key = ?", (account_key,))
+        conn.execute("DELETE FROM live_realised_pnl_events WHERE account_key = ?", (account_key,))
         # A successful full broker reconciliation is the sole authority that
         # may resolve UNKNOWN.  Preserve that state transition explicitly in
         # the ledger before releasing the now-accounted-for reservation.
@@ -255,6 +282,28 @@ def _rebuild_locked(
                     now,
                 ),
             )
+        for (
+            runtime_id,
+            strategy_id,
+            trading_date,
+            fill_id,
+            pnl_delta,
+            recorded_at,
+        ) in rebuilt_pnl_events:
+            conn.execute(
+                "INSERT INTO live_realised_pnl_events "
+                "(account_key, runtime_id, strategy_id, trading_date, idempotency_key, "
+                "realised_pnl_delta, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    account_key,
+                    runtime_id,
+                    strategy_id,
+                    trading_date,
+                    fill_id,
+                    pnl_delta,
+                    recorded_at,
+                ),
+            )
 
     _mark_provenance(account_database, account_key=account_key, status=ProvenanceStatus.RECONCILED)
     log.info(
@@ -265,6 +314,68 @@ def _rebuild_locked(
         total_critical,
     )
     return AccountRebuildResult(status="reconciled", critical_mismatch_total=total_critical)
+
+
+def _realised_pnl_events(
+    group: RuntimeGroupSnapshot,
+) -> list[tuple[str, str, str, str, float, str]]:
+    """Reconstruct account P&L events from the durable local fill ledger.
+
+    This mirrors ``AccountReservationGate.record_fill`` but starts from an
+    empty account ledger, which is exactly the account-rebuild situation.  It
+    is intentionally derived from fills rather than ``strategy_state`` totals:
+    each broker fill ID remains the idempotency/audit key.
+    """
+    assert group.repository is not None
+    rows = (
+        group.repository.database.connect()
+        .execute(
+            "SELECT f.broker_fill_id, f.quantity, f.price, f.charges, f.filled_at, "
+            "oi.side, oi.security_id, oi.trading_date "
+            "FROM fills f JOIN orders o ON o.id = f.order_id "
+            "JOIN order_intents oi ON oi.id = o.intent_id "
+            "WHERE f.strategy_id = ? AND f.execution_mode = 'live' "
+            "ORDER BY f.filled_at, f.id",
+            (group.strategy_id,),
+        )
+        .fetchall()
+    )
+    state: dict[tuple[str, str], tuple[int, float]] = {}
+    events: list[tuple[str, str, str, str, float, str]] = []
+    for row in rows:
+        security_id = str(row["security_id"])
+        trading_date = str(row["trading_date"])
+        position_key = (trading_date, security_id)
+        quantity = int(row["quantity"])
+        price = float(row["price"])
+        signed = quantity if str(row["side"]) == "BUY" else -quantity
+        current_quantity, current_average = state.get(position_key, (0, price))
+        realised_delta = -float(row["charges"])
+        if current_quantity and (current_quantity > 0) != (signed > 0):
+            closed = min(abs(current_quantity), abs(signed))
+            direction = 1 if current_quantity > 0 else -1
+            realised_delta += direction * closed * (price - current_average)
+        new_quantity = current_quantity + signed
+        if current_quantity == 0 or (current_quantity > 0) == (signed > 0):
+            total = abs(current_quantity) + abs(signed)
+            new_average = (abs(current_quantity) * current_average + abs(signed) * price) / total
+        elif new_quantity == 0 or (new_quantity > 0) == (current_quantity > 0):
+            new_average = current_average
+        else:
+            new_average = price
+        state[position_key] = (new_quantity, new_average)
+        if realised_delta:
+            events.append(
+                (
+                    group.runtime_id,
+                    group.strategy_id,
+                    trading_date,
+                    str(row["broker_fill_id"]),
+                    realised_delta,
+                    str(row["filled_at"]),
+                )
+            )
+    return events
 
 
 def _mark_provenance(database: Database, *, account_key: str, status: str) -> None:

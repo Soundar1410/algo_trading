@@ -11,6 +11,7 @@ from common.reconciliation import (
     can_mark_closed,
     can_mark_rejected,
     permitted_action_for,
+    resolution_is_permitted,
 )
 
 _PERMITTED_VOCABULARY = frozenset(
@@ -67,6 +68,12 @@ def test_mark_rejected_requires_a_positive_broker_confirmation():
     assert not can_mark_rejected(broker_status=None)
     assert not can_mark_rejected(broker_status=OrderStatus.UNKNOWN)
     assert not can_mark_rejected(broker_status=OrderStatus.CANCELLED)
+    assert resolution_is_permitted(
+        "UNKNOWN_ORDER", "mark_rejected", broker_status=OrderStatus.REJECTED
+    )
+    assert not resolution_is_permitted(
+        "UNKNOWN_ORDER", "mark_rejected", broker_status=OrderStatus.UNKNOWN
+    )
 
 
 # -------------------------------------------------------------- mark_closed

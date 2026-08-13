@@ -5,8 +5,9 @@
 #
 # PAPER ONLY at delivery. Setting mode to `live` will NOT start a live
 # strategy: the broker factory consults the live gate (common.config.models.
-# effective_live_gate) and refuses, and live order placement does not exist
-# until Phase 10.
+# effective_live_gate) and refuses. Phase 10's live machinery exists but every
+# committed gate remains disabled; operational activation requires separate
+# evidence and explicit approval.
 
 strategy_id: ema_cross_9_21_buy
 enabled: true

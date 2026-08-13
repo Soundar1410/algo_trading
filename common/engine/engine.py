@@ -90,6 +90,7 @@ from .models import (
     OrderSide,
     SignalAction,
     StrategySignal,
+    UnmanageablePositionState,
 )
 from .positions import PositionManager
 from .regime import build_regime_tagger
@@ -682,6 +683,12 @@ class TradingEngine:
             return
         try:
             recovered = self._recover_position()
+        except UnmanageablePositionState:
+            # Blocking new entries is insufficient when known exposure exists
+            # but cannot be represented: this process would continue while
+            # managing nothing. Abort the worker so supervision and operators
+            # see a hard recovery failure.
+            raise
         except Exception as exc:
             log.exception("%s: could not establish whether a position was carried over", self.label)
             self._block_entries(

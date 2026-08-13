@@ -56,6 +56,7 @@ from common.reconciliation import (
     get_provenance,
     rebuild_account_shared_state,
 )
+from common.reconciliation.recovery import load_local_reconciliation_state
 from common.risk import AccountReservationGate
 
 from .worker import WorkerConfig, resolved_config_from_worker
@@ -80,7 +81,9 @@ class LiveRuntimeContext:
         local_orders, local_positions = _local_snapshot(
             self.repository, strategy_id=self.strategy_id
         )
-        result = ReconciliationRunner(self.repository.database).run(
+        result = ReconciliationRunner(
+            self.repository.database, recovery_repository=self.repository
+        ).run(
             runtime_id=self.runtime_id,
             strategy_id=self.strategy_id,
             broker=self.broker,
@@ -308,42 +311,7 @@ def _acquire_account_live_lock(lock_dir: Path, account_key: str) -> FileLock:
 def _local_snapshot(
     repository: ExecutionRepository, *, strategy_id: str
 ) -> tuple[list[LocalOrderState], list[LocalPositionState]]:
-    from common.models import OrderStatus
-
-    orders = [
-        LocalOrderState(
-            correlation_id=str(row["correlation_id"]),
-            status=OrderStatus(str(row["status"])),
-        )
-        for row in repository.all_orders(
-            strategy_id=strategy_id, execution_mode=ExecutionMode.LIVE
-        )
-    ]
-    pending = repository.database.connect().execute(
-        "SELECT oi.correlation_id FROM order_intents oi "
-        "LEFT JOIN orders o ON o.intent_id = oi.id "
-        "WHERE oi.strategy_id = ? AND oi.execution_mode = 'live' AND o.id IS NULL",
-        (strategy_id,),
-    )
-    orders.extend(
-        LocalOrderState(
-            correlation_id=str(row["correlation_id"]), status=OrderStatus.UNKNOWN
-        )
-        for row in pending
-    )
-    positions = [
-        LocalPositionState(
-            security_id=position.security_id,
-            quantity=position.quantity,
-            average_price=position.average_price,
-            product_type="INTRADAY",
-            status=position.status.value,
-        )
-        for position in repository.positions_all_dates(
-            strategy_id=strategy_id, execution_mode=ExecutionMode.LIVE
-        )
-    ]
-    return orders, positions
+    return load_local_reconciliation_state(repository, strategy_id=strategy_id)
 
 
 def prepare_live_runtime(
@@ -508,7 +476,10 @@ def prepare_live_runtime(
                     broker=broker,
                     local_orders=local_orders,
                     local_positions=local_positions,
-                    reconciliation_runner=ReconciliationRunner(repository.database),
+                    reconciliation_runner=ReconciliationRunner(
+                        repository.database, recovery_repository=repository
+                    ),
+                    repository=repository,
                 ),
             ),
             lock_path=Path(config.lock_dir) / "dhan_account_rebuild.lock",

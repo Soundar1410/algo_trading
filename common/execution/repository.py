@@ -336,13 +336,16 @@ class ExecutionRepository:
                     _now(),
                 ),
             )
-            order_id = int(cursor.lastrowid or 0)
-            if order_id == 0:
-                row = conn.execute(
-                    "SELECT id FROM orders WHERE intent_id = ?", (intent_id,)
-                ).fetchone()
-                order_id = int(row["id"])
-            return order_id
+            # SQLite leaves ``lastrowid`` unchanged when the UPSERT takes its
+            # UPDATE arm. Reusing it can therefore return the ID of some
+            # unrelated prior insert on this connection and attach a recovered
+            # fill to the wrong/non-existent order. Read back through the
+            # unique intent identity on both insert and update paths.
+            del cursor
+            row = conn.execute("SELECT id FROM orders WHERE intent_id = ?", (intent_id,)).fetchone()
+            if row is None:  # pragma: no cover - the UPSERT above must create it
+                raise RuntimeError(f"order upsert for intent_id={intent_id} produced no row")
+            return int(row["id"])
 
     # ------------------------------------------------- fill + position (one txn)
     def apply_fill(

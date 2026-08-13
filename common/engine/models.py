@@ -49,7 +49,12 @@ __all__ = [
     "SignalAction",
     "StrategySignal",
     "Trade",
+    "UnmanageablePositionState",
 ]
+
+
+class UnmanageablePositionState(RuntimeError):
+    """Open exposure exists but this engine cannot safely adopt/manage it."""
 
 
 class Moneyness(StrEnum):

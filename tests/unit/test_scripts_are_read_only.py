@@ -98,8 +98,15 @@ CONTROL_SCRIPTS = {
     "stop_strategy.py",
 }
 
+#: Manages only the short-lived confirmation gate in the account-shared DB.
+#: It neither reaches a broker nor writes any trading table, but it is not
+#: labelled read-only because issuing/revoking approval evidence is an
+#: intentional operational mutation.
+CONFIRMATION_SCRIPTS = {"live_confirmation.py"}
+
 READ_ONLY_FILES = [p for p in SCRIPT_FILES if p.name in READ_ONLY_SCRIPTS]
 CONTROL_FILES = [p for p in SCRIPT_FILES if p.name in CONTROL_SCRIPTS]
+CONFIRMATION_FILES = [p for p in SCRIPT_FILES if p.name in CONFIRMATION_SCRIPTS]
 
 #: Tables a control script must never write directly — trades, positions and
 #: the state that gates them. Contrast ``audit_events``, which every control
@@ -119,13 +126,24 @@ FORBIDDEN_TRADING_TABLES = (
 def test_the_scripts_directory_is_what_we_think_it_is():
     """Guards every parametrisation below: an empty glob would pass everything."""
     names = {path.name for path in SCRIPT_FILES}
-    assert names == READ_ONLY_SCRIPTS | CONTROL_SCRIPTS
-    assert READ_ONLY_SCRIPTS.isdisjoint(CONTROL_SCRIPTS), "a script must belong to exactly one tier"
+    assert names == READ_ONLY_SCRIPTS | CONTROL_SCRIPTS | CONFIRMATION_SCRIPTS
+    tiers = (READ_ONLY_SCRIPTS, CONTROL_SCRIPTS, CONFIRMATION_SCRIPTS)
+    assert all(left.isdisjoint(right) for i, left in enumerate(tiers) for right in tiers[i + 1 :])
 
 
 def test_the_launcher_directory_is_what_we_think_it_is():
     names = {path.name for path in LAUNCHER_FILES}
     assert names == LAUNCHER_SCRIPTS
+
+
+@pytest.mark.parametrize("script", CONFIRMATION_FILES, ids=lambda p: p.name)
+def test_confirmation_workflow_cannot_reach_a_broker_or_trading_table(script: Path):
+    assert _broker_imports(script) == set(), f"{script.name} imports a broker"
+    source = script.read_text(encoding="utf-8")
+    for table in FORBIDDEN_TRADING_TABLES:
+        assert not re.search(rf"\b{re.escape(table)}\b", source, re.IGNORECASE)
+    assert "live_confirmations" in source
+    assert "live_confirmation_events" in source
 
 
 # ============================================================== read-only tier

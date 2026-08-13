@@ -23,7 +23,7 @@ approved for live.
 >
 > Operational activation still requires the 30-day paper evaluation, a second
 > genuine strategy remaining in paper, strategy-specific minimum-quantity
-> approval, approved static-IP/provider setup, confirmation/auth readiness, and
+> approval, approved static-IP/provider setup, live auth revalidation, and
 > a separate human decision to enable the gates. See
 > `docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md`.
 
@@ -49,7 +49,8 @@ records what is built, the reuse inventory, commands and the next phase.
 
 ```bash
 python3.11 -m venv .venv
-.venv/bin/python -m pip install -e ".[dev]"     # or: -r requirements.lock
+.venv/bin/python -m pip install -r requirements.lock
+.venv/bin/python -m pip install -e . --no-deps
 
 cp .env.example .env        # then fill in locally — .env is gitignored
 ```
@@ -57,6 +58,10 @@ cp .env.example .env        # then fill in locally — .env is gitignored
 `.env` is the only place secrets live. They are never written to YAML, never
 persisted to SQLite, never shown in the dashboard, and are redacted from every
 log record by `common.logging.SecretRedactingFilter`.
+
+The first install command reproduces the reviewed dependency set; the second
+installs this repository and its console entry points without re-resolving
+those locked dependencies.
 
 ## Checks
 

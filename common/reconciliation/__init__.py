@@ -18,7 +18,12 @@ from .compare import (
     compare_orders,
     compare_positions,
 )
-from .policies import can_mark_closed, can_mark_rejected, permitted_action_for
+from .policies import (
+    can_mark_closed,
+    can_mark_rejected,
+    permitted_action_for,
+    resolution_is_permitted,
+)
 from .runner import ReconciliationResult, ReconciliationRunner
 from .snapshot import BrokerSnapshot, fetch_broker_snapshot
 
@@ -42,4 +47,5 @@ __all__ = [
     "get_provenance",
     "permitted_action_for",
     "rebuild_account_shared_state",
+    "resolution_is_permitted",
 ]

@@ -83,6 +83,7 @@ class LocalOrderState:
     correlation_id: str
     status: OrderStatus
     broker_order_id: str | None = None
+    filled_quantity: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,8 +128,7 @@ def compare_orders(
                 correlation_id=correlation_id,
                 broker_order_id=broker_duplicates[0].broker_order_id,
                 detail=(
-                    f"{len(broker_duplicates)} broker rows share correlation_id "
-                    f"{correlation_id!r}"
+                    f"{len(broker_duplicates)} broker rows share correlation_id {correlation_id!r}"
                 ),
             )
         )
@@ -180,6 +180,31 @@ def compare_orders(
                     )
                 )
             # a terminal local order with no broker record is not flagged.
+        elif local.status is OrderStatus.UNKNOWN or local.status is not broker.status:
+            mismatches.append(
+                Mismatch(
+                    category="UNKNOWN_ORDER",
+                    is_critical=True,
+                    correlation_id=correlation_id,
+                    broker_order_id=broker.broker_order_id,
+                    detail=(
+                        f"local order status {local.status.value} does not match "
+                        f"broker status {broker.status.value}"
+                    ),
+                )
+            )
+        elif local.filled_quantity is not None and local.filled_quantity != broker.filled_quantity:
+            mismatches.append(
+                Mismatch(
+                    category="QUANTITY_MISMATCH",
+                    is_critical=True,
+                    correlation_id=correlation_id,
+                    broker_order_id=broker.broker_order_id,
+                    local_quantity=local.filled_quantity,
+                    broker_quantity=broker.filled_quantity,
+                    detail="local and broker order filled quantities differ",
+                )
+            )
 
     for correlation_id, broker in broker_by_id.items():
         if correlation_id not in local_by_id:
@@ -208,9 +233,62 @@ def compare_positions(
     silently prefers one side's number.
     """
     mismatches: list[Mismatch] = []
-    local_open = {p.security_id: p for p in local_positions if p.status == "OPEN"}
-    local_closed = {p.security_id: p for p in local_positions if p.status == "CLOSED"}
-    broker_by_id = {p.security_id: p for p in broker_positions if p.quantity != 0}
+
+    # Do not normalise an ambiguous snapshot with a dict comprehension.  That
+    # used to make the last duplicate row win, so two local rows or two broker
+    # product rows for one security could look exactly like a clean match.
+    # The existing QUANTITY_MISMATCH vocabulary is deliberately reused: the
+    # trustworthy quantity for an ambiguous identity is unknowable, and this
+    # category is already critical/fail-closed.
+    local_groups: dict[str, list[LocalPositionState]] = {}
+    for local_position in local_positions:
+        if local_position.status == "OPEN":
+            local_groups.setdefault(local_position.security_id, []).append(local_position)
+    broker_groups: dict[str, list[BrokerPosition]] = {}
+    for broker_position in broker_positions:
+        if broker_position.quantity != 0:
+            broker_groups.setdefault(broker_position.security_id, []).append(broker_position)
+
+    duplicate_ids = {security_id for security_id, rows in local_groups.items() if len(rows) > 1} | {
+        security_id for security_id, rows in broker_groups.items() if len(rows) > 1
+    }
+    for security_id in sorted(duplicate_ids):
+        local_rows = local_groups.get(security_id, [])
+        broker_rows = broker_groups.get(security_id, [])
+        mismatches.append(
+            Mismatch(
+                category="QUANTITY_MISMATCH",
+                is_critical=True,
+                security_id=security_id,
+                local_quantity=sum(row.quantity for row in local_rows) or None,
+                broker_quantity=sum(row.quantity for row in broker_rows) or None,
+                detail=(
+                    f"ambiguous position identity for security_id {security_id!r}: "
+                    f"{len(local_rows)} local OPEN row(s), {len(broker_rows)} broker "
+                    "non-zero row(s); reconciliation refuses last-row-wins normalisation"
+                ),
+            )
+        )
+
+    local_open = {
+        security_id: rows[0]
+        for security_id, rows in local_groups.items()
+        if security_id not in duplicate_ids
+    }
+    local_closed_groups: dict[str, list[LocalPositionState]] = {}
+    for position in local_positions:
+        if position.status == "CLOSED":
+            local_closed_groups.setdefault(position.security_id, []).append(position)
+    local_closed = {
+        security_id: rows[-1]
+        for security_id, rows in local_closed_groups.items()
+        if security_id not in duplicate_ids
+    }
+    broker_by_id = {
+        security_id: rows[0]
+        for security_id, rows in broker_groups.items()
+        if security_id not in duplicate_ids
+    }
 
     all_ids = set(local_open) | set(broker_by_id)
     for security_id in all_ids:
@@ -238,8 +316,7 @@ def compare_positions(
                         security_id=security_id,
                         broker_quantity=broker.quantity,
                         detail=(
-                            "local position is recorded CLOSED but the broker still "
-                            "reports it open"
+                            "local position is recorded CLOSED but the broker still reports it open"
                         ),
                     )
                 )
@@ -279,8 +356,7 @@ def compare_positions(
                         local_quantity=local.quantity,
                         broker_quantity=broker.quantity,
                         detail=(
-                            f"local quantity {local.quantity} != "
-                            f"broker quantity {broker.quantity}"
+                            f"local quantity {local.quantity} != broker quantity {broker.quantity}"
                         ),
                     )
                 )

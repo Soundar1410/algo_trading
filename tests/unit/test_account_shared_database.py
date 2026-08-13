@@ -27,7 +27,7 @@ def test_migrations_apply_and_create_every_expected_table(tmp_path: Path):
     database = open_account_shared_database(tmp_path / "dhan_account_shared.db")
     applied = migrate_account_shared_database(database)
 
-    assert [m.version for m in applied] == ["0001", "0002"]
+    assert [m.version for m in applied] == ["0001", "0002", "0003"]
     with database.connect() as conn:
         tables = {
             row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
@@ -43,6 +43,7 @@ def test_migrations_apply_and_create_every_expected_table(tmp_path: Path):
         "live_confirmations",
         "live_preflight_results",
         "live_account_controls",
+        "live_confirmation_events",
     } <= tables
     assert database.integrity_check() == []
     assert database.foreign_key_check() == []

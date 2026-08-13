@@ -2,6 +2,7 @@
 # Generated: 2026-07-30T04:02:24Z on Darwin arm64, Python 3.11.9
 # Regenerate:  .venv/bin/python -m pip install -e '.[dev]' && .venv/bin/python -m pip freeze --exclude-editable > requirements.lock
 # Install:     .venv/bin/python -m pip install -r requirements.lock
+#              .venv/bin/python -m pip install -e . --no-deps
 #
 # uv is not installed on this Mac; the spec permits uv.lock OR requirements.lock.
 #

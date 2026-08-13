@@ -6,10 +6,11 @@ proves the vocabulary is closed, not that a given category may use a given
 action).
 
 Never auto-flatten a broker-only position. Never mark an order rejected
-except from a positive, broker-confirmed rejection. The runner
-(:mod:`common.reconciliation.runner`) calls :func:`permitted_action_for`
-before ever writing a resolution — a category with no permitted automated
-action stays unresolved, alerted, and blocking, which is the safe default.
+except from a positive, broker-confirmed rejection. Broker-evidence recovery
+(:mod:`common.reconciliation.recovery`) calls
+:func:`resolution_is_permitted` before applying or writing a resolution — a
+category/action without positive evidence stays unresolved, alerted, and
+blocking, which is the safe default.
 """
 
 from __future__ import annotations
@@ -58,3 +59,23 @@ def can_mark_closed(*, broker_quantity: int | None) -> bool:
     report proves closure (zero or absent quantity) — never inferred from
     the local side alone."""
     return broker_quantity is None or broker_quantity == 0
+
+
+def resolution_is_permitted(
+    category: str,
+    action: str,
+    *,
+    broker_status: OrderStatus | None = None,
+    broker_quantity: int | None = None,
+) -> bool:
+    """Validate an action together with the positive broker evidence it needs."""
+    if action == "mark_rejected":
+        return category == "UNKNOWN_ORDER" and can_mark_rejected(
+            broker_status=broker_status
+        )
+    if action == "mark_closed":
+        return (
+            permitted_action_for(category) == action
+            and can_mark_closed(broker_quantity=broker_quantity)
+        )
+    return permitted_action_for(category) == action

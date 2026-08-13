@@ -285,7 +285,10 @@ def test_an_open_position_with_no_contract_record_blocks_entries_rather_than_tra
     error = (
         Database(database_path)
         .connect()
-        .execute("SELECT severity, component, message FROM errors ORDER BY id DESC LIMIT 1")
+        .execute(
+            "SELECT severity, component, message FROM errors "
+            "WHERE component = 'engine.recovery' ORDER BY id DESC LIMIT 1"
+        )
         .fetchone()
     )
     assert error["severity"] == "CRITICAL"
@@ -319,7 +322,66 @@ def test_recovery_does_not_reach_across_trading_dates(worker_config, database_pa
     worker_config.trading_date = "2026-07-17"
     second = _run(worker_config, _SECOND_TAPE)
 
+    assert second.exit_code == 1
     assert second.recovered_position is False
+    assert second.orders_placed == 0
+    error = (
+        Database(database_path)
+        .connect()
+        .execute(
+            "SELECT severity, component, message FROM errors "
+            "WHERE component = 'engine.recovery' ORDER BY id DESC LIMIT 1"
+        )
+        .fetchone()
+    )
+    assert error["severity"] == "CRITICAL"
+    assert error["component"] == "engine.recovery"
+    assert "carry-forward" in error["message"]
+
+
+def test_multiple_open_positions_are_refused_before_engine_handoff(worker_config, database_path):
+    _run(worker_config, _FIRST_TAPE)
+    with Database(database_path).transaction() as conn:
+        original = conn.execute(
+            "SELECT * FROM positions WHERE strategy_id = ?", (STRATEGY_ID,)
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO positions "
+            "(runtime_id, strategy_id, execution_mode, trading_date, instrument, "
+            "security_id, quantity, average_price, entry_correlation_id, realised_pnl, "
+            "charges, status, opened_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 'OPEN', ?, ?)",
+            (
+                original["runtime_id"],
+                original["strategy_id"],
+                original["execution_mode"],
+                original["trading_date"],
+                "SECOND OPTION",
+                "SIM:NIFTY:WEEKLY:24500:PE",
+                original["quantity"],
+                original["average_price"],
+                "unexpected-second-entry",
+                original["opened_at"],
+                original["updated_at"],
+            ),
+        )
+
+    second = _run(worker_config, _SECOND_TAPE)
+
+    assert second.exit_code == 1
+    assert second.recovered_position is False
+    assert second.orders_placed == 0
+    error = (
+        Database(database_path)
+        .connect()
+        .execute(
+            "SELECT severity, component, message FROM errors "
+            "WHERE component = 'engine.recovery' ORDER BY id DESC LIMIT 1"
+        )
+        .fetchone()
+    )
+    assert error["severity"] == "CRITICAL"
+    assert "exactly one" in error["message"]
 
 
 # ------------------------------------- Phase 6 Part 1: daily risk state across a restart
@@ -552,9 +614,7 @@ def test_a_trailing_stops_peak_survives_a_restart_and_still_exits(
     first = _run(trailing_worker_config, _TRAILING_RUN1_TAPE)
     assert first.exit_code == 0, first.error
     assert first.trades_closed == 0, "the tape must stop short of firing, or this proves nothing"
-    assert (
-        _open_positions_for(database_path, TRAILING_STRATEGY_ID)[0].status is PositionStatus.OPEN
-    )
+    assert _open_positions_for(database_path, TRAILING_STRATEGY_ID)[0].status is PositionStatus.OPEN
 
     second = _run(trailing_worker_config, _TRAILING_RUN2_TAPE)
 
@@ -775,8 +835,7 @@ def test_a_bad_state_version_blocks_position_recovery_before_exit_state_is_ever_
         Database(database_path)
         .connect()
         .execute(
-            "SELECT severity, component FROM errors WHERE strategy_id = ? "
-            "ORDER BY id DESC LIMIT 1",
+            "SELECT severity, component FROM errors WHERE strategy_id = ? ORDER BY id DESC LIMIT 1",
             (TRAILING_STRATEGY_ID,),
         )
         .fetchone()

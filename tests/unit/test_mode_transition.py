@@ -243,6 +243,7 @@ def test_live_to_paper_still_blocks_matching_open_broker_exposure(tmp_path: Path
                 status=OrderStatus.FILLED,
                 updated_at=datetime.now(UTC),
                 broker_order_id="b1",
+                filled_quantity=75,
             ),
         ),
         positions=(
