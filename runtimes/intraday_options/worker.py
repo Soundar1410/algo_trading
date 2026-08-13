@@ -243,6 +243,46 @@ class WorkerConfig:
     #: so this stays picklable for the spawned child (module docstring).
     heartbeat_interval_seconds: float = DEFAULT_INTERVAL_SECONDS
 
+    # ---------------------------------------------------------- Phase 10
+    #: The real live-gate inputs, carried as primitives (not a ResolvedConfig
+    #: — see the module docstring's picklability constraint) so
+    #: ``resolved_config_from_worker`` can reconstruct the *actual* gate the
+    #: operator configured, rather than the fixed ``live_trading_enabled=
+    #: False`` stub every worker used to see regardless of real config. Every
+    #: default here is the fail-closed value: a worker built without these
+    #: explicitly set behaves exactly as conservatively as the old stub did.
+    global_live_trading_enabled: bool = False
+    runtime_enabled: bool = False
+    runtime_live_execution_allowed: bool = False
+    strategy_enabled: bool = False
+    strategy_live_approved: bool = False
+    #: Whether live preflight has already run and passed, computed by the
+    #: process that admitted this worker (``__main__.py::build_supervisor``,
+    #: via ``common.broker.live_preflight_gate.LivePreflightGate``) —
+    #: **not** recomputed here. A worker process constructing its own real
+    #: ``dhanhq`` client at startup, purely to run preflight, is deferred:
+    #: it would pull the Dhan SDK into this module's measured import-time
+    #: budget (module docstring; ``test_worker_import_boundary.py``) for a
+    #: path that, with every committed config staying ``mode: paper``,
+    #: never executes. Documented explicitly as a known gap versus the
+    #: originally-approved "the worker re-runs preflight itself" design,
+    #: not a silent deviation — see the Phase 10 report.
+    live_preflight_passed: bool = False
+    #: The controlled-live quantity cap, threaded through so a live
+    #: ``ResolvedConfig`` can be reconstructed without inventing a value —
+    #: see ``StrategyConfig.live_quantity_lots``.
+    live_quantity_lots: int | None = None
+    #: Enough of ``LivePreflightConfig`` to reconstruct a *valid* live
+    #: ``ResolvedConfig`` (its own cross-field validator requires all of
+    #: these whenever mode is live) — never invented here, always the real
+    #: values from ``runtime.live_preflight`` in the source YAML, populated
+    #: by ``config_adapter.py::build_worker_config``.
+    live_expected_static_ip: str | None = None
+    live_max_preflight_age_seconds: int | None = None
+    live_rate_limit_new_order_limit: int | None = None
+    live_rate_limit_new_order_window_seconds: int | None = None
+    live_max_daily_loss: float | None = None
+
 
 @dataclass
 class WorkerOutcome:
@@ -497,7 +537,8 @@ def _run_locked(
     # The gate lives here, not in the strategy: a live-mode strategy must fail
     # to obtain a broker at all rather than run with a paper one.
     broker = build_broker(
-        resolved_config_stub(config),
+        resolved_config_from_worker(config),
+        preflight_passed=config.live_preflight_passed,
         paper_execution=config.paper_execution,
         cost_rates=config.cost_rates,
     )
@@ -860,26 +901,68 @@ def _maybe_square_off(
     return SquareOffState.COMPLETED, acted, True
 
 
-def resolved_config_stub(config: WorkerConfig) -> Any:
-    """Build the ResolvedConfig the broker factory gates on.
+def resolved_config_from_worker(config: WorkerConfig) -> Any:
+    """Build the real ``ResolvedConfig`` the broker factory gates on.
+
+    Phase 10: this used to be ``resolved_config_stub``, which hard-coded
+    ``GlobalConfig(live_trading_enabled=False)`` and ``enabled=True``
+    regardless of what the operator actually configured — an extra
+    fail-safe by accident, but one that also meant flipping every real gate
+    to ``true`` in YAML still could not reach this call site, because
+    nothing here ever looked at the real values. This reads the actual
+    gate inputs ``config_adapter.py`` threaded through as picklable
+    primitives (see ``WorkerConfig``'s Phase 10 fields) — every committed
+    config still resolves to every gate closed, but now because the real
+    values genuinely are ``false``/``paper``, not because this function
+    refuses to look.
 
     Imported lazily and constructed here so ``WorkerConfig`` stays a plain
     picklable record; pydantic models cross process boundaries fine, but keeping
     the worker's own contract primitive makes the spawn constraint obvious.
     """
     from common.config.models import (
+        AccountRiskConfig,
         GlobalConfig,
+        LiveOrderRateLimitConfig,
+        LivePreflightConfig,
+        RateLimitCallClass,
+        RateLimitRule,
         ResolvedConfig,
         RuntimeConfig,
         StrategyConfig,
     )
 
+    rate_rules: tuple[RateLimitRule, ...] = ()
+    if (
+        config.live_rate_limit_new_order_limit is not None
+        and config.live_rate_limit_new_order_window_seconds is not None
+    ):
+        rate_rules = (
+            RateLimitRule(
+                call_class=RateLimitCallClass.NEW_ORDER,
+                limit=config.live_rate_limit_new_order_limit,
+                window_seconds=config.live_rate_limit_new_order_window_seconds,
+            ),
+        )
+
     return ResolvedConfig(
-        global_config=GlobalConfig(live_trading_enabled=False),
-        runtime=RuntimeConfig(runtime_id=config.runtime_id, enabled=True),
+        global_config=GlobalConfig(live_trading_enabled=config.global_live_trading_enabled),
+        runtime=RuntimeConfig(
+            runtime_id=config.runtime_id,
+            enabled=config.runtime_enabled,
+            live_execution_allowed=config.runtime_live_execution_allowed,
+            live_preflight=LivePreflightConfig(
+                expected_static_ip=config.live_expected_static_ip,
+                max_preflight_age_seconds=config.live_max_preflight_age_seconds,
+                rate_limits=LiveOrderRateLimitConfig(rules=rate_rules),
+                account_risk=AccountRiskConfig(max_daily_loss=config.live_max_daily_loss),
+            ),
+        ),
         strategy=StrategyConfig(
             strategy_id=config.strategy_id,
-            enabled=True,
+            enabled=config.strategy_enabled,
             mode=config.execution_mode,
+            live_approved=config.strategy_live_approved,
+            live_quantity_lots=config.live_quantity_lots,
         ),
     )

@@ -12,20 +12,27 @@ implementation:
    would leave an operator believing real orders are being placed when they are
    not — the failure would only surface as a missing position days later. The
    strategy refuses to start instead.
-2. **Live is unimplemented, not merely gated.** Even a fully approved live
-   strategy cannot obtain a broker here, because ``DhanLiveBroker`` order
-   placement does not exist until Phase 10. The gate check runs first anyway, so
-   the error an operator sees names the real blocker rather than the phase.
+2. **A live strategy needs a real ``DhanLiveBroker`` construction dependency,
+   not just a passing gate.** Phase 10 adds real order placement
+   (:class:`~common.broker.dhan_live.DhanLiveBroker`), but a passing gate alone
+   is still not enough to build one — the caller must also supply a
+   :class:`LiveBrokerDependencies` bundle (client, segment, product type,
+   correlation-id-derived identity are all worker-level concerns, wired in
+   ``runtimes/intraday_options``, not invented here). Without one, this
+   function refuses exactly as it always has — every committed config stays
+   incapable of live execution regardless of this module's own capability.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from common.config.models import ExecutionMode, ResolvedConfig, effective_live_gate
 from common.logging import get_logger
 
 from .base import Broker
+from .dhan_live import DhanLiveBroker, DhanOrderClient
 from .paper import InstrumentRulesLookup, PaperBroker
 from .quotes import QuoteBook
 
@@ -36,6 +43,21 @@ class LiveExecutionBlocked(RuntimeError):
     """Raised when a live strategy may not run. Never caught to fall back to paper."""
 
 
+@dataclass(frozen=True, slots=True)
+class LiveBrokerDependencies:
+    """Everything :class:`~common.broker.dhan_live.DhanLiveBroker` needs
+    that ``build_broker`` cannot derive from ``ResolvedConfig`` alone.
+    Constructing one of these at all is itself a worker-level decision
+    (Dhan credentials, the resolved contract's exchange segment) — nothing
+    in this module manufactures one; its absence is why every committed
+    config stays incapable of live execution regardless of the gate.
+    """
+
+    client: DhanOrderClient
+    exchange_segment: str
+    product_type: str
+
+
 def build_broker(
     cfg: ResolvedConfig,
     *,
@@ -44,6 +66,7 @@ def build_broker(
     cost_rates: dict[str, Any] | None = None,
     quotes: QuoteBook | None = None,
     instrument_rules: InstrumentRulesLookup | None = None,
+    live_dependencies: LiveBrokerDependencies | None = None,
 ) -> Broker:
     """Return the broker for one strategy, or refuse to build one.
 
@@ -60,11 +83,15 @@ def build_broker(
             rules. Optional, and ``None`` leaves those rules inactive: a runtime
             with no instrument master (every simulated-contract run) must not have
             correct orders refused against a lot size nobody knows.
+        live_dependencies: the Dhan client/segment/product-type bundle a real
+            ``DhanLiveBroker`` needs. ``None`` (the only value any committed
+            config path supplies today) means live execution stays refused
+            even for a fully-approved, gate-passing strategy — see
+            :class:`LiveBrokerDependencies`.
 
     Raises:
-        LiveExecutionBlocked: if the strategy is live-mode. Always, in Phase 1 —
-            either because the gate blocks it or because live placement is
-            unimplemented.
+        LiveExecutionBlocked: if the strategy is live-mode and either the
+            gate blocks it or no ``live_dependencies`` were supplied.
     """
     if cfg.strategy.mode is ExecutionMode.PAPER:
         _log.info(
@@ -94,10 +121,20 @@ def build_broker(
             "a live strategy running as paper would misrepresent real exposure."
         )
 
-    # Unreachable while preflight is unimplemented, but written as a hard stop
-    # rather than a fallthrough: if a future change ever lets the gate open,
-    # this must still refuse until Phase 10 delivers real order placement.
-    raise LiveExecutionBlocked(
-        f"Strategy {cfg.strategy.strategy_id!r} passed the live gate, but live order "
-        "placement is not implemented. DhanLiveBroker order methods arrive in Phase 10."
+    if live_dependencies is None:
+        raise LiveExecutionBlocked(
+            f"Strategy {cfg.strategy.strategy_id!r} passed the live gate, but no "
+            "LiveBrokerDependencies were supplied — refusing rather than guessing a "
+            "Dhan client, exchange segment or product type."
+        )
+
+    _log.info(
+        "routing strategy to DhanLiveBroker strategy_id=%s runtime_id=%s",
+        cfg.strategy.strategy_id,
+        cfg.runtime.runtime_id,
+    )
+    return DhanLiveBroker(
+        client=live_dependencies.client,
+        exchange_segment=live_dependencies.exchange_segment,
+        product_type=live_dependencies.product_type,
     )

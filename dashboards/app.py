@@ -43,6 +43,7 @@ lazily so the test suite never needs it at collection time.
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -58,14 +59,224 @@ from common.config import (
     load_settings,
 )
 from common.health import HealthSnapshot
+from common.persistence import DatabaseError, connect_readonly
 
 from ._shared import SnapshotUnavailable, load_snapshot
 
 #: Spec section 9 requires reconciliation status on the Master page.
-#: Reconciliation itself is Phase 10 throughout the spec (controlled-live
-#: only) — shown explicitly rather than as a blank so an operator does not
-#: mistake "not built yet" for "nothing to reconcile".
+#: Shown for a card built without ever calling :func:`load_reconciliation_status`
+#: (every hand-built ``RuntimeCard`` in tests before Phase 10, and any future
+#: caller of ``render`` that skips it deliberately) — an explicit "not read"
+#: state, never confused with "nothing to reconcile". ``load_master`` itself
+#: always attempts a real read; this is the fallback only for the field's own
+#: default, not the real path's typical outcome.
 RECONCILIATION_STATUS = "Not implemented (Phase 10 — controlled live)"
+
+
+@dataclass(frozen=True)
+class ReconciliationStatus:
+    """The most recent reconciliation run for one runtime group (spec's
+    Master-page bullet: "Reconciliation status"). Read-only, straight off
+    ``reconciliation_runs`` — never re-runs reconciliation itself (the
+    dashboard must never own trading state, spec line 707)."""
+
+    run_status: str  # 'running' | 'completed' | 'failed'
+    critical_mismatch_count: int
+    entries_blocked: bool
+    started_at: str
+    completed_at: str | None
+
+
+def load_reconciliation_status(
+    database_path: Path | str,
+) -> ReconciliationStatus | SnapshotUnavailable | None:
+    """The latest ``reconciliation_runs`` row across the whole runtime
+    group, or why there is nothing to show. ``None`` means no reconciliation
+    has ever run for this group yet — distinct from :class:`SnapshotUnavailable`
+    (the database itself could not be read) and from a real completed/failed
+    run.
+    """
+    db_path = Path(database_path)
+    if not db_path.is_file():
+        return SnapshotUnavailable(f"No database yet at {db_path}. Start the supervisor first.")
+    try:
+        conn = connect_readonly(db_path)
+    except DatabaseError as exc:
+        return SnapshotUnavailable(str(exc))
+    try:
+        row = conn.execute(
+            "SELECT status, critical_mismatch_count, entries_blocked, started_at, "
+            "completed_at FROM reconciliation_runs ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()
+    except sqlite3.Error as exc:
+        return SnapshotUnavailable(f"Database not ready ({type(exc).__name__}): {exc}")
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return ReconciliationStatus(
+        run_status=row["status"],
+        critical_mismatch_count=row["critical_mismatch_count"],
+        entries_blocked=bool(row["entries_blocked"]),
+        started_at=row["started_at"],
+        completed_at=row["completed_at"],
+    )
+
+
+#: Reservation states whose projected_capital still counts as active
+#: exposure — mirrors common.risk.account_reservations.ACTIVE_STATES,
+#: repeated here (not imported) for the same reason common.risk.account_risk
+#: repeats it rather than importing it: this module's SQL needs the literal
+#: tuple, and this page must not import common.risk (a risk-engine module
+#: with its own Database-typed API this read-only page cannot satisfy —
+#: see load_account_status's docstring).
+_ACTIVE_RESERVATION_STATES = (
+    "RESERVED",
+    "SUBMITTED",
+    "ACKNOWLEDGED",
+    "PARTIALLY_FILLED",
+    "UNKNOWN",
+    "RECONCILED",
+)
+
+
+@dataclass(frozen=True)
+class AccountRow:
+    """One Dhan account's account-wide risk and rate-limit picture — spans
+    every runtime group sharing this ``account_key``, read straight off the
+    *shared* account database (``dhan_account_shared.db``), not any one
+    runtime group's own database.
+
+    ``has_unmarked_position`` is deliberately narrower than
+    ``common.risk.account_risk.AccountExposureSnapshot.mtm_stale``: that
+    field is age-bound (a mark older than ``max_mtm_age_seconds``), which
+    needs a runtime's own config this page does not load for every account
+    key it might show. Here it means only "no mark has ever been recorded
+    for this open position" — real information, just a narrower claim.
+    """
+
+    account_key: str
+    reconciliation_status: str
+    realised_pnl_today: float
+    unrealised_pnl: float
+    has_unmarked_position: bool
+    open_position_count: int
+    open_positions_capital: float
+    reserved_capital: float
+    new_order_count_current_window: int
+
+
+@dataclass(frozen=True)
+class AccountWideStatus:
+    trading_date: str
+    accounts: tuple[AccountRow, ...]
+
+
+def _account_row(conn: sqlite3.Connection, account_key: str, trading_date: str) -> AccountRow:
+    provenance_row = conn.execute(
+        "SELECT reconciliation_status FROM live_account_state_provenance WHERE account_key = ?",
+        (account_key,),
+    ).fetchone()
+    # A missing provenance row must never read as "reconciled" — spec: a
+    # missing/recreated/empty shared database is never zero exposure.
+    reconciliation_status = (
+        provenance_row["reconciliation_status"] if provenance_row else "never_reconciled"
+    )
+
+    realised = conn.execute(
+        "SELECT COALESCE(SUM(realised_pnl_delta), 0) AS total FROM live_realised_pnl_events "
+        "WHERE account_key = ? AND trading_date = ?",
+        (account_key, trading_date),
+    ).fetchone()["total"]
+
+    positions = conn.execute(
+        "SELECT security_id, deployed_capital FROM live_open_positions WHERE account_key = ?",
+        (account_key,),
+    ).fetchall()
+    mtm_by_security = {
+        row["security_id"]: row
+        for row in conn.execute(
+            "SELECT security_id, unrealised_pnl FROM live_position_mtm WHERE account_key = ?",
+            (account_key,),
+        )
+    }
+    unrealised = 0.0
+    has_unmarked_position = False
+    for position in positions:
+        mark = mtm_by_security.get(position["security_id"])
+        if mark is None:
+            has_unmarked_position = True
+            continue
+        unrealised += mark["unrealised_pnl"]
+
+    placeholders = ",".join("?" * len(_ACTIVE_RESERVATION_STATES))
+    reserved = conn.execute(
+        "SELECT COALESCE(SUM(projected_capital), 0) AS total FROM live_risk_reservations "
+        f"WHERE account_key = ? AND state IN ({placeholders})",
+        (account_key, *_ACTIVE_RESERVATION_STATES),
+    ).fetchone()["total"]
+
+    window_row = conn.execute(
+        "SELECT count FROM live_order_rate_windows WHERE account_key = ? "
+        "AND call_class = 'new_order' ORDER BY window_start DESC LIMIT 1",
+        (account_key,),
+    ).fetchone()
+
+    return AccountRow(
+        account_key=account_key,
+        reconciliation_status=reconciliation_status,
+        realised_pnl_today=realised,
+        unrealised_pnl=unrealised,
+        has_unmarked_position=has_unmarked_position,
+        open_position_count=len(positions),
+        open_positions_capital=sum(p["deployed_capital"] for p in positions),
+        reserved_capital=reserved,
+        new_order_count_current_window=window_row["count"] if window_row else 0,
+    )
+
+
+def load_account_status(
+    database_path: Path | str, *, trading_date: str
+) -> AccountWideStatus | SnapshotUnavailable:
+    """Account-wide risk and rate-limit state, read from the *shared*
+    account database — distinct from :func:`load_master`, which reads one
+    runtime group's own database. Never derives an ``account_key`` itself
+    (that needs the account-identity pepper, a broker-layer concern this
+    read-only page does not import — ``tests/unit/test_dashboard.py`` AST-
+    enforces that no dashboard module imports anything with "broker" in its
+    name). Instead reports on every ``account_key`` this shared database has
+    ever recorded anything for, across ``live_account_state_provenance``,
+    ``live_risk_reservations`` and ``live_open_positions`` — a key present in
+    only the latter two (provenance row missing) still gets a row, correctly
+    defaulted to ``never_reconciled``, rather than being silently omitted.
+
+    A missing file means no live worker has ever run yet on this machine —
+    not "zero accounts, all clear".
+    """
+    db_path = Path(database_path)
+    if not db_path.is_file():
+        return SnapshotUnavailable(f"No account-shared database yet at {db_path}.")
+    try:
+        conn = connect_readonly(db_path)
+    except DatabaseError as exc:
+        return SnapshotUnavailable(str(exc))
+    try:
+        keys: set[str] = set()
+        for table in (
+            "live_account_state_provenance",
+            "live_risk_reservations",
+            "live_open_positions",
+        ):
+            keys.update(
+                row["account_key"]
+                for row in conn.execute(f"SELECT DISTINCT account_key FROM {table}")
+            )
+        accounts = tuple(_account_row(conn, key, trading_date) for key in sorted(keys))
+    except sqlite3.Error as exc:
+        return SnapshotUnavailable(f"Database not ready ({type(exc).__name__}): {exc}")
+    finally:
+        conn.close()
+    return AccountWideStatus(trading_date=trading_date, accounts=accounts)
 
 
 @dataclass(frozen=True)
@@ -147,6 +358,10 @@ class RuntimeCard:
     database_healthy: bool
     recent_errors: tuple[str, ...]
     live_gate: LiveGateStatus | ConfigUnavailable | None = None
+    #: Phase 10. ``None`` (the default) means never read — every hand-built
+    #: card before this field existed keeps rendering the same placeholder
+    #: text ``load_master`` no longer relies on for its own real path.
+    reconciliation_status: ReconciliationStatus | SnapshotUnavailable | None = None
 
 
 def load_live_gate_status(
@@ -202,6 +417,9 @@ def load_master(
     if isinstance(result, SnapshotUnavailable):
         return result
     card = _card_from_snapshot(result)
+    # Always attempted, unlike live_gate: reconciliation status needs only
+    # database_path, already in hand — no config_root gating required.
+    card = replace(card, reconciliation_status=load_reconciliation_status(database_path))
     if config_root is None:
         return card
     live_gate = load_live_gate_status(config_root, runtime_id, settings)
@@ -263,6 +481,65 @@ def _render_live_gate(streamlit: Any, live_gate: LiveGateStatus | ConfigUnavaila
             streamlit.warning(f"{strategy.strategy_id}: blocked — {reasons}")
 
 
+def _render_reconciliation_status(
+    streamlit: Any, status: ReconciliationStatus | SnapshotUnavailable | None
+) -> None:
+    """Read-only reflection of the latest ``reconciliation_runs`` row —
+    never triggers a reconciliation run itself (spec line 707: the
+    dashboard must not own trading state)."""
+    if status is None:
+        streamlit.caption(f"Reconciliation: {RECONCILIATION_STATUS}")
+        return
+    if isinstance(status, SnapshotUnavailable):
+        streamlit.caption(f"Reconciliation: unavailable ({status.reason})")
+        return
+    if status.run_status == "failed":
+        streamlit.error(f"Reconciliation: last run FAILED at {status.started_at}")
+    elif status.entries_blocked:
+        streamlit.warning(
+            f"Reconciliation: {status.critical_mismatch_count} critical mismatch(es) — "
+            "new live entries blocked"
+        )
+    else:
+        streamlit.caption(
+            f"Reconciliation: {status.run_status}, "
+            f"{status.critical_mismatch_count} critical mismatch(es), "
+            f"last run {status.completed_at or status.started_at}"
+        )
+
+
+def _render_account_status(streamlit: Any, status: AccountWideStatus | SnapshotUnavailable) -> None:
+    """Account-wide risk/rate-limit section — spans every runtime group
+    sharing an account, so it is drawn once per page load, not once per
+    :class:`RuntimeCard` (see :func:`main`)."""
+    streamlit.markdown("**Account-wide risk** (shared across every runtime group)")
+    if isinstance(status, SnapshotUnavailable):
+        streamlit.caption(f"Account-wide risk: unavailable ({status.reason})")
+        return
+    if not status.accounts:
+        streamlit.caption("No live worker has recorded any account-shared state yet.")
+        return
+    for account in status.accounts:
+        label = f"{account.account_key[:12]}…"
+        if account.reconciliation_status != "reconciled":
+            streamlit.warning(
+                f"{label}: reconciliation status is {account.reconciliation_status!r} — "
+                "new live entries are blocked account-wide until a full rebuild succeeds"
+            )
+        row = streamlit.columns(4)
+        row[0].metric(
+            "Daily P&L", f"{account.realised_pnl_today + account.unrealised_pnl:,.2f}"
+        )
+        row[1].metric("Open positions", account.open_position_count)
+        row[2].metric(
+            "Reserved + deployed capital",
+            f"{account.reserved_capital + account.open_positions_capital:,.2f}",
+        )
+        row[3].metric("New-order calls (current window)", account.new_order_count_current_window)
+        if account.has_unmarked_position:
+            streamlit.caption(f"{label}: at least one open position has no mark-to-market yet.")
+
+
 def render(streamlit: Any, result: RuntimeCard | SnapshotUnavailable) -> None:
     """Draw the Master page. Takes the streamlit module so this stays testable."""
     if isinstance(result, SnapshotUnavailable):
@@ -305,7 +582,7 @@ def render(streamlit: Any, result: RuntimeCard | SnapshotUnavailable) -> None:
 
     _render_live_gate(streamlit, card.live_gate)
 
-    streamlit.caption(f"Reconciliation: {RECONCILIATION_STATUS}")
+    _render_reconciliation_status(streamlit, card.reconciliation_status)
 
     if card.recent_errors:
         streamlit.subheader("Recent errors")
@@ -335,6 +612,10 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
     render(
         st,
         load_master(database_path, runtime_id, trading_date, config_root=paths.config_root),
+    )
+
+    _render_account_status(
+        st, load_account_status(paths.account_shared_database_path, trading_date=trading_date)
     )
 
 

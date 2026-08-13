@@ -312,22 +312,47 @@ def test_purge_cost_does_not_scale_with_backlog_size_once_indexed(tmp_path: Path
 def test_purge_is_dramatically_faster_with_the_index_than_without(tmp_path: Path):
     """The literal before/after: two databases with an identical 400k-row
     backlog and an identical batch_limit, differing only in whether
-    migration 0005's index exists. Measured on dev hardware this is roughly
-    a 20x speedup (0.001s vs 0.023s); the assertion asks for a fraction of
-    that, plus an absolute ceiling, to stay robust on a slower machine."""
+    migration 0005's index exists.
+
+    The load-sensitive half of this ("how much faster") was a genuine
+    wall-clock ratio assertion (``with_index_time < without_index_time /
+    5``) — demonstrated flaky even on an otherwise idle machine, not just
+    under CI load, because both times are small enough (single-digit
+    milliseconds) for scheduler jitter alone to swing the ratio. Replaced
+    with the real causal claim the docstring always meant: the same query
+    genuinely takes a different plan on the two databases (index seek vs.
+    full scan plus a temp-B-tree sort) — the same structural check
+    ``test_purge_query_plan_seeks_the_new_index_not_a_full_scan`` runs
+    against ``migrated_db``, applied here specifically to prove *this
+    test's own* two databases actually differ the way the test claims,
+    not merely databases elsewhere in the file. The absolute wall-clock
+    ceiling below is kept as a secondary, non-comparative guard — a real
+    performance regression (e.g. the index silently stops being used)
+    would still show up as this test taking much longer, without depending
+    on a fragile ratio between two noisy measurements."""
     with_index = _seed_heartbeat_backlog(tmp_path / "with_index.db", count=400_000)
     without_index = _seed_heartbeat_backlog(
         tmp_path / "without_index.db", count=400_000, drop_new_index=True
     )
 
-    with_index_time = _time_purge(with_index)
-    without_index_time = _time_purge(without_index)
-
-    assert with_index_time < without_index_time / 5, (
-        f"expected at least a 5x speedup from the index; got "
-        f"with_index={with_index_time:.4f}s without_index={without_index_time:.4f}s"
+    query = (
+        "SELECT id FROM runtime_heartbeats WHERE beat_at < ? ORDER BY beat_at LIMIT ?"
     )
-    assert with_index_time < 0.5  # absolute regression guard, independent of the ratio above
+    with_index_plan = " | ".join(
+        row["detail"]
+        for row in with_index.connect().execute(f"EXPLAIN QUERY PLAN {query}", ("2020-01-01", 5000))
+    )
+    without_index_plan = " | ".join(
+        row["detail"]
+        for row in without_index.connect().execute(
+            f"EXPLAIN QUERY PLAN {query}", ("2020-01-01", 5000)
+        )
+    )
+    assert "SEARCH" in with_index_plan and "TEMP B-TREE" not in with_index_plan, with_index_plan
+    assert "SCAN" in without_index_plan or "TEMP B-TREE" in without_index_plan, without_index_plan
+
+    with_index_time = _time_purge(with_index)
+    assert with_index_time < 0.5  # absolute regression guard, independent of the plan check above
 
 
 # --------------------------------------------------------------------- logs

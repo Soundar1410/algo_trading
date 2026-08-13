@@ -96,6 +96,17 @@ class OrderStatus(StrEnum):
     ``UNKNOWN`` is not a failure state. It means a submission timed out and the
     order's real fate must be established by querying the broker with the
     correlation ID — never by issuing a second order.
+
+    ``EXPIRED`` is Phase 10: Dhan documents ``EXPIRED`` as a real terminal
+    ``orderStatus`` value, distinct from both ``REJECTED`` and ``CANCELLED``
+    (a DAY-validity order that never filled before market close) —
+    verified against ``https://dhanhq.co/docs/v2/orders/`` rather than
+    folded into ``CANCELLED`` to avoid a schema change, per the corrected
+    Phase 10 design. Our own ``PENDING`` predates any Dhan order existing at
+    all (a locally-reserved, not-yet-submitted intent) and is never the
+    target of a Dhan-status mapping — Dhan's own "PENDING" (order resting on
+    the exchange) maps to ``ACKNOWLEDGED`` instead; see
+    ``common.broker.dhan_live.map_dhan_order_status``.
     """
 
     PENDING = "PENDING"
@@ -105,6 +116,7 @@ class OrderStatus(StrEnum):
     FILLED = "FILLED"
     REJECTED = "REJECTED"
     CANCELLED = "CANCELLED"
+    EXPIRED = "EXPIRED"
     UNKNOWN = "UNKNOWN"
 
     @property
@@ -113,6 +125,7 @@ class OrderStatus(StrEnum):
             OrderStatus.FILLED,
             OrderStatus.REJECTED,
             OrderStatus.CANCELLED,
+            OrderStatus.EXPIRED,
         }
 
 

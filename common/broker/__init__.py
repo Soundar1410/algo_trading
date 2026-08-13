@@ -1,10 +1,11 @@
-"""Broker adapters. One contract, two implementations — only one of which exists."""
+"""Broker adapters. One contract, two implementations."""
 
 from __future__ import annotations
 
-from .base import Broker, BrokerError, Quote
+from .base import Broker, BrokerError, BrokerPosition, Quote
 from .costs import ChargesCalculator, CostRates
-from .factory import LiveExecutionBlocked, build_broker
+from .dhan_live import DhanApiResponse, DhanLiveBroker, DhanOrderClient
+from .factory import LiveBrokerDependencies, LiveExecutionBlocked, build_broker
 from .paper import (
     InstrumentRules,
     PaperBroker,
@@ -18,9 +19,14 @@ from .quotes import QuoteBook, quote_from_tick
 __all__ = [
     "Broker",
     "BrokerError",
+    "BrokerPosition",
     "ChargesCalculator",
     "CostRates",
+    "DhanApiResponse",
+    "DhanLiveBroker",
+    "DhanOrderClient",
     "InstrumentRules",
+    "LiveBrokerDependencies",
     "LiveExecutionBlocked",
     "PaperBroker",
     "PaperFillConfig",

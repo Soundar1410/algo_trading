@@ -22,11 +22,14 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 from common.authentication import AuthBootstrap, AuthCredentials, AuthError
+from common.broker.base import Broker
 from common.config import (
     ProjectPaths,
+    ResolvedConfig,
     RuntimeConfig,
     Settings,
     discover_enabled_strategies,
@@ -36,11 +39,13 @@ from common.config import (
     load_settings,
 )
 from common.config.secrets import read_secret
+from common.execution import ExecutionRepository, check_mode_transition_safety
 from common.logging import get_logger, setup_logging
 from common.market_data.adapter import MarketFeedAdapter
 from common.notifications import build_notifier
 from common.persistence import Database, MigrationRunner
 from common.process import legacy_system_status
+from common.reconciliation import ReconciliationRunner
 from common.retention import backup_database, run_retention
 from common.utils.timeutils import local_date_in, now_ist
 
@@ -91,6 +96,8 @@ def build_supervisor(
     settings: Settings | None = None,
     trading_date: str | None = None,
     strategy_ids: frozenset[str] | None = None,
+    live_broker_factory: Callable[[ResolvedConfig], Broker] | None = None,
+    live_preflight_passed_for: Callable[[ResolvedConfig], bool] | None = None,
 ) -> IntradayOptionsSupervisor:
     """Discover this runtime's enabled strategies, admit them, build the group.
 
@@ -106,6 +113,25 @@ def build_supervisor(
     mechanism (Phase 7 Part 4): a per-strategy start still goes through a
     supervisor, exactly as an unfiltered start does — the spec is explicit
     that a bare worker is never spawned outside one.
+
+    Phase 10 mode-transition safety (spec 366-373) runs here, before
+    :meth:`~runtimes.intraday_options.supervisor.IntradayOptionsSupervisor
+    .add_worker` — a strategy whose transition is unsafe is skipped
+    entirely this session (no worker registered for it), logged loudly.
+    ``live_broker_factory``/``live_preflight_passed_for`` are ``None`` by
+    default (every test and today's ``main()``): with no factory, a
+    strategy with live history simply cannot prove a live -> paper/disabled
+    transition safe and is refused, fail-closed — see
+    ``common.execution.mode_transition``'s own docstring for why "cannot
+    prove" and "proven unsafe" are treated identically.
+
+    **Known gap, documented rather than silently incomplete**: this only
+    covers strategies :func:`~common.config.discover_enabled_strategies`
+    returns, i.e. still ``enabled: true``. A strategy that transitions
+    ``live -> disabled`` (``enabled: false``) is not discovered here at
+    all, so this safety check does not yet run for that specific case —
+    closing it needs a broader discovery call that also surfaces newly
+    disabled strategies, which does not exist yet.
     """
     settings = settings if settings is not None else load_settings()
     trading_date = trading_date or local_date_in(now_ist()).isoformat()
@@ -131,20 +157,58 @@ def build_supervisor(
         notifier=build_notifier(settings),
     )
 
-    for cfg in discover_enabled_strategies(config_root, runtime_id, settings=settings):
-        if strategy_ids is not None and cfg.strategy.strategy_id not in strategy_ids:
-            continue
-        worker_config = build_worker_config(
-            cfg,
-            database_path=database_path,
-            lock_dir=paths.lock_root,
-            pid_dir=paths.pid_root,
-            log_dir=paths.log_root,
-            trading_date=trading_date,
-        )
-        # Cheap and harmless to compute for a paper strategy too — add_worker
-        # only ever consults it for a live-mode worker.
-        supervisor.add_worker(worker_config, live_gate=effective_live_gate(cfg))
+    transition_database = Database(database_path)
+    try:
+        MigrationRunner(transition_database).run_pending()
+        repository = ExecutionRepository(transition_database)
+        reconciliation_runner = ReconciliationRunner(transition_database)
+
+        for cfg in discover_enabled_strategies(config_root, runtime_id, settings=settings):
+            if strategy_ids is not None and cfg.strategy.strategy_id not in strategy_ids:
+                continue
+
+            broker_for_check = (
+                live_broker_factory(cfg) if live_broker_factory is not None else None
+            )
+            transition_decision = check_mode_transition_safety(
+                repository,
+                strategy_id=cfg.strategy.strategy_id,
+                runtime_id=runtime_id,
+                new_mode=cfg.strategy.mode,
+                broker=broker_for_check,
+                reconciliation_runner=(
+                    reconciliation_runner if broker_for_check is not None else None
+                ),
+            )
+            if not transition_decision.allowed:
+                _log.error(
+                    "refusing to admit strategy_id=%s this session: mode transition to "
+                    "%s is unsafe: %s",
+                    cfg.strategy.strategy_id,
+                    cfg.strategy.mode.value,
+                    transition_decision.reason,
+                )
+                continue
+
+            live_preflight_passed = (
+                live_preflight_passed_for(cfg)
+                if live_preflight_passed_for is not None
+                else False
+            )
+            worker_config = build_worker_config(
+                cfg,
+                database_path=database_path,
+                lock_dir=paths.lock_root,
+                pid_dir=paths.pid_root,
+                log_dir=paths.log_root,
+                trading_date=trading_date,
+                live_preflight_passed=live_preflight_passed,
+            )
+            # Cheap and harmless to compute for a paper strategy too — add_worker
+            # only ever consults it for a live-mode worker.
+            supervisor.add_worker(worker_config, live_gate=effective_live_gate(cfg))
+    finally:
+        transition_database.close()
 
     return supervisor
 

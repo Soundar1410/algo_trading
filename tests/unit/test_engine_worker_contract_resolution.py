@@ -57,11 +57,19 @@ def _worker_config(tmp_path: Path, **engine_kwargs: object) -> WorkerConfig:
 
 
 def _seed_cache(tmp_path: Path) -> Path:
-    """Put today's master in a cache directory so no test reaches the network."""
+    """Put today's master in a cache directory so no test reaches the network.
+
+    Imports ``now_ist`` from ``common.market_data.scrip_master`` rather than
+    its original home in ``common.utils.timeutils`` so that a test which
+    monkeypatches the former (``test_the_selector_and_the_resolver_agree_on_
+    the_expiry``) gets a cache file stamped with the *same* "today" that
+    ``ScripMasterCache``'s own default ``today`` callable — also resolved
+    through ``scrip_master``'s module namespace — will look for. Unpatched,
+    this is the identical function either way.
+    """
     from datetime import date
 
-    from common.market_data.scrip_master import ScripMasterCache
-    from common.utils.timeutils import now_ist
+    from common.market_data.scrip_master import ScripMasterCache, now_ist
 
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -115,9 +123,28 @@ def test_the_exchange_lot_size_beats_the_configured_one(tmp_path: Path):
     assert selector.select(24148.0, OptionType.CE).lot_size == 75
 
 
-def test_the_selector_and_the_resolver_agree_on_the_expiry(tmp_path: Path):
+def test_the_selector_and_the_resolver_agree_on_the_expiry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     """With no expiry configured the resolver picks one; the selector must be
-    told which, or the two disagree about the series being traded."""
+    told which, or the two disagree about the series being traded.
+
+    ``nearest_expiry()`` defaults to real wall-clock "today" in IST when no
+    explicit date is passed (by design — see its own docstring), and the
+    fixture CSV's newest listed expiry (2026-08-04) is a fixed, historical
+    date. Pinning ``now_ist`` to an instant inside the fixture's own expiry
+    range makes this test's outcome independent of the date it happens to
+    run on, rather than assuming wall-clock time stays before the fixture's
+    newest expiry forever.
+    """
+    from datetime import datetime
+
+    from common.utils.timeutils import DEFAULT_TZ, get_tz
+
+    monkeypatch.setattr(
+        "common.market_data.scrip_master.now_ist",
+        lambda: datetime(2026, 8, 1, 9, 30, tzinfo=get_tz(DEFAULT_TZ)),
+    )
     config = _worker_config(
         tmp_path,
         contract_resolver="dhan",

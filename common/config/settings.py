@@ -43,6 +43,16 @@ class Settings(BaseSettings):
     telegram_bot_token: SecretStr | None = None
     telegram_chat_id: SecretStr | None = None
 
+    # Phase 10. A per-installation key, not a Dhan credential: it HMACs the
+    # authenticated account's client ID into a stable, non-secret partition
+    # key (common.broker.live_preflight.check_account_identity) so a live
+    # client ID is never itself persisted or logged. Operator-generated once;
+    # absent is fine for paper-only checkouts (nothing derives an identity
+    # without it, and nothing live can run without one — see
+    # ResolvedConfig's preflight-completeness validator plus the live
+    # preflight's own account-identity check).
+    account_identity_pepper: SecretStr | None = None
+
     project_root: str | None = None
 
     algo_log_level: str = "INFO"

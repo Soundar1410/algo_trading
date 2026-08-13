@@ -8,8 +8,30 @@ from pathlib import Path
 import pytest
 
 from common.config import ConfigError, EngineKind, ExecutionMode, ExpiryPolicy, ResolvedConfig
-from common.config.models import GlobalConfig, RuntimeConfig, StrategyConfig
+from common.config.models import (
+    AccountRiskConfig,
+    GlobalConfig,
+    LiveOrderRateLimitConfig,
+    LivePreflightConfig,
+    RateLimitCallClass,
+    RateLimitRule,
+    RuntimeConfig,
+    StrategyConfig,
+)
 from runtimes.intraday_options.config_adapter import build_worker_config
+
+#: Phase 10: a ``mode: live`` StrategyConfig requires a complete
+#: ``live_preflight`` block and its own ``live_quantity_lots`` (see
+#: ResolvedConfig's validator). Not what test_execution_mode_is_carried_through
+#: is about, so supplied unconditionally here rather than per-test.
+_COMPLETE_LIVE_PREFLIGHT = LivePreflightConfig(
+    expected_static_ip="203.0.113.10",
+    max_preflight_age_seconds=300,
+    rate_limits=LiveOrderRateLimitConfig(
+        rules=(RateLimitRule(call_class=RateLimitCallClass.NEW_ORDER, limit=5, window_seconds=60),)
+    ),
+    account_risk=AccountRiskConfig(max_daily_loss=5000.0),
+)
 
 
 def _cfg(**strategy_overrides) -> ResolvedConfig:
@@ -21,9 +43,16 @@ def _cfg(**strategy_overrides) -> ResolvedConfig:
         "risk": {},
     }
     strategy_kwargs.update(strategy_overrides)
+    is_live = strategy_kwargs.get("mode") is ExecutionMode.LIVE
+    if is_live:
+        strategy_kwargs.setdefault("live_quantity_lots", 1)
     return ResolvedConfig(
         global_config=GlobalConfig(),
-        runtime=RuntimeConfig(runtime_id="intraday_options", enabled=True),
+        runtime=RuntimeConfig(
+            runtime_id="intraday_options",
+            enabled=True,
+            live_preflight=_COMPLETE_LIVE_PREFLIGHT if is_live else LivePreflightConfig(),
+        ),
         strategy=StrategyConfig(**strategy_kwargs),
     )
 

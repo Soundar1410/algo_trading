@@ -54,14 +54,14 @@ from __future__ import annotations
 import itertools
 import math
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
 
 from common.models import Fill, Order, OrderIntent, OrderStatus, OrderType, RiskDecision, Side
 
-from .base import BrokerError, Quote
+from .base import BrokerError, BrokerPosition, Quote
 from .costs import ChargesCalculator, CostRates
 from .quotes import QuoteBook
 
@@ -357,6 +357,62 @@ class PaperBroker:
     def working_orders(self) -> tuple[str, ...]:
         """Correlation IDs of limit orders still resting. Public for assertions."""
         return tuple(self._working)
+
+    # -------------------------------------------------- modify/cancel (Phase 10)
+    def modify(
+        self, correlation_id: str, *, quantity: int | None = None, limit_price: float | None = None
+    ) -> Order:
+        """Change a still-resting limit order's quantity and/or limit price.
+
+        Only a resting order (:attr:`working_orders`) is modifiable — exactly
+        matching what a real exchange allows and what :class:`DhanLiveBroker`
+        can honestly support, so a strategy tested against paper cannot
+        depend on a modify that live mode would refuse identically.
+        """
+        working = self._working.get(correlation_id)
+        if working is None:
+            raise BrokerError(
+                f"cannot modify {correlation_id!r}: no resting order found "
+                "(already filled, cancelled, or never existed)"
+            )
+        new_quantity = quantity if quantity is not None else working.intent.quantity
+        new_price = limit_price if limit_price is not None else working.intent.limit_price
+        self._working[correlation_id] = _WorkingOrder(
+            intent=replace(working.intent, quantity=new_quantity, limit_price=new_price),
+            submitted_at=working.submitted_at,
+            eligible_at=working.eligible_at,
+        )
+        order = replace(self._orders[correlation_id], updated_at=datetime.now(UTC))
+        self._orders[correlation_id] = order
+        return order
+
+    def cancel(self, correlation_id: str) -> Order:
+        working = self._working.pop(correlation_id, None)
+        if working is None:
+            raise BrokerError(
+                f"cannot cancel {correlation_id!r}: no resting order found "
+                "(already filled, cancelled, or never existed)"
+            )
+        order = replace(
+            self._orders[correlation_id],
+            status=OrderStatus.CANCELLED,
+            updated_at=datetime.now(UTC),
+        )
+        self._orders[correlation_id] = order
+        return order
+
+    # --------------------------------------------------- reconciliation reads
+    def fetch_order_book(self) -> tuple[Order, ...]:
+        return tuple(self._orders.values())
+
+    def fetch_trades(self) -> tuple[Fill, ...]:
+        return tuple(fill for order in self._orders.values() for fill in order.fills)
+
+    def fetch_positions(self) -> tuple[BrokerPosition, ...]:
+        """Always empty. Paper mode has no exchange-side position concept —
+        that is :class:`~common.models.Position`'s job, tracked locally by
+        the engine/repository, not simulated a second time here."""
+        return ()
 
     # ------------------------------------------------------------------ submit
     def submit(self, intent: OrderIntent, quote: Quote) -> Order:

@@ -10,14 +10,47 @@ from __future__ import annotations
 
 import pytest
 
-from common.broker import LiveExecutionBlocked, PaperBroker, build_broker
+from common.broker import (
+    DhanLiveBroker,
+    LiveBrokerDependencies,
+    LiveExecutionBlocked,
+    PaperBroker,
+    build_broker,
+)
 from common.config.models import (
+    AccountRiskConfig,
     ExecutionMode,
     GlobalConfig,
+    LiveOrderRateLimitConfig,
+    LivePreflightConfig,
+    RateLimitCallClass,
+    RateLimitRule,
     ResolvedConfig,
     RuntimeConfig,
     StrategyConfig,
 )
+
+#: Phase 10: a mode: live StrategyConfig requires its own live_quantity_lots
+#: and a complete runtime.live_preflight block (ResolvedConfig's own
+#: validator) purely to construct — unrelated to what most tests in this
+#: file check (the pre-existing global/runtime/strategy permission gate), so
+#: supplied unconditionally here.
+_COMPLETE_LIVE_PREFLIGHT = LivePreflightConfig(
+    expected_static_ip="203.0.113.10",
+    max_preflight_age_seconds=300,
+    rate_limits=LiveOrderRateLimitConfig(
+        rules=(RateLimitRule(call_class=RateLimitCallClass.NEW_ORDER, limit=5, window_seconds=60),)
+    ),
+    account_risk=AccountRiskConfig(max_daily_loss=5000.0),
+)
+
+
+class _FakeDhanOrderClient:
+    """The minimal DhanOrderClient double this file needs — never a real
+    dhanhq object, never a network call."""
+
+    def get_order_list(self):  # type: ignore[no-untyped-def]
+        return {"status": "success", "data": []}
 
 
 def _config(
@@ -35,12 +68,16 @@ def _config(
             runtime_id="intraday_options",
             enabled=runtime_enabled,
             live_execution_allowed=live_execution_allowed,
+            live_preflight=(
+                _COMPLETE_LIVE_PREFLIGHT if mode is ExecutionMode.LIVE else LivePreflightConfig()
+            ),
         ),
         strategy=StrategyConfig(
             strategy_id="st01",
             enabled=strategy_enabled,
             mode=mode,
             live_approved=live_approved,
+            live_quantity_lots=1 if mode is ExecutionMode.LIVE else None,
         ),
     )
 
@@ -78,9 +115,14 @@ def test_the_refusal_names_every_failing_condition():
     assert "not live_approved" in message
 
 
-def test_a_fully_approved_live_strategy_still_cannot_trade_in_phase_1():
-    """Even with every gate open, live placement does not exist yet."""
-    with pytest.raises(LiveExecutionBlocked, match="Phase 10"):
+def test_a_fully_approved_live_strategy_without_live_dependencies_still_cannot_trade():
+    """Phase 10: even with every gate open, a passing gate alone is not
+    enough — build_broker must never guess a Dhan client, exchange segment
+    or product type. This is a deliberate Phase 10 change from the earlier
+    (Phase 1-9) behaviour, where a passing gate always raised unconditionally
+    because DhanLiveBroker did not exist at all yet; the assertion below
+    updates to match the real refusal reason now that it does."""
+    with pytest.raises(LiveExecutionBlocked, match="no LiveBrokerDependencies"):
         build_broker(
             _config(
                 mode=ExecutionMode.LIVE,
@@ -90,6 +132,27 @@ def test_a_fully_approved_live_strategy_still_cannot_trade_in_phase_1():
             ),
             preflight_passed=True,
         )
+
+
+def test_a_fully_approved_live_strategy_now_gets_a_dhan_live_broker():
+    """Requirement #2: all gates true plus valid preflight (and now, the
+    live-construction dependencies a worker supplies) selects live
+    execution — the strategy-wise routing the mixed-mode gate requires."""
+    client = _FakeDhanOrderClient()
+    broker = build_broker(
+        _config(
+            mode=ExecutionMode.LIVE,
+            live_trading_enabled=True,
+            live_execution_allowed=True,
+            live_approved=True,
+        ),
+        preflight_passed=True,
+        live_dependencies=LiveBrokerDependencies(
+            client=client, exchange_segment="NSE_FNO", product_type="INTRADAY"
+        ),
+    )
+    assert isinstance(broker, DhanLiveBroker)
+    assert broker.name == "dhan_live"
 
 
 def test_preflight_defaults_to_failed_so_a_forgetful_caller_is_blocked():

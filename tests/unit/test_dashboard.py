@@ -295,11 +295,26 @@ def test_load_live_gate_status_evaluates_the_real_gate_for_live_mode_strategies(
     _write_config(config_root / "global.yaml", GLOBAL_YAML_GATE_CLOSED)
     _write_config(
         config_root / "runtimes" / f"{RUNTIME_ID}.yaml",
-        f"runtime_id: {RUNTIME_ID}\nenabled: true\n",
+        # Phase 10: a mode: live strategy now requires its runtime group to
+        # carry a complete live_preflight block (ResolvedConfig's own
+        # validator) purely to *parse* — unrelated to what this test checks
+        # (that global.live_trading_enabled=false still blocks it).
+        f"runtime_id: {RUNTIME_ID}\nenabled: true\n"
+        "live_preflight:\n"
+        "  expected_static_ip: '203.0.113.10'\n"
+        "  max_preflight_age_seconds: 300\n"
+        "  rate_limits:\n"
+        "    rules:\n"
+        "      - call_class: new_order\n"
+        "        limit: 5\n"
+        "        window_seconds: 60\n"
+        "  account_risk:\n"
+        "    max_daily_loss: 5000.0\n",
     )
     _write_config(
         config_root / "strategies" / "io_live_v1.yaml",
-        "strategy_id: io_live_v1\nenabled: true\nmode: live\nlive_approved: true\n",
+        "strategy_id: io_live_v1\nenabled: true\nmode: live\nlive_approved: true\n"
+        "live_quantity_lots: 1\n",
     )
 
     status = master_page.load_live_gate_status(config_root, RUNTIME_ID, Settings())

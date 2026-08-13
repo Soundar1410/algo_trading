@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from .account_shared import (
+    ACCOUNT_VERSIONS_DIR,
+    migrate_account_shared_database,
+    open_account_shared_database,
+)
 from .database import Database, DatabaseError, connect_readonly
 from .migrations import (
     Migration,
@@ -12,6 +17,7 @@ from .migrations import (
 )
 
 __all__ = [
+    "ACCOUNT_VERSIONS_DIR",
     "Database",
     "DatabaseError",
     "Migration",
@@ -20,4 +26,6 @@ __all__ = [
     "connect_readonly",
     "discover_migrations",
     "migrate",
+    "migrate_account_shared_database",
+    "open_account_shared_database",
 ]

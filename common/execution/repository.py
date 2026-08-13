@@ -28,6 +28,7 @@ from datetime import UTC, datetime
 from common.config.models import ExecutionMode
 from common.execution.audit_events import AUDIT_ACTIONS
 from common.execution.health_events import AUTH_EVENTS, FEED_EVENTS
+from common.logging import redact_for_persistence
 from common.models import (
     CURRENT_STATE_VERSION,
     Candle,
@@ -682,6 +683,33 @@ class ExecutionRepository:
         )
         return [_row_to_position(row) for row in rows]
 
+    def open_positions_all_dates(
+        self, *, strategy_id: str, execution_mode: ExecutionMode
+    ) -> list[Position]:
+        """Every open position for this strategy/mode, across every
+        trading_date ever recorded — not scoped to "today" like
+        :meth:`open_positions`.
+
+        Phase 10's mode-transition safety check needs this: a position
+        opened on a prior trading date and never closed (e.g. from a bug or
+        a crash) must still block a mode change today, not only an open
+        position dated exactly today.
+        """
+        rows = (
+            self._db.connect()
+            .execute(
+                """
+            SELECT * FROM positions
+            WHERE strategy_id = ? AND execution_mode = ?
+              AND status = 'OPEN' AND quantity != 0
+            ORDER BY trading_date, id
+            """,
+                (strategy_id, execution_mode.value),
+            )
+            .fetchall()
+        )
+        return [_row_to_position(row) for row in rows]
+
     def closed_position_count(
         self, *, strategy_id: str, execution_mode: ExecutionMode, trading_date: str
     ) -> int:
@@ -714,6 +742,25 @@ class ExecutionRepository:
                 SELECT * FROM orders
                 WHERE strategy_id = ? AND execution_mode = ?
                   AND status NOT IN ('FILLED', 'REJECTED', 'CANCELLED')
+                ORDER BY id
+                """,
+                (strategy_id, execution_mode.value),
+            )
+        )
+
+    def all_orders(self, *, strategy_id: str, execution_mode: ExecutionMode) -> list[sqlite3.Row]:
+        """Every order for this strategy/mode, terminal states included —
+        unlike :meth:`open_orders`. Broker-vs-local reconciliation
+        (``common.reconciliation.compare_orders``) needs this: a locally
+        ``FILLED`` order is correctly absent from ``open_orders`` but the
+        broker's own order-book report still names it, and without the
+        terminal rows here that match would be misread as ``BROKER_ONLY``.
+        """
+        return list(
+            self._db.connect().execute(
+                """
+                SELECT * FROM orders
+                WHERE strategy_id = ? AND execution_mode = ?
                 ORDER BY id
                 """,
                 (strategy_id, execution_mode.value),
@@ -958,7 +1005,9 @@ class ExecutionRepository:
                     execution_mode.value if execution_mode else None,
                     action,
                     actor,
-                    detail,
+                    # Free text a logging handler never sees — see
+                    # common.logging.redact_for_persistence's own docstring.
+                    redact_for_persistence(detail),
                     _now(),
                 ),
             )

@@ -101,8 +101,18 @@ def build_worker_config(
     pid_dir: Path,
     log_dir: Path,
     trading_date: str,
+    live_preflight_passed: bool = False,
 ) -> WorkerConfig:
     """Build the ``WorkerConfig`` for one enabled strategy.
+
+    Args:
+        live_preflight_passed: whether live preflight has already run and
+            passed for this strategy, this session — computed by the
+            caller (``__main__.py::build_supervisor``, via
+            ``common.broker.live_preflight_gate.LivePreflightGate``)
+            *before* calling this function. Defaults ``False``, so a caller
+            that forgets to run preflight — or a paper strategy, for which
+            this is simply never checked — gets the fail-closed value.
 
     Raises:
         ConfigError: a required ``parameters`` key is missing, or a risk time
@@ -114,6 +124,11 @@ def build_worker_config(
     parameters = cfg.strategy.parameters
     for key in _REQUIRED_PARAMETERS:
         _parameter(parameters, key, strategy_id)
+
+    live_preflight = cfg.runtime.live_preflight
+    new_order_rule = next(
+        (r for r in live_preflight.rate_limits.rules if r.call_class.value == "new_order"), None
+    )
 
     return WorkerConfig(
         runtime_id=cfg.runtime.runtime_id,
@@ -139,6 +154,23 @@ def build_worker_config(
             else None
         ),
         heartbeat_interval_seconds=cfg.runtime.health.heartbeat_interval_seconds,
+        # Phase 10: the real live-gate inputs, threaded through as
+        # picklable primitives — see WorkerConfig's own docstring for why
+        # this replaced the old always-false stub.
+        global_live_trading_enabled=cfg.global_config.live_trading_enabled,
+        runtime_enabled=cfg.runtime.enabled,
+        runtime_live_execution_allowed=cfg.runtime.live_execution_allowed,
+        strategy_enabled=cfg.strategy.enabled,
+        strategy_live_approved=cfg.strategy.live_approved,
+        live_preflight_passed=live_preflight_passed,
+        live_quantity_lots=cfg.strategy.live_quantity_lots,
+        live_expected_static_ip=live_preflight.expected_static_ip,
+        live_max_preflight_age_seconds=live_preflight.max_preflight_age_seconds,
+        live_rate_limit_new_order_limit=(new_order_rule.limit if new_order_rule else None),
+        live_rate_limit_new_order_window_seconds=(
+            new_order_rule.window_seconds if new_order_rule else None
+        ),
+        live_max_daily_loss=live_preflight.account_risk.max_daily_loss,
     )
 
 

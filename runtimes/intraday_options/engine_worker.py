@@ -109,7 +109,7 @@ from .worker import (
     WorkerConfig,
     WorkerOutcome,
     close_previous_session,
-    resolved_config_stub,
+    resolved_config_from_worker,
 )
 
 log = get_logger(__name__)
@@ -630,7 +630,8 @@ def _build(
     # The live gate stays where Phase 1 put it (deviation D5/D19): the factory
     # refuses live, and the engine's arrival does not get its own opinion about it.
     broker = build_broker(
-        resolved_config_stub(config),
+        resolved_config_from_worker(config),
+        preflight_passed=config.live_preflight_passed,
         paper_execution=config.paper_execution,
         cost_rates=config.cost_rates,
         quotes=quotes,

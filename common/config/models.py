@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from common.risk.squareoff import ExpiryPolicy
 
@@ -54,6 +54,13 @@ class GlobalConfig(_StrictModel):
 
     live_trading_enabled: bool = False
     timezone: str = "Asia/Kolkata"
+    #: Human-readable label only (e.g. for dashboards). Phase 10: deliberately
+    #: NOT the partition key for any live-risk/rate-limit table — an operator
+    #: typo here must never be able to split one real Dhan account's limits
+    #: into two independently-enforced buckets. The authoritative partition
+    #: key is derived from the authenticated broker account itself; see
+    #: common.broker.live_preflight.check_account_identity.
+    live_account_display_name: str | None = None
 
 
 class HealthConfig(_StrictModel):
@@ -91,6 +98,115 @@ class RetentionConfig(_StrictModel):
     scrip_cache_retain_count: int = Field(default=3, gt=0)
 
 
+class RateLimitCallClass(StrEnum):
+    """Dhan order-endpoint call categories (spec section 14): a shared limiter
+    must distinguish these rather than throttling everything identically."""
+
+    NEW_ORDER = "new_order"
+    MODIFY = "modify"
+    CANCEL = "cancel"
+    READ = "read"
+
+
+class RateLimitRule(_StrictModel):
+    """One call class's limit within one rolling window.
+
+    No default is set here deliberately (see ``LiveOrderRateLimitConfig``'s
+    own docstring: an unconfigured call class has zero permits, not
+    unlimited) — but a recommended, cited value exists for an operator
+    configuring ``new_order`` for real:
+
+    **Dhan's own current documented Order API limit is 10 requests/second**
+    (``https://dhanhq.co/docs/v2/releases/``, Version 2.3, 08 Sep 2025:
+    "changing rate limit for Order APIs to 10 order per second, in
+    accordance with regulations"; cross-confirmed by
+    ``https://dhan.co/support/platforms/dhanhq-api/what-are-the-api-rate-
+    limits-for-dhan/``: "Order APIs: Up to 10 requests per second"). The
+    older `dhanhq.co/docs/v1` support article's "25 requests/second" is
+    superseded by this regulatory change and must not be used.
+
+    The recommended configured value is ``limit=5, window_seconds=1`` — a
+    50% margin below Dhan's documented 10/second, sized specifically
+    against this limiter's own fixed-window mechanic
+    (``common.broker.live_rate_limiter``, ``_floor_to_window``): a
+    fixed-window limiter can legally admit up to ``limit`` requests at the
+    tail of one window and another ``limit`` at the head of the next, so
+    the true worst-case burst near a window boundary is ``2 x limit``
+    within a short real span. At ``limit=5`` that worst case is exactly 10
+    — Dhan's own documented ceiling, not over it — with nothing left over
+    to also absorb clock skew between this process's ``datetime.now()`` and
+    Dhan's own request-timestamp enforcement. A larger ``window_seconds``
+    at a proportionally larger ``limit`` (e.g. ``limit=300,
+    window_seconds=60`` for the same 5/s average) does **not** carry the
+    same guarantee — it widens the real-time span the ``2 x limit`` worst
+    case can occur within, which is why this recommendation keeps
+    ``window_seconds=1`` matching Dhan's own per-second granularity exactly.
+    """
+
+    call_class: RateLimitCallClass
+    limit: int = Field(gt=0)
+    window_seconds: int = Field(gt=0)
+
+
+class LiveOrderRateLimitConfig(_StrictModel):
+    """Account-wide, cross-process live order-call limits (spec section 14).
+
+    Deliberately a strict, closed-vocabulary model rather than a loose
+    ``dict[str, tuple[int, int]]``: a free-form mapping cannot reject an
+    unknown call class, a non-positive limit or a non-positive window at load
+    time, and a financial rate limit is exactly the kind of value that must
+    fail loudly on a typo rather than silently accept it.
+
+    An unconfigured call class has **zero** permits — not unlimited. Empty
+    ``rules`` therefore blocks every live order/modify/cancel/read call until
+    the operator explicitly configures a limit for it.
+    """
+
+    rules: tuple[RateLimitRule, ...] = Field(default_factory=tuple)
+
+
+class AccountRiskConfig(_StrictModel):
+    """Account-wide live-risk ceilings (spec section 13, account-level controls).
+
+    Every field is optional at the type level but required in substance
+    whenever any strategy in the group is live — enforced by
+    :class:`ResolvedConfig`'s cross-field validator below, not by a default
+    here, so "forgot to set a limit" fails closed instead of silently
+    permitting unlimited exposure.
+    """
+
+    max_daily_loss: float | None = Field(default=None, gt=0)
+    max_open_positions: int | None = Field(default=None, gt=0)
+    max_open_legs: int | None = Field(default=None, gt=0)
+    max_deployed_capital: float | None = Field(default=None, gt=0)
+    max_mtm_age_seconds: int | None = Field(default=None, gt=0)
+
+
+class LivePreflightConfig(_StrictModel):
+    """Every input the Phase 10 live preflight needs (spec sections 10/13/14).
+
+    Absent by default (every field ``None``/empty) so that omitting this
+    block entirely on a paper-only runtime group costs nothing, while a
+    runtime group that enables even one live strategy must fill in every
+    field or fail closed (:class:`ResolvedConfig`'s validator).
+    """
+
+    #: The IP Dhan is expected to have whitelisted for this account. Checked
+    #: against Dhan's own registered list *and* an independently observed
+    #: current egress IP — see common.broker.live_preflight.check_static_ip.
+    expected_static_ip: str | None = None
+    #: Named, approved egress-IP provider key. ``None`` (the shipped default)
+    #: means no provider is configured, so static-IP preflight is BLOCKED
+    #: rather than trusting the Dhan whitelist alone — no provider ships
+    #: without separate operator approval (a new outbound dependency).
+    egress_ip_provider: str | None = None
+    #: How long a preflight result stays authoritative before it must be
+    #: re-run. No default: a live runtime group must set this explicitly.
+    max_preflight_age_seconds: int | None = Field(default=None, gt=0)
+    rate_limits: LiveOrderRateLimitConfig = Field(default_factory=LiveOrderRateLimitConfig)
+    account_risk: AccountRiskConfig = Field(default_factory=AccountRiskConfig)
+
+
 class RuntimeConfig(_StrictModel):
     """One strategy group: lifecycle and live permission, never a shared mode."""
 
@@ -101,6 +217,7 @@ class RuntimeConfig(_StrictModel):
     database: str | None = None
     health: HealthConfig = Field(default_factory=HealthConfig)
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
+    live_preflight: LivePreflightConfig = Field(default_factory=LivePreflightConfig)
 
     @field_validator("runtime_id")
     @classmethod
@@ -129,6 +246,13 @@ class StrategyConfig(_StrictModel):
     parameters: dict[str, Any] = Field(default_factory=dict)
     expiry_policy: ExpiryPolicy = ExpiryPolicy.FORCE_SQUARE_OFF_BEFORE_EXPIRY
     square_off_before_expiry_days: int = Field(default=0, ge=0)
+    #: The controlled-live minimum-quantity cap, in lots — deliberately a
+    #: *separate* field from ``parameters.strategy_kwargs.lots_per_trade``
+    #: (the paper sizing field), never read on the live path and never
+    #: inherited by it. ``None`` is fine for a paper strategy; a live one
+    #: must set this explicitly (validator below) so the existing 10-lot
+    #: paper default can never accidentally become the initial live size.
+    live_quantity_lots: int | None = Field(default=None, gt=0)
 
     @field_validator("strategy_id")
     @classmethod
@@ -136,6 +260,17 @@ class StrategyConfig(_StrictModel):
         if not v.strip():
             raise ValueError("strategy_id must not be empty")
         return v
+
+    @model_validator(mode="after")
+    def _live_requires_its_own_quantity(self) -> StrategyConfig:
+        if self.mode is ExecutionMode.LIVE and self.live_quantity_lots is None:
+            raise ValueError(
+                f"strategy {self.strategy_id!r} is mode: live but sets no "
+                "live_quantity_lots. A live strategy must declare its own "
+                "controlled-live quantity explicitly — it never inherits "
+                "parameters.strategy_kwargs.lots_per_trade (paper-only sizing)."
+            )
+        return self
 
     @field_validator("expiry_policy")
     @classmethod
@@ -163,6 +298,50 @@ class ResolvedConfig(_StrictModel):
     global_config: GlobalConfig
     runtime: RuntimeConfig
     strategy: StrategyConfig
+
+    @model_validator(mode="after")
+    def _live_requires_a_complete_preflight_contract(self) -> ResolvedConfig:
+        """Every new live-only config field must be present, or fail closed.
+
+        A runtime group that never enables a live strategy pays nothing for
+        this (every ``LivePreflightConfig`` field may stay ``None``/empty).
+        The moment any strategy in the group is ``mode: live``, silence on
+        any of these is refused rather than treated as "unlimited" or
+        "skip this check" — spec 2393: "No strategy should infer a
+        permissive default when required risk configuration is missing."
+        """
+        if self.strategy.mode is not ExecutionMode.LIVE:
+            return self
+
+        preflight = self.runtime.live_preflight
+        missing: list[str] = []
+        if not preflight.expected_static_ip:
+            missing.append("runtime.live_preflight.expected_static_ip")
+        if preflight.max_preflight_age_seconds is None:
+            missing.append("runtime.live_preflight.max_preflight_age_seconds")
+        if not preflight.rate_limits.rules:
+            missing.append("runtime.live_preflight.rate_limits.rules")
+        account_risk = preflight.account_risk
+        if all(
+            getattr(account_risk, field) is None
+            for field in (
+                "max_daily_loss",
+                "max_open_positions",
+                "max_open_legs",
+                "max_deployed_capital",
+                "max_mtm_age_seconds",
+            )
+        ):
+            missing.append("runtime.live_preflight.account_risk (at least one limit)")
+
+        if missing:
+            raise ValueError(
+                f"strategy {self.strategy.strategy_id!r} is mode: live but "
+                f"runtime {self.runtime.runtime_id!r} is missing required live "
+                f"configuration: {', '.join(missing)}. Absence is refused, not "
+                "treated as unlimited or skipped."
+            )
+        return self
 
 
 # --------------------------------------------------------------- live gate

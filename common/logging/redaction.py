@@ -53,6 +53,7 @@ _MIN_SECRET_LENGTH = 4
 _SENSITIVE_KEYS = (
     "access_token",
     "accesstoken",
+    "account_identity_pepper",
     "api_key",
     "apikey",
     "app_secret",
@@ -166,6 +167,10 @@ def secrets_from_settings(settings: object) -> tuple[str, ...]:
         "dhan_access_token",
         "telegram_bot_token",
         "telegram_chat_id",
+        # Phase 10. Not a Dhan credential, but its whole purpose is to make an
+        # HMAC irreversible — the same "never let it leak" property as the
+        # things above, for the same reason (see Settings.account_identity_pepper).
+        "account_identity_pepper",
     ):
         holder = getattr(settings, attr, None)
         if holder is None:

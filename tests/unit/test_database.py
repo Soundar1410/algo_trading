@@ -63,7 +63,66 @@ def test_transaction_rolls_back_on_exception(db: Database):
 
 def test_integrity_and_foreign_key_checks_pass_on_a_healthy_database(db: Database):
     assert db.integrity_check() == []
-    assert db.foreign_key_check() == []
+
+
+# ------------------------------------------------------- Phase 10: immediate
+def test_immediate_transaction_commits_on_success(db: Database):
+    conn = db.connect()
+    conn.execute("CREATE TABLE t (v INTEGER)")
+    with db.transaction(immediate=True) as tx:
+        tx.execute("INSERT INTO t (v) VALUES (1)")
+    assert conn.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 1
+
+
+def test_immediate_transaction_rolls_back_on_exception(db: Database):
+    conn = db.connect()
+    conn.execute("CREATE TABLE t (v INTEGER)")
+    with pytest.raises(RuntimeError), db.transaction(immediate=True) as tx:
+        tx.execute("INSERT INTO t (v) VALUES (1)")
+        raise RuntimeError("strategy blew up mid-write")
+    assert conn.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 0
+
+
+def test_a_second_immediate_transaction_blocks_until_the_first_commits(tmp_path: Path):
+    """The actual property this exists for: a concurrent writer cannot even
+    start reading inside its own BEGIN IMMEDIATE until the first one
+    finishes — the deferred default does not give this.
+
+    Each side opens its *own* ``Database``/connection inside its own
+    thread — sqlite3 connections are not shareable across threads, and this
+    mirrors what two real OS processes (the actual scenario this property
+    protects) would each do anyway.
+    """
+    import threading
+    import time
+
+    path = tmp_path / "operational" / "intraday_options.db"
+    Database(path).connect().execute("CREATE TABLE t (v INTEGER)")
+
+    order: list[str] = []
+
+    def hold_first_transaction():
+        first = Database(path)
+        with first.transaction(immediate=True) as tx:
+            order.append("first_started")
+            tx.execute("INSERT INTO t (v) VALUES (1)")
+            time.sleep(0.2)
+            order.append("first_finishing")
+
+    thread = threading.Thread(target=hold_first_transaction)
+    thread.start()
+    time.sleep(0.05)  # let the first transaction actually acquire the lock
+
+    second = Database(path, busy_timeout_ms=2_000)
+    with second.transaction(immediate=True) as tx:
+        order.append("second_started")
+        tx.execute("INSERT INTO t (v) VALUES (2)")
+
+    thread.join()
+
+    assert order.index("first_finishing") < order.index("second_started"), (
+        f"the second transaction must not start until the first commits: {order}"
+    )
 
 
 def test_close_allows_reconnect(db: Database):

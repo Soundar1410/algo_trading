@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from common.logging import (
     REDACTED,
     SecretRedactingFilter,
     get_logger,
+    redact_for_persistence,
     secrets_from_settings,
     setup_logging,
 )
@@ -310,3 +312,127 @@ def test_a_rejection_reason_carries_no_credential(tmp_path: Path):
     contents = (tmp_path / "algo_trading.log").read_text(encoding="utf-8")
     for secret in ("1100112233", "4821", "654321", "JBSWY3DPEHPK3PXP"):
         assert secret not in contents, f"{secret} reached the log file"
+
+
+# --------------------------------------------------- persist-time redaction
+#
+# Phase 10: reconciliation_mismatches.detail and audit_events.detail are
+# written straight to SQLite, never through a logging handler —
+# SecretRedactingFilter alone cannot protect them. redact_for_persistence()
+# closes that gap; these tests cover it directly plus its two real call
+# sites (common.reconciliation.runner, common.execution.repository).
+
+
+def test_redact_for_persistence_passes_none_through():
+    assert redact_for_persistence(None) is None
+
+
+def test_redact_for_persistence_is_a_harmless_passthrough_with_no_active_filter(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Most unit tests never call setup_logging — a write must not be
+    blocked or mangled just because no filter has been installed yet."""
+    monkeypatch.setattr("common.logging.setup._ACTIVE_FILTER", None)
+    assert redact_for_persistence("plain text, nothing sensitive") == (
+        "plain text, nothing sensitive"
+    )
+
+
+def test_redact_for_persistence_masks_through_the_active_filter(monkeypatch: pytest.MonkeyPatch):
+    redactor = SecretRedactingFilter(("SECRETVALUE1234",))
+    monkeypatch.setattr("common.logging.setup._ACTIVE_FILTER", redactor)
+    masked = redact_for_persistence("broker said: token=SECRETVALUE1234 rejected")
+    assert "SECRETVALUE1234" not in masked
+    assert REDACTED in masked
+
+
+def test_reconciliation_mismatch_detail_is_redacted_before_it_reaches_the_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from common.persistence import Database, MigrationRunner
+    from common.reconciliation import ReconciliationRunner
+    from common.reconciliation.compare import Mismatch
+
+    redactor = SecretRedactingFilter(("SECRETVALUE1234",))
+    monkeypatch.setattr("common.logging.setup._ACTIVE_FILTER", redactor)
+
+    database = Database(tmp_path / "operational" / "intraday_options.db")
+    MigrationRunner(database).run_pending()
+    runner = ReconciliationRunner(database)
+
+    class _EmptyBroker:
+        name = "fake"
+
+        def is_healthy(self) -> bool:
+            return True
+
+        def fetch_order_book(self):  # type: ignore[no-untyped-def]
+            return ()
+
+        def fetch_trades(self):  # type: ignore[no-untyped-def]
+            return ()
+
+        def fetch_positions(self):  # type: ignore[no-untyped-def]
+            return ()
+
+    result = runner.run(
+        runtime_id="intraday_options",
+        strategy_id="st01",
+        local_orders=(),
+        local_positions=(),
+        broker=_EmptyBroker(),  # type: ignore[arg-type]
+    )
+
+    # Injected directly against the private persist step — compare.py's own
+    # detail strings are all computer-generated with no secret-shaped
+    # content, so this proves the persistence layer itself redacts,
+    # independent of whether any current comparison ever produces a value
+    # worth redacting.
+    runner._persist_mismatches(
+        run_id=result.run_id,
+        runtime_id="intraday_options",
+        strategy_id="st01",
+        mismatches=(
+            Mismatch(
+                category="LOCAL_ONLY",
+                is_critical=False,
+                detail="broker rejected: token=SECRETVALUE1234",
+            ),
+        ),
+        now=datetime(2026, 8, 13, 9, 30, tzinfo=UTC),
+    )
+
+    row = database.connect().execute(
+        "SELECT detail FROM reconciliation_mismatches WHERE run_id = ?", (result.run_id,)
+    ).fetchone()
+    assert row is not None
+    assert "SECRETVALUE1234" not in row["detail"]
+    assert REDACTED in row["detail"]
+
+
+def test_audit_event_detail_is_redacted_before_it_reaches_the_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from common.execution import ExecutionRepository
+    from common.persistence import Database, MigrationRunner
+
+    redactor = SecretRedactingFilter(("SECRETVALUE1234",))
+    monkeypatch.setattr("common.logging.setup._ACTIVE_FILTER", redactor)
+
+    database = Database(tmp_path / "operational" / "intraday_options.db")
+    MigrationRunner(database).run_pending()
+    repository = ExecutionRepository(database)
+
+    repository.record_audit_event(
+        runtime_id="intraday_options",
+        action="stop_runtime",
+        actor="operator1",
+        detail="reason: token=SECRETVALUE1234 leaked in operator note",
+    )
+
+    row = database.connect().execute(
+        "SELECT detail FROM audit_events WHERE runtime_id = ?", ("intraday_options",)
+    ).fetchone()
+    assert row is not None
+    assert "SECRETVALUE1234" not in row["detail"]
+    assert REDACTED in row["detail"]

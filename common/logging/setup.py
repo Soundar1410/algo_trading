@@ -101,6 +101,33 @@ def active_redactor() -> SecretRedactingFilter | None:
     return _ACTIVE_FILTER
 
 
+def redact_for_persistence(text: str | None) -> str | None:
+    """Redact free text before it is written straight to a persisted column
+    that a logging handler never sees — ``reconciliation_mismatches.detail``,
+    ``audit_events.detail``/``actor``, and any future ``live_confirmations``
+    writer. :class:`~common.logging.redaction.SecretRedactingFilter` only
+    protects text that passes through a logging call; a value going
+    directly into a SQLite ``INSERT`` bypasses it entirely unless a call
+    site does this explicitly.
+
+    Falls back to returning ``text`` unchanged when no filter is active yet
+    (nothing in this process has called :func:`setup_logging` — most unit
+    tests, and any script that persists before logging is configured)
+    rather than raising: a missing filter must never block a write that
+    would otherwise succeed, and today's callers only ever pass synthetic,
+    computer-generated strings (no secret has ever flowed through either
+    column) — this is deliberate defense-in-depth against a future call
+    site that starts passing raw broker text through, not a fix for a
+    currently-exploitable leak.
+    """
+    if text is None:
+        return None
+    redactor = _ACTIVE_FILTER
+    if redactor is None:
+        return text
+    return redactor.redact(text)
+
+
 def get_logger(name: str, **context: Any) -> logging.Logger | StructuredAdapter:
     """Return a logger, optionally bound to structured context.
 

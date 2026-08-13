@@ -86,14 +86,29 @@ class Database:
             self._connection = None
 
     @contextmanager
-    def transaction(self) -> Iterator[sqlite3.Connection]:
+    def transaction(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         """Run a block in one transaction; roll back on any exception.
 
         Keep network calls out of these blocks — a broker submission inside an
         open transaction holds a write lock for the round trip.
+
+        Args:
+            immediate: use ``BEGIN IMMEDIATE`` instead of a plain (deferred)
+                ``BEGIN``. Deferred acquires no lock until the first write,
+                so a read-then-conditionally-write sequence — "is there
+                still capacity, and if so reserve it" — can read a stale
+                count and write based on it: a concurrent writer's commit
+                between this transaction's read and its write is invisible
+                to it. ``BEGIN IMMEDIATE`` acquires the write lock up front,
+                so a concurrent immediate transaction cannot even start its
+                own read until this one finishes — the only way a
+                check-and-reserve is genuinely atomic across processes.
+                Phase 10's rate limiter and risk reservations both need
+                this; nothing before them did, so the default stays False
+                and every existing call site is unaffected.
         """
         conn = self.connect()
-        conn.execute("BEGIN")
+        conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
         try:
             yield conn
         except Exception:

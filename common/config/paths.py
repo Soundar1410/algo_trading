@@ -124,6 +124,19 @@ class ProjectPaths:
         """Operational database for one runtime group, e.g. ``intraday_options``."""
         return self.operational_root / f"{runtime_id}.db"
 
+    @property
+    def account_shared_database_path(self) -> Path:
+        """Phase 10: the one database shared by every live worker in every
+        runtime group using the same Dhan account — order-rate windows,
+        risk reservations, realised-P&L events, open-position/MTM state,
+        live confirmations, preflight results and the account-state
+        provenance marker. Deliberately *not* one-per-runtime-group (unlike
+        :meth:`database_path`): those tables must be readable/writable by
+        every live worker across every group, which a per-group file cannot
+        do without a cross-file join. See common.persistence.account_shared.
+        """
+        return self.operational_root / "dhan_account_shared.db"
+
     def ensure_writable_dirs(self) -> None:
         """Create the directories the platform writes to.
 

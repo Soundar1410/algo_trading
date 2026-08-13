@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -55,7 +56,13 @@ def _runner(db: Database, versions: Path) -> MigrationRunner:
 
 # ------------------------------------------------------------- discovery
 def test_filename_supplies_version_and_name(tmp_path: Path):
-    migration = Migration.from_path(tmp_path / "0007_add_positions.sql")
+    # Phase 10: from_path also computes a checksum (see Migration.checksum),
+    # so the file must actually exist — unrelated to what this test checks
+    # (filename -> version/name parsing).
+    path = tmp_path / "0007_add_positions.sql"
+    path.write_text("CREATE TABLE IF NOT EXISTS positions (id INTEGER);\n", encoding="utf-8")
+
+    migration = Migration.from_path(path)
     assert migration.version == "0007"
     assert migration.name == "add_positions"
 
@@ -279,24 +286,47 @@ def test_shipped_migrations_start_at_the_walking_skeleton():
     from common.persistence.migrations import VERSIONS_DIR
 
     shipped = discover_migrations(VERSIONS_DIR)
-    assert [m.version for m in shipped] == ["0001", "0002", "0003", "0004", "0005"]
+    assert [m.version for m in shipped] == [
+        "0001",
+        "0002",
+        "0003",
+        "0004",
+        "0005",
+        "0006",
+        "0007",
+    ]
     assert shipped[0].name == "walking_skeleton"
     assert shipped[1].name == "feed_and_auth_health"
     assert shipped[2].name == "paper_fill_realism"
     assert shipped[3].name == "operator_audit"
     assert shipped[4].name == "retention_indexes"
+    # Phase 10.
+    assert shipped[5].name == "widen_order_status_for_expired"
+    assert shipped[6].name == "reconciliation_tables"
 
 
 def test_shipped_migrations_apply_to_a_fresh_database(tmp_path: Path):
-    """The real migrations must survive the runner's own replay-safety rules."""
+    """The real migrations must survive the runner's own replay-safety rules.
+
+    0006 is fine to apply unconfirmed here: a fresh database's `orders` table
+    has zero rows, so MigrationRunner._check_destructive_preconditions never
+    requires require_fresh_backup_for_destructive for this case (nothing to
+    lose) — see the dedicated 0006-specific tests below for the non-empty
+    case, which does require it.
+    """
     from common.persistence.migrations import VERSIONS_DIR
 
     database = Database(tmp_path / "operational" / "intraday_options.db")
     applied = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
 
-    assert [m.version for m in applied] == ["0001", "0002", "0003", "0004", "0005"]
+    assert [m.version for m in applied] == ["0001", "0002", "0003", "0004", "0005", "0006", "0007"]
     assert database.integrity_check() == []
     assert database.foreign_key_check() == []
+    with database.connect() as conn:
+        status_check_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='orders'"
+        ).fetchone()["sql"]
+    assert "EXPIRED" in status_check_sql
 
 
 def test_later_migrations_upgrade_a_database_created_by_0001_alone(tmp_path: Path):
@@ -327,7 +357,12 @@ def test_later_migrations_upgrade_a_database_created_by_0001_alone(tmp_path: Pat
 
     applied = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
 
-    assert [m.version for m in applied] == ["0002", "0003", "0004", "0005"]
+    # 0006 applies without require_fresh_backup_for_destructive here: this
+    # database's `orders` table (created by 0001, never populated by this
+    # test) has zero rows, so MigrationRunner._check_destructive_preconditions
+    # has nothing to protect — see the dedicated 0006 tests for the
+    # non-empty-table case, which does require it.
+    assert [m.version for m in applied] == ["0002", "0003", "0004", "0005", "0006", "0007"]
     with database.connect() as conn:
         survivors = conn.execute("SELECT COUNT(*) FROM runtime_sessions").fetchone()[0]
         tables = {
@@ -392,3 +427,300 @@ def test_shipped_migrations_are_idempotent(tmp_path: Path):
     database = Database(tmp_path / "operational" / "intraday_options.db")
     MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
     assert MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending() == []
+
+
+# ================================================================= Phase 10
+# ------------------------------------------------- checksum bootstrap/verify
+def test_checksum_baseline_is_established_for_a_legacy_database(db: Database, versions: Path):
+    """A database migrated before Phase 10 has no ``checksum`` column at all.
+
+    The next run must add it and backfill every already-applied row from
+    the file currently on disk — a one-time trust point — rather than
+    require a rebuild or silently skip verification forever.
+    """
+    MigrationRunner(db, versions_dir=versions).run_pending()
+    with db.transaction() as conn:
+        conn.execute("ALTER TABLE schema_migrations DROP COLUMN checksum")
+
+    MigrationRunner(db, versions_dir=versions).run_pending()
+
+    with db.connect() as conn:
+        rows = conn.execute("SELECT version, checksum FROM schema_migrations").fetchall()
+    assert {r["version"] for r in rows} == {"0001", "0002"}
+    assert all(r["checksum"] for r in rows), "every pre-existing row must get a real checksum"
+
+
+def test_checksum_verification_passes_on_an_unmodified_database(db: Database, versions: Path):
+    MigrationRunner(db, versions_dir=versions).run_pending()
+    # Must not raise.
+    MigrationRunner(db, versions_dir=versions).run_pending()
+
+
+def test_a_hand_edited_applied_migration_is_refused_at_startup(db: Database, versions: Path):
+    MigrationRunner(db, versions_dir=versions).run_pending()
+
+    (versions / "0001_runtime_sessions.sql").write_text(
+        FIRST + "\n-- an edit made after this migration was already applied\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(MigrationError, match="has changed since it was applied"):
+        MigrationRunner(db, versions_dir=versions).run_pending()
+
+
+def test_checksum_bootstrap_refuses_when_the_original_file_is_gone(
+    db: Database, versions: Path, tmp_path: Path
+):
+    """Cannot establish a trust baseline for a version with no file on disk."""
+    MigrationRunner(db, versions_dir=versions).run_pending()
+    with db.transaction() as conn:
+        conn.execute("ALTER TABLE schema_migrations DROP COLUMN checksum")
+
+    empty_versions = tmp_path / "empty_versions"
+    empty_versions.mkdir()
+
+    with pytest.raises(MigrationError, match="no corresponding file"):
+        MigrationRunner(db, versions_dir=empty_versions).run_pending()
+
+
+# ---------------------------------------- failed-migration transaction safety
+def test_a_migration_that_fails_partway_leaves_no_recorded_version_and_is_retried_next_startup(
+    db: Database, tmp_path: Path
+):
+    """The runner's core safety argument, proven end to end rather than
+    merely asserted in a docstring: a crash (or here, a genuine SQL error)
+    partway through a multi-statement migration leaves whatever ran before
+    the bad statement in place (``executescript`` auto-commits per
+    statement) but records **no** version — and the next attempt safely
+    replays the already-applied part (``IF NOT EXISTS`` no-ops) before
+    hitting the same failure, never silently continuing and never
+    falsely marking the version as applied."""
+    broken_versions = tmp_path / "broken"
+    broken_versions.mkdir()
+    (broken_versions / "0001_partly_broken.sql").write_text(
+        "CREATE TABLE IF NOT EXISTS ok_table (id INTEGER);\n"
+        "THIS IS NOT VALID SQL AT ALL;\n",
+        encoding="utf-8",
+    )
+
+    runner = MigrationRunner(db, versions_dir=broken_versions)
+    with pytest.raises(MigrationError, match="failed"):
+        runner.run_pending()
+
+    with db.connect() as conn:
+        tables = {
+            r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        recorded = conn.execute(
+            "SELECT COUNT(*) AS n FROM schema_migrations WHERE version = '0001'"
+        ).fetchone()["n"]
+    assert "ok_table" in tables, "the statement before the bad one still ran"
+    assert recorded == 0, "a failed migration must never be recorded as applied"
+
+    # Fix the file in place — safe, because it was never recorded as applied,
+    # so this is not "editing an already-applied migration".
+    (broken_versions / "0001_partly_broken.sql").write_text(
+        "CREATE TABLE IF NOT EXISTS ok_table (id INTEGER);\n"
+        "CREATE TABLE IF NOT EXISTS also_ok (id INTEGER);\n",
+        encoding="utf-8",
+    )
+
+    applied = MigrationRunner(db, versions_dir=broken_versions).run_pending()
+
+    assert [m.version for m in applied] == ["0001"]
+    with db.connect() as conn:
+        tables = {
+            r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        recorded = conn.execute(
+            "SELECT COUNT(*) AS n FROM schema_migrations WHERE version = '0001'"
+        ).fetchone()["n"]
+    assert {"ok_table", "also_ok"} <= tables
+    assert recorded == 1
+
+
+# ------------------------------------------------- 0006 (reviewed-destructive)
+def test_migration_0006_upgrades_an_existing_orders_table_with_data(tmp_path: Path):
+    """The real upgrade path, not just a fresh database: seed a database
+    through 0001-0005 only, put one row per pre-existing status in
+    ``orders`` plus a referencing ``fills`` row, then apply 0006 and prove
+    every prior row survives untouched, referential integrity holds, a new
+    ``EXPIRED`` row is now accepted, and an unrecognised status is still
+    rejected by the (now wider) CHECK."""
+    from common.persistence.migrations import VERSIONS_DIR
+
+    up_to_0005 = tmp_path / "up_to_0005"
+    up_to_0005.mkdir()
+    for migration in discover_migrations(VERSIONS_DIR):
+        if migration.version in {"0006", "0007"}:
+            continue
+        (up_to_0005 / migration.path.name).write_text(
+            migration.path.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+
+    database = Database(tmp_path / "operational" / "intraday_options.db")
+    MigrationRunner(database, versions_dir=up_to_0005).run_pending()
+
+    statuses = [
+        "PENDING",
+        "SUBMITTED",
+        "ACKNOWLEDGED",
+        "PARTIALLY_FILLED",
+        "FILLED",
+        "REJECTED",
+        "CANCELLED",
+        "UNKNOWN",
+    ]
+    with database.transaction() as conn:
+        conn.execute(
+            "INSERT INTO runtime_sessions (id, runtime_id, execution_mode, process_role, pid, "
+            "started_at) VALUES (1, 'intraday_options', 'live', 'worker', 1, "
+            "'2026-07-30T09:15:00Z')"
+        )
+        for i, status in enumerate(statuses, start=1):
+            conn.execute(
+                "INSERT INTO order_intents (id, correlation_id, correlation_namespace, "
+                "session_id, runtime_id, strategy_id, execution_mode, trading_date, "
+                "sequence_number, instrument, security_id, side, quantity, order_type, "
+                "product_type, risk_decision, created_at) VALUES "
+                "(?, ?, 'live', 1, 'intraday_options', 'st01', 'live', '2026-07-30', ?, "
+                "'NIFTY', '1', 'BUY', 50, 'MARKET', 'INTRADAY', 'ALLOWED', "
+                "'2026-07-30T09:15:00Z')",
+                (i, f"corr_{i:03d}", i),
+            )
+            conn.execute(
+                "INSERT INTO orders (id, intent_id, correlation_id, runtime_id, strategy_id, "
+                "execution_mode, status, filled_quantity, updated_at) VALUES "
+                "(?, ?, ?, 'intraday_options', 'st01', 'live', ?, 0, '2026-07-30T09:16:00Z')",
+                (i, i, f"corr_{i:03d}", status),
+            )
+        conn.execute(
+            "INSERT INTO fills (order_id, correlation_id, runtime_id, strategy_id, "
+            "execution_mode, broker_fill_id, quantity, price, filled_at) VALUES "
+            "(5, 'corr_005', 'intraday_options', 'st01', 'live', 'bf_001', 50, 100.0, "
+            "'2026-07-30T09:16:00Z')"
+        )
+
+    before = {
+        row["id"]: dict(row)
+        for row in database.connect().execute("SELECT * FROM orders").fetchall()
+    }
+
+    MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending(
+        require_fresh_backup_for_destructive=True
+    )
+
+    assert database.integrity_check() == []
+    assert database.foreign_key_check() == []
+
+    with database.connect() as conn:
+        after = {row["id"]: dict(row) for row in conn.execute("SELECT * FROM orders").fetchall()}
+        assert after == before, "every prior row must survive 0006 unchanged"
+
+        fill_survives = conn.execute(
+            "SELECT COUNT(*) AS n FROM fills WHERE order_id = 5"
+        ).fetchone()["n"]
+        assert fill_survives == 1, "the fills FK to orders(id) must still resolve"
+
+        conn.execute(
+            "INSERT INTO order_intents (id, correlation_id, correlation_namespace, "
+            "session_id, runtime_id, strategy_id, execution_mode, trading_date, "
+            "sequence_number, instrument, security_id, side, quantity, order_type, "
+            "product_type, risk_decision, created_at) VALUES "
+            "(9, 'corr_009', 'live', 1, 'intraday_options', 'st01', 'live', '2026-07-30', 9, "
+            "'NIFTY', '1', 'BUY', 50, 'MARKET', 'INTRADAY', 'ALLOWED', "
+            "'2026-07-30T09:15:00Z')"
+        )
+        conn.execute(
+            "INSERT INTO orders (intent_id, correlation_id, runtime_id, strategy_id, "
+            "execution_mode, status, filled_quantity, updated_at) VALUES "
+            "(9, 'corr_009', 'intraday_options', 'st01', 'live', 'EXPIRED', 0, "
+            "'2026-07-30T09:17:00Z')"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO orders (intent_id, correlation_id, runtime_id, strategy_id, "
+                "execution_mode, status, filled_quantity, updated_at) VALUES "
+                "(9, 'corr_bad', 'intraday_options', 'st01', 'live', 'NOT_A_REAL_STATUS', 0, "
+                "'2026-07-30T09:18:00Z')"
+            )
+
+
+def test_migration_0006_refuses_without_a_confirmed_fresh_backup_when_orders_has_rows(
+    tmp_path: Path,
+):
+    from common.persistence.migrations import VERSIONS_DIR
+
+    up_to_0005 = tmp_path / "up_to_0005"
+    up_to_0005.mkdir()
+    for migration in discover_migrations(VERSIONS_DIR):
+        if migration.version in {"0006", "0007"}:
+            continue
+        (up_to_0005 / migration.path.name).write_text(
+            migration.path.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+
+    database = Database(tmp_path / "operational" / "intraday_options.db")
+    MigrationRunner(database, versions_dir=up_to_0005).run_pending()
+    with database.transaction() as conn:
+        conn.execute(
+            "INSERT INTO runtime_sessions (id, runtime_id, execution_mode, process_role, "
+            "pid, started_at) VALUES (1, 'intraday_options', 'live', 'worker', 1, "
+            "'2026-07-30T09:15:00Z')"
+        )
+        conn.execute(
+            "INSERT INTO order_intents (id, correlation_id, correlation_namespace, "
+            "session_id, runtime_id, strategy_id, execution_mode, trading_date, "
+            "sequence_number, instrument, security_id, side, quantity, order_type, "
+            "product_type, risk_decision, created_at) VALUES "
+            "(1, 'corr_001', 'live', 1, 'intraday_options', 'st01', 'live', '2026-07-30', 1, "
+            "'NIFTY', '1', 'BUY', 50, 'MARKET', 'INTRADAY', 'ALLOWED', "
+            "'2026-07-30T09:15:00Z')"
+        )
+        conn.execute(
+            "INSERT INTO orders (intent_id, correlation_id, runtime_id, strategy_id, "
+            "execution_mode, status, filled_quantity, updated_at) VALUES "
+            "(1, 'corr_001', 'intraday_options', 'st01', 'live', 'PENDING', 0, "
+            "'2026-07-30T09:15:00Z')"
+        )
+
+    with pytest.raises(MigrationError, match="fresh backup"):
+        MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
+
+    # Explicit confirmation lets it proceed.
+    applied = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending(
+        require_fresh_backup_for_destructive=True
+    )
+    assert "0006" in [m.version for m in applied]
+
+
+def test_migration_0006_detects_an_interrupted_previous_attempt_and_refuses_to_guess(
+    tmp_path: Path,
+):
+    """Simulates a crash between 0006's DROP and RENAME steps: ``orders_new``
+    exists, ``orders`` does not. The runner must not guess whether the copy
+    finished — it must stop and ask for manual recovery from backup."""
+    from common.persistence.migrations import VERSIONS_DIR
+
+    up_to_0005 = tmp_path / "up_to_0005"
+    up_to_0005.mkdir()
+    for migration in discover_migrations(VERSIONS_DIR):
+        if migration.version in {"0006", "0007"}:
+            continue
+        (up_to_0005 / migration.path.name).write_text(
+            migration.path.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+
+    database = Database(tmp_path / "operational" / "intraday_options.db")
+    MigrationRunner(database, versions_dir=up_to_0005).run_pending()
+
+    with database.transaction() as conn:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("CREATE TABLE orders_new (id INTEGER PRIMARY KEY)")
+        conn.execute("DROP TABLE orders")
+        conn.execute("PRAGMA foreign_keys = ON")
+
+    with pytest.raises(MigrationError, match="Refusing to guess"):
+        MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending(
+            require_fresh_backup_for_destructive=True
+        )

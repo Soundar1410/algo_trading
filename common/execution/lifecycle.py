@@ -32,11 +32,41 @@ from common.models import (
     RiskDecision,
     Signal,
 )
+from common.risk.account_reservations import AccountReservationGate, IllegalReservationTransition
 
 from .correlation import build_correlation_id
 from .repository import ExecutionRepository
 
 _log = get_logger(__name__)
+
+#: OrderStatus -> the account-reservation state it corresponds to, for
+#: syncing the reservation after a live submission. Every reservation is
+#: transitioned through SUBMITTED first (submit() genuinely was called,
+#: regardless of outcome) and then, if different, on to the real target —
+#: RESERVED has no direct edge to most of these, SUBMITTED does (see
+#: common.risk.account_reservations._LEGAL_TRANSITIONS).
+_ORDER_STATUS_TO_RESERVATION_STATE: dict[OrderStatus, str] = {
+    OrderStatus.SUBMITTED: "SUBMITTED",
+    OrderStatus.ACKNOWLEDGED: "ACKNOWLEDGED",
+    OrderStatus.PARTIALLY_FILLED: "PARTIALLY_FILLED",
+    OrderStatus.FILLED: "FILLED",
+    OrderStatus.REJECTED: "REJECTED",
+    OrderStatus.CANCELLED: "CANCELLED",
+    OrderStatus.EXPIRED: "EXPIRED",
+    OrderStatus.UNKNOWN: "UNKNOWN",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class LiveAccountRiskLimits:
+    """The account-wide ceilings one live strategy's reservations are
+    checked against — ``None`` in any field means that particular ceiling
+    is not enforced (a runtime group can enforce a subset), never
+    "unlimited by omission" for the ones that ARE configured."""
+
+    max_deployed_capital: float | None = None
+    max_open_positions: int | None = None
+    max_open_legs: int | None = None
 
 
 @dataclass(frozen=True)
@@ -68,6 +98,9 @@ class OrderLifecycle:
         product_type: str = "INTRADAY",
         config_fingerprint: str | None = None,
         quotes: QuoteBook | None = None,
+        account_reservation_gate: AccountReservationGate | None = None,
+        account_key: str | None = None,
+        account_risk_limits: LiveAccountRiskLimits | None = None,
     ) -> None:
         self._repo = repository
         self._broker = broker
@@ -83,6 +116,15 @@ class OrderLifecycle:
         #: what every offline construction and the fixture worker want. ``None``
         #: is therefore a supported configuration, not a missing dependency.
         self._quotes = quotes
+        #: Phase 10. ``None`` for paper (the only value any paper construction
+        #: ever supplies) — a paper OrderLifecycle never even imports the
+        #: account-shared database, let alone reserves against it. A live
+        #: OrderLifecycle without one is a construction bug, not a silent
+        #: "unlimited": ``_check_and_reserve_account_risk`` below refuses
+        #: closed rather than skip the check when mode is LIVE and this is None.
+        self._account_reservation_gate = account_reservation_gate
+        self._account_key = account_key
+        self._account_risk_limits = account_risk_limits or LiveAccountRiskLimits()
 
     def handle_signal(
         self,
@@ -120,6 +162,13 @@ class OrderLifecycle:
             trading_date=trading_date,
             sequence_number=sequence,
         )
+        quote = self._quote_for(signal)
+        risk_decision, risk_reason = self._check_and_reserve_account_risk(
+            correlation_id=correlation_id,
+            trading_date=trading_date,
+            quantity=signal.quantity,
+            quote=quote,
+        )
         intent = OrderIntent(
             correlation_id=correlation_id,
             strategy_id=self._strategy_id,
@@ -136,14 +185,26 @@ class OrderLifecycle:
             created_at=datetime.now(UTC),
             signal_id=signal_id,
             config_fingerprint=self._fingerprint,
-            risk_decision=RiskDecision.ALLOWED,
+            risk_decision=risk_decision,
+            risk_reason=risk_reason,
         )
 
         # Commits before the broker is called: a crash during submission leaves
         # a recoverable record, keyed by a correlation ID that already exists.
+        # Persisted regardless of risk_decision — a blocked intent is a normal
+        # recorded outcome, not something the audit trail should be missing.
         intent_id = self._repo.reserve_intent(session_id=self._session_id, intent=intent)
 
-        quote = self._quote_for(signal)
+        if risk_decision is RiskDecision.BLOCKED:
+            _log.warning(
+                "live order blocked by account risk correlation_id=%s reason=%s",
+                correlation_id,
+                risk_reason,
+            )
+            return ExecutionResult(
+                correlation_id=correlation_id,
+                skipped_reason=f"account risk blocked: {risk_reason}",
+            )
 
         try:
             order = self._broker.submit(intent, quote)
@@ -168,11 +229,14 @@ class OrderLifecycle:
             self._repo.record_submission(
                 intent_id=intent_id, order=rejected, runtime_id=self._runtime_id
             )
+            self._sync_account_reservation(correlation_id, OrderStatus.REJECTED)
             return ExecutionResult(
                 correlation_id=correlation_id,
                 order=rejected,
                 skipped_reason=f"broker rejected: {exc}",
             )
+
+        self._sync_account_reservation(correlation_id, order.status)
 
         order_id = self._repo.record_submission(
             intent_id=intent_id, order=order, runtime_id=self._runtime_id
@@ -231,3 +295,91 @@ class OrderLifecycle:
             last_price=signal.reference_price,
             quoted_at=signal.evaluated_at,
         )
+
+    # ------------------------------------------------------- account risk (live)
+    def _check_and_reserve_account_risk(
+        self, *, correlation_id: str, trading_date: str, quantity: int, quote: Quote
+    ) -> tuple[RiskDecision, str | None]:
+        """Atomically check-and-reserve account-wide capacity for a live
+        intent, *before* it is ever persisted or the broker is ever called
+        (architecture report §4.2). Paper mode never reaches the reservation
+        gate at all — it returns ``ALLOWED`` unconditionally, structurally
+        excluded rather than filtered by a runtime flag.
+
+        A live ``OrderLifecycle`` with no gate wired is a construction bug,
+        not silent permission: it fails closed exactly like a live intent
+        that failed the check, rather than skip the check because nothing
+        was configured to run it (spec 2393's "no permissive default").
+        """
+        if self._mode is not ExecutionMode.LIVE:
+            return RiskDecision.ALLOWED, None
+
+        if self._account_reservation_gate is None or self._account_key is None:
+            _log.error(
+                "live OrderLifecycle for strategy_id=%s has no account reservation gate "
+                "wired — blocking correlation_id=%s rather than silently permitting it",
+                self._strategy_id,
+                correlation_id,
+            )
+            return RiskDecision.BLOCKED, "no account reservation gate wired for a live strategy"
+
+        # Worst-case capital at risk: quantity * price, the standard
+        # premium-at-risk estimate for a bought option. A more precise
+        # per-instrument model (margin-based, for sold/short exposure) is a
+        # strategy/instrument-specific refinement, not something this
+        # generic lifecycle can assume — see the reservation's own
+        # projected_capital field for where that refinement would plug in.
+        projected_capital = quantity * quote.last_price
+
+        decision = self._account_reservation_gate.check_and_reserve(
+            account_key=self._account_key,
+            runtime_id=self._runtime_id,
+            strategy_id=self._strategy_id,
+            correlation_id=correlation_id,
+            trading_date=trading_date,
+            projected_capital=projected_capital,
+            projected_legs=1,
+            quantity=quantity,
+            max_deployed_capital=self._account_risk_limits.max_deployed_capital,
+            max_open_positions=self._account_risk_limits.max_open_positions,
+            max_open_legs=self._account_risk_limits.max_open_legs,
+            now=datetime.now(UTC),
+        )
+        if decision.allowed:
+            return RiskDecision.ALLOWED, None
+        return RiskDecision.BLOCKED, decision.reason
+
+    def _sync_account_reservation(self, correlation_id: str, order_status: OrderStatus) -> None:
+        """Move the reservation from RESERVED through SUBMITTED to the
+        real outcome. A no-op for paper (no gate wired) and for any
+        correlation ID this lifecycle never reserved (e.g. a risk-blocked
+        intent, which never got past ``check_and_reserve`` and so has no
+        RESERVED row to advance) — both are expected, not errors.
+        """
+        if self._account_reservation_gate is None or self._account_key is None:
+            return
+        target = _ORDER_STATUS_TO_RESERVATION_STATE.get(order_status)
+        if target is None:
+            return
+        now = datetime.now(UTC)
+        try:
+            if target != "SUBMITTED":
+                self._account_reservation_gate.transition(
+                    account_key=self._account_key,
+                    correlation_id=correlation_id,
+                    new_state="SUBMITTED",
+                    now=now,
+                )
+            self._account_reservation_gate.transition(
+                account_key=self._account_key,
+                correlation_id=correlation_id,
+                new_state=target,
+                now=now,
+            )
+        except IllegalReservationTransition as exc:
+            _log.error(
+                "could not sync account reservation for correlation_id=%s to %s: %s",
+                correlation_id,
+                target,
+                exc,
+            )

@@ -7,12 +7,17 @@ from pathlib import Path
 import pytest
 
 from common.config import (
+    AccountRiskConfig,
     ConfigError,
     EngineKind,
     ExecutionMode,
     ExpiryPolicy,
     GlobalConfig,
     HealthConfig,
+    LiveOrderRateLimitConfig,
+    LivePreflightConfig,
+    RateLimitCallClass,
+    RateLimitRule,
     ResolvedConfig,
     RetentionConfig,
     RuntimeConfig,
@@ -314,6 +319,23 @@ def test_absent_env_override_leaves_config_untouched():
 
 
 # --------------------------------------------------------------- live gate
+#: Phase 10 added two more fail-closed requirements for any ``mode: live``
+#: strategy — a declared ``live_quantity_lots`` and a complete
+#: ``live_preflight`` block (see ``ResolvedConfig``'s own validator). Neither
+#: is what these particular tests are about (they exercise the pre-existing
+#: global/runtime/strategy permission gate), so the helper below always
+#: supplies both when constructing a live-mode config, keeping every
+#: existing assertion in this file unchanged.
+_COMPLETE_LIVE_PREFLIGHT = LivePreflightConfig(
+    expected_static_ip="203.0.113.10",
+    max_preflight_age_seconds=300,
+    rate_limits=LiveOrderRateLimitConfig(
+        rules=(RateLimitRule(call_class=RateLimitCallClass.NEW_ORDER, limit=5, window_seconds=60),)
+    ),
+    account_risk=AccountRiskConfig(max_daily_loss=5000.0),
+)
+
+
 def _resolved(
     *,
     global_live: bool,
@@ -329,12 +351,14 @@ def _resolved(
             runtime_id="intraday_options",
             enabled=runtime_enabled,
             live_execution_allowed=runtime_live_allowed,
+            live_preflight=_COMPLETE_LIVE_PREFLIGHT,
         ),
         strategy=StrategyConfig(
             strategy_id="io_fixture_v1",
             enabled=strategy_enabled,
             mode=mode,
             live_approved=live_approved,
+            live_quantity_lots=1 if mode is ExecutionMode.LIVE else None,
         ),
     )
 
