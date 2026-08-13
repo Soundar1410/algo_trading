@@ -116,17 +116,20 @@ class LivePreflightGate:
         now: datetime,
         ttl_seconds: float,
         run_check: Callable[[], LivePreflightOutcome],
+        force: bool = False,
     ) -> StoredPreflightResult:
         """Return a fresh, authoritative preflight result — running the real
         check (inside *this* process) and persisting it whenever the stored
-        one is missing, stale, or checked against a different configuration.
+        one is missing, stale, checked against a different configuration, or
+        ``force`` is true (used at the worker boundary so a parent's fresh row
+        is never mistaken for a check performed by the child itself).
         A failed re-run is never fabricated as a pass: whatever ``run_check``
         returns is recorded and returned as-is.
         """
         existing = self.current(
             account_key=account_key, runtime_id=runtime_id, strategy_id=strategy_id
         )
-        if existing is not None and self.is_fresh(
+        if not force and existing is not None and self.is_fresh(
             existing, now=now, ttl_seconds=ttl_seconds, config_fingerprint=config_fingerprint
         ):
             return existing

@@ -22,6 +22,7 @@ market data", extended here to the account-level aggregate).
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -75,7 +76,29 @@ def account_daily_pnl(
     now: datetime,
     max_mtm_age_seconds: float | None,
 ) -> AccountExposureSnapshot:
-    conn = database.connect()
+    return account_daily_pnl_from_connection(
+        database.connect(),
+        account_key=account_key,
+        trading_date=trading_date,
+        now=now,
+        max_mtm_age_seconds=max_mtm_age_seconds,
+    )
+
+
+def account_daily_pnl_from_connection(
+    conn: sqlite3.Connection,
+    *,
+    account_key: str,
+    trading_date: str,
+    now: datetime,
+    max_mtm_age_seconds: float | None,
+) -> AccountExposureSnapshot:
+    """Compute the snapshot on a caller-owned connection/transaction.
+
+    The reservation gate uses this form inside the same ``BEGIN IMMEDIATE``
+    transaction as its capacity check.  That prevents a second worker from
+    changing shared exposure between the daily-loss decision and reservation.
+    """
 
     realised = conn.execute(
         "SELECT COALESCE(SUM(realised_pnl_delta), 0) AS total FROM live_realised_pnl_events "

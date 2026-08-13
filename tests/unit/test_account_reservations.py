@@ -21,6 +21,13 @@ NOW = datetime(2026, 8, 13, 9, 15, tzinfo=UTC)
 def _gate(tmp_path: Path) -> AccountReservationGate:
     database = open_account_shared_database(tmp_path / "dhan_account_shared.db")
     migrate_account_shared_database(database)
+    with database.transaction() as conn:
+        conn.executemany(
+            "INSERT INTO live_account_state_provenance "
+            "(account_key, reconciliation_status, last_reconciled_at, established_at) "
+            "VALUES (?, 'reconciled', ?, ?)",
+            ((account_key, NOW.isoformat(), NOW.isoformat()) for account_key in ("acct1", "acct2")),
+        )
     return AccountReservationGate(database)
 
 
@@ -91,11 +98,15 @@ def test_two_reservations_that_individually_pass_but_collectively_exceed_the_lim
     test_two_concurrent_workers_...  proves across real OS processes."""
     gate = _gate(tmp_path)
     first = _reserve(
-        gate, correlation_id="l_io_st01_20260813_0001", projected_capital=30_000.0,
+        gate,
+        correlation_id="l_io_st01_20260813_0001",
+        projected_capital=30_000.0,
         max_deployed_capital=50_000.0,
     )
     second = _reserve(
-        gate, correlation_id="l_io_st01_20260813_0002", projected_capital=30_000.0,
+        gate,
+        correlation_id="l_io_st01_20260813_0002",
+        projected_capital=30_000.0,
         max_deployed_capital=50_000.0,
     )
     assert first.allowed
@@ -113,9 +124,7 @@ def test_reserving_the_same_correlation_id_twice_is_refused_not_double_reserved(
 
 def test_accounts_are_independent(tmp_path: Path):
     gate = _gate(tmp_path)
-    _reserve(
-        gate, account_key="acct1", projected_capital=40_000.0, max_deployed_capital=50_000.0
-    )
+    _reserve(gate, account_key="acct1", projected_capital=40_000.0, max_deployed_capital=50_000.0)
     decision = _reserve(
         gate,
         account_key="acct2",
@@ -146,19 +155,51 @@ def test_no_configured_limit_never_blocks(tmp_path: Path):
     assert decision.allowed
 
 
+def test_risk_reducing_exit_is_reserved_even_when_entry_state_is_untrusted(tmp_path: Path):
+    gate = _gate(tmp_path)
+    database = open_account_shared_database(tmp_path / "dhan_account_shared.db")
+    with database.transaction() as conn:
+        conn.execute(
+            "UPDATE live_account_state_provenance SET reconciliation_status = 'failed' "
+            "WHERE account_key = 'acct1'"
+        )
+
+    decision = _reserve(
+        gate,
+        projected_capital=0.0,
+        projected_legs=0,
+        max_deployed_capital=1.0,
+        max_open_positions=1,
+        max_open_legs=1,
+        max_daily_loss=1.0,
+        max_mtm_age_seconds=1.0,
+        risk_reducing=True,
+    )
+
+    assert decision.allowed
+    assert (
+        gate.current_state(account_key="acct1", correlation_id="l_io_st01_20260813_0001")
+        == "RESERVED"
+    )
+
+
 # ------------------------------------------------------------- state transitions
 def test_pending_reservation_consumes_capacity_until_released(tmp_path: Path):
     """Requirement: pending/UNKNOWN submissions consume account risk
     capacity, not just filled positions."""
     gate = _gate(tmp_path)
     _reserve(
-        gate, correlation_id="l_io_st01_20260813_0001", projected_capital=40_000.0,
+        gate,
+        correlation_id="l_io_st01_20260813_0001",
+        projected_capital=40_000.0,
         max_deployed_capital=50_000.0,
     )
     # Still RESERVED (not yet filled, not yet released) — the next
     # reservation must still see this one's capital.
     decision = _reserve(
-        gate, correlation_id="l_io_st01_20260813_0002", projected_capital=20_000.0,
+        gate,
+        correlation_id="l_io_st01_20260813_0002",
+        projected_capital=20_000.0,
         max_deployed_capital=50_000.0,
     )
     assert not decision.allowed
@@ -167,7 +208,9 @@ def test_pending_reservation_consumes_capacity_until_released(tmp_path: Path):
 def test_a_released_reservation_no_longer_consumes_capacity(tmp_path: Path):
     gate = _gate(tmp_path)
     _reserve(
-        gate, correlation_id="l_io_st01_20260813_0001", projected_capital=40_000.0,
+        gate,
+        correlation_id="l_io_st01_20260813_0001",
+        projected_capital=40_000.0,
         max_deployed_capital=50_000.0,
     )
     gate.transition(
@@ -177,7 +220,9 @@ def test_a_released_reservation_no_longer_consumes_capacity(tmp_path: Path):
         account_key="acct1", correlation_id="l_io_st01_20260813_0001", new_state="RELEASED", now=NOW
     )
     decision = _reserve(
-        gate, correlation_id="l_io_st01_20260813_0002", projected_capital=40_000.0,
+        gate,
+        correlation_id="l_io_st01_20260813_0002",
+        projected_capital=40_000.0,
         max_deployed_capital=50_000.0,
     )
     assert decision.allowed
@@ -260,8 +305,12 @@ def test_partial_fill_updates_residual_quantity(tmp_path: Path):
         residual_quantity=2,
     )
     database = open_account_shared_database(tmp_path / "dhan_account_shared.db")
-    row = database.connect().execute(
-        "SELECT residual_quantity FROM live_risk_reservations WHERE correlation_id = ?",
-        ("l_io_st01_20260813_0001",),
-    ).fetchone()
+    row = (
+        database.connect()
+        .execute(
+            "SELECT residual_quantity FROM live_risk_reservations WHERE correlation_id = ?",
+            ("l_io_st01_20260813_0001",),
+        )
+        .fetchone()
+    )
     assert row["residual_quantity"] == 2

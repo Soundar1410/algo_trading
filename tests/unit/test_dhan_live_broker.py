@@ -19,7 +19,8 @@ from common.broker.dhan_live import (
     map_dhan_order_status,
     resolve_unknown_via_lookup,
 )
-from common.config.models import ExecutionMode
+from common.broker.paper import InstrumentRules
+from common.config.models import ExecutionMode, RateLimitCallClass
 from common.models import OrderIntent, OrderStatus, OrderType, Side
 
 
@@ -57,6 +58,7 @@ class _FakeDhanClient:
         self.lookup_response: dict[str, Any] = dict(_not_set)
         self.order_list_response: dict[str, Any] = {"status": "success", "data": []}
         self.positions_response: dict[str, Any] = {"status": "success", "data": []}
+        self.trade_book_response: dict[str, Any] = {"status": "success", "data": []}
         self.modify_response: dict[str, Any] = {"status": "success", "data": {}}
         self.cancel_response: dict[str, Any] = {"status": "success", "data": {}}
         self.place_order_calls: list[dict[str, Any]] = []
@@ -83,10 +85,57 @@ class _FakeDhanClient:
     def get_positions(self) -> dict[str, Any]:
         return self.positions_response
 
+    def get_trade_book(self, order_id: str | None = None) -> dict[str, Any]:
+        del order_id
+        return self.trade_book_response
 
-def _broker(client: _FakeDhanClient | None = None) -> tuple[DhanLiveBroker, _FakeDhanClient]:
+
+class _AllowingGuard:
+    def __init__(self) -> None:
+        self.calls: list[RateLimitCallClass] = []
+
+    def before_call(self, call_class: RateLimitCallClass, *, risk_reducing: bool = False) -> None:
+        del risk_reducing
+        self.calls.append(call_class)
+
+
+class _ResolvingUpdates:
+    def __init__(self, *, resolves: bool = True) -> None:
+        self.resolves = resolves
+        self.registered: list[tuple[str, str]] = []
+        self.waited: list[tuple[str, str, float]] = []
+
+    def register(self, correlation_id: str, broker_order_id: str) -> None:
+        self.registered.append((correlation_id, broker_order_id))
+
+    def wait_for_resolution(
+        self, correlation_id: str, broker_order_id: str, timeout_seconds: float
+    ) -> object | None:
+        self.waited.append((correlation_id, broker_order_id, timeout_seconds))
+        return object() if self.resolves else None
+
+
+def _broker(
+    client: _FakeDhanClient | None = None,
+    *,
+    order_updates: _ResolvingUpdates | None = None,
+) -> tuple[DhanLiveBroker, _FakeDhanClient]:
     c = client or _FakeDhanClient()
-    return DhanLiveBroker(client=c, exchange_segment="NSE_FNO", product_type="INTRADAY"), c
+    return (
+        DhanLiveBroker(
+            client=c,
+            exchange_segment="NSE_FNO",
+            product_type="INTRADAY",
+            call_guard=_AllowingGuard(),
+            instrument_rules=lambda security_id: (
+                InstrumentRules(lot_size=75, tick_size=0.05) if security_id == "49081" else None
+            ),
+            max_quantity_lots=1,
+            order_updates=order_updates,
+            settlement_timeout_seconds=0.01,
+        ),
+        c,
+    )
 
 
 # ------------------------------------------------------------ status mapping
@@ -265,6 +314,40 @@ def test_submit_a_limit_order_without_a_limit_price_raises_before_any_network_ca
     assert client.place_order_calls == []
 
 
+def test_ambiguous_submit_uses_correlation_lookup_once_and_never_resubmits():
+    broker, client = _broker()
+    client.place_order_response = {
+        "status": "failure",
+        "remarks": "timeout",
+        "data": "",
+    }
+    client.lookup_response = {
+        "status": "success",
+        "data": {"orderId": "1", "orderStatus": "PENDING"},
+    }
+
+    order = broker.submit(_intent(), quote=None)  # type: ignore[arg-type]
+
+    assert order.status is OrderStatus.ACKNOWLEDGED
+    assert order.broker_order_id == "1"
+    assert len(client.place_order_calls) == 1
+
+
+def test_transport_exception_is_unknown_and_duplicate_submit_stays_suppressed():
+    class _RaisingClient(_FakeDhanClient):
+        def place_order(self, **kwargs: Any) -> dict[str, Any]:
+            self.place_order_calls.append(kwargs)
+            raise OSError("transport failed")
+
+    broker, client = _broker(_RaisingClient())
+
+    order = broker.submit(_intent(), quote=None)  # type: ignore[arg-type]
+    assert order.status is OrderStatus.UNKNOWN
+    with pytest.raises(BrokerError, match="duplicate live submit refused"):
+        broker.submit(_intent(), quote=None)  # type: ignore[arg-type]
+    assert len(client.place_order_calls) == 1
+
+
 def test_submit_remembers_the_broker_order_id_for_later_modify_cancel():
     broker, client = _broker()
     client.place_order_response = {
@@ -279,10 +362,66 @@ def test_submit_remembers_the_broker_order_id_for_later_modify_cancel():
     assert order.broker_order_id == "998877"
 
 
+def test_order_update_is_primary_then_rest_confirms_fill_without_resubmission():
+    updates = _ResolvingUpdates()
+    broker, client = _broker(order_updates=updates)
+    client.place_order_response = {
+        "status": "success",
+        "data": {"orderId": "1", "orderStatus": "TRANSIT"},
+    }
+    client.lookup_response = {
+        "status": "success",
+        "data": {
+            "orderId": "1",
+            "orderStatus": "TRADED",
+            "filledQty": 75,
+            "averageTradedPrice": 190.5,
+        },
+    }
+    client.trade_book_response = {
+        "status": "success",
+        "data": [
+            {
+                "orderId": "1",
+                "exchangeTradeId": "trade-1",
+                "tradedQuantity": 75,
+                "tradedPrice": 190.5,
+                "exchangeTime": "2026-08-13 09:20:01",
+            }
+        ],
+    }
+
+    order = broker.submit(_intent(), quote=None)  # type: ignore[arg-type]
+
+    assert order.status is OrderStatus.FILLED
+    assert order.filled_quantity == 75
+    assert len(order.fills) == 1
+    assert len(client.place_order_calls) == 1
+    assert updates.waited == [("l_io_st01_20260813_0001", "1", 0.01)]
+
+
+def test_order_update_timeout_uses_one_lookup_fallback_and_never_resubmits():
+    updates = _ResolvingUpdates(resolves=False)
+    broker, client = _broker(order_updates=updates)
+    client.place_order_response = {
+        "status": "success",
+        "data": {"orderId": "1", "orderStatus": "TRANSIT"},
+    }
+    client.lookup_response = {
+        "status": "success",
+        "data": {"orderId": "1", "orderStatus": "PENDING"},
+    }
+
+    order = broker.submit(_intent(), quote=None)  # type: ignore[arg-type]
+
+    assert order.status is OrderStatus.ACKNOWLEDGED
+    assert len(client.place_order_calls) == 1
+
+
 # ------------------------------------------------------------------- cancel
 def test_cancel_an_unknown_correlation_id_raises():
     broker, _ = _broker()
-    with pytest.raises(BrokerError, match="no known Dhan order id"):
+    with pytest.raises(BrokerError, match="correlation lookup failed"):
         broker.cancel("l_io_st01_20260813_9999")
 
 
@@ -295,7 +434,11 @@ def test_cancel_success_reports_cancelled():
     }
     intent = _intent()
     broker.submit(intent, quote=None)  # type: ignore[arg-type]
-    client.cancel_response = {"status": "success", "remarks": "", "data": {}}
+    client.cancel_response = {
+        "status": "success",
+        "remarks": "",
+        "data": {"orderStatus": "CANCELLED"},
+    }
 
     order = broker.cancel(intent.correlation_id)
     assert order.status is OrderStatus.CANCELLED
@@ -321,11 +464,11 @@ def test_cancel_an_ambiguous_result_is_not_trusted_as_cancelled():
 # ------------------------------------------------------------------- modify
 def test_modify_an_unknown_correlation_id_raises():
     broker, _ = _broker()
-    with pytest.raises(BrokerError, match="no known Dhan order id"):
+    with pytest.raises(BrokerError, match="correlation lookup failed"):
         broker.modify("l_io_st01_20260813_9999", quantity=10)
 
 
-def test_modify_failure_raises():
+def test_modify_failure_is_unknown_not_assumed_rejected():
     broker, client = _broker()
     client.place_order_response = {
         "status": "success",
@@ -336,8 +479,8 @@ def test_modify_failure_raises():
     broker.submit(intent, quote=None)  # type: ignore[arg-type]
     client.modify_response = {"status": "failure", "remarks": "rejected", "data": ""}
 
-    with pytest.raises(BrokerError):
-        broker.modify(intent.correlation_id, quantity=25)
+    order = broker.modify(intent.correlation_id, quantity=75)
+    assert order.status is OrderStatus.UNKNOWN
 
 
 # ---------------------------------------------------------- reconciliation reads
@@ -355,29 +498,52 @@ def test_fetch_order_book_maps_every_row():
     assert {o.status for o in book} == {OrderStatus.SUBMITTED, OrderStatus.FILLED}
 
 
-def test_fetch_order_book_skips_rows_missing_identity():
+def test_fetch_order_book_preserves_rows_missing_identity_for_reconciliation():
     broker, client = _broker()
     client.order_list_response = {
         "status": "success",
         "data": [{"correlationId": None, "orderId": "1", "orderStatus": "TRANSIT"}],
     }
-    assert broker.fetch_order_book() == ()
+    book = broker.fetch_order_book()
+    assert len(book) == 1
+    assert book[0].correlation_id == "unattributed:1"
 
 
-def test_fetch_order_book_is_empty_on_failure():
+def test_fetch_order_book_failure_is_not_misreported_as_an_empty_account():
     broker, client = _broker()
     client.order_list_response = {"status": "failure", "remarks": "down", "data": ""}
-    assert broker.fetch_order_book() == ()
+    with pytest.raises(BrokerError, match="order-book fetch failed"):
+        broker.fetch_order_book()
 
 
-def test_fetch_trades_returns_empty_and_warns_rather_than_guessing(
-    caplog: pytest.LogCaptureFixture,
-):
-    broker, _ = _broker()
-    with caplog.at_level(logging.WARNING):
-        trades = broker.fetch_trades()
-    assert trades == ()
-    assert any("no confirmed SDK method" in r.getMessage() for r in caplog.records)
+def test_fetch_trades_joins_trade_rows_to_order_book_correlation_ids():
+    broker, client = _broker()
+    client.order_list_response = {
+        "status": "success",
+        "data": [
+            {
+                "correlationId": "l_io_st01_20260813_0001",
+                "orderId": "1",
+                "orderStatus": "TRADED",
+            }
+        ],
+    }
+    client.trade_book_response = {
+        "status": "success",
+        "data": [
+            {
+                "orderId": "1",
+                "exchangeTradeId": "trade-1",
+                "tradedQuantity": 75,
+                "tradedPrice": 190.5,
+                "exchangeTime": "2026-08-13 09:20:01",
+            }
+        ],
+    }
+    trades = broker.fetch_trades()
+    assert len(trades) == 1
+    assert trades[0].correlation_id == "l_io_st01_20260813_0001"
+    assert trades[0].quantity == 75
 
 
 def test_fetch_positions_maps_every_row():
@@ -394,10 +560,11 @@ def test_fetch_positions_maps_every_row():
     assert positions[0].quantity == 75
 
 
-def test_fetch_positions_is_empty_on_failure():
+def test_fetch_positions_failure_is_not_misreported_as_an_empty_account():
     broker, client = _broker()
     client.positions_response = {"status": "failure", "remarks": "down", "data": ""}
-    assert broker.fetch_positions() == ()
+    with pytest.raises(BrokerError, match="positions fetch failed"):
+        broker.fetch_positions()
 
 
 # ------------------------------------------------------------------ health
@@ -419,10 +586,11 @@ def test_broker_name_identifies_itself():
 
 
 # ------------------------------------------------------------- order_by_correlation_id
-def test_order_by_correlation_id_returns_none_on_failure():
+def test_order_by_correlation_id_failure_is_not_treated_as_not_found():
     broker, client = _broker()
     client.lookup_response = {"status": "failure", "remarks": "not found", "data": ""}
-    assert broker.order_by_correlation_id("l_io_st01_20260813_0001") is None
+    with pytest.raises(BrokerError, match="absence is not trusted"):
+        broker.order_by_correlation_id("l_io_st01_20260813_0001")
 
 
 def test_order_by_correlation_id_returns_the_mapped_order_on_success():

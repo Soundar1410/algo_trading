@@ -13,9 +13,10 @@ refused individually (spec's mixed-mode gate) — it never stops a paper
 strategy elsewhere in the same group from starting, and it is never rerouted
 to paper.
 
-Requires real Dhan credentials in ``.env`` (see ``.env.example``). Paper mode
-only: see :mod:`common.broker.factory` for why a live-mode strategy can never
-obtain a broker yet, live order placement is Phase 10.
+Requires real Dhan credentials in ``.env`` (see ``.env.example``). Every
+committed strategy remains paper. The Phase 10 live route exists, but admission
+requires all static gates plus parent and worker-local preflight and therefore
+remains unreachable from committed configuration.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from common.config import (
     RuntimeConfig,
     Settings,
     discover_enabled_strategies,
+    discover_strategies,
     effective_live_gate,
     load_paths,
     load_runtime_config,
@@ -46,7 +48,7 @@ from common.notifications import build_notifier
 from common.persistence import Database, MigrationRunner
 from common.process import legacy_system_status
 from common.reconciliation import ReconciliationRunner
-from common.retention import backup_database, run_retention
+from common.retention import backup_database, run_retention, verify_backup_restorable
 from common.utils.timeutils import local_date_in, now_ist
 
 from .config_adapter import build_worker_config
@@ -119,19 +121,15 @@ def build_supervisor(
     .add_worker` — a strategy whose transition is unsafe is skipped
     entirely this session (no worker registered for it), logged loudly.
     ``live_broker_factory``/``live_preflight_passed_for`` are ``None`` by
-    default (every test and today's ``main()``): with no factory, a
+    default for direct test/library callers: with no factory, a
     strategy with live history simply cannot prove a live -> paper/disabled
     transition safe and is refused, fail-closed — see
     ``common.execution.mode_transition``'s own docstring for why "cannot
     prove" and "proven unsafe" are treated identically.
 
-    **Known gap, documented rather than silently incomplete**: this only
-    covers strategies :func:`~common.config.discover_enabled_strategies`
-    returns, i.e. still ``enabled: true``. A strategy that transitions
-    ``live -> disabled`` (``enabled: false``) is not discovered here at
-    all, so this safety check does not yet run for that specific case —
-    closing it needs a broader discovery call that also surfaces newly
-    disabled strategies, which does not exist yet.
+    Discovery deliberately includes disabled configurations so a
+    ``live -> disabled`` transition cannot bypass the exposure check. Disabled
+    strategies are discarded only after that check and never spawn a worker.
     """
     settings = settings if settings is not None else load_settings()
     trading_date = trading_date or local_date_in(now_ist()).isoformat()
@@ -163,7 +161,7 @@ def build_supervisor(
         repository = ExecutionRepository(transition_database)
         reconciliation_runner = ReconciliationRunner(transition_database)
 
-        for cfg in discover_enabled_strategies(config_root, runtime_id, settings=settings):
+        for cfg in discover_strategies(config_root, runtime_id, settings=settings):
             if strategy_ids is not None and cfg.strategy.strategy_id not in strategy_ids:
                 continue
 
@@ -174,7 +172,7 @@ def build_supervisor(
                 repository,
                 strategy_id=cfg.strategy.strategy_id,
                 runtime_id=runtime_id,
-                new_mode=cfg.strategy.mode,
+                new_mode=cfg.strategy.mode if cfg.strategy.enabled else None,
                 broker=broker_for_check,
                 reconciliation_runner=(
                     reconciliation_runner if broker_for_check is not None else None
@@ -190,9 +188,22 @@ def build_supervisor(
                 )
                 continue
 
+            if not cfg.strategy.enabled:
+                # Disabled strategies start no worker, but disabling must not
+                # bypass the live-to-disabled exposure check above.
+                continue
+
+            # Do not spend authentication/IP/order-book reads for paper or for
+            # a live strategy already blocked by a static permission flag.  If
+            # every non-preflight gate is open, however, the production
+            # callback is mandatory and its result is the final admission fact.
+            needs_live_preflight = (
+                cfg.strategy.mode.value == "live"
+                and effective_live_gate(cfg, preflight_passed=True).allowed
+            )
             live_preflight_passed = (
                 live_preflight_passed_for(cfg)
-                if live_preflight_passed_for is not None
+                if needs_live_preflight and live_preflight_passed_for is not None
                 else False
             )
             worker_config = build_worker_config(
@@ -203,10 +214,19 @@ def build_supervisor(
                 log_dir=paths.log_root,
                 trading_date=trading_date,
                 live_preflight_passed=live_preflight_passed,
+                account_shared_database_path=paths.account_shared_database_path,
+                token_cache_dir=paths.cache_root,
             )
-            # Cheap and harmless to compute for a paper strategy too — add_worker
-            # only ever consults it for a live-mode worker.
-            supervisor.add_worker(worker_config, live_gate=effective_live_gate(cfg))
+            # Admission and the child receive the same preflight fact.  Omitting
+            # it here used to make a successful preflight irrelevant because
+            # ``effective_live_gate`` silently re-applied its fail-closed default.
+            supervisor.add_worker(
+                worker_config,
+                tick_channel=worker_config.engine is not None,
+                live_gate=effective_live_gate(
+                    cfg, preflight_passed=live_preflight_passed
+                ),
+            )
     finally:
         transition_database.close()
 
@@ -292,12 +312,16 @@ def main(argv: list[str] | None = None) -> int:
     # is what keeps them at exactly one call site.
     database_path = _database_path(paths, runtime_cfg, args.runtime_id)
     database = Database(database_path)
-    backup_database(
+    backup_path = backup_database(
         database.path,
         paths.backup_root,
         retain_count=runtime_cfg.retention.backup_retain_count,
     )
-    MigrationRunner(database).run_pending()
+    if backup_path is not None:
+        verify_backup_restorable(backup_path)
+    MigrationRunner(database).run_pending(
+        require_fresh_backup_for_destructive=backup_path is not None
+    )
     run_retention(
         database=database,
         log_dir=paths.log_root,
@@ -340,9 +364,12 @@ def main(argv: list[str] | None = None) -> int:
     # Imported here, not at module level, so this module can be read and
     # linted without the Dhan SDK present — the same discipline
     # scripts/capture_live_tape.py uses for the same reason.
-    from common.market_data.dhan import DhanMarketFeedAdapter
+    from common.market_data.dhan import DhanMarketFeedAdapter, build_dhan_order_client
+
+    from .live_runtime import parent_live_preflight_passed
 
     adapter = DhanMarketFeedAdapter(client_id=client_id, access_token=token)
+    order_client = build_dhan_order_client(client_id=client_id, access_token=token)
 
     supervisor = build_supervisor(
         runtime_id=args.runtime_id,
@@ -351,6 +378,14 @@ def main(argv: list[str] | None = None) -> int:
         adapter=adapter,
         settings=settings,
         strategy_ids=frozenset({args.strategy_id}) if args.strategy_id else None,
+        live_preflight_passed_for=lambda cfg: parent_live_preflight_passed(
+            cfg,
+            settings=settings,
+            client_id=client_id,
+            access_token=token,
+            account_database_path=paths.account_shared_database_path,
+            order_client=order_client,
+        ),
     )
     # Recorded here rather than inside AuthBootstrap: get_token() ran before
     # this runtime's database (and therefore auth_events) existed — see

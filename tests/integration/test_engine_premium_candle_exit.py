@@ -23,7 +23,7 @@ rather than proving that a port of a strategy still matches itself.
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -32,7 +32,7 @@ import pytest
 from common.engine.config import EngineConfig, SessionConfig
 from common.engine.engine import TradingEngine
 from common.engine.feed import SimulatedFeed
-from common.engine.models import ExitReason, OptionType, OrderSide
+from common.engine.models import ExitReason, OpenPosition, OptionType, OrderSide
 from common.engine.positions import InMemoryGateway, PositionManager
 from common.engine.selection import OptionSelector, SimulatedOptionChainResolver
 from common.models import Tick
@@ -69,6 +69,7 @@ def _build_engine(
     *,
     strategy: EngineFixtureStrategy | None = None,
     warmup_from_history: bool = True,
+    publish_account_mtm: Callable[[OpenPosition, datetime], None] | None = None,
 ) -> tuple[TradingEngine, EngineFixtureStrategy, PositionManager]:
     """A fully real engine over a simulated tape. No monkeypatching anywhere."""
     strategy = strategy or EngineFixtureStrategy(enter_on_candle=1, premium_exit=True)
@@ -91,6 +92,7 @@ def _build_engine(
         strategy=strategy,
         position_manager=positions,
         underlying_security_id=UNDERLYING,
+        publish_account_mtm=publish_account_mtm,
     )
     return engine, strategy, positions
 
@@ -105,6 +107,45 @@ def _entry_tape() -> list[Tick]:
 
 def _premium_tape(contract: str, prices_at: Sequence[tuple[datetime, float]]) -> list[Tick]:
     return [_tick(contract, price, ts) for ts, price in prices_at]
+
+
+def test_live_account_mtm_sink_receives_each_open_position_mark() -> None:
+    marks: list[tuple[str, float, datetime]] = []
+
+    def publish(position: OpenPosition, as_of: datetime) -> None:
+        marks.append((position.contract.security_id, position.unrealised_pnl, as_of))
+
+    mark_time = _ts(9, 22)
+    engine, _, positions = _build_engine(
+        [
+            *_entry_tape(),
+            _tick(CE_CONTRACT, 100.0, _ts(9, 21, 30)),
+            _tick(CE_CONTRACT, 105.0, mark_time),
+        ],
+        publish_account_mtm=publish,
+    )
+    engine.run()
+
+    assert positions.has_position()
+    assert marks == [(CE_CONTRACT, 5.0 * LOT_SIZE, mark_time)]
+
+
+def test_live_account_mtm_sink_failure_blocks_entries_but_keeps_managing_position() -> None:
+    def fail(_position: OpenPosition, _as_of: datetime) -> None:
+        raise OSError("shared database unavailable")
+
+    engine, _, positions = _build_engine(
+        [
+            *_entry_tape(),
+            _tick(CE_CONTRACT, 100.0, _ts(9, 21, 30)),
+            _tick(CE_CONTRACT, 105.0, _ts(9, 22)),
+        ],
+        publish_account_mtm=fail,
+    )
+    engine.run()
+
+    assert positions.has_position()
+    assert engine.entries_blocked == "account-wide live MTM could not be updated"
 
 
 #: Fills the entry at 100, then walks the premium series up (105, 108) and down

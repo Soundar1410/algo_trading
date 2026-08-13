@@ -331,7 +331,9 @@ class IntradayOptionsSupervisor:
             line 2973-2974: the live strategy is blocked, not rerouted to
             paper, and the paper strategy continues safely.
         """
-        if worker_config.execution_mode is not ExecutionMode.PAPER:
+        if worker_config.execution_mode is ExecutionMode.LIVE and (
+            live_gate is None or not live_gate.allowed
+        ):
             self._blocked_workers.append(
                 (worker_config, self._live_admission_refusal(worker_config, live_gate))
             )
@@ -382,17 +384,8 @@ class IntradayOptionsSupervisor:
             reasons = "no live gate decision was evaluated for this worker"
         elif not live_gate.allowed:
             reasons = "; ".join(live_gate.blocked_reasons)
-        else:
-            # Unreachable until Phase 10 delivers DhanLiveBroker order placement.
-            # Written as a hard stop for the same reason common.broker.factory
-            # does (see LiveExecutionBlocked there): if a future change ever lets
-            # the gate open, this must still refuse rather than spawn a process
-            # guaranteed to fail once it reaches build_broker.
-            return (
-                f"Strategy {worker_config.strategy_id!r} passed the live gate, but live "
-                "order placement is not implemented. DhanLiveBroker order methods "
-                "arrive in Phase 10. The rest of the group continues."
-            )
+        else:  # pragma: no cover - called only for an actual refusal
+            reasons = "live gate refusal was requested without a failing condition"
         return (
             f"Strategy {worker_config.strategy_id!r} is configured for live execution "
             f"but the live gate blocks it: {reasons}. This strategy will not start. It "

@@ -81,10 +81,23 @@ def repository(database_path: Path) -> ExecutionRepository:
 def account_db(tmp_path: Path):
     database = open_account_shared_database(tmp_path / "dhan_account_shared.db")
     migrate_account_shared_database(database)
+    now = datetime.now(UTC).isoformat()
+    with database.transaction() as conn:
+        conn.execute(
+            "INSERT INTO live_account_state_provenance "
+            "(account_key, reconciliation_status, last_reconciled_at, established_at) "
+            "VALUES ('acct1', 'reconciled', ?, ?)",
+            (now, now),
+        )
     return database
 
 
-def _signal(*, mode: ExecutionMode = ExecutionMode.PAPER, minute: int = 15) -> Signal:
+def _signal(
+    *,
+    mode: ExecutionMode = ExecutionMode.PAPER,
+    minute: int = 15,
+    side: Side = Side.BUY,
+) -> Signal:
     start = datetime(2026, 8, 13, 9, minute, tzinfo=IST)
     candle = Candle(
         security_id="49081",
@@ -103,7 +116,7 @@ def _signal(*, mode: ExecutionMode = ExecutionMode.PAPER, minute: int = 15) -> S
         execution_mode=mode,
         instrument="NIFTY",
         security_id="49081",
-        side=Side.BUY,
+        side=side,
         quantity=75,
         candle=candle,
         reference_price=candle.close,
@@ -303,3 +316,47 @@ def test_an_unknown_outcome_leaves_the_reservation_conservatively_reserved(repos
 
     state = gate.current_state(account_key="acct1", correlation_id=result.correlation_id)
     assert state == "UNKNOWN"
+
+
+def test_live_exit_is_classified_risk_reducing_and_bypasses_entry_caps(repository, account_db):
+    session = _session(repository, ExecutionMode.LIVE)
+    repository.database.connect().execute(
+        "INSERT INTO positions (runtime_id, strategy_id, execution_mode, trading_date, "
+        "instrument, security_id, quantity, average_price, status, opened_at, updated_at) "
+        "VALUES ('intraday_options', 'st01', 'live', ?, 'NIFTY', '49081', 75, "
+        "190.0, 'OPEN', ?, ?)",
+        (TRADING_DATE, datetime.now(UTC).isoformat(), datetime.now(UTC).isoformat()),
+    )
+    captured: list[bool] = []
+
+    class _CapturingBroker(_ScriptedBroker):
+        def submit(self, intent, quote):  # type: ignore[no-untyped-def]
+            del quote
+            self.submit_calls += 1
+            captured.append(intent.risk_reducing)
+            return _live_order(intent.correlation_id, OrderStatus.ACKNOWLEDGED)
+
+    broker = _CapturingBroker()
+    lifecycle = _lifecycle(
+        repository,
+        session,
+        broker=broker,
+        mode=ExecutionMode.LIVE,
+        reservation_gate=AccountReservationGate(account_db),
+        account_key="acct1",
+        limits=LiveAccountRiskLimits(
+            max_deployed_capital=1.0,
+            max_open_positions=1,
+            max_open_legs=1,
+            max_daily_loss=1.0,
+            max_mtm_age_seconds=1.0,
+        ),
+    )
+
+    result = lifecycle.handle_signal(
+        _signal(mode=ExecutionMode.LIVE, side=Side.SELL), trading_date=TRADING_DATE
+    )
+
+    assert result.traded
+    assert broker.submit_calls == 1
+    assert captured == [True]

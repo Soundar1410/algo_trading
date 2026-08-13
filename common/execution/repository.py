@@ -741,7 +741,7 @@ class ExecutionRepository:
                 """
                 SELECT * FROM orders
                 WHERE strategy_id = ? AND execution_mode = ?
-                  AND status NOT IN ('FILLED', 'REJECTED', 'CANCELLED')
+                  AND status NOT IN ('FILLED', 'REJECTED', 'CANCELLED', 'EXPIRED')
                 ORDER BY id
                 """,
                 (strategy_id, execution_mode.value),

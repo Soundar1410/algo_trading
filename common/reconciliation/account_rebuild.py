@@ -34,7 +34,7 @@ from pathlib import Path
 
 from filelock import FileLock, Timeout
 
-from common.broker.base import Broker
+from common.broker.base import Broker, BrokerPosition
 from common.logging import get_logger
 from common.persistence.database import Database
 
@@ -59,6 +59,7 @@ class RuntimeGroupSnapshot:
     the account-wide rebuild needs to reconcile that group."""
 
     runtime_id: str
+    strategy_id: str
     broker: Broker
     local_orders: Sequence[LocalOrderState]
     local_positions: Sequence[LocalPositionState]
@@ -126,11 +127,22 @@ def _rebuild_locked(
     account_key: str,
     runtime_groups: Sequence[RuntimeGroupSnapshot],
 ) -> AccountRebuildResult:
+    if not runtime_groups:
+        _mark_provenance(
+            account_database, account_key=account_key, status=ProvenanceStatus.FAILED
+        )
+        return AccountRebuildResult(
+            status="failed",
+            critical_mismatch_total=0,
+            error_message="no runtime-group snapshots were supplied; nothing was proven",
+        )
+
     total_critical = 0
+    rebuilt_positions: list[tuple[RuntimeGroupSnapshot, BrokerPosition]] = []
     for group in runtime_groups:
         result = group.reconciliation_runner.run(
             runtime_id=group.runtime_id,
-            strategy_id=None,
+            strategy_id=group.strategy_id,
             broker=group.broker,
             local_orders=group.local_orders,
             local_positions=group.local_positions,
@@ -155,6 +167,94 @@ def _rebuild_locked(
                 ),
             )
         total_critical += result.critical_mismatch_count
+
+        if result.critical_mismatch_count:
+            _mark_provenance(
+                account_database, account_key=account_key, status=ProvenanceStatus.FAILED
+            )
+            return AccountRebuildResult(
+                status="failed",
+                critical_mismatch_total=total_critical,
+                error_message=(
+                    f"reconciliation found {result.critical_mismatch_count} critical "
+                    f"mismatch(es) for runtime group {group.runtime_id!r}"
+                ),
+            )
+
+        snapshot = result.broker_snapshot
+        if snapshot is None:
+            _mark_provenance(
+                account_database, account_key=account_key, status=ProvenanceStatus.FAILED
+            )
+            return AccountRebuildResult(
+                status="failed",
+                critical_mismatch_total=total_critical,
+                error_message=f"runtime group {group.runtime_id!r} produced no broker snapshot",
+            )
+        pending = [order for order in snapshot.orders if not order.status.is_terminal]
+        if pending:
+            _mark_provenance(
+                account_database, account_key=account_key, status=ProvenanceStatus.FAILED
+            )
+            return AccountRebuildResult(
+                status="failed",
+                critical_mismatch_total=total_critical,
+                error_message=(
+                    f"runtime group {group.runtime_id!r} still has {len(pending)} "
+                    "non-terminal broker order(s)"
+                ),
+            )
+        local_security_ids = {
+            position.security_id
+            for position in group.local_positions
+            if position.status == "OPEN" and position.quantity != 0
+        }
+        rebuilt_positions.extend(
+            (group, position)
+            for position in snapshot.positions
+            if position.security_id in local_security_ids and position.quantity != 0
+        )
+
+    now = datetime.now(UTC).isoformat()
+    with account_database.transaction(immediate=True) as conn:
+        conn.execute(
+            "DELETE FROM live_open_positions WHERE account_key = ?", (account_key,)
+        )
+        conn.execute(
+            "DELETE FROM live_position_mtm WHERE account_key = ?", (account_key,)
+        )
+        # A successful full broker reconciliation is the sole authority that
+        # may resolve UNKNOWN.  Preserve that state transition explicitly in
+        # the ledger before releasing the now-accounted-for reservation.
+        conn.execute(
+            "UPDATE live_risk_reservations SET state = 'RECONCILED', updated_at = ? "
+            "WHERE account_key = ? AND state IN "
+            "('RESERVED','SUBMITTED','ACKNOWLEDGED','PARTIALLY_FILLED','UNKNOWN')",
+            (now, account_key),
+        )
+        conn.execute(
+            "UPDATE live_risk_reservations SET state = 'RELEASED', updated_at = ? "
+            "WHERE account_key = ? AND state = 'RECONCILED'",
+            (now, account_key),
+        )
+        for group, position in rebuilt_positions:
+            conn.execute(
+                "INSERT INTO live_open_positions "
+                "(account_key, runtime_id, strategy_id, security_id, quantity, "
+                "average_price, deployed_capital, opened_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    account_key,
+                    group.runtime_id,
+                    group.strategy_id,
+                    position.security_id,
+                    position.quantity,
+                    position.average_price,
+                    abs(position.quantity) * position.average_price,
+                    now,
+                    now,
+                ),
+            )
 
     _mark_provenance(account_database, account_key=account_key, status=ProvenanceStatus.RECONCILED)
     log.info(

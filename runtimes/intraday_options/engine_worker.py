@@ -67,6 +67,7 @@ from typing import Any
 
 from common.broker import build_broker
 from common.broker.quotes import QuoteBook
+from common.config.models import ExecutionMode
 from common.config.paths import load_paths
 from common.engine.config import EngineConfig, SessionConfig
 from common.engine.daily_guard import DailyRiskRecovery
@@ -74,7 +75,13 @@ from common.engine.engine import TradingEngine
 from common.engine.feed import SubscriptionMode
 from common.engine.gateway import LifecycleGateway
 from common.engine.hub_feed import HubTickFeed
-from common.engine.models import AdoptedPosition, OptionContract, OptionType, OrderSide
+from common.engine.models import (
+    AdoptedPosition,
+    OpenPosition,
+    OptionContract,
+    OptionType,
+    OrderSide,
+)
 from common.engine.positions import PositionManager
 from common.engine.reporting_bindings import HeartbeatEngineReporter, RepositoryReportWriter
 from common.engine.selection import (
@@ -477,8 +484,9 @@ def run_engine(
         config.pid_dir.parent, config.runtime_id, config.strategy_id
     )
 
+    live_close: Callable[[], None] | None = None
     try:
-        engine, gateway, feed, positions, recovered = _build(
+        engine, gateway, feed, positions, recovered, live_close = _build(
             config,
             engine_config,
             repository=repository,
@@ -502,7 +510,12 @@ def run_engine(
             )
         )
         requested = _drive(engine, config, candle_queue)
+        if live_close is not None:
+            live_close()
+            live_close = None
     except Exception as exc:
+        if live_close is not None:
+            live_close()
         outcome.exit_code = 1
         outcome.error = str(exc)
         repository.record_error(
@@ -604,7 +617,14 @@ def _build(
     tick_queue: Any,
     control_queue: Any,
     square_off_request_file: Path,
-) -> tuple[TradingEngine, LifecycleGateway, HubTickFeed, PositionManager, _Recovered]:
+) -> tuple[
+    TradingEngine,
+    LifecycleGateway,
+    HubTickFeed,
+    PositionManager,
+    _Recovered,
+    Callable[[], None] | None,
+]:
     """Assemble the engine and everything behind it."""
     option_selector, option_segment = build_option_selector(config, engine_config)
     # Full (21) is the only mode carrying a bid/ask book, and the paper fill model
@@ -627,16 +647,41 @@ def _build(
     # to validate synthetic contracts against would reject correct orders.
     instrument_rules = getattr(option_selector.resolver, "instrument_rules", None)
 
-    # The live gate stays where Phase 1 put it (deviation D5/D19): the factory
-    # refuses live, and the engine's arrival does not get its own opinion about it.
-    broker = build_broker(
-        resolved_config_from_worker(config),
-        preflight_passed=config.live_preflight_passed,
-        paper_execution=config.paper_execution,
-        cost_rates=config.cost_rates,
-        quotes=quotes,
-        instrument_rules=instrument_rules,
-    )
+    live_context = None
+    if config.execution_mode is ExecutionMode.LIVE:
+        if instrument_rules is None or option_segment is None:
+            raise RuntimeError(
+                "live execution requires the Dhan contract resolver and authoritative "
+                "instrument rules"
+            )
+        from common.config import load_settings
+        from common.market_data.scrip_master import resolve_index_meta
+
+        from .live_runtime import prepare_live_runtime
+
+        meta = resolve_index_meta(
+            config.instrument,
+            index_security_id=engine_config.index_security_id or None,
+            index_segment=engine_config.index_segment or None,
+            fno_segment=engine_config.fno_segment or None,
+        )
+        live_context = prepare_live_runtime(
+            config,
+            repository=repository,
+            settings=load_settings(),
+            exchange_segment=meta.fno_segment,
+            instrument_rules=instrument_rules,
+        )
+        broker = live_context.broker
+    else:
+        broker = build_broker(
+            resolved_config_from_worker(config),
+            preflight_passed=config.live_preflight_passed,
+            paper_execution=config.paper_execution,
+            cost_rates=config.cost_rates,
+            quotes=quotes,
+            instrument_rules=instrument_rules,
+        )
     lifecycle = OrderLifecycle(
         repository=repository,
         broker=broker,
@@ -646,6 +691,13 @@ def _build(
         session_id=session_id,
         config_fingerprint=config.config_fingerprint,
         quotes=quotes,
+        account_reservation_gate=(
+            live_context.reservation_gate if live_context is not None else None
+        ),
+        account_key=live_context.account_key if live_context is not None else None,
+        account_risk_limits=(
+            live_context.risk_limits if live_context is not None else None
+        ),
     )
     gateway = LifecycleGateway(
         lifecycle,
@@ -778,6 +830,18 @@ def _build(
             lowest_favourable=lowest_favourable,
         )
 
+    def _publish_account_mtm(position: OpenPosition, as_of: datetime) -> None:
+        if live_context is None:  # pragma: no cover - callback is live-only
+            return
+        live_context.reservation_gate.record_mtm(
+            account_key=live_context.account_key,
+            runtime_id=config.runtime_id,
+            strategy_id=config.strategy_id,
+            security_id=position.contract.security_id,
+            unrealised_pnl=position.unrealised_pnl,
+            as_of=as_of,
+        )
+
     engine = TradingEngine(
         cfg,
         feed=feed,
@@ -808,11 +872,19 @@ def _build(
         recover_exit_state=_recover_exit_state,
         persist_exit_state=_persist_exit_state,
         persist_position_marks=_persist_position_marks,
+        publish_account_mtm=_publish_account_mtm if live_context is not None else None,
         warmup_manager=warmup_manager,
         warmup_source=warmup_source,
     )
     holder.append(engine)
-    return engine, gateway, feed, positions, recovered
+    return (
+        engine,
+        gateway,
+        feed,
+        positions,
+        recovered,
+        live_context.close if live_context is not None else None,
+    )
 
 
 def build_option_selector(

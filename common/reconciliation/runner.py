@@ -29,7 +29,7 @@ from .compare import (
     compare_orders,
     compare_positions,
 )
-from .snapshot import fetch_broker_snapshot
+from .snapshot import BrokerSnapshot, fetch_broker_snapshot
 
 log = get_logger(__name__)
 
@@ -48,6 +48,7 @@ class ReconciliationResult:
     entries_blocked: bool
     mismatches: tuple[Mismatch, ...]
     error_message: str | None = None
+    broker_snapshot: BrokerSnapshot | None = None
 
 
 class ReconciliationRunner:
@@ -83,6 +84,7 @@ class ReconciliationRunner:
                 entries_blocked=True,
                 mismatches=(),
                 error_message=str(exc),
+                broker_snapshot=None,
             )
 
         order_mismatches = compare_orders(local_orders, broker_snapshot.orders)
@@ -116,6 +118,7 @@ class ReconciliationRunner:
             critical_mismatch_count=critical_count,
             entries_blocked=entries_blocked,
             mismatches=tuple(mismatches),
+            broker_snapshot=broker_snapshot,
         )
 
     # ------------------------------------------------------------- persistence

@@ -28,12 +28,15 @@ turns the stub the other way, to prove the refusal itself.
 
 from __future__ import annotations
 
+import inspect
 import sqlite3
 from pathlib import Path
 
 import pytest
 
+import runtimes.intraday_options.__main__ as runtime_main
 from common.config import load_paths
+from common.execution import ModeTransitionDecision
 from common.market_data import RecordedFeedAdapter, load_tick_tape
 from common.process.legacy_guard import LaunchdLabelState, LegacySystemStatus
 from runtimes.intraday_options.__main__ import (
@@ -120,6 +123,38 @@ def _admitted_ids(supervisor) -> set[str]:
     # adding a public one for a single test would outrun what anything else
     # needs.
     return {config.strategy_id for config, _ in supervisor._workers}
+
+
+def test_real_entrypoint_supplies_the_production_live_preflight_callback():
+    """Regression for the Phase-10 production-call-site gap."""
+    source = inspect.getsource(runtime_main.main)
+    assert "live_preflight_passed_for=" in source
+    assert "parent_live_preflight_passed" in source
+
+
+def test_disabled_strategy_is_checked_as_a_disable_transition(
+    populated_config, adapter, tmp_path, monkeypatch
+):
+    _write(
+        populated_config / "strategies" / "io_bravo.yaml",
+        "strategy_id: io_bravo\nenabled: false\nparameters:\n"
+        "  instrument: NIFTY\n  security_id: '222'\n",
+    )
+    seen: dict[str, object] = {}
+
+    def check(_repository, *, strategy_id, new_mode, **_kwargs):
+        seen[strategy_id] = new_mode
+        return ModeTransitionDecision(True)
+
+    monkeypatch.setattr(runtime_main, "check_mode_transition_safety", check)
+    build_supervisor(
+        runtime_id=RUNTIME_ID,
+        config_root=populated_config,
+        paths=load_paths(tmp_path),
+        adapter=adapter,
+    )
+
+    assert seen["io_bravo"] is None
 
 
 def test_with_no_filter_every_enabled_strategy_is_admitted(populated_config, adapter, tmp_path):

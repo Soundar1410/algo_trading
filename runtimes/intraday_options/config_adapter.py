@@ -42,7 +42,7 @@ from datetime import time
 from pathlib import Path
 from typing import Any
 
-from common.config import ConfigError, ResolvedConfig, StrategyConfig, fingerprint
+from common.config import ConfigError, ExecutionMode, ResolvedConfig, StrategyConfig, fingerprint
 from common.risk import SquareOffPolicy
 
 from .worker import EngineWorkerConfig, WorkerConfig
@@ -102,6 +102,8 @@ def build_worker_config(
     log_dir: Path,
     trading_date: str,
     live_preflight_passed: bool = False,
+    account_shared_database_path: Path | None = None,
+    token_cache_dir: Path | None = None,
 ) -> WorkerConfig:
     """Build the ``WorkerConfig`` for one enabled strategy.
 
@@ -165,12 +167,23 @@ def build_worker_config(
         live_preflight_passed=live_preflight_passed,
         live_quantity_lots=cfg.strategy.live_quantity_lots,
         live_expected_static_ip=live_preflight.expected_static_ip,
+        live_egress_ip_provider=live_preflight.egress_ip_provider,
         live_max_preflight_age_seconds=live_preflight.max_preflight_age_seconds,
+        live_rate_limit_rules=tuple(
+            (rule.call_class.value, rule.limit, rule.window_seconds)
+            for rule in live_preflight.rate_limits.rules
+        ),
         live_rate_limit_new_order_limit=(new_order_rule.limit if new_order_rule else None),
         live_rate_limit_new_order_window_seconds=(
             new_order_rule.window_seconds if new_order_rule else None
         ),
         live_max_daily_loss=live_preflight.account_risk.max_daily_loss,
+        live_max_open_positions=live_preflight.account_risk.max_open_positions,
+        live_max_open_legs=live_preflight.account_risk.max_open_legs,
+        live_max_deployed_capital=live_preflight.account_risk.max_deployed_capital,
+        live_max_mtm_age_seconds=live_preflight.account_risk.max_mtm_age_seconds,
+        account_shared_database_path=account_shared_database_path,
+        token_cache_dir=token_cache_dir,
     )
 
 
@@ -196,6 +209,17 @@ def _build_engine_worker_config(
         )
     daily_max_loss_pct = parameters.get("daily_max_loss_pct")
     strategy_kwargs = dict(parameters.get("strategy_kwargs") or {})
+    if strategy.mode is ExecutionMode.LIVE:
+        if strategy.live_quantity_lots is None:  # defence beyond ResolvedConfig
+            raise ConfigError("a live engine strategy has no live_quantity_lots")
+        lots = strategy.live_quantity_lots
+    else:
+        lots = int(
+            strategy_kwargs.get(
+                "lots_per_trade",
+                parameters.get("lots_per_trade", parameters.get("lots", 1)),
+            )
+        )
     return EngineWorkerConfig(
         strategy_ref=strategy_ref,
         strategy_kwargs=strategy_kwargs,
@@ -210,11 +234,7 @@ def _build_engine_worker_config(
         # parameters.lots_per_trade/.lots is accepted only as a fallback, for
         # a future strategy whose constructor does not nest sizing under
         # strategy_kwargs.
-        lots=int(
-            strategy_kwargs.get(
-                "lots_per_trade", parameters.get("lots_per_trade", parameters.get("lots", 1))
-            )
-        ),
+        lots=lots,
         strike_step=int(parameters.get("strike_step", 50)),
         lot_size=int(parameters.get("lot_size", 50)),
         expiry=parameters.get("expiry"),

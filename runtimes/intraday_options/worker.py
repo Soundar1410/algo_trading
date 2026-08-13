@@ -278,10 +278,18 @@ class WorkerConfig:
     #: values from ``runtime.live_preflight`` in the source YAML, populated
     #: by ``config_adapter.py::build_worker_config``.
     live_expected_static_ip: str | None = None
+    live_egress_ip_provider: str | None = None
     live_max_preflight_age_seconds: int | None = None
+    live_rate_limit_rules: tuple[tuple[str, int, int], ...] = ()
     live_rate_limit_new_order_limit: int | None = None
     live_rate_limit_new_order_window_seconds: int | None = None
     live_max_daily_loss: float | None = None
+    live_max_open_positions: int | None = None
+    live_max_open_legs: int | None = None
+    live_max_deployed_capital: float | None = None
+    live_max_mtm_age_seconds: int | None = None
+    account_shared_database_path: Path | None = None
+    token_cache_dir: Path | None = None
 
 
 @dataclass
@@ -932,8 +940,17 @@ def resolved_config_from_worker(config: WorkerConfig) -> Any:
         StrategyConfig,
     )
 
-    rate_rules: tuple[RateLimitRule, ...] = ()
+    rate_rules = tuple(
+        RateLimitRule(
+            call_class=RateLimitCallClass(call_class),
+            limit=limit,
+            window_seconds=window_seconds,
+        )
+        for call_class, limit, window_seconds in config.live_rate_limit_rules
+    )
     if (
+        not rate_rules
+        and
         config.live_rate_limit_new_order_limit is not None
         and config.live_rate_limit_new_order_window_seconds is not None
     ):
@@ -953,9 +970,16 @@ def resolved_config_from_worker(config: WorkerConfig) -> Any:
             live_execution_allowed=config.runtime_live_execution_allowed,
             live_preflight=LivePreflightConfig(
                 expected_static_ip=config.live_expected_static_ip,
+                egress_ip_provider=config.live_egress_ip_provider,
                 max_preflight_age_seconds=config.live_max_preflight_age_seconds,
                 rate_limits=LiveOrderRateLimitConfig(rules=rate_rules),
-                account_risk=AccountRiskConfig(max_daily_loss=config.live_max_daily_loss),
+                account_risk=AccountRiskConfig(
+                    max_daily_loss=config.live_max_daily_loss,
+                    max_open_positions=config.live_max_open_positions,
+                    max_open_legs=config.live_max_open_legs,
+                    max_deployed_capital=config.live_max_deployed_capital,
+                    max_mtm_age_seconds=config.live_max_mtm_age_seconds,
+                ),
             ),
         ),
         strategy=StrategyConfig(

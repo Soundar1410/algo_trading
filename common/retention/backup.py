@@ -15,6 +15,7 @@ migration runs, and prune old copies.
 from __future__ import annotations
 
 import sqlite3
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -68,6 +69,48 @@ def backup_database(
     _log.info("backed up %s to %s", db_path, dest)
     _prune_backups(db_path, backup_dir, retain_count=retain_count)
     return dest
+
+
+def verify_backup_restorable(backup_path: Path) -> None:
+    """Prove that a freshly-created snapshot can be opened and restored.
+
+    A successful ``sqlite3.Connection.backup`` call is not, by itself, a
+    rollback test.  Controlled startup calls this immediately after creating
+    the pre-migration snapshot and before authorising a reviewed-destructive
+    migration.  The temporary restore deliberately uses SQLite's backup API in
+    the opposite direction and then runs both integrity checks against the
+    restored file.  Nothing in the live operational database is modified.
+    """
+    source_path = Path(backup_path)
+    if not source_path.is_file():
+        raise FileNotFoundError(f"backup does not exist: {source_path}")
+
+    with tempfile.TemporaryDirectory(prefix="algo_backup_restore_") as directory:
+        restored_path = Path(directory) / source_path.name
+        source = sqlite3.connect(str(source_path))
+        try:
+            restored = sqlite3.connect(str(restored_path))
+            try:
+                source.backup(restored)
+            finally:
+                restored.close()
+        finally:
+            source.close()
+
+        check = sqlite3.connect(str(restored_path))
+        try:
+            integrity = [row[0] for row in check.execute("PRAGMA integrity_check").fetchall()]
+            if integrity != ["ok"]:
+                raise sqlite3.DatabaseError(
+                    f"restored backup failed integrity_check: {integrity}"
+                )
+            foreign_keys = check.execute("PRAGMA foreign_key_check").fetchall()
+            if foreign_keys:
+                raise sqlite3.DatabaseError(
+                    f"restored backup failed foreign_key_check: {foreign_keys}"
+                )
+        finally:
+            check.close()
 
 
 def _prune_backups(db_path: Path, backup_dir: Path, *, retain_count: int) -> int:

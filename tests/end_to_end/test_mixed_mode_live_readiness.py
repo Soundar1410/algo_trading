@@ -47,6 +47,7 @@ live_execution_allowed: false
 shared_market_feed: true
 live_preflight:
   expected_static_ip: '203.0.113.10'
+  egress_ip_provider: test
   max_preflight_age_seconds: 300
   rate_limits:
     rules:
@@ -58,8 +59,21 @@ live_preflight:
       - call_class: new_order
         limit: 5
         window_seconds: 1
+      - call_class: modify
+        limit: 5
+        window_seconds: 1
+      - call_class: cancel
+        limit: 5
+        window_seconds: 1
+      - call_class: read
+        limit: 5
+        window_seconds: 1
   account_risk:
     max_daily_loss: 5000.0
+    max_open_positions: 2
+    max_open_legs: 2
+    max_deployed_capital: 100000.0
+    max_mtm_age_seconds: 30
 """
 
 _PAPER_EXECUTION_BLOCK = """
@@ -213,3 +227,40 @@ def test_correlation_ids_and_mode_stay_separated_for_the_admitted_paper_strategy
     for row in rows:
         assert row["execution_mode"] == "paper"
         assert is_paper(row["correlation_id"])
+
+
+def test_live_fixture_is_admitted_only_when_the_supplied_preflight_passes(
+    mixed_mode_config_root: Path, tmp_path: Path, tick_tape_path: Path
+):
+    """Code-level wiring proof; no worker is started and no network is used."""
+    global_path = mixed_mode_config_root / "global.yaml"
+    _write(
+        global_path,
+        GLOBAL_YAML_LIVE_DISABLED.replace(
+            "live_trading_enabled: false", "live_trading_enabled: true"
+        ),
+    )
+    runtime_path = mixed_mode_config_root / "runtimes" / f"{RUNTIME_ID}.yaml"
+    _write(
+        runtime_path,
+        RUNTIME_YAML.replace(
+            "live_execution_allowed: false", "live_execution_allowed: true"
+        ),
+    )
+    calls: list[str] = []
+
+    def preflight(cfg) -> bool:
+        calls.append(cfg.strategy.strategy_id)
+        return True
+
+    supervisor = build_supervisor(
+        runtime_id=RUNTIME_ID,
+        config_root=mixed_mode_config_root,
+        paths=_paths(tmp_path),
+        adapter=RecordedFeedAdapter(load_tick_tape(tick_tape_path)),
+        live_preflight_passed_for=preflight,
+    )
+
+    admitted = {config.strategy_id for config, _channel in supervisor._workers}
+    assert calls == ["live_fixture_mixed_mode"]
+    assert admitted == {"paper_fixture_mixed_mode", "live_fixture_mixed_mode"}

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from common.config.models import ExecutionMode, effective_live_gate
+from common.config.models import ExecutionMode, RateLimitCallClass, effective_live_gate
 from runtimes.intraday_options.worker import WorkerConfig, resolved_config_from_worker
 
 
@@ -30,6 +30,23 @@ def _worker_config(**overrides) -> WorkerConfig:
     return WorkerConfig(**base)
 
 
+def _complete_live_fields() -> dict[str, object]:
+    return {
+        "live_quantity_lots": 1,
+        "live_expected_static_ip": "203.0.113.10",
+        "live_egress_ip_provider": "test",
+        "live_max_preflight_age_seconds": 300,
+        "live_rate_limit_rules": tuple(
+            (call_class.value, 5, 1) for call_class in RateLimitCallClass
+        ),
+        "live_max_daily_loss": 5000.0,
+        "live_max_open_positions": 2,
+        "live_max_open_legs": 2,
+        "live_max_deployed_capital": 100_000.0,
+        "live_max_mtm_age_seconds": 30,
+    }
+
+
 def test_every_new_field_defaults_to_the_fail_closed_value():
     config = _worker_config()
     assert config.global_live_trading_enabled is False
@@ -47,15 +64,7 @@ def test_a_default_worker_config_produces_a_fully_blocked_live_gate():
     validator — see config_adapter.py, which only ever builds a
     WorkerConfig from an already-valid ResolvedConfig), every gate boolean
     default stays closed."""
-    config = _worker_config(
-        execution_mode=ExecutionMode.LIVE,
-        live_quantity_lots=1,
-        live_expected_static_ip="203.0.113.10",
-        live_max_preflight_age_seconds=300,
-        live_rate_limit_new_order_limit=5,
-        live_rate_limit_new_order_window_seconds=60,
-        live_max_daily_loss=5000.0,
-    )
+    config = _worker_config(execution_mode=ExecutionMode.LIVE, **_complete_live_fields())
     resolved = resolved_config_from_worker(config)
     decision = effective_live_gate(resolved, preflight_passed=config.live_preflight_passed)
     assert not decision.allowed
@@ -65,6 +74,7 @@ def test_real_global_live_trading_enabled_value_reaches_the_gate():
     """The core fix: unlike the old stub (hard-coded False no matter what),
     a genuinely-true value must actually reach effective_live_gate."""
     config = _worker_config(
+        **_complete_live_fields(),
         execution_mode=ExecutionMode.LIVE,
         global_live_trading_enabled=True,
         runtime_enabled=True,
@@ -72,12 +82,6 @@ def test_real_global_live_trading_enabled_value_reaches_the_gate():
         strategy_enabled=True,
         strategy_live_approved=True,
         live_preflight_passed=True,
-        live_quantity_lots=1,
-        live_expected_static_ip="203.0.113.10",
-        live_max_preflight_age_seconds=300,
-        live_rate_limit_new_order_limit=5,
-        live_rate_limit_new_order_window_seconds=60,
-        live_max_daily_loss=5000.0,
     )
     resolved = resolved_config_from_worker(config)
     decision = effective_live_gate(resolved, preflight_passed=config.live_preflight_passed)
@@ -88,6 +92,7 @@ def test_each_gate_field_alone_still_blocks_when_the_others_are_true():
     """Mirrors test_broker_factory.py's own
     test_every_single_gate_alone_is_enough_to_block, at this layer."""
     base_true = dict(
+        **_complete_live_fields(),
         execution_mode=ExecutionMode.LIVE,
         global_live_trading_enabled=True,
         runtime_enabled=True,
@@ -95,12 +100,6 @@ def test_each_gate_field_alone_still_blocks_when_the_others_are_true():
         strategy_enabled=True,
         strategy_live_approved=True,
         live_preflight_passed=True,
-        live_quantity_lots=1,
-        live_expected_static_ip="203.0.113.10",
-        live_max_preflight_age_seconds=300,
-        live_rate_limit_new_order_limit=5,
-        live_rate_limit_new_order_window_seconds=60,
-        live_max_daily_loss=5000.0,
     )
     for field in (
         "global_live_trading_enabled",
@@ -127,23 +126,24 @@ def test_a_paper_worker_config_needs_no_live_preflight_fields_at_all():
     assert resolved.strategy.live_quantity_lots is None
 
 
-def test_the_new_order_rate_rule_round_trips():
+def test_every_rate_rule_round_trips():
+    live_fields = _complete_live_fields()
+    live_fields["live_rate_limit_rules"] = tuple(
+        (call_class.value, 7 if call_class is RateLimitCallClass.NEW_ORDER else 5, 45)
+        for call_class in RateLimitCallClass
+    )
     config = _worker_config(
+        **live_fields,
         execution_mode=ExecutionMode.LIVE,
         global_live_trading_enabled=True,
         runtime_enabled=True,
         runtime_live_execution_allowed=True,
         strategy_enabled=True,
         strategy_live_approved=True,
-        live_quantity_lots=1,
-        live_expected_static_ip="203.0.113.10",
-        live_max_preflight_age_seconds=300,
-        live_rate_limit_new_order_limit=7,
-        live_rate_limit_new_order_window_seconds=45,
-        live_max_daily_loss=5000.0,
     )
     resolved = resolved_config_from_worker(config)
     rules = resolved.runtime.live_preflight.rate_limits.rules
-    assert len(rules) == 1
-    assert rules[0].limit == 7
-    assert rules[0].window_seconds == 45
+    assert len(rules) == 4
+    new_order = next(rule for rule in rules if rule.call_class is RateLimitCallClass.NEW_ORDER)
+    assert new_order.limit == 7
+    assert new_order.window_seconds == 45

@@ -106,6 +106,7 @@ def test_a_successful_rebuild_across_every_group_marks_reconciled(tmp_path: Path
         runtime_groups=[
             RuntimeGroupSnapshot(
                 runtime_id="intraday_options",
+                strategy_id="st01",
                 broker=broker,
                 local_orders=[],
                 local_positions=[],
@@ -131,6 +132,7 @@ def test_a_failed_group_reconciliation_marks_the_whole_rebuild_failed(tmp_path: 
         runtime_groups=[
             RuntimeGroupSnapshot(
                 runtime_id="intraday_options",
+                strategy_id="st01",
                 broker=broker,
                 local_orders=[],
                 local_positions=[],
@@ -160,6 +162,7 @@ def test_rebuild_covers_every_configured_group_not_just_the_first(tmp_path: Path
         runtime_groups=[
             RuntimeGroupSnapshot(
                 runtime_id="intraday_options",
+                strategy_id="st01",
                 broker=io_broker,
                 local_orders=[],
                 local_positions=[],
@@ -167,6 +170,7 @@ def test_rebuild_covers_every_configured_group_not_just_the_first(tmp_path: Path
             ),
             RuntimeGroupSnapshot(
                 runtime_id="positional_options",
+                strategy_id="st02",
                 broker=po_broker,
                 local_orders=[],
                 local_positions=[],
@@ -176,7 +180,7 @@ def test_rebuild_covers_every_configured_group_not_just_the_first(tmp_path: Path
         lock_path=tmp_path / "locks" / "account_rebuild.lock",
     )
 
-    assert result.status == "reconciled"
+    assert result.status == "failed"
     assert result.critical_mismatch_total == 1  # the intraday_options group's BROKER_ONLY order
 
 
@@ -189,7 +193,6 @@ def test_a_missing_group_snapshot_leaves_that_groups_state_untrusted(tmp_path: P
     result = rebuild_account_shared_state(
         account_db, account_key="acct1", runtime_groups=[], lock_path=tmp_path / "locks" / "l.lock"
     )
-    # Zero groups reconciled "successfully" (vacuously) — but note this is a
-    # caller misconfiguration to avoid, not a safe default to rely on.
-    assert result.status == "reconciled"
+    assert result.status == "failed"
     assert result.critical_mismatch_total == 0
+    assert get_provenance(account_db, account_key="acct1") == ProvenanceStatus.FAILED

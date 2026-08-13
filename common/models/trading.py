@@ -206,6 +206,10 @@ class OrderIntent:
     config_fingerprint: str | None = None
     risk_decision: RiskDecision = RiskDecision.ALLOWED
     risk_reason: str | None = None
+    # True only when this order can reduce an existing same-instrument
+    # position without crossing through zero. Live safety gates use this to
+    # keep account-loss/entry-readiness checks from trapping open exposure.
+    risk_reducing: bool = False
 
     @property
     def correlation_namespace(self) -> str:

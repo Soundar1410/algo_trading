@@ -48,8 +48,17 @@ def _hammer_rate_limit(db_path: str, account_key: str, result_queue) -> None:  #
 
 def test_shared_rate_limit_holds_across_two_runtime_groups_real_processes(tmp_path: Path):
     db_path = tmp_path / "dhan_account_shared.db"
-    migrate_account_shared_database(open_account_shared_database(db_path))
+    database = open_account_shared_database(db_path)
+    migrate_account_shared_database(database)
     account_key = "acct_shared"
+    with database.transaction() as conn:
+        conn.execute(
+            "INSERT INTO live_account_state_provenance "
+            "(account_key, reconciliation_status, last_reconciled_at, established_at) "
+            "VALUES (?, 'reconciled', ?, ?)",
+            (account_key, NOW_ISO, NOW_ISO),
+        )
+    database.close()
 
     # 2 processes * 8 attempts = 16, comfortably exceeding the 10-order limit
     # — if the limiter were scoped per runtime_id rather than per account,
@@ -120,8 +129,17 @@ def test_account_risk_capacity_is_shared_across_two_runtime_groups_real_processe
     groups authenticated to the same account cannot each independently
     reserve up to the full cap."""
     db_path = tmp_path / "dhan_account_shared.db"
-    migrate_account_shared_database(open_account_shared_database(db_path))
+    database = open_account_shared_database(db_path)
+    migrate_account_shared_database(database)
     account_key = "acct_shared"
+    with database.transaction() as conn:
+        conn.execute(
+            "INSERT INTO live_account_state_provenance "
+            "(account_key, reconciliation_status, last_reconciled_at, established_at) "
+            "VALUES (?, 'reconciled', ?, ?)",
+            (account_key, NOW_ISO, NOW_ISO),
+        )
+    database.close()
 
     # Each process attempts 5 reservations of 20,000 capital = up to 100,000
     # each; the shared cap is 100,000 for the *account*, not per group. If

@@ -103,6 +103,19 @@ from .adapter import TickCallback
 
 _log = get_logger(__name__)
 
+
+def build_dhan_order_client(*, client_id: str, access_token: str) -> Any:
+    """Construct the pinned SDK client for live order/read operations.
+
+    Keeping this tiny factory here preserves the repository's enforced SDK
+    import boundary: broker/runtime code depends on a narrow protocol and never
+    imports ``dhanhq`` itself.  The import remains lazy, so paper workers and
+    the test suite do not load the SDK order surface.
+    """
+    from dhanhq import dhanhq
+
+    return dhanhq(client_id, access_token)
+
 #: Subscription modes, as the v2 protocol numbers them. Ticker gives last price
 #: and time, which is all a candle needs. Quote adds traded quantity, volume and
 #: session OHLC — **not** depth, despite what this comment claimed before Phase 4

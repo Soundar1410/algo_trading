@@ -19,8 +19,9 @@ implementation:
    :class:`LiveBrokerDependencies` bundle (client, segment, product type,
    correlation-id-derived identity are all worker-level concerns, wired in
    ``runtimes/intraday_options``, not invented here). Without one, this
-   function refuses exactly as it always has — every committed config stays
-   incapable of live execution regardless of this module's own capability.
+   function refuses. The production live worker supplies it only after its
+   own preflight/reconciliation path; every committed config still blocks
+   before that path because all live-enabling values remain false.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ from common.config.models import ExecutionMode, ResolvedConfig, effective_live_g
 from common.logging import get_logger
 
 from .base import Broker
-from .dhan_live import DhanLiveBroker, DhanOrderClient
+from .dhan_live import DhanLiveBroker, DhanOrderClient, LiveCallGuard, LiveOrderUpdates
 from .paper import InstrumentRulesLookup, PaperBroker
 from .quotes import QuoteBook
 
@@ -49,13 +50,15 @@ class LiveBrokerDependencies:
     that ``build_broker`` cannot derive from ``ResolvedConfig`` alone.
     Constructing one of these at all is itself a worker-level decision
     (Dhan credentials, the resolved contract's exchange segment) — nothing
-    in this module manufactures one; its absence is why every committed
-    config stays incapable of live execution regardless of the gate.
+    in this module manufactures one; production constructs it only inside the
+    live worker after local safety checks.
     """
 
     client: DhanOrderClient
     exchange_segment: str
     product_type: str
+    call_guard: LiveCallGuard
+    order_updates: LiveOrderUpdates | None = None
 
 
 def build_broker(
@@ -127,6 +130,12 @@ def build_broker(
             "LiveBrokerDependencies were supplied — refusing rather than guessing a "
             "Dhan client, exchange segment or product type."
         )
+    if instrument_rules is None:
+        raise LiveExecutionBlocked(
+            f"Strategy {cfg.strategy.strategy_id!r} passed the live gate, but no "
+            "authoritative instrument rules were supplied. Live quantity/lot/tick "
+            "validation cannot be skipped."
+        )
 
     _log.info(
         "routing strategy to DhanLiveBroker strategy_id=%s runtime_id=%s",
@@ -137,4 +146,8 @@ def build_broker(
         client=live_dependencies.client,
         exchange_segment=live_dependencies.exchange_segment,
         product_type=live_dependencies.product_type,
+        call_guard=live_dependencies.call_guard,
+        instrument_rules=instrument_rules,
+        max_quantity_lots=int(cfg.strategy.live_quantity_lots or 0),
+        order_updates=live_dependencies.order_updates,
     )

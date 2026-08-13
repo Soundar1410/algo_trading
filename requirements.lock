@@ -36,9 +36,9 @@ MarkupSafe==3.0.3
 mypy==2.3.0
 mypy_extensions==1.1.0
 narwhals==2.24.0
-numpy==2.4.6
+numpy==2.3.5
 packaging==26.2
-pandas==3.0.5
+pandas==2.3.3
 pandas-ta-classic==0.6.52
 pathspec==1.1.1
 pillow==12.3.0
@@ -54,6 +54,7 @@ pydeck==0.9.3
 Pygments==2.20.0
 pyOpenSSL==26.3.0
 PyOTP==2.10.0
+pytz==2026.3.post1
 pytest==9.1.1
 pytest-cov==7.1.0
 python-dateutil==2.9.0.post0
@@ -74,6 +75,7 @@ types-PyYAML==6.0.12.20260724
 types-psutil==7.2.2.20260518
 typing-inspection==0.4.2
 typing_extensions==4.16.0
+tzdata==2026.3
 urllib3==2.7.0
 uvicorn==0.51.0
 websockets==16.1.1

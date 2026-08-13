@@ -196,8 +196,8 @@ def test_live_to_paper_with_live_history_but_no_broker_wired_is_refused(tmp_path
     assert "cannot prove" in decision.reason
 
 
-def test_live_to_paper_requires_a_fresh_successful_reconciliation(tmp_path: Path):
-    """A clean, matching reconciliation permits the transition."""
+def test_live_to_paper_still_blocks_matching_open_broker_exposure(tmp_path: Path):
+    """Reconciliation proving exposure matches does not prove it is flat."""
     repository = _repository(tmp_path)
     _open_a_position(
         repository, mode=ExecutionMode.LIVE, trading_date="2026-08-13", correlation_id="l1"
@@ -229,7 +229,8 @@ def test_live_to_paper_requires_a_fresh_successful_reconciliation(tmp_path: Path
         broker=broker,
         reconciliation_runner=reconciliation_runner,
     )
-    assert decision.allowed
+    assert not decision.allowed
+    assert "open live position" in decision.reason
 
 
 def test_live_to_paper_is_blocked_by_a_critical_mismatch(tmp_path: Path):

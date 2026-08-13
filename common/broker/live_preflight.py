@@ -17,6 +17,7 @@ import hmac
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from importlib import import_module
 from typing import Protocol
 
 
@@ -110,6 +111,30 @@ class FakeEgressIpProvider:
 
     def current_public_ip(self) -> str | None:
         return self._ip
+
+
+def load_egress_ip_provider(reference: str | None) -> EgressIpProvider | None:
+    """Load an operator-approved provider from ``"module:attribute"``.
+
+    No provider implementation is shipped: choosing an external IP-echo
+    service or local infrastructure source remains a separate operational
+    approval.  This loader closes the runtime wiring seam without making that
+    choice.  A missing, malformed, raising, or incompatible reference returns
+    ``None`` so :func:`check_static_ip` blocks; it never substitutes a network
+    service or trusts the configured IP by itself.
+    """
+    if not reference:
+        return None
+    module_name, separator, attribute_name = reference.partition(":")
+    if not separator or not module_name or not attribute_name:
+        return None
+    try:
+        candidate = getattr(import_module(module_name), attribute_name)
+        provider = candidate() if callable(candidate) else candidate
+        method = getattr(provider, "current_public_ip", None)
+    except Exception:
+        return None
+    return provider if callable(method) else None
 
 
 def check_static_ip(

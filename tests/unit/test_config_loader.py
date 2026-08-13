@@ -328,11 +328,21 @@ def test_absent_env_override_leaves_config_untouched():
 #: existing assertion in this file unchanged.
 _COMPLETE_LIVE_PREFLIGHT = LivePreflightConfig(
     expected_static_ip="203.0.113.10",
+    egress_ip_provider="test",
     max_preflight_age_seconds=300,
     rate_limits=LiveOrderRateLimitConfig(
-        rules=(RateLimitRule(call_class=RateLimitCallClass.NEW_ORDER, limit=5, window_seconds=60),)
+        rules=tuple(
+            RateLimitRule(call_class=call_class, limit=5, window_seconds=1)
+            for call_class in RateLimitCallClass
+        )
     ),
-    account_risk=AccountRiskConfig(max_daily_loss=5000.0),
+    account_risk=AccountRiskConfig(
+        max_daily_loss=5000.0,
+        max_open_positions=2,
+        max_open_legs=2,
+        max_deployed_capital=100_000.0,
+        max_mtm_age_seconds=30,
+    ),
 )
 
 

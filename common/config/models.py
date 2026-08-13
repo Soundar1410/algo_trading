@@ -164,6 +164,13 @@ class LiveOrderRateLimitConfig(_StrictModel):
 
     rules: tuple[RateLimitRule, ...] = Field(default_factory=tuple)
 
+    @model_validator(mode="after")
+    def _one_rule_per_call_class(self) -> LiveOrderRateLimitConfig:
+        call_classes = [rule.call_class for rule in self.rules]
+        if len(call_classes) != len(set(call_classes)):
+            raise ValueError("rate_limits.rules contains a duplicate call_class")
+        return self
+
 
 class AccountRiskConfig(_StrictModel):
     """Account-wide live-risk ceilings (spec section 13, account-level controls).
@@ -317,22 +324,29 @@ class ResolvedConfig(_StrictModel):
         missing: list[str] = []
         if not preflight.expected_static_ip:
             missing.append("runtime.live_preflight.expected_static_ip")
+        if not preflight.egress_ip_provider:
+            missing.append("runtime.live_preflight.egress_ip_provider")
         if preflight.max_preflight_age_seconds is None:
             missing.append("runtime.live_preflight.max_preflight_age_seconds")
-        if not preflight.rate_limits.rules:
-            missing.append("runtime.live_preflight.rate_limits.rules")
-        account_risk = preflight.account_risk
-        if all(
-            getattr(account_risk, field) is None
-            for field in (
-                "max_daily_loss",
-                "max_open_positions",
-                "max_open_legs",
-                "max_deployed_capital",
-                "max_mtm_age_seconds",
+        configured_call_classes = {
+            rule.call_class for rule in preflight.rate_limits.rules
+        }
+        missing_call_classes = set(RateLimitCallClass) - configured_call_classes
+        if missing_call_classes:
+            missing.append(
+                "runtime.live_preflight.rate_limits.rules missing "
+                + ", ".join(sorted(item.value for item in missing_call_classes))
             )
+        account_risk = preflight.account_risk
+        for field in (
+            "max_daily_loss",
+            "max_open_positions",
+            "max_open_legs",
+            "max_deployed_capital",
+            "max_mtm_age_seconds",
         ):
-            missing.append("runtime.live_preflight.account_risk (at least one limit)")
+            if getattr(account_risk, field) is None:
+                missing.append(f"runtime.live_preflight.account_risk.{field}")
 
         if missing:
             raise ValueError(
@@ -363,12 +377,9 @@ class LiveGateDecision:
         return self.allowed
 
 
-#: Phase 0 has no authentication, no broker connectivity check, no static-IP
-#: preflight and no reconciliation — so the preflight input below can only ever
-#: be False in this phase. It becomes a real check in Phase 10.
-PREFLIGHT_NOT_IMPLEMENTED = (
-    "live preflight checks are not implemented (deferred to Phase 10: token "
-    "validity, broker connectivity, static IP, reconciliation, locks)"
+PREFLIGHT_NOT_PASSED = (
+    "live preflight did not pass (token/account/static-IP/database/"
+    "connectivity/confirmation checks)"
 )
 
 
@@ -410,7 +421,7 @@ def effective_live_gate(
     if not cfg.strategy.live_approved:
         reasons.append(f"strategy {cfg.strategy.strategy_id!r} is not live_approved")
     if not preflight_passed:
-        reasons.append(PREFLIGHT_NOT_IMPLEMENTED)
+        reasons.append(PREFLIGHT_NOT_PASSED)
 
     if reasons:
         return LiveGateDecision(False, tuple(reasons))

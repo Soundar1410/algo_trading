@@ -302,14 +302,28 @@ def test_load_live_gate_status_evaluates_the_real_gate_for_live_mode_strategies(
         f"runtime_id: {RUNTIME_ID}\nenabled: true\n"
         "live_preflight:\n"
         "  expected_static_ip: '203.0.113.10'\n"
+        "  egress_ip_provider: test\n"
         "  max_preflight_age_seconds: 300\n"
         "  rate_limits:\n"
         "    rules:\n"
         "      - call_class: new_order\n"
         "        limit: 5\n"
-        "        window_seconds: 60\n"
+        "        window_seconds: 1\n"
+        "      - call_class: modify\n"
+        "        limit: 5\n"
+        "        window_seconds: 1\n"
+        "      - call_class: cancel\n"
+        "        limit: 5\n"
+        "        window_seconds: 1\n"
+        "      - call_class: read\n"
+        "        limit: 5\n"
+        "        window_seconds: 1\n"
         "  account_risk:\n"
-        "    max_daily_loss: 5000.0\n",
+        "    max_daily_loss: 5000.0\n"
+        "    max_open_positions: 2\n"
+        "    max_open_legs: 2\n"
+        "    max_deployed_capital: 100000.0\n"
+        "    max_mtm_age_seconds: 30\n",
     )
     _write_config(
         config_root / "strategies" / "io_live_v1.yaml",

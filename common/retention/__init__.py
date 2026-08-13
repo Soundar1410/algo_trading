@@ -15,7 +15,7 @@ the same startup call site; everything :func:`run_retention` does runs
 
 from __future__ import annotations
 
-from .backup import backup_database
+from .backup import backup_database, verify_backup_restorable
 from .database import purge_old_rows
 from .logs import LogRetentionReport, rotate_launchd_logs, sweep_logs
 from .policy import NEVER_PURGED_TABLES, RETAINED_TABLES
@@ -31,4 +31,5 @@ __all__ = [
     "rotate_launchd_logs",
     "run_retention",
     "sweep_logs",
+    "verify_backup_restorable",
 ]

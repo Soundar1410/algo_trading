@@ -16,10 +16,10 @@ alert, which is a different behaviour, and Phase 1 has no live path at all.
 
 from __future__ import annotations
 
+import multiprocessing as mp
 import queue
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from multiprocessing import Queue as MPQueue
 from typing import Any
 
 DEFAULT_MAX_DEPTH = 1000
@@ -128,7 +128,11 @@ class BoundedWorkerQueue:
         if self.max_depth <= 0:
             raise ValueError("max_depth must be positive")
         if self._queue is None:
-            self._queue = MPQueue(maxsize=self.max_depth)
+            # Workers are always created from the spawn context.  A queue built
+            # from Linux's default fork context cannot be pickled into a spawned
+            # child (``SemLock created in a fork context``), even though the same
+            # code happens to work on macOS where spawn is already the default.
+            self._queue = mp.get_context("spawn").Queue(maxsize=self.max_depth)
 
     @classmethod
     def in_process(cls, name: str, max_depth: int = DEFAULT_MAX_DEPTH) -> BoundedWorkerQueue:

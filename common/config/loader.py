@@ -247,6 +247,24 @@ def discover_enabled_strategies(
             function degrades around — the group does not start until it is
             fixed, rather than starting short one strategy nobody noticed.
     """
+    return [
+        cfg
+        for cfg in discover_strategies(config_root, runtime_id, settings=settings)
+        if cfg.strategy.enabled
+    ]
+
+
+def discover_strategies(
+    config_root: Path,
+    runtime_id: str,
+    *,
+    settings: Settings | None = None,
+) -> list[ResolvedConfig]:
+    """Resolve every strategy file, including disabled strategies.
+
+    Startup uses this wider view solely for live-to-disabled transition
+    safety.  Worker admission still filters on ``strategy.enabled``.
+    """
     settings = settings if settings is not None else load_settings()
     strategies_dir = config_root / "strategies"
     if not strategies_dir.is_dir():
@@ -255,6 +273,5 @@ def discover_enabled_strategies(
     resolved: list[ResolvedConfig] = []
     for path in sorted(strategies_dir.glob("*.yaml")):
         cfg = load_resolved_config(config_root, runtime_id, path.stem, settings=settings)
-        if cfg.strategy.enabled:
-            resolved.append(cfg)
+        resolved.append(cfg)
     return resolved

@@ -136,6 +136,7 @@ class TradingEngine:
         recover_exit_state: Callable[[], dict[str, Any] | None] | None = None,
         persist_exit_state: Callable[[dict[str, Any] | None, str | None], None] | None = None,
         persist_position_marks: Callable[[float, float], None] | None = None,
+        publish_account_mtm: Callable[[OpenPosition, datetime], None] | None = None,
         clock: Callable[[], datetime] = now_ist,
     ) -> None:
         self.cfg = cfg
@@ -220,6 +221,12 @@ class TradingEngine:
         # whatever the positions row's own fill-time value was (0.0, if never
         # touched), exactly as before this part existed. See _persist_position_marks.
         self._persist_position_marks_cb = persist_position_marks
+        # Live workers inject the account-wide MTM sink.  Paper/offline runs
+        # leave it unset, so the shared engine keeps exactly the same behaviour.
+        # A sink failure blocks *future entries* but never interrupts management
+        # of an already-open position; abandoning that position would be the
+        # less conservative outcome.
+        self._publish_account_mtm_cb = publish_account_mtm
         # The last candle this strategy-day fully processed before a restart,
         # restored (only when a position was actually adopted) from
         # AdoptedPosition.last_candle_end_at -- Phase 6 Part 3. None => no
@@ -1026,6 +1033,16 @@ class TradingEngine:
         pos = self.positions.get(tick.security_id)
         if pos is not None:
             pos.update_price(tick.last_price)
+            if self._publish_account_mtm_cb is not None:
+                try:
+                    self._publish_account_mtm_cb(pos, tick.exchange_time)
+                except Exception:
+                    log.exception(
+                        "%s: account-wide live MTM write failed; blocking new "
+                        "entries while continuing to manage the open position",
+                        self.label,
+                    )
+                    self._block_entries("account-wide live MTM could not be updated")
             reason = self.strategy.risk_manager.on_pnl(pos.unrealised_pnl)
             if reason is None:
                 strat_signal = self.strategy.on_position_tick(pos, tick)

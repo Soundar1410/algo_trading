@@ -7,12 +7,12 @@ the next phase. Updated after every phase.
 
 | | |
 |---|---|
-| **Current phase** | **Phase 10 — Controlled live readiness. Code-complete with one named, outstanding wiring gap.** `DhanLiveBroker`, account-wide reserve-before-submit risk, a shared cross-process order-rate limiter, reconciliation and mode-transition safety all exist, all tested with mocks/fakes only — no real Dhan network or order-placement call was ever made. `ema_cross_9_21_buy` (Phase 9's only real strategy) is unchanged. **Every committed config value keeps every live gate fail-closed** (`global.live_trading_enabled: false`, `live_execution_allowed: false`, `live_approved: false`, no `mode: live` anywhere in `config/`), now enforced at commit/CI time by `scripts/assert_no_live_config_committed.py`. **Not yet PASS**: `check_static_ip`/`run_live_preflight`/`LivePreflightGate.ensure_fresh` are correctly implemented but have **zero production call sites** — the real CLI entrypoint (`runtimes/intraday_options/__main__.py::main()`) calls `build_supervisor(...)` without `live_preflight_passed_for`, so this architecture-doc-required component (lines 1590-1592) cannot run even in the hypothetical case every other gate were flipped. Two named, unresolved design decisions block wiring it — known limitation 39. Full detail: [section 8](#8-next-phase). |
-| **Next phase** | Two things, not one: (1) resolve known limitation 39 (static-IP preflight wiring) so Phase 10 can honestly be called code-complete; (2) only then, operational live activation — not this repository's decision to make unilaterally, needing an `EgressIpProvider` choice, static-IP resolution, and a separate explicit approval (known limitations 35–39). |
-| **Last updated** | 13 August 2026 — static-IP preflight wiring gap found and named (limitation 39); Dhan's real order-rate limit looked up and cited, see [section 8](#8-next-phase) |
+| **Current phase** | **Phase 10 — Controlled live readiness: CODE COMPLETE, fully disabled.** Production parent/worker preflight wiring, Dhan order/update handling, account-wide reserve-before-submit risk plus live MTM, shared rate limiting, broker-authoritative reconciliation, safe mode transitions, and migration restore validation exist and are tested with mocks/fakes only. `ema_cross_9_21_buy` and its Rev 3.1 matrix are unchanged. **Every committed live gate remains fail-closed** (`global.live_trading_enabled: false`, `live_execution_allowed: false`, `live_approved: false`, no `mode: live` in `config/`), enforced by `scripts/assert_no_live_config_committed.py`. No real Dhan order/network call was made. |
+| **Next phase** | Operational evidence and explicit human decisions, not more live-enabling code: complete/review the 30-day paper run, build a second genuine strategy and keep it paper, choose/configure an approved egress-IP provider and static IP, resolve the confirmation/auth operational items, then separately decide whether to approve minimum-quantity live activation. |
+| **Last updated** | 13 August 2026 — Phase 10 hardening review closed the production preflight, worker revalidation, order-update, account MTM, reconciliation and controlled-rollout gaps; all committed live gates remain disabled |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
-| **Live order placement** | **Not fully code-complete.** `DhanLiveBroker` exists and is tested, but the static-IP preflight check that gates it is unreachable from the real entrypoint (known limitation 39) — not merely operationally disabled, structurally unreachable. Every committed gate is separately fail-closed regardless; `OPERATIONAL LIVE ACTIVATION ELIGIBLE: NO — BLOCKED`. |
+| **Live order placement** | Code path exists but is deliberately unreachable from committed configuration. Parent and child preflight both fail closed without approved operational inputs; `OPERATIONAL LIVE ACTIVATION ELIGIBLE: NO — BLOCKED`. |
 
 ---
 
@@ -30,7 +30,7 @@ the next phase. Updated after every phase.
 | 7 | Operations | **Complete — all five parts.** **Part 1** (health snapshot layer — `common/health/snapshot.py`, `auth_events`/`feed_events` writers and producers, configurable heartbeat interval). **Part 2** (Telegram in production — real notifier construction at both entrypoints, deferred delivery, rate limiting/aggregation, `notifications`-table persistence, redacted rendering — D71-D74). **Part 3** (the Streamlit dashboard — Master/Intraday Options/System Health pages plus two honest stubs, reading through `common.health.snapshot` for operational state — D75; addendum adds `effective_live_gate` status to Master, config-sourced, the one deliberate exception to database-only reads). **Part 4** (PID ownership hardened onto `create_time()`, fail-first proven — D76; two previously-hidden bugs found and fixed along the way — D77/D78; seven operator scripts plus `authenticate`, `audit_events` migration `0004`, file-based square-off request channel). **Part 5** (`common/retention/` — bounded age-based DB purge in one transaction, log compression/deletion, pre-migration backup with retained-backup count, one entry point at controlled startup — D80; `ScripMasterCache.prune()` given its first caller; `Settings.algo_log_level` wiring bug found and fixed — D79) |
 | 8 | LaunchAgent validation | **Complete** |
 | 9 | Real strategies | **Complete** |
-| 10 | Controlled live readiness | **Not yet code-complete — one named wiring gap.** `DhanLiveBroker`, account-wide risk reservation, order-rate limiting, reconciliation and mode-transition safety all exist and are tested with mocks/fakes, never a real Dhan call. But static-IP preflight (an explicitly-named required component, architecture doc lines 1590-1592) has zero production call sites — see known limitation 39. **Operationally blocked** regardless: every committed config value still keeps every live gate fail-closed; static-IP resolution, an `EgressIpProvider` choice, and a separate explicit go-live approval remain outstanding (known limitations 35–39) |
+| 10 | Controlled live readiness | **CODE COMPLETE, fully disabled.** Generic infrastructure is production-wired and mock-tested; operational activation remains blocked by evidence, second-strategy, provider/static-IP, confirmation/auth and explicit-approval gates. |
 
 ### What Phase 0 delivered
 
@@ -4365,14 +4365,11 @@ start/stop/crash/restart tests pass.
     implementation (an external IP-echo HTTPS service, or an operator-infra
     local source) is an open decision requiring separate approval before
     Phase 10 gates can ever open for real capital.
-36. **`DhanLiveBroker.fetch_trades()` has no confirmed SDK method wired.**
-    `dhanhq==2.2.0`'s exact trade-book endpoint was not conclusively
-    identified against the installed source during Phase 10. Rather than
-    guess an endpoint and risk silently misreporting, it returns `()` and
-    logs a warning — a reconciliation run against a live account would
-    currently see fewer broker trades than reality, never fabricated ones,
-    but this must be resolved (confirmed against the SDK, or Dhan's own
-    trade-book REST endpoint called directly) before Phase 10 gates open.
+36. **CLOSED — Dhan trade-book integration.** The installed
+    `dhanhq==2.2.0` source confirms `get_trade_book(order_id=None)`.
+    `DhanLiveBroker.fetch_trades()` now uses it, joins `orderId` through the
+    broker order book to recover correlation identity, and blocks on malformed,
+    failed or unattributable rows rather than reporting an incomplete snapshot.
 37. **`live_confirmations` (the explicit live-confirmation-token table,
     migration `account_versions/0001`) has no writer yet.** Nothing in this
     codebase issues, checks, or revokes a confirmation token/local approval
@@ -4387,62 +4384,16 @@ start/stop/crash/restart tests pass.
     handling — the checklist item at the end of that incident writeup is
     still open and still blocks live trading for the same reason it did
     before this phase.
-39. **Static-IP preflight is code-complete but has zero production call
-    sites — this is a code-completeness gap, not just an operational one**
-    (13 August 2026, found on direct question; see the "Correction, same
-    day" note in section 7). `common.broker.live_preflight.check_static_ip`,
-    `run_live_preflight`, and `common.broker.live_preflight_gate
-    .LivePreflightGate.ensure_fresh` are all correctly implemented and unit-
-    tested, but `grep -rn "ensure_fresh(\|run_live_preflight("
-    common runtimes` (excluding `tests/`) returns zero matches outside their
-    own definitions. `runtimes/intraday_options/__main__.py::build_supervisor`
-    accepts an optional `live_preflight_passed_for` callable specifically
-    for this purpose, but the real entrypoint — `main()`, invoked via
-    `if __name__ == "__main__":` — calls `build_supervisor(...)` without
-    supplying one, leaving it at its `None` default. Static-IP preflight is
-    an architecture-doc-named required Phase 10 component (lines 1590-1592)
-    and part of the controlled-live gate (lines 2978-2987); it cannot be
-    marked done while it cannot execute even in the hypothetical case every
-    committed config gate were flipped true.
-
-    **Two separate, named decisions block wiring it, deliberately not
-    guessed at:**
-
-    a. **Choosing a production `EgressIpProvider` implementation
-       conflicts with this project's own standing rule.** CLAUDE.md states
-       explicitly: *"do not add a production `EgressIpProvider`... without
-       that separate approval."* Constructing one (an external IP-echo
-       HTTPS service, or an operator-infra-local source) is itself a new
-       outbound network dependency on the live path with its own trust and
-       reliability implications that have never been discussed. A generic
-       instruction to "wire it, constructing whatever is needed" is not,
-       on its own, the specific approval that rule requires for a named
-       provider choice.
-    b. **Worker-process-level re-validation cadence is undecided and has
-       real risk implications.** The interface `build_supervisor(...,
-       live_preflight_passed_for: Callable[[ResolvedConfig], bool])` is
-       invoked once, in the supervisor/parent process, before any worker
-       spawns — matching neither the freshness/TTL machinery
-       `LivePreflightGate` was built to provide, nor the originally-
-       approved design `worker.py` itself documents as deferred (lines
-       259-269): *"the originally-approved 'the worker re-runs preflight
-       itself' design."* Wiring `live_preflight_passed_for` to run the
-       check once at supervisor start and trust that boolean for a
-       worker's entire (potentially multi-hour) running session would
-       reproduce, in the one place it was built specifically to prevent,
-       the exact "trusted from a value merely computed once in a parent
-       process" anti-pattern the original Stage 1 audit's own corrections
-       named. The alternative — a worker re-authenticating and re-checking
-       its own egress IP periodically during a live session — trades off
-       staleness risk against hammering Dhan's own rate-limited
-       account-identity/connectivity endpoints (limitation 39's own
-       neighbour, the rate-limit citation above), and no cadence for that
-       has ever been specified beyond the unelaborated phrase above.
-
-    Neither decision was made unilaterally in this pass. No code was
-    written toward wiring this — writing a "supervisor computes it once"
-    version to make the gap disappear would itself have been the silent
-    narrowing of scope this limitation exists to avoid.
+39. **CLOSED — production static-IP preflight and worker revalidation.**
+    The earlier finding was correct for commit `3de9602`: static-IP preflight
+    had zero production call sites. It is now wired through
+    `runtimes.intraday_options.__main__.main` for parent admission and
+    `runtimes.intraday_options.live_runtime.prepare_live_runtime` for an
+    independently forced child check. `GuardedLiveCall` enforces TTL freshness
+    and account-shared rate capacity before every Dhan call. The configured
+    provider is loaded from a strict `module:attribute` seam; no production
+    provider was selected without approval, so missing provider configuration
+    still blocks operational activation.
 
 
 ### Operational risk noted during the audit
@@ -4744,9 +4695,9 @@ confirms zero live-enabling value anywhere in `config/`.
   `scripts/assert_no_live_config_committed.py`, which this session ran
   clean against the real tree.
 - **`OPERATIONAL LIVE ACTIVATION ELIGIBLE: NO — BLOCKED.`** Static-IP
-  resolution, an `EgressIpProvider` choice, `DhanLiveBroker.fetch_trades()`'s
-  confirmed SDK method, and a `live_confirmations` operator workflow are all
-  still outstanding (known limitations 35–37), and the known-limitation-18
+  resolution, an approved `EgressIpProvider`, and a `live_confirmations`
+  operator workflow are still outstanding (known limitations 35 and 37),
+  and the known-limitation-18
   auth-token-invalidation fix remains unresolved (limitation 38) — none of
   these block Phase 10 code-completeness, and all of them block operational
   activation.
@@ -4769,7 +4720,9 @@ run at all, under any config. Recorded as known limitation 39, with the
 two concrete design decisions that block closing it. `DhanLiveBroker`
 existing, being fully mocked in its own tests, and being unreachable from
 committed config all remain true and are not retracted — only the
-"Phase 10 is fully code-complete" conclusion is.
+"Phase 10 is fully code-complete" conclusion was at that commit. A subsequent
+hardening review closed limitation 39 with both parent admission and forced
+worker-local/TTL revalidation; see the current Phase 10 section below.
 
 ---
 
@@ -4782,20 +4735,21 @@ complete** — all five parts, see below. **Phase 7 is complete — all five par
 see below. **Phase 8 is complete**, see below. **Phase 9 is complete** — the first
 (and, per CLAUDE.md, only) real strategy, `ema_cross_9_21_buy`, is fully
 integrated end to end through the ported engine, paper only — see below.
-**Phase 10 is not yet code-complete.** Controlled-live infrastructure exists
-and is tested with mocks/fakes only, but a follow-up review (13 August
-2026) found that static-IP preflight — an explicitly-named required Phase
-10 component (architecture doc lines 1590-1592) — has zero production call
-sites and cannot run even hypothetically; see known limitation 39 for the
-two named design decisions blocking wiring it, and the "Real Dhan order-
-rate limit" bullet below for a related gap (no cited number/margin) that
-**was** closed this pass. Next is first closing limitation 39, then
-separately, **operational live activation**, which is explicitly not this
-repository's decision to make unilaterally: it needs static-IP resolution,
-an `EgressIpProvider` choice, and a separate, explicit go-live approval
-(known limitations 35–39).
+**Phase 10 controlled-live code is complete and remains fully disabled.** A
+hardening review on 13 August 2026 closed the earlier production preflight
+wiring gap: the parent performs admission preflight only when all static gates
+would otherwise pass, the child independently forces a fresh check, and every
+subsequent broker call crosses TTL preflight and the shared rate limiter. The
+same review wired the Dhan trade-book method and live order-update transport,
+shared account MTM, broker-authoritative startup reconstruction, disabled-
+strategy mode-transition checks, restorable backup validation, and a lifetime
+account lease enforcing Phase 10's one-live-strategy rollout. This remains
+code-level fixture/mock evidence only. **Operational activation is separately
+blocked** by the 30-day paper evidence, a second genuine paper strategy,
+strategy-specific approval, static-IP/provider setup, confirmation/auth
+operations, and an explicit decision to change any committed gate.
 
-### Phase 10 — Controlled live readiness — **Not yet code-complete: one named wiring gap (limitation 39)**
+### Phase 10 — Controlled live readiness — **CODE COMPLETE; operational activation blocked**
 
 Built on branch `phase-10-controlled-live`, under an explicit two-stage
 approval (Stage 1: read-only inspection and a written design, rejected twice
@@ -4811,9 +4765,8 @@ is no placeholder production strategy and no strategy-specific branch in
 **What exists now, all tested with mocks/fakes, never a real Dhan call:**
 
 - **`DhanLiveBroker`** (`common/broker/dhan_live.py`) — the full operation
-  set (submit, fetch order status/book/positions, correlation-ID lookup;
-  modify/cancel deferred per the architecture's own "add with first
-  consumer" policy, confirmed with the operator). Submission-failure
+  set (submit, modify, cancel, order/correlation lookup, order book, Dhan
+  trade book and positions). Submission-failure
   classification is evidence-gated: only a genuine `success` with an
   `orderId` resolves definitively; every `failure` becomes `UNKNOWN` until a
   positive `get_order_by_correlationID` confirmation — never inferred from
@@ -4835,7 +4788,13 @@ is no placeholder production strategy and no strategy-specific branch in
   `RECONCILED` — enforced in Python, not merely by a `CHECK` constraint.
   Realised P&L is an idempotent append-only event ledger; unrealised MTM is
   overwritten per mark, never appended (the double-counting bug the first
-  rejected design had).
+  rejected design had). Entry-only trust failures never trap an existing live
+  position: a same-security, opposite-side order no larger than the locally
+  tracked open quantity is marked risk-reducing, receives an auditable
+  zero-capital reservation, and may cross the guarded call path even while
+  provenance/MTM/confirmation readiness blocks new exposure. It still crosses
+  the shared rate limiter, and any ambiguous outcome still becomes `UNKNOWN`
+  and requires reconciliation.
 - **Live order rate limit — real number, real margin, cited.**
   `RateLimitRule.limit`/`.window_seconds` are operator-configured with no
   baked-in default (an unconfigured call class stays zero-permit, never
@@ -4895,6 +4854,15 @@ is no placeholder production strategy and no strategy-specific branch in
   independently observed current egress IP via an injectable
   `EgressIpProvider`), not a whitelist-only check. Shipped default
   `egress_provider=None` fails **closed** (see known limitation 35).
+- **Production preflight and update wiring**
+  (`common/broker/dhan_preflight.py`, `common/broker/live_call_guard.py`,
+  `common/broker/order_update_consumer.py`,
+  `runtimes/intraday_options/live_runtime.py`) — the real CLI supplies the
+  parent admission callback; the worker forces its own fresh check after
+  taking its process/account locks and revalidates on every guarded Dhan call.
+  A reconnecting, stoppable Dhan order-update websocket is the primary
+  settlement signal; one correlation lookup is the bounded fallback, and an
+  ambiguous submission is never resubmitted.
 - **Worker wiring** — `runtimes/intraday_options/worker.py`'s
   `resolved_config_stub` (which hard-coded `GlobalConfig(live_trading_
   enabled=False)` regardless of real config, found during Stage 1) is
@@ -4902,7 +4870,10 @@ is no placeholder production strategy and no strategy-specific branch in
   `ResolvedConfig` from the worker's actual fields — the fix that lets a
   genuinely-`true` config value actually reach `effective_live_gate`, proven
   by `tests/unit/test_worker_resolved_config.py`. `__main__.py` calls
-  `check_mode_transition_safety` before adding each worker.
+  `check_mode_transition_safety` for enabled and newly-disabled strategies
+  before adding a worker. A per-account lifetime lease enforces the approved
+  one-live-strategy rollout until multi-live startup enumeration is separately
+  designed; shared cross-process limit/risk machinery remains generic.
 - **Dashboards** — `dashboards/app.py`'s Master page reads real
   `reconciliation_runs` status (replacing the old "Not implemented"
   placeholder) and an account-wide risk/rate-limit section reading
@@ -4914,7 +4885,7 @@ is no placeholder production strategy and no strategy-specific branch in
   (`tests/end_to_end/test_mixed_mode_live_readiness.py`) — a paper-designated
   and a live-designated fixture strategy (never `ema_cross_9_21_buy`, never a
   placeholder production strategy) in the same runtime group, through the
-  real `build_supervisor`/`discover_enabled_strategies` config path: with
+  real `build_supervisor`/`discover_strategies` config path: with
   global live disabled, the live strategy is blocked outright, never
   rerouted to paper, and leaves no trace in any trading table; the paper
   strategy trades normally with its own `p_`-namespaced correlation IDs.
@@ -4961,24 +4932,20 @@ is no placeholder production strategy and no strategy-specific branch in
   excluded `__init__.py`).
 
 **What Phase 10 deliberately did NOT deliver** (operational preconditions,
-tracked as known limitations 35–38, not closed by this phase): a chosen
-`EgressIpProvider` implementation; `DhanLiveBroker.fetch_trades()` wired to a
-confirmed dhanhq trade-book method; a `live_confirmations` writer/operator
-workflow; the known-limitation-18 auth-token-invalidation fix.
+not code-path omissions): a chosen production `EgressIpProvider`; a
+`live_confirmations` writer/operator workflow; or the known-limitation-18
+auth-token-invalidation operational fix. Missing inputs all block closed.
 
-**What a follow-up review found was NOT actually done, despite an earlier
-report claiming code-completeness (13 August 2026, corrected same day):**
-static-IP preflight has **zero production call sites** — see known
-limitation 39. This is not an operational precondition like the four
-above (things intentionally deferred past code-completeness); it is a gap
-*within* code-completeness itself — an architecture-doc-required Phase 10
-component (lines 1590-1592) that cannot execute even in the hypothetical
-case every committed config gate were flipped, because nothing calls it.
-`PHASE 10 CODE COMPLETE` is not declared PASS while limitation 39 stands.
+**Correction closed by the hardening review:** the earlier report's static-IP
+production-call-site criticism was valid at commit `3de9602`. The real CLI now
+supplies parent admission preflight and the worker independently revalidates at
+startup and by TTL before guarded Dhan calls. No provider was guessed: a strict
+configured `module:attribute` seam loads an operator-approved implementation,
+and absent/malformed/raising providers block closed.
 
 **No committed configuration value was changed to enable live trading** —
 every gate remains exactly as fail-closed as it was at the end of Phase 9,
-now with a CI-time guard enforcing it, independent of limitation 39.
+now with a CI-time guard enforcing it; limitation 39 is closed independently.
 `OPERATIONAL LIVE ACTIVATION ELIGIBLE: NO — BLOCKED.`
 
 ### Phase 9 — Real strategies — **Complete**

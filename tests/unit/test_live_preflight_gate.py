@@ -128,6 +128,32 @@ def test_ensure_fresh_reuses_a_fresh_matching_result_without_rerunning(tmp_path:
     assert result.passed is True
 
 
+def test_force_reruns_even_a_fresh_parent_result_at_the_worker_boundary(tmp_path: Path):
+    gate = LivePreflightGate(_database(tmp_path))
+    checked_at = datetime(2026, 8, 13, 9, 15, tzinfo=UTC)
+    gate.record(_outcome(checked_at=checked_at))
+    rerun_at = checked_at + timedelta(seconds=1)
+    calls: list[int] = []
+
+    def run_check():  # type: ignore[no-untyped-def]
+        calls.append(1)
+        return _outcome(checked_at=rerun_at)
+
+    result = gate.ensure_fresh(
+        account_key="acct1",
+        runtime_id="intraday_options",
+        strategy_id="st01",
+        config_fingerprint="fp1",
+        now=rerun_at,
+        ttl_seconds=300,
+        run_check=run_check,
+        force=True,
+    )
+
+    assert calls == [1]
+    assert result.checked_at == rerun_at
+
+
 def test_ensure_fresh_reruns_when_stale(tmp_path: Path):
     gate = LivePreflightGate(_database(tmp_path))
     checked_at = datetime(2026, 8, 13, 9, 15, tzinfo=UTC)

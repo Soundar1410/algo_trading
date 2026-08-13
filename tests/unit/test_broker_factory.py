@@ -17,6 +17,7 @@ from common.broker import (
     PaperBroker,
     build_broker,
 )
+from common.broker.paper import InstrumentRules
 from common.config.models import (
     AccountRiskConfig,
     ExecutionMode,
@@ -37,11 +38,21 @@ from common.config.models import (
 #: supplied unconditionally here.
 _COMPLETE_LIVE_PREFLIGHT = LivePreflightConfig(
     expected_static_ip="203.0.113.10",
+    egress_ip_provider="test",
     max_preflight_age_seconds=300,
     rate_limits=LiveOrderRateLimitConfig(
-        rules=(RateLimitRule(call_class=RateLimitCallClass.NEW_ORDER, limit=5, window_seconds=60),)
+        rules=tuple(
+            RateLimitRule(call_class=call_class, limit=5, window_seconds=1)
+            for call_class in RateLimitCallClass
+        )
     ),
-    account_risk=AccountRiskConfig(max_daily_loss=5000.0),
+    account_risk=AccountRiskConfig(
+        max_daily_loss=5000.0,
+        max_open_positions=2,
+        max_open_legs=2,
+        max_deployed_capital=100_000.0,
+        max_mtm_age_seconds=30,
+    ),
 )
 
 
@@ -51,6 +62,11 @@ class _FakeDhanOrderClient:
 
     def get_order_list(self):  # type: ignore[no-untyped-def]
         return {"status": "success", "data": []}
+
+
+class _AllowingGuard:
+    def before_call(self, call_class: RateLimitCallClass, *, risk_reducing: bool = False) -> None:
+        del call_class, risk_reducing
 
 
 def _config(
@@ -148,8 +164,12 @@ def test_a_fully_approved_live_strategy_now_gets_a_dhan_live_broker():
         ),
         preflight_passed=True,
         live_dependencies=LiveBrokerDependencies(
-            client=client, exchange_segment="NSE_FNO", product_type="INTRADAY"
+            client=client,
+            exchange_segment="NSE_FNO",
+            product_type="INTRADAY",
+            call_guard=_AllowingGuard(),
         ),
+        instrument_rules=lambda security_id: InstrumentRules(lot_size=75, tick_size=0.05),
     )
     assert isinstance(broker, DhanLiveBroker)
     assert broker.name == "dhan_live"

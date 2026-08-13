@@ -25,8 +25,13 @@ dependencies = [
     # removal, so we require a websockets new enough to have removed it rather
     # than silently resolving to a pre-14 release where the guard is moot.
     "websockets>=14",
-    "pandas>=2.2",
-    "numpy>=1.26",
+    # NumPy >=2.4's inline stubs use Python-3.12-only ``type`` statements;
+    # this project supports and type-checks as Python 3.11, so that range
+    # makes the required mypy command fail before it reaches our code.
+    # pandas 3.0.5's published wheel is missing pandas.compat.compressors in
+    # the supported environment and fails at import before our code runs.
+    "pandas>=2.2,<3.0",
+    "numpy>=1.26,<2.4",
     "pandas-ta-classic>=0.3",     # indicators, behind one adapter (Phase 4)
     "pyotp>=2.9",                 # TOTP for the Dhan auth bootstrap (Phase 2)
     "pydantic>=2.7",

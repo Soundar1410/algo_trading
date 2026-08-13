@@ -8,23 +8,26 @@ it (market data, candles, signals, risk, persistence, health) is shared, so a
 strategy that has been paper-forward-tested is the same strategy when it is later
 approved for live.
 
-> **Status: Phase 2, Block 1 complete.** The walking skeleton (Phase 1) runs end
-> to end on a recorded feed. Phase 2 adds the authentication bootstrap with TOTP,
-> a crash-safe token cache, feed reconnect/resubscription, and the option-chain
-> three-second throttle — all built and tested **offline**.
+> **Status: Phase 10 controlled-live code complete; operational activation
+> blocked.** The shared paper/live architecture, the real
+> `ema_cross_9_21_buy` paper strategy, and generic controlled-live machinery are
+> implemented. Every committed live gate remains disabled and tests use
+> mocks/fakes only—no real order was placed.
 >
 > The `dhanhq` pin is now **ratified at `2.2.0`** (2.1.0 is yanked upstream and
 > cannot resubscribe on `websockets>=14`), and the feed payload shape is ratified
 > from SDK source — which corrected three real defects, including an `LTT` bug
 > that silently bucketed every candle by arrival time instead of exchange time.
 >
-> **Not yet run against Dhan's servers.** Authentication, subscription and
-> reconnection are unproven live, and the tape fixture is synthesised rather than
-> captured. That is Block 2. There is also still **no real strategy** (Phase 9)
-> and no engine port (Phase 3). See `docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md`.
+> Operational activation still requires the 30-day paper evaluation, a second
+> genuine strategy remaining in paper, strategy-specific minimum-quantity
+> approval, approved static-IP/provider setup, confirmation/auth readiness, and
+> a separate human decision to enable the gates. See
+> `docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md`.
 
-> **Live order placement is not implemented and is fail-closed.** `DhanLiveBroker`
-> order methods arrive in Phase 10 only, behind an explicit approval gate.
+> **Live order placement code exists but is fail-closed.** `DhanLiveBroker` and
+> its preflight/risk/reconciliation/update path cannot be reached from committed
+> configuration.
 
 ## Architecture source of truth
 

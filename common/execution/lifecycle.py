@@ -67,6 +67,8 @@ class LiveAccountRiskLimits:
     max_deployed_capital: float | None = None
     max_open_positions: int | None = None
     max_open_legs: int | None = None
+    max_daily_loss: float | None = None
+    max_mtm_age_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -163,11 +165,13 @@ class OrderLifecycle:
             sequence_number=sequence,
         )
         quote = self._quote_for(signal)
+        risk_reducing = self._is_risk_reducing(signal, trading_date=trading_date)
         risk_decision, risk_reason = self._check_and_reserve_account_risk(
             correlation_id=correlation_id,
             trading_date=trading_date,
             quantity=signal.quantity,
             quote=quote,
+            risk_reducing=risk_reducing,
         )
         intent = OrderIntent(
             correlation_id=correlation_id,
@@ -187,6 +191,7 @@ class OrderLifecycle:
             config_fingerprint=self._fingerprint,
             risk_decision=risk_decision,
             risk_reason=risk_reason,
+            risk_reducing=risk_reducing,
         )
 
         # Commits before the broker is called: a crash during submission leaves
@@ -236,8 +241,6 @@ class OrderLifecycle:
                 skipped_reason=f"broker rejected: {exc}",
             )
 
-        self._sync_account_reservation(correlation_id, order.status)
-
         order_id = self._repo.record_submission(
             intent_id=intent_id, order=order, runtime_id=self._runtime_id
         )
@@ -257,6 +260,19 @@ class OrderLifecycle:
                 target_price=target_price,
                 last_candle_end_at=signal.candle.end_at.isoformat(),
             )
+            if self._account_reservation_gate is not None and self._account_key is not None:
+                self._account_reservation_gate.record_fill(
+                    account_key=self._account_key,
+                    runtime_id=self._runtime_id,
+                    strategy_id=self._strategy_id,
+                    trading_date=trading_date,
+                    security_id=signal.security_id,
+                    side=signal.side,
+                    fill=fill,
+                    position=position,
+                )
+
+        self._sync_account_reservation(correlation_id, order.status)
 
         _log.info(
             "order filled correlation_id=%s side=%s qty=%d price=%s",
@@ -297,8 +313,32 @@ class OrderLifecycle:
         )
 
     # ------------------------------------------------------- account risk (live)
+    def _is_risk_reducing(self, signal: Signal, *, trading_date: str) -> bool:
+        if self._mode is not ExecutionMode.LIVE:
+            return False
+        positions = self._repo.open_positions(
+            strategy_id=self._strategy_id,
+            execution_mode=self._mode,
+            trading_date=trading_date,
+        )
+        matching = [
+            position for position in positions if position.security_id == signal.security_id
+        ]
+        if len(matching) != 1:
+            return False
+        position = matching[0]
+        return position.quantity * signal.side.sign < 0 and signal.quantity <= abs(
+            position.quantity
+        )
+
     def _check_and_reserve_account_risk(
-        self, *, correlation_id: str, trading_date: str, quantity: int, quote: Quote
+        self,
+        *,
+        correlation_id: str,
+        trading_date: str,
+        quantity: int,
+        quote: Quote,
+        risk_reducing: bool,
     ) -> tuple[RiskDecision, str | None]:
         """Atomically check-and-reserve account-wide capacity for a live
         intent, *before* it is ever persisted or the broker is ever called
@@ -329,7 +369,7 @@ class OrderLifecycle:
         # strategy/instrument-specific refinement, not something this
         # generic lifecycle can assume — see the reservation's own
         # projected_capital field for where that refinement would plug in.
-        projected_capital = quantity * quote.last_price
+        projected_capital = 0.0 if risk_reducing else quantity * quote.last_price
 
         decision = self._account_reservation_gate.check_and_reserve(
             account_key=self._account_key,
@@ -338,12 +378,15 @@ class OrderLifecycle:
             correlation_id=correlation_id,
             trading_date=trading_date,
             projected_capital=projected_capital,
-            projected_legs=1,
+            projected_legs=0 if risk_reducing else 1,
             quantity=quantity,
             max_deployed_capital=self._account_risk_limits.max_deployed_capital,
             max_open_positions=self._account_risk_limits.max_open_positions,
             max_open_legs=self._account_risk_limits.max_open_legs,
             now=datetime.now(UTC),
+            max_daily_loss=self._account_risk_limits.max_daily_loss,
+            max_mtm_age_seconds=self._account_risk_limits.max_mtm_age_seconds,
+            risk_reducing=risk_reducing,
         )
         if decision.allowed:
             return RiskDecision.ALLOWED, None
