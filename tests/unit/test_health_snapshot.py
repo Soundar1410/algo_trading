@@ -374,7 +374,8 @@ def test_recent_errors_respects_the_limit_and_most_recent_first(
 
     snapshot = _snapshot(database_path, recent_error_limit=2)
 
-    assert snapshot.recent_errors == ("error 2", "error 1")
+    assert [e.message for e in snapshot.recent_errors] == ["error 2", "error 1"]
+    assert all(e.occurred_at for e in snapshot.recent_errors)
 
 
 def test_a_snapshot_never_writes_through_a_readonly_connection(

@@ -11,11 +11,15 @@ imports a broker, a feed, or a write connection — enforced by
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypeVar
 
 from common.health import HealthSnapshot, read_snapshot
 from common.persistence import DatabaseError, connect_readonly
+
+T = TypeVar("T")
 
 
 @dataclass(frozen=True)
@@ -23,6 +27,32 @@ class SnapshotUnavailable:
     """Why a page has nothing to show. Rendered as a message, not raised."""
 
     reason: str
+
+
+def run_bounded(
+    database_path: Path | str, fn: Callable[[sqlite3.Connection], T]
+) -> T | SnapshotUnavailable:
+    """Open a bounded read-only connection, run ``fn``, always close it.
+
+    The same three failure modes :func:`load_snapshot` handles (missing,
+    locked, pre-migration/corrupt), generalised for every read-model query
+    added since — one place, so a new query function in ``dashboards/data/``
+    never has to repeat this try/except by hand. ``fn`` must not close the
+    connection itself; this function owns its lifetime end to end.
+    """
+    db_path = Path(database_path)
+    if not db_path.is_file():
+        return SnapshotUnavailable(f"No database yet at {db_path}. Start the supervisor first.")
+    try:
+        conn = connect_readonly(db_path)
+    except DatabaseError as exc:
+        return SnapshotUnavailable(str(exc))
+    try:
+        return fn(conn)
+    except sqlite3.Error as exc:
+        return SnapshotUnavailable(f"Database not ready ({type(exc).__name__}): {exc}")
+    finally:
+        conn.close()
 
 
 def load_snapshot(

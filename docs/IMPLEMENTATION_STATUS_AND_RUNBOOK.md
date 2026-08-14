@@ -74,7 +74,7 @@ the next phase. Updated after every phase.
 | 4 | Candle, indicator and paper-execution foundation | **Complete.** **Part 1 complete** (real contract resolution — closes 17, alarms 15). **Part 2 complete** (indicator layer — closes D21). **Part 3 complete** (continuity, timezone, wall-clock square-off — closes 4 and 7, and a live blocker). **Part 4 complete** (warm-up source and injection — closes 16). **Part 5 complete** (`PaperBroker` realism — closes 5 and D11; the live Full-mode gate item ran 6 August 2026 and passed, closing known limitation 20 along the way). **Phase 4 complete** — all five parts done, its one live gate item proven rather than asserted |
 | 5 | Mixed-mode supervisor and persistence | **Complete** |
 | 6 | Paper recovery and expiry handling | **Complete — all five parts.** **Part 1** (daily risk state across a restart — closes the risk-limit-bypass gap in bullet 1, and finds/fixes **D58**/limitation 22 along the way). **Part 2** (position-management state snapshot/restore — exit-policy state via `BaseExit`/`RiskManager`/`BaseStrategy` snapshot hooks, and stop/target persistence through a widened `RiskManager`/`ExecutionGateway`, fail-open on a bad snapshot, negative-control-tested). **Part 3** (MFE/MAE, square-off attempts, state-version validation and position-gated last-candle idempotency — the rest of §7's "restore at minimum" list). **Part 4** (`force_square_off_before_expiry` composed into the existing `SquareOffAuthority` seam — **D66-D68**; `simulate_exchange_settlement` refused at config load, none of spec section 11's eight settlement-policy items built — limitation 27). **Part 5** (the phase's record: bullets re-checked against what is built, not assumed; D56's persistence-identity gap given a written candidate direction, not an implementation — **D69**, limitation 30). Bullet 2's fixed strikes/basket legs/rolling counters remain blocked on `FixedStrikeEngine`/`MultiLegEngine` — D56/D34, unchanged, not this phase's to close |
-| 7 | Operations | **Complete — all five parts.** **Part 1** (health snapshot layer — `common/health/snapshot.py`, `auth_events`/`feed_events` writers and producers, configurable heartbeat interval). **Part 2** (Telegram in production — real notifier construction at both entrypoints, deferred delivery, rate limiting/aggregation, `notifications`-table persistence, redacted rendering — D71-D74). **Part 3** (the Streamlit dashboard — Master/Intraday Options/System Health pages plus two honest stubs, reading through `common.health.snapshot` for operational state — D75; addendum adds `effective_live_gate` status to Master, config-sourced, the one deliberate exception to database-only reads). **Part 4** (PID ownership hardened onto `create_time()`, fail-first proven — D76; two previously-hidden bugs found and fixed along the way — D77/D78; seven operator scripts plus `authenticate`, `audit_events` migration `0004`, file-based square-off request channel). **Part 5** (`common/retention/` — bounded age-based DB purge in one transaction, log compression/deletion, pre-migration backup with retained-backup count, one entry point at controlled startup — D80; `ScripMasterCache.prune()` given its first caller; `Settings.algo_log_level` wiring bug found and fixed — D79) |
+| 7 | Operations | **Complete — all five parts.** **Part 1** (health snapshot layer — `common/health/snapshot.py`, `auth_events`/`feed_events` writers and producers, configurable heartbeat interval). **Part 2** (Telegram in production — real notifier construction at both entrypoints, deferred delivery, rate limiting/aggregation, `notifications`-table persistence, redacted rendering — D71-D74). **Part 3** (the Streamlit dashboard — Master/Intraday Options/System Health pages plus two honest stubs, reading through `common.health.snapshot` for operational state — D75; addendum adds `effective_live_gate` status to Master, config-sourced, the one deliberate exception to database-only reads; **14 August 2026 addendum rewrote this into a unified, tabbed application — Home/Intraday Options/Positional Options/Intraday Stocks/System Health — behind a typed `dashboards/data/` read-model layer, see "Dashboard — unified Home/..." under §8**). **Part 4** (PID ownership hardened onto `create_time()`, fail-first proven — D76; two previously-hidden bugs found and fixed along the way — D77/D78; seven operator scripts plus `authenticate`, `audit_events` migration `0004`, file-based square-off request channel). **Part 5** (`common/retention/` — bounded age-based DB purge in one transaction, log compression/deletion, pre-migration backup with retained-backup count, one entry point at controlled startup — D80; `ScripMasterCache.prune()` given its first caller; `Settings.algo_log_level` wiring bug found and fixed — D79) |
 | 8 | LaunchAgent validation | **Complete** |
 | 9 | Real strategies | **Complete** |
 | 10 | Controlled live readiness | **CODE HARDENED, fully disabled.** Generic infrastructure is production-wired and fake-tested; operational activation remains blocked by paper evidence, a separately specified second real strategy, provider/static-IP, auth revalidation and explicit-approval gates. |
@@ -4793,7 +4793,110 @@ account lease enforcing Phase 10's one-live-strategy rollout. This remains
 code-level fixture/mock evidence only. **Operational activation is separately
 blocked** by the 30-day paper evidence, a second genuine paper strategy,
 strategy-specific approval, static-IP/provider setup, live auth revalidation,
-and an explicit decision to change any committed gate.
+and an explicit decision to change any committed gate. **The read-only
+dashboard was rewritten into a unified, tabbed application on 14 August
+2026** — see below; this is a dashboard-scope addendum, not a live-gate
+change, and every committed live gate remains exactly as disabled as
+before it.
+
+### Dashboard — unified Home/Intraday Options/Positional Options/Intraday Stocks/System Health (14 August 2026)
+
+Phase 7 Part 3 shipped one Master tile, one per-strategy page and one
+System Health page. This addendum grew that into the full information
+architecture a later spec pass asked for — five top-level pages (Home,
+Intraday Options, Positional Options, Intraday Stocks, System Health), each
+category page tabbed rather than flat — without weakening any of Part 3's
+guarantees and without touching `common/execution/`, `common/health/
+snapshot.py`, any runtime/strategy code, or the schema.
+
+**Architecture.** A new `dashboards/data/` package holds every typed
+read-model query (`account.py` — reconciliation/account-wide/live-gate
+matrix, moved out of `app.py` unchanged; `intraday_options.py` — overview,
+live positions, orders/fills, closed trades (entry/exit price and side
+derived structurally from fills via `positions.entry_correlation_id`, never
+string-parsed), performance metrics, strategy comparison, signals;
+`calendar_stats.py` — trading-day/30-day-rollup math; `incidents.py` —
+active-vs-resolved classification; `positional.py`/`stocks.py` — typed
+dataclass shells for runtimes that do not exist yet). Every function takes
+an already-open `connect_readonly` connection, mirroring
+`common.health.snapshot.read_snapshot`'s own convention; `dashboards/
+_shared.py` gained `run_bounded()` to generalise the missing/locked/pre-
+migration handling every query needs. Pages stay thin: `load_*` returns a
+dataclass, `render(streamlit, data)` takes the module as a parameter (every
+test drives a fake one), `main()` imports Streamlit lazily. The existing
+`pages/` multipage convention was kept (a working, tested mechanism);
+`st.page_link` gives Home its three clickable category cards — each
+resolves its own `config/runtimes/<id>.yaml` rather than a hardcoded
+runtime id, so a future real `positional_options`/`intraday_stocks` runtime
+lights its card up with no dashboard code change.
+
+**Two deliberate non-changes, called out rather than papered over.** (1) No
+schema migration and no runtime instrumentation were added. Current
+mark/unrealised P&L for paper positions and structured option contract
+metadata (strike/expiry/CE-PE) are not persisted anywhere; `ema_cross_9_21_buy`
+trades the NIFTY index directly (`security_id: "13"`), not an option
+contract, so contract metadata is inapplicable to it, not merely
+unpersisted. Both render as "—" with an explanation rather than being
+derived from a stale entry price. (2) `positions` holds one row per
+(strategy, mode, trading date, security) identity with no separate
+append-only trade ledger: if a strategy round-trips the same security
+twice on the same day, reopening overwrites the earlier closure's `status`
+back to `OPEN` and Closed Trades/Performance for that day shows only the
+currently-closed state, not every historical round trip. Confirmed against
+a real seeded fixture during manual verification (a BUY→SELL→BUY sequence
+on one trading date left `positions` with a single OPEN row, `realised_pnl`
+still correctly carrying the first round trip's P&L into the daily
+realised-P&L total, but Closed Trades reporting zero rows for that day) —
+a genuine persistence-model characteristic, not a dashboard defect, and out
+of scope to change here (no runtime/schema edits without separate
+approval).
+
+**Active vs. resolved incidents** (the spec's named complaint —
+`common.health.snapshot.RecentError`'s own docstring records the real
+14 August 2026 incident this traces to) are now separated without new
+schema: `dashboards/data/incidents.classify_incidents` marks an error
+"active" only when it is the most recent recorded error for its
+(strategy, component) pair *and* that component's current health signal
+(`broker.healthy`, `database.integrity_ok`, feed subscriptions-match/
+last-event, a strategy's current `health_state`) is still unhealthy;
+System Health shows the two lists separately, both always timestamped.
+
+**Read-only/live-safety proof unchanged in kind, extended in scope.** The
+three AST-based import-boundary checks in `tests/unit/test_dashboard.py`
+(no broker/feed import, no top-level `streamlit` import outside `pages/`,
+no write-capable `Database` import) now walk `dashboards/**/*.py`
+recursively rather than the five original files, so the new `data/`
+package and `formatting.py` are covered by the same guarantee. A new
+`AppTest`-based smoke suite (`tests/unit/test_dashboard_apptest.py`) runs
+every page through the real Streamlit runtime end to end against a
+throwaway `PROJECT_ROOT` and found one real bug no fake-streamlit test
+could have: `st.page_link` resolves its path relative to the entrypoint
+script's own directory, not the repository root — `dashboards/app.py`'s
+category links were wrong (`dashboards/pages/...` instead of `pages/...`)
+until this suite caught it. The same suite proves no page writes to the
+database (row counts identical before/after loading every page for real).
+Manual verification: a throwaway project root was seeded with a realistic
+paper round trip via the real `OrderLifecycle`/`PaperBroker` write path,
+`streamlit run dashboards/app.py` was started on a non-default port
+(never 8501/8511 — a pre-existing, independently-started dashboard process
+on 8511 was left untouched throughout), every page returned HTTP 200 with
+an empty server log, then the verification process was stopped; no order
+was placed and no runtime was started or stopped.
+
+**Tests added**: `test_dashboard.py` (safety suite, recursive), `test_
+dashboard_read_models.py` (pure calendar/metrics/incident/formatting
+calculations), `test_dashboard_intraday_options_data.py` (DB-backed, real
+`OrderLifecycle` fixtures), `test_dashboard_intraday_options_page.py`
+(render tests, all eight tabs), `test_dashboard_home.py` (multi-runtime
+aggregation, a missing-database card degrading only itself, paper/live P&L
+never combined), `test_dashboard_system_health.py` (the active/resolved
+incident scenario directly), `test_dashboard_positional_and_stocks.py`,
+`test_dashboard_apptest.py`. `test_dashboard_account_wide.py`/`test_
+dashboard_reconciliation.py` (Phase 10's own tests) were updated to import
+from their new home in `dashboards/data/account.py`, logic unchanged.
+`tests/end_to_end/test_walking_skeleton.py`'s dashboard gate test was
+updated the same way (`load_master`/`RuntimeCard` retired in favour of the
+snapshot read every page now shares).
 
 ### Phase 10 — Controlled live readiness — **CODE COMPLETE; operational activation blocked**
 
@@ -4993,6 +5096,73 @@ and absent/malformed/raising providers block closed.
 every gate remains exactly as fail-closed as it was at the end of Phase 9,
 now with a CI-time guard enforcing it; limitation 39 is closed independently.
 `OPERATIONAL LIVE ACTIVATION ELIGIBLE: NO — BLOCKED.`
+
+**Post-completion fix (14 August 2026): `dashboards/app.py` failed every real
+`streamlit run` with `ImportError: attempted relative import with no known
+parent package`.** Reported via a screenshot of the Master page. Root cause:
+`dashboards/app.py` is the one module in the `dashboards` package that
+Streamlit itself executes directly as the entry point — its ScriptRunner
+installs a fake `__main__` module and `exec()`s the compiled script into it,
+never importing `dashboards.app` as a package member — so its module-level
+`from ._shared import ...` (present unchanged since Phase 7 Part 3,
+`9a88cdae`) had no parent package to resolve against. `dashboards/pages/*.py`
+already carries the fix for exactly this constraint (a `sys.path` fix-up
+walking up to `pyproject.toml`, then an absolute `dashboards.*` import) —
+`app.py` was the one entry point that never got it, because it is imported
+normally (as `dashboards.app`) by every test in `tests/unit/test_dashboard.py`,
+which masked the bug from the whole suite (45 tests, all green) and from the
+AST-only "no broker/feed" checks (which parse the file, never execute it).
+The Phase 7 Part 3 runbook entry's live verification (`streamlit run
+dashboards/app.py`, HTTP 200, empty server log) did not catch it either:
+Streamlit serves the static app shell with a 200 regardless of a script
+error — the exception is pushed to the browser over the websocket after a
+session connects and run, exactly the in-page red traceback box the
+screenshot showed, not a startup failure a bare `curl` against `/` or a
+server-log grep would ever see. Fixed the same way the `pages/*.py` shims
+already do it: `app.py` now carries the identical `sys.path` fix-up ahead of
+one `from dashboards._shared import ...` absolute import (`# noqa: E402`,
+matching the shims' own exception). Verified three ways: `runpy.run_path(...,
+run_name="__main__")` — the same execution shape Streamlit's own
+`ScriptRunner` uses — now runs past the import into the page itself instead
+of raising; a real `streamlit run dashboards/app.py` server was started and
+its log grepped for `error`/`traceback`/`exception` (none, where the
+pre-fix log would show the exception once a session actually connected);
+`tests/unit/test_dashboard.py` (45 passed, 4 pre-existing skips), ruff, and
+mypy all still pass unmodified. No behavior change for every other page —
+they were never affected, since Streamlit only ever imports them (via the
+`pages/*.py` shims), never `exec()`s them as `__main__`.
+
+**Post-completion fix (14 August 2026, same session): System Health's
+"Recent errors" panel carried no timestamp, so a resolved incident read as
+a live one.** Reported via a second screenshot, taken right after the fix
+above, of System Health showing two red error rows ("feed did not finish
+within 10.0s...", "a runtime subscription has been waiting 30.2s..."). Both
+were real — but a `grep` of `logs/algo_trading.log` timestamped them at
+10:19:18 / 10:23:20 IST, and the running worker (PID 20696, started 14:02:58,
+after both of that morning's feed fixes — `a36b606`, `bcd2d5a`) had been
+evaluating 5-minute bars cleanly with zero new errors straight through to
+14:15. `common.health.snapshot._recent_errors` selected only `message`, never
+`occurred_at`, from the `errors` table (indexed on exactly that column,
+`idx_errors_recent`, but the column was never read) — so the panel had no way
+to distinguish a four-hour-old, already-fixed incident from one happening
+now. `HealthSnapshot.recent_errors` changes type from `tuple[str, ...]` to a
+new `tuple[RecentError, ...]` (`message` + `occurred_at`, exported from
+`common.health` alongside every other read-model dataclass this layer
+already returns); `_recent_errors` now selects both columns. Every consumer
+— `dashboards/system_health.py`, `dashboards/app.py`'s Master page, and
+`scripts/status.py` — renders `f"{occurred_at} — {message}"` instead of the
+bare message; `scripts/status.py --json`'s `dataclasses.asdict(snapshot)`
+serializes the nested dataclass with no code change. Verified directly
+against the real, running database
+(`read_snapshot(connect_readonly(...), runtime_id="intraday_options",
+trading_date="2026-08-14"))`: both rows now carry `occurred_at` timestamps
+(`2026-08-14T04:49:18`/`04:53:20+00:00`, i.e. the same 10:19/10:23 IST
+incident), confirming an operator looking at the dashboard right now would
+see the age and not mistake it for a live emergency. `tests/unit/
+test_dashboard.py` and `tests/unit/test_health_snapshot.py` updated for the
+new type (`test_recent_errors_respects_the_limit_and_most_recent_first` now
+asserts `occurred_at` is populated, not just message order); full suite,
+ruff, and mypy all pass.
 
 ### Phase 9 — Real strategies — **Complete**
 

@@ -101,6 +101,20 @@ class BrokerHealth:
 
 
 @dataclass(frozen=True)
+class RecentError:
+    """One ``errors`` row, message paired with when it happened.
+
+    Without ``occurred_at`` a resolved incident from hours ago reads
+    identically to one happening right now — the exact confusion a screenshot
+    of ``dashboards/system_health.py``'s "Recent errors" panel surfaced on
+    14 August 2026: the two rows shown were a real feed outage, already fixed
+    and superseded by a clean restart nearly four hours earlier."""
+
+    message: str
+    occurred_at: str
+
+
+@dataclass(frozen=True)
 class DatabaseHealth:
     """Computed directly against the connection handed in — no write needed.
 
@@ -158,7 +172,7 @@ class HealthSnapshot:
     realised_pnl_paper: float
     realised_pnl_live: float
     orders_today: int
-    recent_errors: tuple[str, ...]
+    recent_errors: tuple[RecentError, ...]
 
 
 def read_snapshot(
@@ -470,9 +484,13 @@ def _orders_today(conn: sqlite3.Connection, runtime_id: str, trading_date: str) 
     return int(row["c"]) if row else 0
 
 
-def _recent_errors(conn: sqlite3.Connection, runtime_id: str, limit: int) -> tuple[str, ...]:
+def _recent_errors(
+    conn: sqlite3.Connection, runtime_id: str, limit: int
+) -> tuple[RecentError, ...]:
     rows = conn.execute(
-        "SELECT message FROM errors WHERE runtime_id = ? ORDER BY id DESC LIMIT ?",
+        "SELECT message, occurred_at FROM errors WHERE runtime_id = ? ORDER BY id DESC LIMIT ?",
         (runtime_id, limit),
     ).fetchall()
-    return tuple(row["message"] for row in rows)
+    return tuple(
+        RecentError(message=row["message"], occurred_at=row["occurred_at"]) for row in rows
+    )

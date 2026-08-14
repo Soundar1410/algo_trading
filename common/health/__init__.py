@@ -10,6 +10,7 @@ from .snapshot import (
     HealthSnapshot,
     MarketDataHealth,
     ProcessHealth,
+    RecentError,
     StrategyHealth,
     read_snapshot,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "HeartbeatWriter",
     "MarketDataHealth",
     "ProcessHealth",
+    "RecentError",
     "StrategyHealth",
     "read_snapshot",
 ]

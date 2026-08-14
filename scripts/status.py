@@ -132,8 +132,8 @@ def _print_human(snapshot: HealthSnapshot) -> None:
 
     if snapshot.recent_errors:
         print("Recent errors:")
-        for message in snapshot.recent_errors:
-            print(f"  - {message}")
+        for error in snapshot.recent_errors:
+            print(f"  - {error.occurred_at} — {error.message}")
 
 
 if __name__ == "__main__":

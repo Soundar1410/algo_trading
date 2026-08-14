@@ -7,7 +7,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
-import dashboards.app as master_page
+import dashboards.data.account as master_page
 from common.persistence import migrate_account_shared_database, open_account_shared_database
 
 
@@ -156,14 +156,14 @@ def test_an_open_position_with_no_mark_is_flagged_unmarked(tmp_path: Path):
 # --------------------------------------------------------------------- render
 def test_render_reports_unavailable_without_crashing():
     fake_st = _FakeStreamlit()
-    master_page._render_account_status(fake_st, master_page.SnapshotUnavailable("locked"))
+    master_page.render_account_status(fake_st, master_page.SnapshotUnavailable("locked"))
     assert any("unavailable" in c for c in fake_st.captions)
 
 
 def test_render_reports_no_accounts_yet():
     fake_st = _FakeStreamlit()
     status = master_page.AccountWideStatus(trading_date="2026-08-13", accounts=())
-    master_page._render_account_status(fake_st, status)
+    master_page.render_account_status(fake_st, status)
     assert any("No live worker" in c for c in fake_st.captions)
 
 
@@ -181,7 +181,7 @@ def test_render_warns_when_an_account_is_not_reconciled():
         new_order_count_current_window=0,
     )
     status = master_page.AccountWideStatus(trading_date="2026-08-13", accounts=(account,))
-    master_page._render_account_status(fake_st, status)
+    master_page.render_account_status(fake_st, status)
     assert any("never_reconciled" in w and "blocked" in w for w in fake_st.warnings)
 
 
@@ -199,7 +199,7 @@ def test_render_shows_metrics_for_a_healthy_reconciled_account():
         new_order_count_current_window=3,
     )
     status = master_page.AccountWideStatus(trading_date="2026-08-13", accounts=(account,))
-    master_page._render_account_status(fake_st, status)
+    master_page.render_account_status(fake_st, status)
     assert fake_st.warnings == []
     assert len(fake_st.column_calls) == 1
     metrics = {label: value for col in fake_st.column_calls[0] for label, value in col.metrics}

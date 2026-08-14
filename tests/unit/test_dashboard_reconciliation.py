@@ -7,7 +7,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
-import dashboards.app as master_page
+import dashboards.data.account as master_page
 from common.persistence import Database, MigrationRunner
 
 
@@ -85,7 +85,7 @@ def test_render_shows_the_placeholder_when_status_is_none():
     """Every hand-built RuntimeCard from before this field existed keeps
     behaving exactly as it always did."""
     fake_st = _FakeStreamlit()
-    master_page._render_reconciliation_status(fake_st, None)
+    master_page.render_reconciliation_status(fake_st, None)
     assert any(master_page.RECONCILIATION_STATUS in c for c in fake_st.captions)
 
 
@@ -98,7 +98,7 @@ def test_render_shows_a_clean_completed_run_as_a_caption():
         started_at="2026-08-13T09:00:00Z",
         completed_at="2026-08-13T09:00:05Z",
     )
-    master_page._render_reconciliation_status(fake_st, status)
+    master_page.render_reconciliation_status(fake_st, status)
     assert any("completed" in c for c in fake_st.captions)
     assert fake_st.warnings == []
     assert fake_st.errors == []
@@ -113,7 +113,7 @@ def test_render_warns_when_entries_are_blocked():
         started_at="2026-08-13T09:00:00Z",
         completed_at="2026-08-13T09:00:05Z",
     )
-    master_page._render_reconciliation_status(fake_st, status)
+    master_page.render_reconciliation_status(fake_st, status)
     assert any("blocked" in w for w in fake_st.warnings)
 
 
@@ -126,38 +126,13 @@ def test_render_errors_on_a_failed_run():
         started_at="2026-08-13T09:00:00Z",
         completed_at=None,
     )
-    master_page._render_reconciliation_status(fake_st, status)
+    master_page.render_reconciliation_status(fake_st, status)
     assert any("FAILED" in e for e in fake_st.errors)
 
 
 def test_render_reports_a_read_failure_without_crashing():
     fake_st = _FakeStreamlit()
-    master_page._render_reconciliation_status(
+    master_page.render_reconciliation_status(
         fake_st, master_page.SnapshotUnavailable("locked")
     )
     assert any("unavailable" in c for c in fake_st.captions)
-
-
-# ------------------------------------------------------------------ load_master
-def test_load_master_populates_real_reconciliation_status(tmp_path: Path):
-    database = _database(tmp_path)
-    now = datetime.now(UTC).isoformat()
-    with database.transaction() as conn:
-        conn.execute(
-            "INSERT INTO runtime_sessions (runtime_id, strategy_id, execution_mode, "
-            "process_role, pid, started_at) VALUES "
-            "('intraday_options', 'st01', 'paper', 'worker', 1, ?)",
-            (now,),
-        )
-        conn.execute(
-            "INSERT INTO reconciliation_runs (runtime_id, execution_mode, trigger_source, "
-            "started_at, completed_at, status, critical_mismatch_count, entries_blocked) "
-            "VALUES ('intraday_options', 'live', 'startup', ?, ?, 'completed', 1, 1)",
-            (now, now),
-        )
-
-    card = master_page.load_master(database.path, "intraday_options", "2026-08-13")
-    assert isinstance(card, master_page.RuntimeCard)
-    assert isinstance(card.reconciliation_status, master_page.ReconciliationStatus)
-    assert card.reconciliation_status.critical_mismatch_count == 1
-    assert card.reconciliation_status.entries_blocked

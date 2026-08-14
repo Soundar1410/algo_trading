@@ -1,41 +1,38 @@
-"""Read-only Streamlit dashboard — Master page.
+"""Read-only Streamlit dashboard — Home command centre.
 
 ``streamlit run dashboards/app.py`` is this platform's one entry point; the
 other four pages (``dashboards/pages/``) are Streamlit's native multipage
-convention, auto-discovered from this script's directory.
+convention, auto-discovered from this script's directory. Home is a compact
+command centre (spec: total strategies, running/stopped/degraded/disabled
+counts, paper vs. live P&L kept visually separate, open positions, orders
+today, DB/feed health, active incidents, recent alerts, a 30-day paper-
+forward-testing rollup) plus three clickable category cards
+(``st.page_link``) into Intraday Options / Positional Options / Intraday
+Stocks.
 
 Two constraints from the spec shape every page in this package, this one
-included:
+included — see ``dashboards/_shared.py``'s module docstring for the full
+argument:
 
 * **The dashboard is read-only.** Every page reads through
-  :func:`~dashboards._shared.load_snapshot`, which opens the database with
-  :func:`~common.persistence.database.connect_readonly` — SQLite's ``mode=ro``
-  URI, so a write is refused by the driver itself rather than by convention.
-* **The dashboard never opens a market-data connection, a broker, or a write
-  connection.** A second WebSocket from a dashboard would compete with the
-  supervisor's shared feed for the same subscription budget, and a broker
-  import here is exactly the side-effecting import the spec forbids.
-  ``tests/unit/test_dashboard.py`` enforces this by AST-walking every module
-  in this package.
-
-Phase 1 shipped one tile reading four inline ``SELECT``s
-(``RuntimeTile``/``_build_tile``, now retired). Phase 7 Part 1 built
-:mod:`common.health.snapshot` specifically so no page — this one included —
-ever writes its own SQL again; Part 3 is what actually puts that layer behind
-a page.
+  :func:`~dashboards._shared.load_snapshot`/:func:`~dashboards._shared.run_bounded`,
+  both backed by :func:`~common.persistence.database.connect_readonly`.
+* **The dashboard never opens a market-data connection, a broker, or a
+  write connection.** ``tests/unit/test_dashboard.py`` AST-walks every
+  module in this package to enforce it.
 
 **Live-gate status is the one deliberate exception to "the database only".**
-Global/runtime/strategy live-gate flags live in ``config/*.yaml``, not SQLite
-— :func:`~common.config.effective_live_gate` takes a ``ResolvedConfig``, which
-only a config read can produce. This is not the resource the two constraints
-above are about: it opens no database write connection, no broker, no feed —
-:mod:`common.config` (and everything it imports transitively) depends only on
-``pydantic``/``yaml``/the standard library, verified directly rather than
-assumed. ``tests/unit/test_dashboard.py``'s AST check still passes unmodified,
-because it looks for broker/feed/write-``Database`` imports specifically, not
-for config reads. Isolated into its own loader and its own failure type
-(:class:`ConfigUnavailable`) so a broken YAML file degrades only this section,
-never the snapshot-backed rest of the page.
+Global/runtime/strategy live-gate flags and the disabled-strategy count live
+in ``config/*.yaml``, not SQLite. Isolated into ``dashboards/data/account.py``
+so a broken YAML file degrades only that section, never the snapshot-backed
+rest of the page.
+
+**Which runtime a category card reads is discovered, not hardcoded.** Each
+of the three cards resolves its own ``config/runtimes/<runtime_id>.yaml``
+and only attempts a database read if that runtime is configured *and*
+enabled — a future real ``positional_options``/``intraday_stocks`` runtime
+lights the same card up with no code change here (spec: "do not hardcode
+the master dashboard permanently to intraday_options").
 
 Data functions are importable and tested directly; Streamlit is imported
 lazily so the test suite never needs it at collection time.
@@ -43,580 +40,550 @@ lazily so the test suite never needs it at collection time.
 
 from __future__ import annotations
 
-import sqlite3
-from dataclasses import dataclass, replace
+import sys
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from common.config import (
-    ConfigError,
-    ExecutionMode,
-    Settings,
-    discover_enabled_strategies,
-    effective_live_gate,
-    load_global_config,
-    load_runtime_config,
-    load_settings,
+from common.config import ConfigError, Settings, load_runtime_config, load_settings
+from common.utils.timeutils import DEFAULT_TZ, get_tz
+
+# ``streamlit run dashboards/app.py`` executes this file directly as
+# ``__main__`` — see the original module's long-standing note (now here)
+# on why the sys.path fix-up below is required before any ``dashboards.*``
+# import, and is a no-op when this module is imported normally as a package
+# member (e.g. by the test suite).
+for _parent in Path(__file__).resolve().parents:
+    if (_parent / "pyproject.toml").is_file():
+        if str(_parent) not in sys.path:
+            sys.path.insert(0, str(_parent))
+        break
+
+from dashboards._shared import SnapshotUnavailable, load_snapshot, run_bounded  # noqa: E402
+from dashboards.data import positional as positional_data  # noqa: E402
+from dashboards.data import stocks as stocks_data  # noqa: E402
+from dashboards.data.account import (  # noqa: E402
+    ConfigUnavailable,
+    LiveGateMatrix,
+    load_account_status,
+    load_live_gate_matrix,
+    render_account_status,
 )
-from common.health import HealthSnapshot
-from common.persistence import DatabaseError, connect_readonly
+from dashboards.data.calendar_stats import (  # noqa: E402
+    DailyOutcome,
+    ThirtyDayRollup,
+    build_thirty_day_rollup,
+)
+from dashboards.data.incidents import IncidentRow, classify_incidents  # noqa: E402
+from dashboards.data.intraday_options import (  # noqa: E402
+    EventErrorRow,
+    OverviewRow,
+    load_daily_outcomes,
+    load_errors,
+    load_inception_date,
+    load_overview,
+)
+from dashboards.formatting import colored, format_age, format_inr, format_ist  # noqa: E402
 
-from ._shared import SnapshotUnavailable, load_snapshot
+_IST = get_tz(DEFAULT_TZ)
 
-#: Spec section 9 requires reconciliation status on the Master page.
-#: Shown for a card built without ever calling :func:`load_reconciliation_status`
-#: (every hand-built ``RuntimeCard`` in tests before Phase 10, and any future
-#: caller of ``render`` that skips it deliberately) — an explicit "not read"
-#: state, never confused with "nothing to reconcile". ``load_master`` itself
-#: always attempts a real read; this is the fallback only for the field's own
-#: default, not the real path's typical outcome.
-RECONCILIATION_STATUS = "Not implemented (Phase 10 — controlled live)"
-
-
-@dataclass(frozen=True)
-class ReconciliationStatus:
-    """The most recent reconciliation run for one runtime group (spec's
-    Master-page bullet: "Reconciliation status"). Read-only, straight off
-    ``reconciliation_runs`` — never re-runs reconciliation itself (the
-    dashboard must never own trading state, spec line 707)."""
-
-    run_status: str  # 'running' | 'completed' | 'failed'
-    critical_mismatch_count: int
-    entries_blocked: bool
-    started_at: str
-    completed_at: str | None
-
-
-def load_reconciliation_status(
-    database_path: Path | str,
-) -> ReconciliationStatus | SnapshotUnavailable | None:
-    """The latest ``reconciliation_runs`` row across the whole runtime
-    group, or why there is nothing to show. ``None`` means no reconciliation
-    has ever run for this group yet — distinct from :class:`SnapshotUnavailable`
-    (the database itself could not be read) and from a real completed/failed
-    run.
-    """
-    db_path = Path(database_path)
-    if not db_path.is_file():
-        return SnapshotUnavailable(f"No database yet at {db_path}. Start the supervisor first.")
-    try:
-        conn = connect_readonly(db_path)
-    except DatabaseError as exc:
-        return SnapshotUnavailable(str(exc))
-    try:
-        row = conn.execute(
-            "SELECT status, critical_mismatch_count, entries_blocked, started_at, "
-            "completed_at FROM reconciliation_runs ORDER BY started_at DESC LIMIT 1"
-        ).fetchone()
-    except sqlite3.Error as exc:
-        return SnapshotUnavailable(f"Database not ready ({type(exc).__name__}): {exc}")
-    finally:
-        conn.close()
-    if row is None:
-        return None
-    return ReconciliationStatus(
-        run_status=row["status"],
-        critical_mismatch_count=row["critical_mismatch_count"],
-        entries_blocked=bool(row["entries_blocked"]),
-        started_at=row["started_at"],
-        completed_at=row["completed_at"],
-    )
-
-
-#: Reservation states whose projected_capital still counts as active
-#: exposure — mirrors common.risk.account_reservations.ACTIVE_STATES,
-#: repeated here (not imported) for the same reason common.risk.account_risk
-#: repeats it rather than importing it: this module's SQL needs the literal
-#: tuple, and this page must not import common.risk (a risk-engine module
-#: with its own Database-typed API this read-only page cannot satisfy —
-#: see load_account_status's docstring).
-_ACTIVE_RESERVATION_STATES = (
-    "RESERVED",
-    "SUBMITTED",
-    "ACKNOWLEDGED",
-    "PARTIALLY_FILLED",
-    "UNKNOWN",
-    "RECONCILED",
+#: (category label, runtime_id, page path for st.page_link, not-configured message)
+#: ``st.page_link`` resolves its path relative to the entrypoint script's
+#: own directory (``dashboards/``, since ``streamlit run dashboards/app.py``
+#: is the entrypoint) — *not* relative to the repository root. Getting this
+#: wrong raises ``StreamlitPageNotFoundError`` at render time; only an
+#: AppTest-driven smoke test catches it, since every other test in this
+#: package drives ``render()`` with a fake streamlit that never validates
+#: the path at all.
+_CATEGORIES: tuple[tuple[str, str, str, str], ...] = (
+    (
+        "Intraday Options",
+        "intraday_options",
+        "pages/1_Intraday_Options.py",
+        "No configuration found for this runtime group.",
+    ),
+    (
+        "Positional Options",
+        "positional_options",
+        "pages/2_Positional_Options.py",
+        positional_data.NOT_CONFIGURED,
+    ),
+    (
+        "Intraday Stocks",
+        "intraday_stocks",
+        "pages/3_Intraday_Stocks.py",
+        stocks_data.NOT_CONFIGURED,
+    ),
 )
 
+_HEALTHY_STATES = {"RUNNING_PAPER", "RUNNING_LIVE", "RUNNING"}
+_DEGRADED_STATES = {"DEGRADED", "STALE", "FAILED", "CRASHED"}
 
-@dataclass(frozen=True)
-class AccountRow:
-    """One Dhan account's account-wide risk and rate-limit picture — spans
-    every runtime group sharing this ``account_key``, read straight off the
-    *shared* account database (``dhan_account_shared.db``), not any one
-    runtime group's own database.
 
-    ``has_unmarked_position`` is deliberately narrower than
-    ``common.risk.account_risk.AccountExposureSnapshot.mtm_stale``: that
-    field is age-bound (a mark older than ``max_mtm_age_seconds``), which
-    needs a runtime's own config this page does not load for every account
-    key it might show. Here it means only "no mark has ever been recorded
-    for this open position" — real information, just a narrower claim.
-    """
-
-    account_key: str
-    reconciliation_status: str
-    realised_pnl_today: float
-    unrealised_pnl: float
-    has_unmarked_position: bool
-    open_position_count: int
-    open_positions_capital: float
-    reserved_capital: float
-    new_order_count_current_window: int
+def _bucket(health_state: str | None) -> str:
+    if health_state in _HEALTHY_STATES:
+        return "running"
+    if health_state in _DEGRADED_STATES:
+        return "degraded"
+    return "stopped"
 
 
 @dataclass(frozen=True)
-class AccountWideStatus:
-    trading_date: str
-    accounts: tuple[AccountRow, ...]
+class CategoryCard:
+    """One category's summary — spec: "one clickable card per runtime
+    category", with status/strategies/mode/today's P&L/open positions/
+    heartbeat/error count, paper and live never blended."""
+
+    category: str
+    page_path: str
+    configured: bool
+    status_label: str
+    detail: str
+    strategies_running: int
+    strategies_total: int
+    realised_pnl_paper: float | None
+    realised_pnl_live: float | None
+    open_positions: int | None
+    last_heartbeat_age_seconds: float | None
+    active_error_count: int
 
 
-def _account_row(conn: sqlite3.Connection, account_key: str, trading_date: str) -> AccountRow:
-    provenance_row = conn.execute(
-        "SELECT reconciliation_status FROM live_account_state_provenance WHERE account_key = ?",
-        (account_key,),
-    ).fetchone()
-    # A missing provenance row must never read as "reconciled" — spec: a
-    # missing/recreated/empty shared database is never zero exposure.
-    reconciliation_status = (
-        provenance_row["reconciliation_status"] if provenance_row else "never_reconciled"
-    )
-
-    realised = conn.execute(
-        "SELECT COALESCE(SUM(realised_pnl_delta), 0) AS total FROM live_realised_pnl_events "
-        "WHERE account_key = ? AND trading_date = ?",
-        (account_key, trading_date),
-    ).fetchone()["total"]
-
-    positions = conn.execute(
-        "SELECT security_id, deployed_capital FROM live_open_positions WHERE account_key = ?",
-        (account_key,),
-    ).fetchall()
-    mtm_by_security = {
-        row["security_id"]: row
-        for row in conn.execute(
-            "SELECT security_id, unrealised_pnl FROM live_position_mtm WHERE account_key = ?",
-            (account_key,),
-        )
-    }
-    unrealised = 0.0
-    has_unmarked_position = False
-    for position in positions:
-        mark = mtm_by_security.get(position["security_id"])
-        if mark is None:
-            has_unmarked_position = True
-            continue
-        unrealised += mark["unrealised_pnl"]
-
-    placeholders = ",".join("?" * len(_ACTIVE_RESERVATION_STATES))
-    reserved = conn.execute(
-        "SELECT COALESCE(SUM(projected_capital), 0) AS total FROM live_risk_reservations "
-        f"WHERE account_key = ? AND state IN ({placeholders})",
-        (account_key, *_ACTIVE_RESERVATION_STATES),
-    ).fetchone()["total"]
-
-    window_row = conn.execute(
-        "SELECT count FROM live_order_rate_windows WHERE account_key = ? "
-        "AND call_class = 'new_order' ORDER BY window_start DESC LIMIT 1",
-        (account_key,),
-    ).fetchone()
-
-    return AccountRow(
-        account_key=account_key,
-        reconciliation_status=reconciliation_status,
-        realised_pnl_today=realised,
-        unrealised_pnl=unrealised,
-        has_unmarked_position=has_unmarked_position,
-        open_position_count=len(positions),
-        open_positions_capital=sum(p["deployed_capital"] for p in positions),
-        reserved_capital=reserved,
-        new_order_count_current_window=window_row["count"] if window_row else 0,
-    )
-
-
-def load_account_status(
-    database_path: Path | str, *, trading_date: str
-) -> AccountWideStatus | SnapshotUnavailable:
-    """Account-wide risk and rate-limit state, read from the *shared*
-    account database — distinct from :func:`load_master`, which reads one
-    runtime group's own database. Never derives an ``account_key`` itself
-    (that needs the account-identity pepper, a broker-layer concern this
-    read-only page does not import — ``tests/unit/test_dashboard.py`` AST-
-    enforces that no dashboard module imports anything with "broker" in its
-    name). Instead reports on every ``account_key`` this shared database has
-    ever recorded anything for, across ``live_account_state_provenance``,
-    ``live_risk_reservations`` and ``live_open_positions`` — a key present in
-    only the latter two (provenance row missing) still gets a row, correctly
-    defaulted to ``never_reconciled``, rather than being silently omitted.
-
-    A missing file means no live worker has ever run yet on this machine —
-    not "zero accounts, all clear".
-    """
-    db_path = Path(database_path)
-    if not db_path.is_file():
-        return SnapshotUnavailable(f"No account-shared database yet at {db_path}.")
-    try:
-        conn = connect_readonly(db_path)
-    except DatabaseError as exc:
-        return SnapshotUnavailable(str(exc))
-    try:
-        keys: set[str] = set()
-        for table in (
-            "live_account_state_provenance",
-            "live_risk_reservations",
-            "live_open_positions",
-        ):
-            keys.update(
-                row["account_key"]
-                for row in conn.execute(f"SELECT DISTINCT account_key FROM {table}")
-            )
-        accounts = tuple(_account_row(conn, key, trading_date) for key in sorted(keys))
-    except sqlite3.Error as exc:
-        return SnapshotUnavailable(f"Database not ready ({type(exc).__name__}): {exc}")
-    finally:
-        conn.close()
-    return AccountWideStatus(trading_date=trading_date, accounts=accounts)
-
-
-@dataclass(frozen=True)
-class ConfigUnavailable:
-    """Why the live-gate section has nothing to show. Rendered as a message,
-    never raised — a broken YAML file must degrade only this section, not the
-    snapshot-backed rest of the page."""
-
-    reason: str
-
-
-@dataclass(frozen=True)
-class StrategyLiveGate:
-    """One live-mode strategy's gate outcome, from the real production check."""
-
-    strategy_id: str
-    allowed: bool
-    blocked_reasons: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class LiveGateStatus:
-    """Global and runtime live-gate status (spec's Master-page bullet),
-    plus every currently-enabled live-mode strategy's own gate outcome.
-
-    ``global_live_trading_enabled``/``runtime_live_execution_allowed`` are the
-    two account/runtime-level permissions read directly off config — the
-    layer the spec bullet names specifically as distinct from strategy-level.
-    ``live_strategies`` reuses :func:`~common.config.effective_live_gate`
-    itself (not a re-derivation of its AND-chain) for every *enabled*
-    strategy whose ``mode`` is ``live``, so what this page shows is exactly
-    what the supervisor's own admission gate would decide.
-    """
-
-    global_live_trading_enabled: bool
-    runtime_live_execution_allowed: bool
-    live_strategies: tuple[StrategyLiveGate, ...]
-
-
-@dataclass(frozen=True)
-class RuntimeCard:
-    """One runtime group's summary — the Master page's one card.
-
-    Deliberately singular today: this platform has exactly one real runtime
-    (``intraday_options``); ``positional_options`` and ``intraday_stocks``
-    have no supervisor, no database and their own stub pages. ``load_master``
-    takes one ``runtime_id`` rather than discovering "every configured
-    runtime" because that would mean globbing ``config/runtimes/*.yaml`` for a
-    list that has exactly one real entry today. A future second runtime calls
-    this once per group, the same way ``main`` below would loop.
-
-    ``disabled_count`` is deliberately absent even though this page now reads
-    some config (see ``live_gate`` below): :func:`~common.config.
-    discover_enabled_strategies` returns only *enabled* strategies by design,
-    so it cannot answer "how many are disabled" either — that would still
-    need a third read (globbing every ``config/strategies/*.yaml`` file and
-    checking each), for one field spec asks for and runtime state alone
-    cannot answer. Not shown, not faked as zero.
-
-    ``live_gate`` is ``None`` when the caller did not ask for it (``load_
-    master`` without ``config_root`` — every existing call before this field
-    existed keeps working unchanged), :class:`ConfigUnavailable` when config
-    could not be read, otherwise a real :class:`LiveGateStatus`.
-    """
-
-    runtime_id: str
-    group_health_state: str | None
-    heartbeat_age_seconds: float | None
-    paper_count: int
-    live_count: int
-    failed_count: int
-    total_count: int
-    open_positions: int
-    orders_today: int
-    realised_pnl_paper: float
-    realised_pnl_live: float
-    feed_last_event: str | None
-    broker_healthy: bool
-    database_healthy: bool
-    recent_errors: tuple[str, ...]
-    live_gate: LiveGateStatus | ConfigUnavailable | None = None
-    #: Phase 10. ``None`` (the default) means never read — every hand-built
-    #: card before this field existed keeps rendering the same placeholder
-    #: text ``load_master`` no longer relies on for its own real path.
-    reconciliation_status: ReconciliationStatus | SnapshotUnavailable | None = None
-
-
-def load_live_gate_status(
-    config_root: Path | str, runtime_id: str, settings: Settings | None = None
-) -> LiveGateStatus | ConfigUnavailable:
-    """Global/runtime live-gate flags, plus every enabled live-mode strategy's
-    real gate outcome — a pure config read, no database involved.
-
-    A missing or malformed ``config/runtimes/<runtime_id>.yaml`` (the runtime
-    simply not configured yet, or a typo) is exactly as unexceptional here as
-    a missing database is to :func:`~dashboards._shared.load_snapshot` —
-    caught and returned as data, not raised.
-    """
-    settings = settings if settings is not None else load_settings()
-    config_root = Path(config_root)
-    try:
-        global_config = load_global_config(config_root)
-        runtime_config = load_runtime_config(config_root, runtime_id)
-        live_strategies = tuple(
-            StrategyLiveGate(
-                strategy_id=cfg.strategy.strategy_id,
-                allowed=(gate := effective_live_gate(cfg)).allowed,
-                blocked_reasons=gate.blocked_reasons,
-            )
-            for cfg in discover_enabled_strategies(config_root, runtime_id, settings=settings)
-            if cfg.strategy.mode is ExecutionMode.LIVE
-        )
-    except ConfigError as exc:
-        return ConfigUnavailable(str(exc))
-    return LiveGateStatus(
-        global_live_trading_enabled=global_config.live_trading_enabled,
-        runtime_live_execution_allowed=runtime_config.live_execution_allowed,
-        live_strategies=live_strategies,
-    )
-
-
-def load_master(
-    database_path: Path | str,
+def _build_category_card(
+    category: str,
     runtime_id: str,
-    trading_date: str,
+    page_path: str,
+    not_configured_message: str,
     *,
-    config_root: Path | str | None = None,
-    settings: Settings | None = None,
-) -> RuntimeCard | SnapshotUnavailable:
-    """Build the one runtime card this page shows, or say why it cannot.
+    config_root: Path,
+    database_path: Path,
+    trading_date: str,
+    settings: Settings,
+) -> CategoryCard:
+    try:
+        runtime_config = load_runtime_config(config_root, runtime_id)
+    except ConfigError:
+        runtime_config = None
 
-    ``config_root`` is optional and additive: omitted (every call site before
-    live-gate status existed, and every existing test), the card's
-    ``live_gate`` stays ``None`` and the section is not shown — a config
-    read failure can never turn into "no snapshot either" by omitting it.
-    """
+    if runtime_config is None or not runtime_config.enabled:
+        return CategoryCard(
+            category=category,
+            page_path=page_path,
+            configured=False,
+            status_label="NOT CONFIGURED",
+            detail=not_configured_message,
+            strategies_running=0,
+            strategies_total=0,
+            realised_pnl_paper=None,
+            realised_pnl_live=None,
+            open_positions=None,
+            last_heartbeat_age_seconds=None,
+            active_error_count=0,
+        )
+
     result = load_snapshot(database_path, runtime_id, trading_date)
     if isinstance(result, SnapshotUnavailable):
-        return result
-    card = _card_from_snapshot(result)
-    # Always attempted, unlike live_gate: reconciliation status needs only
-    # database_path, already in hand — no config_root gating required.
-    card = replace(card, reconciliation_status=load_reconciliation_status(database_path))
-    if config_root is None:
-        return card
-    live_gate = load_live_gate_status(config_root, runtime_id, settings)
-    return replace(card, live_gate=live_gate)
+        return CategoryCard(
+            category=category,
+            page_path=page_path,
+            configured=True,
+            status_label="STOPPED",
+            detail=result.reason,
+            strategies_running=0,
+            strategies_total=0,
+            realised_pnl_paper=None,
+            realised_pnl_live=None,
+            open_positions=None,
+            last_heartbeat_age_seconds=None,
+            active_error_count=0,
+        )
 
+    snapshot = result
+    buckets = [_bucket(s.health_state) for s in snapshot.strategies]
+    running = buckets.count("running")
+    group_state = snapshot.group.health_state if snapshot.group else None
+    if group_state in _HEALTHY_STATES and running == len(buckets) and buckets:
+        status_label = "HEALTHY"
+    elif group_state in _HEALTHY_STATES or running:
+        status_label = "DEGRADED"
+    else:
+        status_label = "STOPPED"
 
-def _card_from_snapshot(snapshot: HealthSnapshot) -> RuntimeCard:
-    paper_count = sum(1 for s in snapshot.strategies if s.execution_mode == "paper")
-    live_count = sum(1 for s in snapshot.strategies if s.execution_mode == "live")
-    failed_count = sum(1 for s in snapshot.strategies if s.health_state == "FAILED")
-    return RuntimeCard(
-        runtime_id=snapshot.runtime_id,
-        group_health_state=snapshot.group.health_state if snapshot.group else None,
-        heartbeat_age_seconds=(
-            snapshot.group.heartbeat_age_seconds if snapshot.group else None
-        ),
-        paper_count=paper_count,
-        live_count=live_count,
-        failed_count=failed_count,
-        total_count=len(snapshot.strategies),
-        open_positions=snapshot.open_positions,
-        orders_today=snapshot.orders_today,
+    error_rows = load_errors_bounded(database_path, runtime_id)
+    strategy_states = {s.strategy_id: s.health_state for s in snapshot.strategies}
+    active_errors = 0
+    if not isinstance(error_rows, SnapshotUnavailable):
+        classified = classify_incidents(
+            error_rows,
+            broker_healthy=snapshot.broker.healthy,
+            database_healthy=snapshot.database.integrity_ok,
+            feed_currently_ok=(
+                snapshot.market_data.subscriptions_match
+                and snapshot.market_data.last_event
+                not in {"disconnected", "reconnect_exhausted"}
+            ),
+            strategy_health_states=strategy_states,
+        )
+        active_errors = sum(1 for row in classified if row.active)
+
+    return CategoryCard(
+        category=category,
+        page_path=page_path,
+        configured=True,
+        status_label=status_label,
+        detail="",
+        strategies_running=running,
+        strategies_total=len(buckets),
         realised_pnl_paper=snapshot.realised_pnl_paper,
         realised_pnl_live=snapshot.realised_pnl_live,
-        feed_last_event=snapshot.market_data.last_event,
-        broker_healthy=snapshot.broker.healthy,
-        database_healthy=snapshot.database.integrity_ok,
-        recent_errors=snapshot.recent_errors,
+        open_positions=snapshot.open_positions,
+        last_heartbeat_age_seconds=(
+            snapshot.group.heartbeat_age_seconds if snapshot.group else None
+        ),
+        active_error_count=active_errors,
     )
 
 
-def _render_live_gate(streamlit: Any, live_gate: LiveGateStatus | ConfigUnavailable | None) -> None:
-    """The live-gate section. A no-op when the caller never asked for it —
-    see ``RuntimeCard.live_gate``'s docstring for why that is the default."""
-    if live_gate is None:
-        return
-    streamlit.markdown("**Live-gate status**")
-    if isinstance(live_gate, ConfigUnavailable):
-        streamlit.warning(f"Live-gate status unavailable: {live_gate.reason}")
-        return
-
-    gate = streamlit.columns(2)
-    gate[0].metric(
-        "Global live trading",
-        "enabled" if live_gate.global_live_trading_enabled else "disabled",
-    )
-    gate[1].metric(
-        "Runtime live execution",
-        "allowed" if live_gate.runtime_live_execution_allowed else "not allowed",
-    )
-    if not live_gate.live_strategies:
-        streamlit.caption("No enabled strategy is configured for live mode.")
-        return
-    for strategy in live_gate.live_strategies:
-        if strategy.allowed:
-            streamlit.write(f"{strategy.strategy_id}: live-approved")
-        else:
-            reasons = "; ".join(strategy.blocked_reasons)
-            streamlit.warning(f"{strategy.strategy_id}: blocked — {reasons}")
+def load_errors_bounded(
+    database_path: Path, runtime_id: str
+) -> tuple[EventErrorRow, ...] | SnapshotUnavailable:
+    return run_bounded(database_path, lambda conn: load_errors(conn, runtime_id))
 
 
-def _render_reconciliation_status(
-    streamlit: Any, status: ReconciliationStatus | SnapshotUnavailable | None
-) -> None:
-    """Read-only reflection of the latest ``reconciliation_runs`` row —
-    never triggers a reconciliation run itself (spec line 707: the
-    dashboard must not own trading state)."""
-    if status is None:
-        streamlit.caption(f"Reconciliation: {RECONCILIATION_STATUS}")
-        return
-    if isinstance(status, SnapshotUnavailable):
-        streamlit.caption(f"Reconciliation: unavailable ({status.reason})")
-        return
-    if status.run_status == "failed":
-        streamlit.error(f"Reconciliation: last run FAILED at {status.started_at}")
-    elif status.entries_blocked:
-        streamlit.warning(
-            f"Reconciliation: {status.critical_mismatch_count} critical mismatch(es) — "
-            "new live entries blocked"
-        )
+@dataclass(frozen=True)
+class HomeView:
+    generated_at_ist: str
+    market_status: str
+    total_strategies: int
+    running_count: int
+    degraded_count: int
+    stopped_count: int
+    disabled_count: int
+    realised_pnl_paper: float
+    realised_pnl_live: float
+    open_positions: int
+    orders_today: int
+    database_healthy: bool | None
+    feed_status: str | None
+    active_incidents: tuple[IncidentRow, ...]
+    category_cards: tuple[CategoryCard, ...]
+    thirty_day: ThirtyDayRollup | None
+    live_gate_matrix: LiveGateMatrix | ConfigUnavailable | None
+
+
+def market_status(now: datetime) -> str:
+    """OPEN/CLOSED from IST weekday + NSE session hours only — no exchange
+    holiday calendar exists anywhere in this project's config today (see
+    ``dashboards/data/calendar_stats.py``'s module caveat)."""
+    local = now.astimezone(_IST)
+    if local.weekday() >= 5:
+        return "CLOSED"
+    minutes = local.hour * 60 + local.minute
+    return "OPEN" if 9 * 60 + 15 <= minutes <= 15 * 60 + 30 else "CLOSED"
+
+
+def load_home(
+    *,
+    config_root: Path,
+    operational_root: Path,
+    trading_date: str,
+    settings: Settings | None = None,
+) -> HomeView:
+    settings = settings if settings is not None else load_settings()
+    now = datetime.now(_IST)
+    today = date.fromisoformat(trading_date)
+
+    primary_database = operational_root / "intraday_options.db"
+    primary_result = load_snapshot(primary_database, "intraday_options", trading_date)
+
+    live_gate_matrix = load_live_gate_matrix(config_root, "intraday_options", settings)
+    if isinstance(live_gate_matrix, ConfigUnavailable):
+        total_strategies = 0
+        disabled_count = 0
+        enabled_strategy_ids: tuple[str, ...] = ()
     else:
-        streamlit.caption(
-            f"Reconciliation: {status.run_status}, "
-            f"{status.critical_mismatch_count} critical mismatch(es), "
-            f"last run {status.completed_at or status.started_at}"
+        total_strategies = len(live_gate_matrix.rows)
+        disabled_count = live_gate_matrix.disabled_count
+        enabled_strategy_ids = tuple(
+            row.strategy_id for row in live_gate_matrix.rows if row.strategy_enabled
         )
 
+    running_count = degraded_count = stopped_count = 0
+    realised_pnl_paper = realised_pnl_live = 0.0
+    open_positions = orders_today = 0
+    database_healthy: bool | None = None
+    feed_status: str | None = None
+    active_incidents: tuple[IncidentRow, ...] = ()
 
-def _render_account_status(streamlit: Any, status: AccountWideStatus | SnapshotUnavailable) -> None:
-    """Account-wide risk/rate-limit section — spans every runtime group
-    sharing an account, so it is drawn once per page load, not once per
-    :class:`RuntimeCard` (see :func:`main`)."""
-    streamlit.markdown("**Account-wide risk** (shared across every runtime group)")
-    if isinstance(status, SnapshotUnavailable):
-        streamlit.caption(f"Account-wide risk: unavailable ({status.reason})")
-        return
-    if not status.accounts:
-        streamlit.caption("No live worker has recorded any account-shared state yet.")
-        return
-    for account in status.accounts:
-        label = f"{account.account_key[:12]}…"
-        if account.reconciliation_status != "reconciled":
-            streamlit.warning(
-                f"{label}: reconciliation status is {account.reconciliation_status!r} — "
-                "new live entries are blocked account-wide until a full rebuild succeeds"
+    overview_rows: tuple[OverviewRow, ...] = ()
+    if not isinstance(primary_result, SnapshotUnavailable):
+        snapshot = primary_result
+        overview_by_id = {}
+
+        overview_result = run_bounded(
+            primary_database, lambda conn: load_overview(conn, "intraday_options", trading_date)
+        )
+        if not isinstance(overview_result, SnapshotUnavailable):
+            overview_rows = overview_result
+            overview_by_id = {row.strategy_id: row for row in overview_rows}
+
+        for strategy_id in enabled_strategy_ids:
+            row = overview_by_id.get(strategy_id)
+            bucket = _bucket(row.health_state if row else None)
+            if bucket == "running":
+                running_count += 1
+            elif bucket == "degraded":
+                degraded_count += 1
+            else:
+                stopped_count += 1
+
+        realised_pnl_paper = snapshot.realised_pnl_paper
+        realised_pnl_live = snapshot.realised_pnl_live
+        open_positions = snapshot.open_positions
+        orders_today = snapshot.orders_today
+        database_healthy = snapshot.database.integrity_ok
+        feed_status = snapshot.market_data.last_event
+
+        error_rows = run_bounded(
+            primary_database, lambda conn: load_errors(conn, "intraday_options")
+        )
+        if not isinstance(error_rows, SnapshotUnavailable):
+            strategy_states = {s.strategy_id: s.health_state for s in snapshot.strategies}
+            classified = classify_incidents(
+                error_rows,
+                broker_healthy=snapshot.broker.healthy,
+                database_healthy=snapshot.database.integrity_ok,
+                feed_currently_ok=(
+                    snapshot.market_data.subscriptions_match
+                    and snapshot.market_data.last_event
+                    not in {"disconnected", "reconnect_exhausted"}
+                ),
+                strategy_health_states=strategy_states,
             )
-        row = streamlit.columns(4)
-        row[0].metric(
-            "Daily P&L", f"{account.realised_pnl_today + account.unrealised_pnl:,.2f}"
+            active_incidents = tuple(row for row in classified if row.active)
+    else:
+        stopped_count = len(enabled_strategy_ids)
+
+    thirty_day: ThirtyDayRollup | None = None
+    inception = run_bounded(
+        primary_database, lambda conn: load_inception_date(conn, "intraday_options")
+    )
+    if not isinstance(inception, SnapshotUnavailable) and inception is not None:
+        window_start = max(inception, today - timedelta(days=29))
+        outcomes = run_bounded(
+            primary_database,
+            lambda conn: tuple(
+                daily
+                for strategy_id in enabled_strategy_ids
+                for daily in load_daily_outcomes(
+                    conn,
+                    "intraday_options",
+                    strategy_id=strategy_id,
+                    execution_mode=None,
+                    start_date=window_start.isoformat(),
+                    end_date=today.isoformat(),
+                )
+            ),
         )
-        row[1].metric("Open positions", account.open_position_count)
-        row[2].metric(
-            "Reserved + deployed capital",
-            f"{account.reserved_capital + account.open_positions_capital:,.2f}",
+        if not isinstance(outcomes, SnapshotUnavailable):
+            # Merge per-strategy daily outcomes into one platform-wide series.
+            merged: dict[date, list[DailyOutcome]] = {}
+            for o in outcomes:
+                merged.setdefault(o.trading_date, []).append(o)
+
+            combined = tuple(
+                DailyOutcome(
+                    trading_date=day,
+                    ran=any(o.ran for o in rows),
+                    trade_count=sum(o.trade_count for o in rows),
+                    net_pnl=sum(o.net_pnl for o in rows),
+                )
+                for day, rows in sorted(merged.items())
+            )
+            thirty_day = build_thirty_day_rollup(combined, inception_date=inception, today=today)
+
+    cards = tuple(
+        _build_category_card(
+            category,
+            runtime_id,
+            page_path,
+            not_configured_message,
+            config_root=config_root,
+            database_path=operational_root / f"{runtime_id}.db",
+            trading_date=trading_date,
+            settings=settings,
         )
-        row[3].metric("New-order calls (current window)", account.new_order_count_current_window)
-        if account.has_unmarked_position:
-            streamlit.caption(f"{label}: at least one open position has no mark-to-market yet.")
+        for category, runtime_id, page_path, not_configured_message in _CATEGORIES
+    )
+
+    return HomeView(
+        generated_at_ist=now.isoformat(),
+        market_status=market_status(now),
+        total_strategies=total_strategies,
+        running_count=running_count,
+        degraded_count=degraded_count,
+        stopped_count=stopped_count,
+        disabled_count=disabled_count,
+        realised_pnl_paper=realised_pnl_paper,
+        realised_pnl_live=realised_pnl_live,
+        open_positions=open_positions,
+        orders_today=orders_today,
+        database_healthy=database_healthy,
+        feed_status=feed_status,
+        active_incidents=active_incidents,
+        category_cards=cards,
+        thirty_day=thirty_day,
+        live_gate_matrix=live_gate_matrix,
+    )
 
 
-def render(streamlit: Any, result: RuntimeCard | SnapshotUnavailable) -> None:
-    """Draw the Master page. Takes the streamlit module so this stays testable."""
-    if isinstance(result, SnapshotUnavailable):
-        streamlit.info(result.reason)
+# =================================================================== render
+def _status_color(label: str) -> str:
+    return {
+        "HEALTHY": "green",
+        "DEGRADED": "orange",
+        "STOPPED": "gray",
+        "NOT CONFIGURED": "gray",
+    }.get(label, "gray")
+
+
+def _render_category_card(streamlit: Any, card: CategoryCard) -> None:
+    with streamlit.container(border=True):
+        streamlit.markdown(f"### {card.category}")
+        streamlit.markdown(colored(f"● {card.status_label}", _status_color(card.status_label)))
+        if not card.configured:
+            streamlit.caption(card.detail)
+        else:
+            streamlit.write(
+                f"Strategies: {card.strategies_running}/{card.strategies_total} running"
+            )
+            row = streamlit.columns(2)
+            row[0].metric("Paper P&L today", format_inr(card.realised_pnl_paper))
+            row[1].metric("Live P&L today", format_inr(card.realised_pnl_live))
+            streamlit.write(
+                "Open positions: "
+                f"{card.open_positions if card.open_positions is not None else '—'}"
+            )
+            streamlit.caption(
+                f"Last heartbeat: {format_age(card.last_heartbeat_age_seconds)} ago · "
+                f"Active errors: {card.active_error_count}"
+            )
+            if card.detail:
+                streamlit.caption(card.detail)
+        streamlit.page_link(card.page_path, label=f"Open {card.category} →")
+
+
+def _render_thirty_day(streamlit: Any, rollup: ThirtyDayRollup | None) -> None:
+    streamlit.subheader("30-day paper forward testing")
+    if rollup is None:
+        streamlit.info(
+            "No runtime activity has been recorded yet — the 30-day clock has not started."
+        )
         return
+    cols = streamlit.columns(4)
+    cols[0].metric("Trading days elapsed", rollup.trading_days_elapsed)
+    cols[1].metric("Days executed", rollup.days_executed)
+    cols[2].metric("Days with trades", rollup.days_with_trades)
+    cols[3].metric("No-trade days", rollup.no_trade_days)
+    cols2 = streamlit.columns(3)
+    cols2[0].metric("Profitable days", rollup.profitable_days)
+    cols2[1].metric("Loss-making days", rollup.loss_making_days)
+    cols2[2].metric("Cumulative net P&L", format_inr(rollup.cumulative_net_pnl))
+    if rollup.data_complete:
+        streamlit.caption(f"✅ {rollup.completeness_note}")
+    else:
+        streamlit.warning(rollup.completeness_note)
 
-    card = result
-    streamlit.subheader(f"{card.runtime_id} — supervisor")
 
+def render(streamlit: Any, view: HomeView) -> None:
     top = streamlit.columns(4)
-    top[0].metric("Group health", card.group_health_state or "STOPPED")
-    top[1].metric(
-        "Heartbeat age",
-        "—" if card.heartbeat_age_seconds is None else f"{card.heartbeat_age_seconds:.0f}s",
-    )
-    top[2].metric("Open positions", card.open_positions)
-    top[3].metric(
-        "Strategies",
-        f"{card.total_count} (paper {card.paper_count} / live {card.live_count})",
-    )
-    streamlit.caption(f"Orders today: {card.orders_today}")
+    top[0].metric("Market", view.market_status)
+    top[1].metric("Last refresh (IST)", format_ist(view.generated_at_ist, with_seconds=False))
+    top[2].metric("Configured strategies", view.total_strategies)
+    top[3].metric("Open positions", view.open_positions)
 
-    if card.failed_count:
-        streamlit.error(f"{card.failed_count} strategy(ies) in FAILED state")
+    counts = streamlit.columns(4)
+    counts[0].metric("Running", view.running_count)
+    counts[1].metric("Degraded", view.degraded_count)
+    counts[2].metric("Stopped", view.stopped_count)
+    counts[3].metric("Disabled", view.disabled_count)
 
+    pnl = streamlit.columns(3)
+    pnl[0].metric("Realised P&L — paper", format_inr(view.realised_pnl_paper))
+    pnl[1].metric("Realised P&L — live", format_inr(view.realised_pnl_live))
+    pnl[2].metric("Orders today", view.orders_today)
     streamlit.caption(
-        "Strategy counts are read from runtime state, not config — a "
-        "strategy with enabled: false in YAML never starts and so never "
-        "appears here. No 'disabled' count is shown for that reason."
+        "Paper and live P&L are never combined into one figure. Unrealised "
+        "P&L is shown only where a real mark is persisted (System Health / "
+        "account-wide risk) — no paper mark-to-market is recorded today."
     )
 
-    pnl = streamlit.columns(2)
-    pnl[0].metric("Realised P&L — paper", f"{card.realised_pnl_paper:,.2f}")
-    pnl[1].metric("Realised P&L — live", f"{card.realised_pnl_live:,.2f}")
+    if view.database_healthy is None:
+        database_label = "—"
+    elif view.database_healthy:
+        database_label = "ok"
+    else:
+        database_label = "problem"
+    health = streamlit.columns(2)
+    health[0].metric("Database", database_label)
+    health[1].metric("Market feed", view.feed_status or "no data yet")
 
-    status = streamlit.columns(3)
-    status[0].metric("Feed", card.feed_last_event or "no data yet")
-    status[1].metric("Broker", "healthy" if card.broker_healthy else "error")
-    status[2].metric("Database", "ok" if card.database_healthy else "problem")
+    if view.active_incidents:
+        streamlit.subheader(f"Active incidents ({len(view.active_incidents)})")
+        for incident in view.active_incidents:
+            streamlit.error(
+                f"{format_ist(incident.occurred_at)} — [{incident.component}] {incident.message}"
+            )
+    else:
+        streamlit.success("No active incidents.")
 
-    _render_live_gate(streamlit, card.live_gate)
+    streamlit.subheader("Categories")
+    cols = streamlit.columns(3)
+    for col, card in zip(cols, view.category_cards, strict=True):
+        with col:
+            _render_category_card(streamlit, card)
 
-    _render_reconciliation_status(streamlit, card.reconciliation_status)
-
-    if card.recent_errors:
-        streamlit.subheader("Recent errors")
-        for message in card.recent_errors:
-            streamlit.error(message)
+    _render_thirty_day(streamlit, view.thirty_day)
 
 
 def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
-    import datetime as _dt
-
     import streamlit as st
 
     from common.config import load_paths
 
-    st.set_page_config(page_title="algo_trading — Master", layout="wide")
+    st.set_page_config(page_title="algo_trading — Home", layout="wide", page_icon="📊")
     st.title("algo_trading")
     st.caption(
         "Read-only. Paper forward testing on live market data. "
         "Controlled-live code exists but every committed live gate is disabled."
     )
 
+    if "auto_refresh" not in st.session_state:
+        st.session_state["auto_refresh"] = True
+
+    with st.sidebar:
+        st.session_state["auto_refresh"] = st.checkbox(
+            "Auto-refresh (30s)", value=st.session_state["auto_refresh"]
+        )
+        if st.button("Refresh now"):
+            st.rerun()
+
     paths = load_paths()
-    runtime_id = "intraday_options"
-    database_path = paths.database_path(runtime_id)
-    trading_date = _dt.date.today().isoformat()
+    trading_date = date.today().isoformat()
 
-    render(
-        st,
-        load_master(database_path, runtime_id, trading_date, config_root=paths.config_root),
-    )
+    @st.fragment(run_every=30 if st.session_state["auto_refresh"] else None)
+    def _body() -> None:
+        view = load_home(
+            config_root=paths.config_root,
+            operational_root=paths.operational_root,
+            trading_date=trading_date,
+        )
+        render(st, view)
+        render_account_status(
+            st, load_account_status(paths.account_shared_database_path, trading_date=trading_date)
+        )
 
-    _render_account_status(
-        st, load_account_status(paths.account_shared_database_path, trading_date=trading_date)
-    )
+    _body()
 
 
 if __name__ == "__main__":  # pragma: no cover

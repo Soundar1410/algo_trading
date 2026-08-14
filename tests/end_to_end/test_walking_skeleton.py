@@ -33,8 +33,9 @@ from common.notifications import RecordingNotifier
 from common.persistence import Database, MigrationRunner, connect_readonly
 from common.process import square_off_request_path, write_square_off_request
 from common.risk import SquareOffPolicy
-from dashboards.app import load_master
-from dashboards.intraday_options import load_intraday_options
+from dashboards._shared import load_snapshot
+from dashboards.data.intraday_options import load_overview
+from dashboards.formatting import mode_label
 from runtimes.intraday_options.worker import EXIT_DUPLICATE, WorkerConfig, run_worker
 
 TRADING_DATE = "2026-07-29"
@@ -202,24 +203,33 @@ def test_the_dashboard_tile_renders_from_a_read_only_connection(
     Phase 7 Part 3 retired the Phase 1 single tile (RuntimeTile/load_tile,
     four inline SELECTs) in favour of the multipage app reading through
     common.health.snapshot. The gate's spirit — a read-only dashboard read
-    works end to end after a real run — now has two assertions: the Master
-    page's card, and the Intraday Options page's per-strategy mode badge,
-    which is where the "simulated" wording moved (dashboards/intraday_
-    options.py's own docstring explains why: Master shows paper/live *counts*
-    across strategies, not one strategy's own mode)."""
+    works end to end after a real run — now has two assertions: the shared
+    snapshot every page (Home included, since Phase 10's dashboard rewrite)
+    builds its own view from, and the Intraday Options page's per-strategy
+    mode badge, which is where the "simulated" wording moved
+    (dashboards/intraday_options.py's own docstring explains why: Home
+    shows paper/live *counts* across strategies, not one strategy's own
+    mode)."""
     run_worker(worker_config, _feed_queue(_candles(tick_tape_path)), RecordingNotifier())
 
-    card = load_master(database_path, RUNTIME_ID, TRADING_DATE)
-    assert card.runtime_id == RUNTIME_ID
-    assert card.orders_today == 2
-    assert card.group_health_state is None  # skelfix is a worker row, not a group one
+    from dashboards._shared import SnapshotUnavailable
 
-    view = load_intraday_options(database_path, RUNTIME_ID, TRADING_DATE)
-    assert len(view.strategies) == 1
-    strategy = view.strategies[0]
+    snapshot = load_snapshot(database_path, RUNTIME_ID, TRADING_DATE)
+    assert not isinstance(snapshot, SnapshotUnavailable)
+    assert snapshot.runtime_id == RUNTIME_ID
+    assert snapshot.orders_today == 2
+    assert snapshot.group is None  # skelfix is a worker row, not a group one
+
+    conn = connect_readonly(database_path)
+    try:
+        rows = load_overview(conn, RUNTIME_ID, TRADING_DATE)
+    finally:
+        conn.close()
+    assert len(rows) == 1
+    strategy = rows[0]
     assert strategy.strategy_id == STRATEGY_ID
     assert strategy.execution_mode == "paper"
-    assert "simulated" in strategy.mode_label
+    assert "simulated" in mode_label(strategy.execution_mode)
     assert strategy.health_state
 
 
