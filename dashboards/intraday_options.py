@@ -110,15 +110,20 @@ def _render_overview(streamlit: Any, rows: tuple[OverviewRow, ...]) -> None:
         return
     for row in rows:
         streamlit.markdown(f"**{row.strategy_id} — {mode_label(row.execution_mode)}**")
-        cols = streamlit.columns(6)
-        cols[0].metric("Health", row.health_state)
-        cols[1].metric("Heartbeat age", format_age(row.heartbeat_age_seconds))
-        cols[2].metric("PID", row.pid if row.pid is not None else "—")
-        cols[3].metric("Open positions", row.open_positions)
-        cols[4].metric("Square-off", row.square_off_state or "—")
-        cols[5].metric(
-            "Today trades / P&L", f"{row.today_trade_count} / {format_inr(row.today_net_pnl)}"
-        )
+        # Two rows of at most 4 columns, not one row of 6 — a long state
+        # value (RUNNING_PAPER, IN_PROGRESS, COMPLETED) must never clip in
+        # a column this narrow (spec: "avoid clipped values such as
+        # 'RUNNING...'"). Today's trade count and P&L are also two
+        # genuinely separate numbers, not one concatenated string.
+        top = streamlit.columns(4)
+        top[0].metric("Health", row.health_state)
+        top[1].metric("Heartbeat age", format_age(row.heartbeat_age_seconds))
+        top[2].metric("PID", row.pid if row.pid is not None else "—")
+        top[3].metric("Open positions", row.open_positions)
+        bottom = streamlit.columns(3)
+        bottom[0].metric("Square-off", row.square_off_state or "—")
+        bottom[1].metric("Today's trades", row.today_trade_count)
+        bottom[2].metric("Today's P&L", format_inr(row.today_net_pnl))
         if row.entries_blocked:
             streamlit.warning(f"{row.strategy_id}: entries blocked")
         if row.current_position_instrument:

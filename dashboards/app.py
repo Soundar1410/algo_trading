@@ -84,7 +84,13 @@ from dashboards.data.intraday_options import (  # noqa: E402
     load_inception_date,
     load_overview,
 )
-from dashboards.formatting import colored, format_age, format_inr, format_ist  # noqa: E402
+from dashboards.formatting import (  # noqa: E402
+    colored,
+    format_age,
+    format_inr,
+    format_ist,
+    format_ist_time_only,
+)
 
 _IST = get_tz(DEFAULT_TZ)
 
@@ -498,7 +504,11 @@ def _render_thirty_day(streamlit: Any, rollup: ThirtyDayRollup | None) -> None:
 def render(streamlit: Any, view: HomeView) -> None:
     top = streamlit.columns(4)
     top[0].metric("Market", view.market_status)
-    top[1].metric("Last refresh (IST)", format_ist(view.generated_at_ist, with_seconds=False))
+    # Time-only, not the full date — "2026-08-14 15:47 IST" clips in a
+    # quarter-width metric column; the date rarely matters for a value that
+    # refreshes every 30s, and the full ISO timestamp is one click away in
+    # any export.
+    top[1].metric("Last refresh (IST)", format_ist_time_only(view.generated_at_ist))
     top[2].metric("Configured strategies", view.total_strategies)
     top[3].metric("Open positions", view.open_positions)
 
