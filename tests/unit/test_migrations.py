@@ -294,6 +294,7 @@ def test_shipped_migrations_start_at_the_walking_skeleton():
         "0005",
         "0006",
         "0007",
+        "0008",
     ]
     assert shipped[0].name == "walking_skeleton"
     assert shipped[1].name == "feed_and_auth_health"
@@ -303,6 +304,8 @@ def test_shipped_migrations_start_at_the_walking_skeleton():
     # Phase 10.
     assert shipped[5].name == "widen_order_status_for_expired"
     assert shipped[6].name == "reconciliation_tables"
+    # Dashboard corrective pass.
+    assert shipped[7].name == "trade_ledger"
 
 
 def test_shipped_migrations_apply_to_a_fresh_database(tmp_path: Path):
@@ -319,7 +322,16 @@ def test_shipped_migrations_apply_to_a_fresh_database(tmp_path: Path):
     database = Database(tmp_path / "operational" / "intraday_options.db")
     applied = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
 
-    assert [m.version for m in applied] == ["0001", "0002", "0003", "0004", "0005", "0006", "0007"]
+    assert [m.version for m in applied] == [
+        "0001",
+        "0002",
+        "0003",
+        "0004",
+        "0005",
+        "0006",
+        "0007",
+        "0008",
+    ]
     assert database.integrity_check() == []
     assert database.foreign_key_check() == []
     with database.connect() as conn:
@@ -362,7 +374,15 @@ def test_later_migrations_upgrade_a_database_created_by_0001_alone(tmp_path: Pat
     # test) has zero rows, so MigrationRunner._check_destructive_preconditions
     # has nothing to protect — see the dedicated 0006 tests for the
     # non-empty-table case, which does require it.
-    assert [m.version for m in applied] == ["0002", "0003", "0004", "0005", "0006", "0007"]
+    assert [m.version for m in applied] == [
+        "0002",
+        "0003",
+        "0004",
+        "0005",
+        "0006",
+        "0007",
+        "0008",
+    ]
     with database.connect() as conn:
         survivors = conn.execute("SELECT COUNT(*) FROM runtime_sessions").fetchone()[0]
         tables = {

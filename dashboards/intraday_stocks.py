@@ -10,6 +10,12 @@ No side effects: no database is opened, because there is none to open. The
 read-model interface these tabs are built against lives in
 ``dashboards/data/stocks.py`` — real dataclasses, ready for a real scanner's
 persistence to satisfy, not queried today.
+
+**The strategy selector is wired in today, deliberately showing nothing.**
+See ``dashboards/positional_options.py``'s module docstring for why
+config-based discovery is skipped here too (``conn=None``,
+``config_root=None``) rather than attributing ``intraday_options``'s own
+strategies to this runtime.
 """
 
 from __future__ import annotations
@@ -25,6 +31,10 @@ for _parent in Path(__file__).resolve().parents:
         break
 
 from dashboards.data.stocks import NOT_CONFIGURED  # noqa: E402
+from dashboards.data.strategy_scope import (  # noqa: E402
+    discover_strategy_options,
+    render_strategy_selector,
+)
 
 #: Kept for backward-compat with anything importing the old flat-page name.
 STATUS_MESSAGE = NOT_CONFIGURED
@@ -41,9 +51,12 @@ _TABS = (
 )
 
 
-def render(streamlit: Any) -> None:
+def render(streamlit: Any, config_root: object = None) -> None:
     streamlit.subheader("Intraday Stocks")
     streamlit.warning(NOT_CONFIGURED)
+    del config_root  # see the module docstring
+    options = discover_strategy_options(None, None, "intraday_stocks")
+    render_strategy_selector(streamlit, options, key="is_strategy")
     tabs = streamlit.tabs([label for label, _ in _TABS])
     for tab, (label, detail) in zip(tabs, _TABS, strict=True):
         with tab:
@@ -53,9 +66,11 @@ def render(streamlit: Any) -> None:
 def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
     import streamlit as st
 
+    from common.config import load_paths
+
     st.set_page_config(page_title="algo_trading — Intraday Stocks", layout="wide", page_icon="📉")
     st.title("Intraday Stocks")
-    render(st)
+    render(st, load_paths().config_root)
 
 
 if __name__ == "__main__":  # pragma: no cover

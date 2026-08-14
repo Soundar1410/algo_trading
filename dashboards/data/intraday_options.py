@@ -66,16 +66,28 @@ class OverviewRow:
 
 
 def load_overview(
-    conn: sqlite3.Connection, runtime_id: str, trading_date: str
+    conn: sqlite3.Connection,
+    runtime_id: str,
+    trading_date: str,
+    *,
+    strategy_id: str | None = None,
 ) -> tuple[OverviewRow, ...]:
-    strategy_ids = [
-        row["strategy_id"]
-        for row in conn.execute(
-            "SELECT DISTINCT strategy_id FROM runtime_heartbeats "
-            "WHERE runtime_id = ? AND strategy_id IS NOT NULL ORDER BY strategy_id",
-            (runtime_id,),
-        )
-    ]
+    if strategy_id is not None:
+        # A specific strategy must show up here even if it has never
+        # heartbeated (spec: a newly configured strategy is selectable
+        # before its first trade) — every per-row query below already
+        # degrades to defaults (health_state "STOPPED", no PID, etc.) for
+        # exactly this case.
+        strategy_ids = [strategy_id]
+    else:
+        strategy_ids = [
+            row["strategy_id"]
+            for row in conn.execute(
+                "SELECT DISTINCT strategy_id FROM runtime_heartbeats "
+                "WHERE runtime_id = ? AND strategy_id IS NOT NULL ORDER BY strategy_id",
+                (runtime_id,),
+            )
+        ]
     rows: list[OverviewRow] = []
     for strategy_id in strategy_ids:
         heartbeat = conn.execute(
@@ -115,9 +127,9 @@ def load_overview(
             (runtime_id, strategy_id, trading_date),
         ).fetchone()
         today = conn.execute(
-            "SELECT COUNT(*) AS n, COALESCE(SUM(realised_pnl - charges), 0.0) AS net "
-            "FROM positions WHERE runtime_id = ? AND strategy_id = ? AND trading_date = ? "
-            "AND status = 'CLOSED'",
+            "SELECT COUNT(*) AS n, "
+            "COALESCE(SUM(gross_pnl - entry_charges - exit_charges), 0.0) AS net "
+            "FROM trade_ledger WHERE runtime_id = ? AND strategy_id = ? AND trading_date = ?",
             (runtime_id, strategy_id, trading_date),
         ).fetchone()
         error = conn.execute(
@@ -179,20 +191,26 @@ class LivePositionRow:
 
 
 def load_live_positions(
-    conn: sqlite3.Connection, runtime_id: str, trading_date: str
+    conn: sqlite3.Connection,
+    runtime_id: str,
+    trading_date: str,
+    *,
+    strategy_id: str | None = None,
 ) -> tuple[LivePositionRow, ...]:
-    rows = conn.execute(
-        """
-        SELECT strategy_id, execution_mode, instrument, security_id, quantity,
-               average_price, stop_price, target_price, highest_favourable,
-               lowest_favourable, opened_at,
-               (julianday('now') - julianday(opened_at)) * 86400.0 AS duration_seconds
-        FROM positions
-        WHERE runtime_id = ? AND trading_date = ? AND status = 'OPEN' AND quantity != 0
-        ORDER BY opened_at DESC
-        """,
-        (runtime_id, trading_date),
-    ).fetchall()
+    query = (
+        "SELECT strategy_id, execution_mode, instrument, security_id, quantity, "
+        "average_price, stop_price, target_price, highest_favourable, "
+        "lowest_favourable, opened_at, "
+        "(julianday('now') - julianday(opened_at)) * 86400.0 AS duration_seconds "
+        "FROM positions "
+        "WHERE runtime_id = ? AND trading_date = ? AND status = 'OPEN' AND quantity != 0"
+    )
+    params: list[object] = [runtime_id, trading_date]
+    if strategy_id is not None:
+        query += " AND strategy_id = ?"
+        params.append(strategy_id)
+    query += " ORDER BY opened_at DESC"
+    rows = conn.execute(query, params).fetchall()
     return tuple(
         LivePositionRow(
             strategy_id=row["strategy_id"],
@@ -251,21 +269,31 @@ class OrderRow:
 
 
 def load_orders(
-    conn: sqlite3.Connection, runtime_id: str, trading_date: str
+    conn: sqlite3.Connection,
+    runtime_id: str,
+    trading_date: str,
+    *,
+    strategy_id: str | None = None,
+    execution_mode: str | None = None,
 ) -> tuple[OrderRow, ...]:
-    intent_rows = conn.execute(
-        """
-        SELECT oi.id AS intent_id, oi.correlation_id, oi.strategy_id, oi.execution_mode,
-               oi.created_at, oi.instrument, oi.security_id, oi.side, oi.quantity,
-               oi.order_type, o.status, o.broker_order_id, o.filled_quantity,
-               o.average_fill_price, o.rejection_reason
-        FROM order_intents oi
-        LEFT JOIN orders o ON o.intent_id = oi.id
-        WHERE oi.runtime_id = ? AND oi.trading_date = ?
-        ORDER BY oi.created_at DESC
-        """,
-        (runtime_id, trading_date),
-    ).fetchall()
+    query = (
+        "SELECT oi.id AS intent_id, oi.correlation_id, oi.strategy_id, oi.execution_mode, "
+        "oi.created_at, oi.instrument, oi.security_id, oi.side, oi.quantity, "
+        "oi.order_type, o.status, o.broker_order_id, o.filled_quantity, "
+        "o.average_fill_price, o.rejection_reason "
+        "FROM order_intents oi "
+        "LEFT JOIN orders o ON o.intent_id = oi.id "
+        "WHERE oi.runtime_id = ? AND oi.trading_date = ?"
+    )
+    params: list[object] = [runtime_id, trading_date]
+    if strategy_id is not None:
+        query += " AND oi.strategy_id = ?"
+        params.append(strategy_id)
+    if execution_mode is not None:
+        query += " AND oi.execution_mode = ?"
+        params.append(execution_mode)
+    query += " ORDER BY oi.created_at DESC"
+    intent_rows = conn.execute(query, params).fetchall()
     if not intent_rows:
         return ()
 
@@ -347,22 +375,21 @@ def load_closed_trades(
     start_date: str,
     end_date: str,
 ) -> tuple[ClosedTradeRow, ...]:
-    """Every closed position in ``[start_date, end_date]``, with entry/exit
-    price and side derived from the fills that opened and closed each one.
-
-    Two queries total regardless of trade count (positions, then every fill
-    in the date range in one shot, grouped in Python) — not one fills query
-    per position, per the spec's "aggregate through indexed queries" rule.
-    Exit side is identified structurally: the fill matching
-    ``positions.entry_correlation_id`` fixes the entry side; every other
-    fill against that same (strategy, mode, security, day) is the exit
-    side — never a string-parsed guess.
+    """Every completed round trip in ``[start_date, end_date]`` — read
+    directly off ``trade_ledger``, the durable per-trade record
+    ``ExecutionRepository`` writes at the same time it applies a closing
+    fill (migration 0008). Not re-derived from ``positions``/``fills`` at
+    read time: a ``positions`` row is reused across any number of close/
+    reopen cycles within a day, so a query built on it would silently lose
+    an earlier round trip's own detail the moment that identity reopened —
+    exactly the bug this table exists to fix. One query, exact prices.
     """
     query = (
-        "SELECT strategy_id, execution_mode, instrument, security_id, quantity, "
-        "average_price, entry_correlation_id, realised_pnl, charges, opened_at, "
-        "closed_at, trading_date FROM positions "
-        "WHERE runtime_id = ? AND status = 'CLOSED' AND trading_date BETWEEN ? AND ?"
+        "SELECT strategy_id, execution_mode, instrument, security_id, trading_date, "
+        "entry_side, quantity, entry_price, exit_price, gross_pnl, entry_charges, "
+        "exit_charges, opened_at, closed_at "
+        "FROM trade_ledger "
+        "WHERE runtime_id = ? AND trading_date BETWEEN ? AND ?"
     )
     params: list[object] = [runtime_id, start_date, end_date]
     if strategy_id is not None:
@@ -372,69 +399,34 @@ def load_closed_trades(
         query += " AND execution_mode = ?"
         params.append(execution_mode)
     query += " ORDER BY closed_at DESC"
-    position_rows = conn.execute(query, params).fetchall()
-    if not position_rows:
-        return ()
+    rows = conn.execute(query, params).fetchall()
 
-    fill_rows = conn.execute(
-        """
-        SELECT f.strategy_id, f.execution_mode, oi.security_id, oi.trading_date,
-               f.correlation_id, f.price, f.quantity, oi.side
-        FROM fills f
-        JOIN order_intents oi ON oi.correlation_id = f.correlation_id
-        WHERE f.runtime_id = ? AND oi.trading_date BETWEEN ? AND ?
-        """,
-        (runtime_id, start_date, end_date),
-    ).fetchall()
-    fills_by_position: dict[tuple[str, str, str, str], list[sqlite3.Row]] = defaultdict(list)
-    for row in fill_rows:
-        key = (row["strategy_id"], row["execution_mode"], row["security_id"], row["trading_date"])
-        fills_by_position[key].append(row)
-
-    trades: list[ClosedTradeRow] = []
-    for p in position_rows:
-        key = (p["strategy_id"], p["execution_mode"], p["security_id"], p["trading_date"])
-        position_fills = fills_by_position.get(key, [])
-        entry_side: str | None = next(
-            (f["side"] for f in position_fills if f["correlation_id"] == p["entry_correlation_id"]),
-            None,
+    trades = []
+    for row in rows:
+        entry_price = float(row["entry_price"])
+        exit_price = float(row["exit_price"])
+        points = (
+            exit_price - entry_price if row["entry_side"] == "BUY" else entry_price - exit_price
         )
-        entry_quantity = 0
-        exit_notional = 0.0
-        exit_quantity = 0
-        for f in position_fills:
-            if f["side"] == entry_side:
-                entry_quantity += int(f["quantity"])
-            else:
-                exit_notional += float(f["price"]) * int(f["quantity"])
-                exit_quantity += int(f["quantity"])
-        exit_price = (exit_notional / exit_quantity) if exit_quantity else None
-        points = None
-        if exit_price is not None:
-            points = (
-                exit_price - p["average_price"]
-                if entry_side == "BUY"
-                else p["average_price"] - exit_price
-            )
-        gross = float(p["realised_pnl"])
-        charges = float(p["charges"])
+        charges = float(row["entry_charges"]) + float(row["exit_charges"])
+        gross = float(row["gross_pnl"])
         trades.append(
             ClosedTradeRow(
-                strategy_id=p["strategy_id"],
-                execution_mode=p["execution_mode"],
-                instrument=p["instrument"],
-                security_id=p["security_id"],
-                trading_date=p["trading_date"],
-                side=entry_side,
-                quantity=entry_quantity or abs(int(p["quantity"])),
-                entry_price=float(p["average_price"]),
+                strategy_id=row["strategy_id"],
+                execution_mode=row["execution_mode"],
+                instrument=row["instrument"],
+                security_id=row["security_id"],
+                trading_date=row["trading_date"],
+                side=row["entry_side"],
+                quantity=int(row["quantity"]),
+                entry_price=entry_price,
                 exit_price=exit_price,
                 points=points,
                 gross_pnl=gross,
                 charges=charges,
                 net_pnl=gross - charges,
-                entry_time=p["opened_at"],
-                exit_time=p["closed_at"],
+                entry_time=row["opened_at"],
+                exit_time=row["closed_at"],
             )
         )
     return tuple(trades)
@@ -525,21 +517,29 @@ class SignalRow:
 
 
 def load_signals(
-    conn: sqlite3.Connection, runtime_id: str, trading_date: str, *, limit: int = 200
+    conn: sqlite3.Connection,
+    runtime_id: str,
+    trading_date: str,
+    *,
+    strategy_id: str | None = None,
+    limit: int = 200,
 ) -> tuple[SignalRow, ...]:
-    rows = conn.execute(
-        """
-        SELECT s.strategy_id, s.execution_mode, s.instrument, s.side, s.candle_open,
-               s.candle_high, s.candle_low, s.candle_close, s.candle_start_at,
-               s.candle_end_at, s.reference_price, s.evaluated_at, s.reason,
-               oi.correlation_id AS order_correlation_id
-        FROM signals s
-        LEFT JOIN order_intents oi ON oi.signal_id = s.id
-        WHERE s.runtime_id = ? AND s.trading_date = ?
-        ORDER BY s.evaluated_at DESC LIMIT ?
-        """,
-        (runtime_id, trading_date, limit),
-    ).fetchall()
+    query = (
+        "SELECT s.strategy_id, s.execution_mode, s.instrument, s.side, s.candle_open, "
+        "s.candle_high, s.candle_low, s.candle_close, s.candle_start_at, "
+        "s.candle_end_at, s.reference_price, s.evaluated_at, s.reason, "
+        "oi.correlation_id AS order_correlation_id "
+        "FROM signals s "
+        "LEFT JOIN order_intents oi ON oi.signal_id = s.id "
+        "WHERE s.runtime_id = ? AND s.trading_date = ?"
+    )
+    params: list[object] = [runtime_id, trading_date]
+    if strategy_id is not None:
+        query += " AND s.strategy_id = ?"
+        params.append(strategy_id)
+    query += " ORDER BY s.evaluated_at DESC LIMIT ?"
+    params.append(limit)
+    rows = conn.execute(query, params).fetchall()
     return tuple(
         SignalRow(
             strategy_id=row["strategy_id"],
@@ -574,14 +574,25 @@ class NotificationRow:
 
 
 def load_notifications(
-    conn: sqlite3.Connection, runtime_id: str, *, limit: int = 100
+    conn: sqlite3.Connection,
+    runtime_id: str,
+    *,
+    strategy_id: str | None = None,
+    limit: int = 100,
 ) -> tuple[NotificationRow, ...]:
-    rows = conn.execute(
+    query = (
         "SELECT strategy_id, execution_mode, channel, event_type, message, delivered, "
-        "failure_reason, created_at FROM notifications WHERE runtime_id = ? "
-        "ORDER BY id DESC LIMIT ?",
-        (runtime_id, limit),
-    ).fetchall()
+        "failure_reason, created_at FROM notifications WHERE runtime_id = ?"
+    )
+    params: list[object] = [runtime_id]
+    if strategy_id is not None:
+        # A strategy-scoped view must not hide runtime-wide notifications
+        # (strategy_id IS NULL) that affect it too.
+        query += " AND (strategy_id = ? OR strategy_id IS NULL)"
+        params.append(strategy_id)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    rows = conn.execute(query, params).fetchall()
     return tuple(
         NotificationRow(
             strategy_id=row["strategy_id"],
@@ -608,13 +619,25 @@ class EventErrorRow:
 
 
 def load_errors(
-    conn: sqlite3.Connection, runtime_id: str, *, limit: int = 100
+    conn: sqlite3.Connection,
+    runtime_id: str,
+    *,
+    strategy_id: str | None = None,
+    limit: int = 100,
 ) -> tuple[EventErrorRow, ...]:
-    rows = conn.execute(
+    query = (
         "SELECT strategy_id, execution_mode, severity, component, message, occurred_at "
-        "FROM errors WHERE runtime_id = ? ORDER BY id DESC LIMIT ?",
-        (runtime_id, limit),
-    ).fetchall()
+        "FROM errors WHERE runtime_id = ?"
+    )
+    params: list[object] = [runtime_id]
+    if strategy_id is not None:
+        # Same rule as notifications: a strategy-scoped view still shows
+        # runtime-wide errors (feed/database/broker) that affect it.
+        query += " AND (strategy_id = ? OR strategy_id IS NULL)"
+        params.append(strategy_id)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    rows = conn.execute(query, params).fetchall()
     return tuple(
         EventErrorRow(
             strategy_id=row["strategy_id"],
@@ -751,6 +774,7 @@ def compute_metrics(trades: tuple[ClosedTradeRow, ...]) -> PerformanceMetrics:
 @dataclass(frozen=True)
 class ComparisonRow:
     strategy_id: str
+    execution_mode: str
     metrics: PerformanceMetrics
     execution_days: int
     eligible_days: int
@@ -766,59 +790,85 @@ def build_strategy_comparison(
     start_date: str,
     end_date: str,
 ) -> tuple[ComparisonRow, ...]:
-    """One leaderboard row per strategy — computed read-only, on demand,
-    from closed trades in ``[start_date, end_date]``. Never writes a
-    snapshot (the reference dashboard's "save today's snapshot" button is
-    deliberately not ported)."""
+    """One leaderboard row per ``(strategy, execution_mode)`` pair —
+    computed read-only, on demand, from ``trade_ledger`` in
+    ``[start_date, end_date]``. Never writes a snapshot (the reference
+    dashboard's "save today's snapshot" button is deliberately not
+    ported). Never blends paper and live into one row: a strategy that has
+    ever run in both modes gets two rows, one per mode, each computed only
+    from that mode's own trades.
+    """
     rows = []
     for strategy_id in strategy_ids:
-        trades = load_closed_trades(
-            conn,
-            runtime_id,
-            strategy_id=strategy_id,
-            start_date=start_date,
-            end_date=end_date,
-        )
-        metrics = compute_metrics(trades)
-        outcomes = load_daily_outcomes(
-            conn,
-            runtime_id,
-            strategy_id=strategy_id,
-            execution_mode=None,
-            start_date=start_date,
-            end_date=end_date,
-        )
-        from .calendar_stats import execution_day_stats
-
-        day_stats = execution_day_stats(
-            outcomes,
-            window_start=date.fromisoformat(start_date),
-            window_end=date.fromisoformat(end_date),
-        )
-        capital_base = load_capital_base(config_root, strategy_id)
-        roi_pct = (
-            (metrics.net_profit / capital_base * 100.0)
-            if capital_base and capital_base > 0
-            else None
-        )
-        rows.append(
-            ComparisonRow(
-                strategy_id=strategy_id,
-                metrics=metrics,
-                execution_days=day_stats.executed_days,
-                eligible_days=day_stats.eligible_trading_days,
-                roi_pct=roi_pct,
+        modes: set[str] = set()
+        config = load_strategy_config_raw(config_root, strategy_id)
+        if config is not None:
+            configured_mode = config.get("mode")
+            if isinstance(configured_mode, str):
+                modes.add(configured_mode)
+        modes.update(
+            r["execution_mode"]
+            for r in conn.execute(
+                "SELECT DISTINCT execution_mode FROM trade_ledger "
+                "WHERE runtime_id = ? AND strategy_id = ? AND trading_date BETWEEN ? AND ?",
+                (runtime_id, strategy_id, start_date, end_date),
             )
         )
+        if not modes:
+            modes.add("paper")  # a strategy with no config/history yet still gets a row
+
+        capital_base = load_capital_base(config_root, strategy_id)
+        for execution_mode in sorted(modes):
+            trades = load_closed_trades(
+                conn,
+                runtime_id,
+                strategy_id=strategy_id,
+                execution_mode=execution_mode,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            metrics = compute_metrics(trades)
+            outcomes = load_daily_outcomes(
+                conn,
+                runtime_id,
+                strategy_id=strategy_id,
+                execution_mode=execution_mode,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            from .calendar_stats import execution_day_stats
+
+            day_stats = execution_day_stats(
+                outcomes,
+                window_start=date.fromisoformat(start_date),
+                window_end=date.fromisoformat(end_date),
+            )
+            roi_pct = (
+                (metrics.net_profit / capital_base * 100.0)
+                if capital_base and capital_base > 0
+                else None
+            )
+            rows.append(
+                ComparisonRow(
+                    strategy_id=strategy_id,
+                    execution_mode=execution_mode,
+                    metrics=metrics,
+                    execution_days=day_stats.executed_days,
+                    eligible_days=day_stats.eligible_trading_days,
+                    roi_pct=roi_pct,
+                )
+            )
     return tuple(rows)
 
 
-def load_capital_base(config_root: object, strategy_id: str) -> float | None:
-    """``parameters.capital_base`` from ``config/strategies/<id>.yaml``, if
-    present — a per-strategy, untyped config value (``StrategyConfig.
-    parameters`` is a free-form dict), so ROI is only ever computed when a
-    strategy has actually declared its own capital base. A config-only
-    read, same exception class as ``dashboards/app.py``'s live-gate read.
+def load_strategy_config_raw(config_root: object, strategy_id: str) -> dict[str, object] | None:
+    """The raw, unvalidated ``config/strategies/<id>.yaml`` mapping, or
+    ``None`` if it does not exist or does not parse — a config-only read,
+    same exception class as ``dashboards/app.py``'s live-gate read. Shared
+    by :func:`load_capital_base`, :func:`build_strategy_comparison` (each
+    strategy's own declared mode) and the Overview tab's "Configuration
+    summary" section, so the file is parsed the same way everywhere rather
+    than three slightly different ad-hoc reads.
     """
     from pathlib import Path
 
@@ -831,7 +881,17 @@ def load_capital_base(config_root: object, strategy_id: str) -> float | None:
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except (yaml.YAMLError, OSError):
         return None
-    if not isinstance(data, dict):
+    return data if isinstance(data, dict) else None
+
+
+def load_capital_base(config_root: object, strategy_id: str) -> float | None:
+    """``parameters.capital_base`` from ``config/strategies/<id>.yaml``, if
+    present — a per-strategy, untyped config value (``StrategyConfig.
+    parameters`` is a free-form dict), so ROI is only ever computed when a
+    strategy has actually declared its own capital base.
+    """
+    data = load_strategy_config_raw(config_root, strategy_id)
+    if data is None:
         return None
     parameters = data.get("parameters")
     if not isinstance(parameters, dict):

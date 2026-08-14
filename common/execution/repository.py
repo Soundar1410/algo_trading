@@ -557,18 +557,51 @@ class ExecutionRepository:
             new_quantity = current.quantity + signed
             realised = current.realised_pnl
             average = current.average_price
+            # Which entry this identity currently represents — reset only
+            # on a genuine reopen from flat (see below), otherwise carried
+            # forward unchanged, same as every other untouched column.
+            opened_at = current.opened_at.isoformat()
+            entry_correlation_id = current.entry_correlation_id
+            ledger_entry: tuple[object, ...] | None = None
 
             if current.quantity != 0 and (current.quantity > 0) != (signed > 0):
                 # Reducing or closing: realise P&L on the closed portion.
                 closed = min(abs(signed), abs(current.quantity))
                 direction = 1 if current.quantity > 0 else -1
-                realised += direction * closed * (fill.price - current.average_price)
+                realised_delta_amount = direction * closed * (fill.price - current.average_price)
+                realised += realised_delta_amount
+                ledger_entry = self._build_ledger_entry(
+                    conn,
+                    runtime_id=runtime_id,
+                    fill=fill,
+                    instrument=instrument,
+                    security_id=security_id,
+                    trading_date=trading_date,
+                    entry_side=(Side.BUY if current.quantity > 0 else Side.SELL),
+                    quantity=closed,
+                    entry_price=current.average_price,
+                    gross_pnl=realised_delta_amount,
+                    entry_correlation_id=entry_correlation_id,
+                    opened_at=opened_at,
+                )
             elif new_quantity != 0:
                 # Adding to the position: weighted-average the entry price.
                 total = abs(current.quantity) + abs(signed)
                 average = (
                     current.average_price * abs(current.quantity) + fill.price * abs(signed)
                 ) / total
+                if current.quantity == 0:
+                    # Reopening a fully-closed identity from flat, not
+                    # scaling into an already-open one — this fill is a new
+                    # entry. Until this fix, opened_at/entry_correlation_id
+                    # were never touched outside the initial INSERT, so a
+                    # second round trip on the same (strategy, mode, day,
+                    # security) identity silently kept reporting the
+                    # *first* entry's timestamp and correlation id forever.
+                    # Bookkeeping only — no entry/exit/risk decision reads
+                    # either column.
+                    opened_at = fill.filled_at.isoformat()
+                    entry_correlation_id = fill.correlation_id
 
             realised_delta = realised - current.realised_pnl
             status = PositionStatus.CLOSED if new_quantity == 0 else PositionStatus.OPEN
@@ -578,7 +611,8 @@ class ExecutionRepository:
                 SET quantity = ?, average_price = ?, realised_pnl = ?, charges = ?,
                     stop_price = COALESCE(?, stop_price),
                     target_price = COALESCE(?, target_price),
-                    status = ?, closed_at = ?, updated_at = ?
+                    status = ?, closed_at = ?, updated_at = ?,
+                    opened_at = ?, entry_correlation_id = ?
                 WHERE strategy_id = ? AND execution_mode = ? AND trading_date = ?
                   AND security_id = ?
                 """,
@@ -592,12 +626,27 @@ class ExecutionRepository:
                     status.value,
                     now if status is PositionStatus.CLOSED else None,
                     now,
+                    opened_at,
+                    entry_correlation_id,
                     fill.strategy_id,
                     fill.execution_mode.value,
                     trading_date,
                     security_id,
                 ),
             )
+            if ledger_entry is not None:
+                conn.execute(
+                    """
+                    INSERT INTO trade_ledger
+                        (runtime_id, strategy_id, execution_mode, trading_date, instrument,
+                         security_id, entry_side, quantity, entry_price, exit_price, gross_pnl,
+                         entry_charges, exit_charges, entry_correlation_id, exit_correlation_id,
+                         exit_broker_fill_id, opened_at, closed_at, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (exit_correlation_id, exit_broker_fill_id) DO NOTHING
+                    """,
+                    ledger_entry,
+                )
 
         result = self._read_position(
             conn,
@@ -608,6 +657,63 @@ class ExecutionRepository:
         )
         assert result is not None
         return result, realised_delta
+
+    @staticmethod
+    def _build_ledger_entry(
+        conn: sqlite3.Connection,
+        *,
+        runtime_id: str,
+        fill: Fill,
+        instrument: str,
+        security_id: str,
+        trading_date: str,
+        entry_side: Side,
+        quantity: int,
+        entry_price: float,
+        gross_pnl: float,
+        entry_correlation_id: str | None,
+        opened_at: str,
+    ) -> tuple[object, ...]:
+        """The durable ``trade_ledger`` row for one realising fill.
+
+        ``entry_charges`` sums every fill recorded under
+        ``entry_correlation_id`` — exact for a strategy that never scales
+        in (the only kind this project runs today, see the migration's own
+        comment); a scaling strategy would attribute all of it to the
+        first partial close, a documented precision limit rather than a
+        schema gap. ``exit_charges`` is this fill's own charges — no
+        apportionment needed, it is a single fill.
+        """
+        entry_charges = 0.0
+        if entry_correlation_id is not None:
+            entry_charges = float(
+                conn.execute(
+                    "SELECT COALESCE(SUM(charges), 0.0) AS total FROM fills "
+                    "WHERE correlation_id = ?",
+                    (entry_correlation_id,),
+                ).fetchone()["total"]
+            )
+        return (
+            runtime_id,
+            fill.strategy_id,
+            fill.execution_mode.value,
+            trading_date,
+            instrument,
+            security_id,
+            entry_side.value,
+            quantity,
+            entry_price,
+            fill.price,
+            gross_pnl,
+            entry_charges,
+            fill.charges,
+            entry_correlation_id,
+            fill.correlation_id,
+            fill.broker_fill_id,
+            opened_at,
+            fill.filled_at.isoformat(),
+            _now(),
+        )
 
     def _touch_strategy_state(
         self,

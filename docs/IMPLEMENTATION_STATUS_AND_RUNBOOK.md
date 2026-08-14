@@ -74,7 +74,7 @@ the next phase. Updated after every phase.
 | 4 | Candle, indicator and paper-execution foundation | **Complete.** **Part 1 complete** (real contract resolution — closes 17, alarms 15). **Part 2 complete** (indicator layer — closes D21). **Part 3 complete** (continuity, timezone, wall-clock square-off — closes 4 and 7, and a live blocker). **Part 4 complete** (warm-up source and injection — closes 16). **Part 5 complete** (`PaperBroker` realism — closes 5 and D11; the live Full-mode gate item ran 6 August 2026 and passed, closing known limitation 20 along the way). **Phase 4 complete** — all five parts done, its one live gate item proven rather than asserted |
 | 5 | Mixed-mode supervisor and persistence | **Complete** |
 | 6 | Paper recovery and expiry handling | **Complete — all five parts.** **Part 1** (daily risk state across a restart — closes the risk-limit-bypass gap in bullet 1, and finds/fixes **D58**/limitation 22 along the way). **Part 2** (position-management state snapshot/restore — exit-policy state via `BaseExit`/`RiskManager`/`BaseStrategy` snapshot hooks, and stop/target persistence through a widened `RiskManager`/`ExecutionGateway`, fail-open on a bad snapshot, negative-control-tested). **Part 3** (MFE/MAE, square-off attempts, state-version validation and position-gated last-candle idempotency — the rest of §7's "restore at minimum" list). **Part 4** (`force_square_off_before_expiry` composed into the existing `SquareOffAuthority` seam — **D66-D68**; `simulate_exchange_settlement` refused at config load, none of spec section 11's eight settlement-policy items built — limitation 27). **Part 5** (the phase's record: bullets re-checked against what is built, not assumed; D56's persistence-identity gap given a written candidate direction, not an implementation — **D69**, limitation 30). Bullet 2's fixed strikes/basket legs/rolling counters remain blocked on `FixedStrikeEngine`/`MultiLegEngine` — D56/D34, unchanged, not this phase's to close |
-| 7 | Operations | **Complete — all five parts.** **Part 1** (health snapshot layer — `common/health/snapshot.py`, `auth_events`/`feed_events` writers and producers, configurable heartbeat interval). **Part 2** (Telegram in production — real notifier construction at both entrypoints, deferred delivery, rate limiting/aggregation, `notifications`-table persistence, redacted rendering — D71-D74). **Part 3** (the Streamlit dashboard — Master/Intraday Options/System Health pages plus two honest stubs, reading through `common.health.snapshot` for operational state — D75; addendum adds `effective_live_gate` status to Master, config-sourced, the one deliberate exception to database-only reads; **14 August 2026 addendum rewrote this into a unified, tabbed application — Home/Intraday Options/Positional Options/Intraday Stocks/System Health — behind a typed `dashboards/data/` read-model layer, see "Dashboard — unified Home/..." under §8**). **Part 4** (PID ownership hardened onto `create_time()`, fail-first proven — D76; two previously-hidden bugs found and fixed along the way — D77/D78; seven operator scripts plus `authenticate`, `audit_events` migration `0004`, file-based square-off request channel). **Part 5** (`common/retention/` — bounded age-based DB purge in one transaction, log compression/deletion, pre-migration backup with retained-backup count, one entry point at controlled startup — D80; `ScripMasterCache.prune()` given its first caller; `Settings.algo_log_level` wiring bug found and fixed — D79) |
+| 7 | Operations | **Complete — all five parts.** **Part 1** (health snapshot layer — `common/health/snapshot.py`, `auth_events`/`feed_events` writers and producers, configurable heartbeat interval). **Part 2** (Telegram in production — real notifier construction at both entrypoints, deferred delivery, rate limiting/aggregation, `notifications`-table persistence, redacted rendering — D71-D74). **Part 3** (the Streamlit dashboard — Master/Intraday Options/System Health pages plus two honest stubs, reading through `common.health.snapshot` for operational state — D75; addendum adds `effective_live_gate` status to Master, config-sourced, the one deliberate exception to database-only reads; **14 August 2026 addendum rewrote this into a unified, tabbed application — Home/Intraday Options/Positional Options/Intraday Stocks/System Health — behind a typed `dashboards/data/` read-model layer, see "Dashboard — unified Home/..." under §8; a same-day second corrective pass added a persistent per-page strategy selector plus migration `0008`'s durable `trade_ledger` (fixing a positions-reopen data-loss bug found during manual verification), see "Dashboard — strategy drill-down and durable trade ledger" under §8**). **Part 4** (PID ownership hardened onto `create_time()`, fail-first proven — D76; two previously-hidden bugs found and fixed along the way — D77/D78; seven operator scripts plus `authenticate`, `audit_events` migration `0004`, file-based square-off request channel). **Part 5** (`common/retention/` — bounded age-based DB purge in one transaction, log compression/deletion, pre-migration backup with retained-backup count, one entry point at controlled startup — D80; `ScripMasterCache.prune()` given its first caller; `Settings.algo_log_level` wiring bug found and fixed — D79) |
 | 8 | LaunchAgent validation | **Complete** |
 | 9 | Real strategies | **Complete** |
 | 10 | Controlled live readiness | **CODE HARDENED, fully disabled.** Generic infrastructure is production-wired and fake-tested; operational activation remains blocked by paper evidence, a separately specified second real strategy, provider/static-IP, auth revalidation and explicit-approval gates. |
@@ -4897,6 +4897,94 @@ from their new home in `dashboards/data/account.py`, logic unchanged.
 `tests/end_to_end/test_walking_skeleton.py`'s dashboard gate test was
 updated the same way (`load_master`/`RuntimeCard` retired in favour of the
 snapshot read every page now shares).
+
+### Dashboard — strategy drill-down and durable trade ledger (14 August 2026, second corrective pass)
+
+A follow-up request the same day: the unified dashboard above had a
+Strategy Comparison table but no way to scope any other tab to one
+strategy, and — surfaced during that pass's own manual verification — its
+Closed Trades/Performance numbers were re-derived from `positions`+`fills`
+at read time, a model that silently loses a round trip's own detail the
+moment its `(strategy, mode, day, security)` identity reopens after
+closing (a real BUY→SELL→BUY sequence left `positions` back in `OPEN`
+status, so Closed Trades reported zero rows for a day that had already
+booked a real ₹930 profit — `positions.realised_pnl` kept accumulating
+correctly throughout; only the per-trade *record* was lost). Fixing that
+required this project's first new runtime instrumentation since Phase 7:
+migration `0008_trade_ledger.sql` adds `trade_ledger`, an append-only
+durable record — one row per realising fill — written by
+`ExecutionRepository._upsert_position` inside the exact same transaction
+that already computes each closing fill's realised P&L. Alongside it, a
+long-standing latent bug in that same method was fixed: `positions.
+opened_at`/`entry_correlation_id` were never reset when a fully-closed
+identity reopened, so a second round trip silently inherited the first
+entry's timestamp and correlation id forever — bookkeeping only, no
+entry/exit/risk rule changed, verified by
+`tests/integration/test_trade_ledger.py`'s reopen-regression tests and
+confirmed visually against a real seeded reopen scenario (two independent,
+correctly-priced Closed Trades rows) during manual verification. `trade_
+ledger` joined `common.retention.policy.NEVER_PURGED_TABLES` — a trading
+record, never age-purged, like `orders`/`fills`/`positions`/
+`order_intents`. `dashboards/data/intraday_options.py`'s `load_closed_
+trades` now reads `trade_ledger` directly (one query, exact prices,
+`ClosedTradeRow`'s shape unchanged) instead of re-deriving from fills;
+`ComparisonRow` gained `execution_mode` so a strategy that has ever run in
+both modes gets two independent rows, never blended.
+
+**The reusable strategy selector** the request asked for lives in the new
+`dashboards/data/strategy_scope.py`: `discover_strategy_options` unions
+config strategies (reusing `dashboards.data.account._raw_strategy_files`),
+current `runtime_heartbeats` strategy ids, and every historically-active
+strategy id across `trade_ledger`/`signals`/`order_intents`/`positions` —
+so a strategy is selectable the moment it is configured, running,
+disabled, or merely has history, labelled Running/Stopped/Disabled/
+Historical only. `render_strategy_selector` is one `st.selectbox` over raw
+strategy ids with a `format_func` label, so `st.session_state[key]` always
+holds exactly the resolved id — both Streamlit's own natural persistence
+across tab switches and reruns, and the same key the Strategy Comparison
+tab's row click (`st.dataframe(..., on_select="rerun", selection_mode=
+"single-row")`, supported natively by the pinned Streamlit 1.60) writes to
+directly to change the active strategy. `dashboards/intraday_options.py`
+places one selector below the title and above the tabs, threading the
+resolved strategy id through Overview, Live Positions, Orders & Fills (new
+Mode filter), Closed Trades/Performance (existing date range, new Mode
+filter), Signals & Events and Health (via `dataclasses.replace` on
+`SystemHealthView`'s `strategy_pids`/incident lists — `system_health.py`
+itself untouched, so the standalone System Health page still shows every
+strategy). Strategy Comparison keeps its own independent "Compare
+strategies" multiselect, defaulting to every available strategy. Overview
+gained a Configuration summary section for the selected strategy (`config/
+strategies/<id>.yaml`, any key matching `secret|token|password|pin|api_key`
+replaced with `"REDACTED"` — defence in depth; no committed strategy YAML
+has ever held a real secret). Two more real "avoid clipped values" bugs
+were found and fixed during this pass's own manual verification against
+seeded multi-strategy data: Overview's "Health" metric (`RUNNING_PAPER`
+clipped to `RUNNING_P...` in a quarter-width column — now a full-width
+colored `health_badge()` markdown line instead of a boxed metric) and, in
+the prior pass, Home's "Last refresh" and Overview's "Square-off" metrics
+(already fixed then, confirmed still correct here).
+
+`dashboards/positional_options.py`/`intraday_stocks.py` gained the same
+selector, deliberately wired with `conn=None, config_root=None` — showing
+nothing today — because `config/strategies/*.yaml` carries no real
+per-runtime membership mechanism (the same single-runtime limitation
+`common.config.discover_enabled_strategies` already documents), so
+attributing `intraday_options`'s own strategies to a stub runtime would be
+fabricated, not prepared, capability.
+
+**Tests**: `tests/integration/test_trade_ledger.py` (full-close row
+correctness, idempotent replay, the reopen regression, paper/live
+separation, entry/exit charge reconciliation against `positions.charges`
+for the non-scaling case); `tests/unit/test_dashboard_strategy_scope.py`
+(all four status labels, filter composition, CSV-scope proof);
+`tests/unit/test_dashboard_apptest.py` gained real-Streamlit coverage of
+the selector filtering Overview, surviving an unrelated rerun, and the
+comparison multiselect's default; `test_migrations.py`/`test_retention.py`
+updated for migration `0008`/the widened `NEVER_PURGED_TABLES` set. Full
+test suite, ruff and mypy (strict) pass; every committed live gate remains
+disabled and `scripts.assert_no_live_config_committed` still passes — this
+pass touched `common/execution/repository.py`'s write path but changed no
+entry/exit/risk decision, only what gets persisted for later reading.
 
 ### Phase 10 — Controlled live readiness — **CODE COMPLETE; operational activation blocked**
 

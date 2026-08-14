@@ -38,8 +38,12 @@ RETAINED_TABLES: dict[str, str] = {
 #: above is an allowlist, so nothing outside it is ever reachable — but
 #: stated here explicitly so a reviewer, and
 #: ``tests/unit/test_retention.py``, can check the two sets stay disjoint
-#: without reading the SQL.
-NEVER_PURGED_TABLES = frozenset({"orders", "fills", "positions", "order_intents"})
+#: without reading the SQL. ``trade_ledger`` (migration 0008) joined this
+#: set the same day it was created: it is a durable trading record, not an
+#: operational/diagnostic log, and the whole point of writing it was to
+#: survive longer than a re-derivable read-model query — deleting it by
+#: age would defeat that.
+NEVER_PURGED_TABLES = frozenset({"orders", "fills", "positions", "order_intents", "trade_ledger"})
 
 DEFAULT_LOG_MAX_AGE_DAYS = 30
 DEFAULT_LOG_COMPRESS_AFTER_DAYS = 1

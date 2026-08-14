@@ -15,6 +15,7 @@ import dashboards.intraday_options as page
 from dashboards.data.incidents import EventErrorRow
 from dashboards.data.intraday_options import (
     ClosedTradeRow,
+    ComparisonRow,
     FillRow,
     LatestError,
     LivePositionRow,
@@ -157,20 +158,60 @@ def test_comparison_empty_state():
     assert any("no strategy" in i.lower() for i in st.infos)
 
 
+def _comparison_row(strategy_id: str = "st01", execution_mode: str = "paper") -> ComparisonRow:
+    return ComparisonRow(
+        strategy_id=strategy_id,
+        execution_mode=execution_mode,
+        metrics=compute_metrics((_closed_trade(),)),
+        execution_days=1,
+        eligible_days=1,
+        roi_pct=None,
+    )
+
+
 def test_comparison_shows_insufficient_sample_label():
     st = FakeStreamlit()
-
-    class _Row:
-        strategy_id = "st01"
-        metrics = compute_metrics((_closed_trade(),))
-        execution_days = 1
-        eligible_days = 1
-        roi_pct = None
-
-    page._render_comparison(st, (_Row(),))
+    page._render_comparison(st, (_comparison_row(),))
     table = st.dataframes[0]
     assert "insufficient" in table[0]["Sample"]
     assert table[0]["ROI %"] == "—"
+    assert any("at least one more strategy" in c for c in st.captions)
+
+
+def test_comparison_with_two_strategies_does_not_show_insufficient_caption():
+    st = FakeStreamlit()
+    page._render_comparison(
+        st, (_comparison_row("st01"), _comparison_row("st02"))
+    )
+    assert not any("at least one more strategy" in c for c in st.captions)
+
+
+def test_comparison_never_blends_paper_and_live_into_one_row():
+    st = FakeStreamlit()
+    page._render_comparison(
+        st,
+        (
+            _comparison_row("st01", execution_mode="paper"),
+            _comparison_row("st01", execution_mode="live"),
+        ),
+    )
+    table = st.dataframes[0]
+    assert len(table) == 2
+    modes = {row["Mode"] for row in table}
+    assert modes == {"PAPER — simulated", "LIVE — real money"}
+
+
+def test_comparison_row_click_returns_the_clicked_strategy_id():
+    st = FakeStreamlit()
+    st.dataframe_selection = {"selection": {"rows": [1]}}
+    clicked = page._render_comparison(st, (_comparison_row("st01"), _comparison_row("st02")))
+    assert clicked == "st02"
+
+
+def test_comparison_no_click_returns_none():
+    st = FakeStreamlit()
+    clicked = page._render_comparison(st, (_comparison_row("st01"), _comparison_row("st02")))
+    assert clicked is None
 
 
 # ================================================================ Signals

@@ -71,9 +71,9 @@ from dashboards.data.account import (  # noqa: E402
     render_account_status,
 )
 from dashboards.data.calendar_stats import (  # noqa: E402
-    DailyOutcome,
     ThirtyDayRollup,
     build_thirty_day_rollup,
+    merge_daily_outcomes,
 )
 from dashboards.data.incidents import IncidentRow, classify_incidents  # noqa: E402
 from dashboards.data.intraday_options import (  # noqa: E402
@@ -392,20 +392,7 @@ def load_home(
             ),
         )
         if not isinstance(outcomes, SnapshotUnavailable):
-            # Merge per-strategy daily outcomes into one platform-wide series.
-            merged: dict[date, list[DailyOutcome]] = {}
-            for o in outcomes:
-                merged.setdefault(o.trading_date, []).append(o)
-
-            combined = tuple(
-                DailyOutcome(
-                    trading_date=day,
-                    ran=any(o.ran for o in rows),
-                    trade_count=sum(o.trade_count for o in rows),
-                    net_pnl=sum(o.net_pnl for o in rows),
-                )
-                for day, rows in sorted(merged.items())
-            )
+            combined = merge_daily_outcomes(outcomes)
             thirty_day = build_thirty_day_rollup(combined, inception_date=inception, today=today)
 
     cards = tuple(

@@ -4,6 +4,16 @@ Eight tabs (spec): Overview, Live Positions, Orders & Fills, Closed Trades,
 Performance, Strategy Comparison, Signals & Events, Health — all backed by
 :mod:`dashboards.data.intraday_options`, never by SQL written in this file.
 
+**A persistent "Strategy:" selector**, right below the title and above the
+tabs, scopes every tab except Strategy Comparison (which has its own
+"Compare strategies" multiselect — see its section below) to one strategy
+or "All Strategies". Built from
+:func:`dashboards.data.strategy_scope.discover_strategy_options` — the
+reusable component this page and the two stub pages share, not a
+per-tab re-derivation — so a strategy appears the moment it is configured,
+running, disabled, or has any historical record, never only once it has
+traded.
+
 **What this page does not show, and why.** Engine type, open legs/baskets,
 selected strikes/expiry, per-leg P&L and roll count are not shown: those
 describe ``MultiLegEngine``/``FixedStrikeEngine``, and per the runbook's
@@ -22,7 +32,9 @@ snapshot" write button is deliberately not ported.
 
 from __future__ import annotations
 
+import re
 import sys
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -38,6 +50,7 @@ from dashboards._shared import SnapshotUnavailable, load_snapshot, run_bounded  
 from dashboards.data.calendar_stats import (  # noqa: E402
     TRADING_DAY_CAVEAT,
     execution_day_stats,
+    merge_daily_outcomes,
     n_trading_days_back,
 )
 from dashboards.data.intraday_options import (  # noqa: E402
@@ -57,8 +70,14 @@ from dashboards.data.intraday_options import (  # noqa: E402
     load_orders,
     load_overview,
     load_signals,
+    load_strategy_config_raw,
     pnl_by_day,
     pnl_by_month,
+)
+from dashboards.data.strategy_scope import (  # noqa: E402
+    StrategyOption,
+    discover_strategy_options,
+    render_strategy_selector,
 )
 from dashboards.formatting import (  # noqa: E402
     MISSING,
@@ -66,6 +85,7 @@ from dashboards.formatting import (  # noqa: E402
     format_inr,
     format_ist,
     format_pct,
+    health_badge,
     mode_label,
     to_csv_bytes,
 )
@@ -77,6 +97,9 @@ NOT_YET_AVAILABLE = (
 )
 
 _PRESETS = ("Today", "Last 7 trading days", "Last 30 trading days", "Custom")
+_MODES = ("All", "Paper", "Live")
+_MODE_VALUES = {"All": None, "Paper": "paper", "Live": "live"}
+_SECRET_KEY_PATTERN = re.compile(r"secret|token|password|pin|api[_-]?key", re.IGNORECASE)
 
 
 def _resolve_date_range(streamlit: Any, key: str, today: date) -> tuple[date, date]:
@@ -95,12 +118,42 @@ def _resolve_date_range(streamlit: Any, key: str, today: date) -> tuple[date, da
     return start, end
 
 
+def _resolve_mode(streamlit: Any, key: str) -> str | None:
+    choice = streamlit.selectbox("Mode", _MODES, key=key)
+    return _MODE_VALUES.get(choice)
+
+
 def _fmt_ratio(value: float | None) -> str:
     if value is None:
         return MISSING
     if value == float("inf"):
         return "∞"
     return f"{value:.2f}"
+
+
+def _redact_secrets(value: object) -> object:
+    """Recursively blank any key that looks secret-shaped. No committed
+    strategy YAML has ever held a real secret (CLAUDE.md: secrets live only
+    in the gitignored .env) — this is defence in depth for the
+    Configuration summary section, not a response to a known leak."""
+    if isinstance(value, dict):
+        return {
+            k: ("REDACTED" if _SECRET_KEY_PATTERN.search(str(k)) else _redact_secrets(v))
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_secrets(v) for v in value]
+    return value
+
+
+def _render_config_summary(streamlit: Any, config_root: object, strategy_id: str) -> None:
+    with streamlit.expander("Configuration summary"):
+        config = load_strategy_config_raw(config_root, strategy_id)
+        if config is None:
+            streamlit.caption("No configuration file found for this strategy.")
+            return
+        streamlit.caption("Current committed configuration — not a historical snapshot.")
+        streamlit.json(_redact_secrets(config))
 
 
 # ============================================================== Overview
@@ -110,16 +163,19 @@ def _render_overview(streamlit: Any, rows: tuple[OverviewRow, ...]) -> None:
         return
     for row in rows:
         streamlit.markdown(f"**{row.strategy_id} — {mode_label(row.execution_mode)}**")
-        # Two rows of at most 4 columns, not one row of 6 — a long state
-        # value (RUNNING_PAPER, IN_PROGRESS, COMPLETED) must never clip in
-        # a column this narrow (spec: "avoid clipped values such as
-        # 'RUNNING...'"). Today's trade count and P&L are also two
-        # genuinely separate numbers, not one concatenated string.
-        top = streamlit.columns(4)
-        top[0].metric("Health", row.health_state)
-        top[1].metric("Heartbeat age", format_age(row.heartbeat_age_seconds))
-        top[2].metric("PID", row.pid if row.pid is not None else "—")
-        top[3].metric("Open positions", row.open_positions)
+        # Health is a colored markdown badge, not a boxed metric: its value
+        # (RUNNING_PAPER, RUNNING_LIVE, ...) is exactly the "avoid clipped
+        # values such as 'RUNNING...'" example the spec names, and markdown
+        # text wraps instead of ellipsizing regardless of column width.
+        # Every other field here is short enough for a three-column row —
+        # confirmed against COMPLETED/IN_PROGRESS, the longest square-off
+        # values. Today's trade count and P&L are two genuinely separate
+        # numbers, not one concatenated string.
+        streamlit.markdown(f"Health: {health_badge(row.health_state)}")
+        top = streamlit.columns(3)
+        top[0].metric("Heartbeat age", format_age(row.heartbeat_age_seconds))
+        top[1].metric("PID", row.pid if row.pid is not None else "—")
+        top[2].metric("Open positions", row.open_positions)
         bottom = streamlit.columns(3)
         bottom[0].metric("Square-off", row.square_off_state or "—")
         bottom[1].metric("Today's trades", row.today_trade_count)
@@ -349,7 +405,7 @@ def _render_performance(
     )
     streamlit.caption(
         f"Executed {day_stats.executed_days} of {day_stats.eligible_trading_days} eligible "
-        f"trading days ({execution_pct_label})."
+        f"trading days ({execution_pct_label}); {day_stats.skipped_days} no-trade day(s)."
     )
     streamlit.caption(TRADING_DAY_CAVEAT)
 
@@ -363,16 +419,32 @@ def _render_performance(
 
 
 # ========================================================= Strategy comparison
-def _render_comparison(streamlit: Any, rows: tuple[Any, ...]) -> None:
+def _render_comparison(
+    streamlit: Any, rows: tuple[Any, ...], *, active_strategy_id: str | None = None
+) -> str | None:
+    """Renders the comparison leaderboard. Returns a newly clicked
+    strategy id when the dataframe's row-selection reports one, else
+    ``None`` — the caller decides whether to write it into the page-level
+    strategy-selector's session-state key and rerun."""
     if not rows:
         streamlit.info("No strategy has any closed trade in this range.")
-        return
+        return None
+
+    strategy_ids_in_view = sorted({r.strategy_id for r in rows})
+    if len(strategy_ids_in_view) < 2:
+        streamlit.caption(
+            "Add at least one more strategy to the comparison above for a "
+            "meaningful comparison — a single strategy's own numbers are "
+            "shown here for reference, not ranked against anything."
+        )
+
     table = []
     for r in rows:
         m = r.metrics
         table.append(
             {
                 "Strategy": r.strategy_id,
+                "Mode": mode_label(r.execution_mode),
                 "Net P&L": format_inr(m.net_profit),
                 "ROI %": format_pct(r.roi_pct) if r.roi_pct is not None else MISSING,
                 "Trades": m.sample_size,
@@ -387,18 +459,35 @@ def _render_comparison(streamlit: Any, rows: tuple[Any, ...]) -> None:
                 "Sample": "reliable" if m.reliable else f"insufficient (n={m.sample_size})",
             }
         )
-    streamlit.dataframe(table, hide_index=True, width="stretch")
+    event = streamlit.dataframe(
+        table,
+        hide_index=True,
+        width="stretch",
+        on_select="rerun",
+        selection_mode="single-row",
+        key="io_comparison_table",
+    )
     streamlit.caption(
         "Rankings are computed read-only, on demand, from closed trades in the "
         "selected range — nothing is written or snapshotted. ROI is shown only "
-        "for a strategy that declares its own capital_base in config."
+        "for a strategy that declares its own capital_base in config. Paper and "
+        "live results for the same strategy are always shown as separate rows, "
+        "never blended. Click a row to view that strategy in the tabs above."
     )
+    if active_strategy_id is not None:
+        streamlit.caption(f"Currently viewing: {active_strategy_id} in the tabs above.")
     streamlit.download_button(
         "Download comparison (CSV)",
         data=to_csv_bytes(table),
         file_name="strategy_comparison.csv",
         mime="text/csv",
     )
+
+    if event:
+        selected_rows = event.get("selection", {}).get("rows", [])
+        if selected_rows:
+            return str(rows[selected_rows[0]].strategy_id)
+    return None
 
 
 # ================================================================ Signals
@@ -468,6 +557,27 @@ def _render_signals(
         streamlit.caption("No errors recorded.")
 
 
+def _scope_health_view(view: Any, strategy_id: str | None) -> Any:
+    """Filter a runtime-wide ``SystemHealthView`` down to one strategy's
+    PIDs and incidents. Auth/feed/database sections stay runtime-wide —
+    they are not per-strategy facts, so there is nothing honest to filter
+    them to. ``dataclasses.replace`` only; ``system_health.py`` itself is
+    untouched, so the standalone System Health page keeps showing every
+    strategy."""
+    if strategy_id is None:
+        return view
+    return replace(
+        view,
+        strategy_pids=tuple(p for p in view.strategy_pids if p.strategy_id == strategy_id),
+        active_incidents=tuple(
+            i for i in view.active_incidents if i.strategy_id in (strategy_id, None)
+        ),
+        resolved_incidents=tuple(
+            i for i in view.resolved_incidents if i.strategy_id in (strategy_id, None)
+        ),
+    )
+
+
 # =================================================================== main
 def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
     import streamlit as st
@@ -487,7 +597,17 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
     if isinstance(result, SnapshotUnavailable):
         st.info(result.reason)
         return
-    strategy_ids = tuple(s.strategy_id for s in result.strategies)
+
+    options_result = run_bounded(
+        database_path,
+        lambda conn: discover_strategy_options(conn, paths.config_root, runtime_id),
+    )
+    options: tuple[StrategyOption, ...] = (
+        () if isinstance(options_result, SnapshotUnavailable) else options_result
+    )
+    all_strategy_ids = tuple(o.strategy_id for o in options)
+
+    selected_strategy = render_strategy_selector(st, options, key="io_strategy")
 
     tabs = st.tabs(
         [
@@ -505,20 +625,28 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
     with tabs[0]:
 
         @st.fragment(run_every=5)
-        def _overview() -> None:
+        def _overview(strategy_id: str | None = selected_strategy) -> None:
             overview = run_bounded(
-                database_path, lambda conn: load_overview(conn, runtime_id, trading_date)
+                database_path,
+                lambda conn: load_overview(
+                    conn, runtime_id, trading_date, strategy_id=strategy_id
+                ),
             )
             _render_overview(st, () if isinstance(overview, SnapshotUnavailable) else overview)
+            if strategy_id is not None:
+                _render_config_summary(st, paths.config_root, strategy_id)
 
         _overview()
 
     with tabs[1]:
 
         @st.fragment(run_every=5)
-        def _positions() -> None:
+        def _positions(strategy_id: str | None = selected_strategy) -> None:
             positions = run_bounded(
-                database_path, lambda conn: load_live_positions(conn, runtime_id, trading_date)
+                database_path,
+                lambda conn: load_live_positions(
+                    conn, runtime_id, trading_date, strategy_id=strategy_id
+                ),
             )
             rows = () if isinstance(positions, SnapshotUnavailable) else positions
             _render_live_positions(st, rows)
@@ -526,11 +654,21 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
         _positions()
 
     with tabs[2]:
+        orders_mode = _resolve_mode(st, "io_orders_mode")
 
         @st.fragment(run_every=5)
-        def _orders() -> None:
+        def _orders(
+            strategy_id: str | None = selected_strategy, execution_mode: str | None = orders_mode
+        ) -> None:
             orders = run_bounded(
-                database_path, lambda conn: load_orders(conn, runtime_id, trading_date)
+                database_path,
+                lambda conn: load_orders(
+                    conn,
+                    runtime_id,
+                    trading_date,
+                    strategy_id=strategy_id,
+                    execution_mode=execution_mode,
+                ),
             )
             _render_orders(st, () if isinstance(orders, SnapshotUnavailable) else orders)
 
@@ -538,13 +676,24 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
 
     with tabs[3]:
         start, end = _resolve_date_range(st, "closed_trades", today)
+        closed_mode = _resolve_mode(st, "io_closed_mode")
 
         @st.fragment(run_every=30)
-        def _closed(start: date = start, end: date = end) -> None:
+        def _closed(
+            start: date = start,
+            end: date = end,
+            strategy_id: str | None = selected_strategy,
+            execution_mode: str | None = closed_mode,
+        ) -> None:
             trades = run_bounded(
                 database_path,
                 lambda conn: load_closed_trades(
-                    conn, runtime_id, start_date=start.isoformat(), end_date=end.isoformat()
+                    conn,
+                    runtime_id,
+                    strategy_id=strategy_id,
+                    execution_mode=execution_mode,
+                    start_date=start.isoformat(),
+                    end_date=end.isoformat(),
                 ),
             )
             _render_closed_trades(st, () if isinstance(trades, SnapshotUnavailable) else trades)
@@ -553,34 +702,51 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
 
     with tabs[4]:
         start, end = _resolve_date_range(st, "performance", today)
+        performance_mode = _resolve_mode(st, "io_performance_mode")
 
         @st.fragment(run_every=30)
-        def _performance(start: date = start, end: date = end) -> None:
+        def _performance(
+            start: date = start,
+            end: date = end,
+            strategy_id: str | None = selected_strategy,
+            execution_mode: str | None = performance_mode,
+        ) -> None:
             trades = run_bounded(
                 database_path,
                 lambda conn: load_closed_trades(
-                    conn, runtime_id, start_date=start.isoformat(), end_date=end.isoformat()
+                    conn,
+                    runtime_id,
+                    strategy_id=strategy_id,
+                    execution_mode=execution_mode,
+                    start_date=start.isoformat(),
+                    end_date=end.isoformat(),
                 ),
             )
-            outcomes = run_bounded(
+            scope_ids = (strategy_id,) if strategy_id is not None else all_strategy_ids
+            raw_outcomes = run_bounded(
                 database_path,
                 lambda conn: tuple(
                     o
-                    for sid in strategy_ids
+                    for sid in scope_ids
                     for o in load_daily_outcomes(
                         conn,
                         runtime_id,
                         strategy_id=sid,
-                        execution_mode=None,
+                        execution_mode=execution_mode,
                         start_date=start.isoformat(),
                         end_date=end.isoformat(),
                     )
                 ),
             )
+            outcomes = (
+                ()
+                if isinstance(raw_outcomes, SnapshotUnavailable)
+                else merge_daily_outcomes(raw_outcomes)
+            )
             _render_performance(
                 st,
                 () if isinstance(trades, SnapshotUnavailable) else trades,
-                () if isinstance(outcomes, SnapshotUnavailable) else outcomes,
+                outcomes,
                 start,
                 end,
             )
@@ -589,35 +755,68 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
 
     with tabs[5]:
         start, end = _resolve_date_range(st, "comparison", today)
+        compare_key = "io_compare_strategies"
+        default_selection = list(all_strategy_ids)
+        status_by_id = {o.strategy_id: o.status_label for o in options}
+        compare_choice = st.multiselect(
+            "Compare strategies",
+            all_strategy_ids,
+            default=default_selection,
+            key=compare_key,
+            format_func=lambda sid: f"{sid} ({status_by_id.get(sid, 'Historical only')})",
+        )
+        compare_ids = tuple(compare_choice)
 
         @st.fragment(run_every=30)
-        def _comparison(start: date = start, end: date = end) -> None:
+        def _comparison(
+            start: date = start,
+            end: date = end,
+            compare_ids: tuple[str, ...] = compare_ids,
+            active_strategy_id: str | None = selected_strategy,
+        ) -> None:
+            if not compare_ids:
+                st.info("Select at least one strategy above to compare.")
+                return
             rows = run_bounded(
                 database_path,
                 lambda conn: build_strategy_comparison(
                     conn,
                     runtime_id,
                     paths.config_root,
-                    strategy_ids,
+                    compare_ids,
                     start_date=start.isoformat(),
                     end_date=end.isoformat(),
                 ),
             )
-            _render_comparison(st, () if isinstance(rows, SnapshotUnavailable) else rows)
+            clicked = _render_comparison(
+                st,
+                () if isinstance(rows, SnapshotUnavailable) else rows,
+                active_strategy_id=active_strategy_id,
+            )
+            if clicked is not None and clicked != st.session_state.get("io_strategy"):
+                st.session_state["io_strategy"] = clicked
+                st.rerun()
 
         _comparison()
 
     with tabs[6]:
 
         @st.fragment(run_every=30)
-        def _signals() -> None:
+        def _signals(strategy_id: str | None = selected_strategy) -> None:
             signals = run_bounded(
-                database_path, lambda conn: load_signals(conn, runtime_id, trading_date)
+                database_path,
+                lambda conn: load_signals(
+                    conn, runtime_id, trading_date, strategy_id=strategy_id
+                ),
             )
             notifications = run_bounded(
-                database_path, lambda conn: load_notifications(conn, runtime_id)
+                database_path,
+                lambda conn: load_notifications(conn, runtime_id, strategy_id=strategy_id),
             )
-            errors = run_bounded(database_path, lambda conn: load_errors(conn, runtime_id))
+            errors = run_bounded(
+                database_path,
+                lambda conn: load_errors(conn, runtime_id, strategy_id=strategy_id),
+            )
             _render_signals(
                 st,
                 () if isinstance(signals, SnapshotUnavailable) else signals,
@@ -630,10 +829,11 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
     with tabs[7]:
 
         @st.fragment(run_every=5)
-        def _health() -> None:
-            health_page.render(
-                st, health_page.load_system_health(database_path, runtime_id, trading_date)
-            )
+        def _health(strategy_id: str | None = selected_strategy) -> None:
+            view = health_page.load_system_health(database_path, runtime_id, trading_date)
+            if not isinstance(view, SnapshotUnavailable):
+                view = _scope_health_view(view, strategy_id)
+            health_page.render(st, view)
 
         _health()
 

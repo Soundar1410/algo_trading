@@ -12,6 +12,17 @@ No side effects: no database is opened, because there is none to open. The
 read-model interface these tabs are built against lives in
 ``dashboards/data/positional.py`` — real dataclasses, ready for a real
 positional worker's persistence to satisfy, not queried today.
+
+**The strategy selector is wired in today, deliberately showing nothing.**
+``discover_strategy_options`` is called with ``conn=None`` (no database)
+*and* ``config_root=None`` — a strategy configured under
+``config/strategies/*.yaml`` cannot be reliably attributed to this runtime
+(no real per-runtime membership mechanism exists yet; see
+``dashboards.data.strategy_scope``'s own docstring), so showing
+``intraday_options``'s own strategies on this page would be fabricated
+membership, not a real "prepared" capability. The moment a real positional
+runtime/database exists, passing its ``conn``/``config_root`` here is the
+only change needed — no restructuring.
 """
 
 from __future__ import annotations
@@ -27,6 +38,10 @@ for _parent in Path(__file__).resolve().parents:
         break
 
 from dashboards.data.positional import NOT_CONFIGURED  # noqa: E402
+from dashboards.data.strategy_scope import (  # noqa: E402
+    discover_strategy_options,
+    render_strategy_selector,
+)
 
 #: Kept for backward-compat with anything importing the old flat-page name.
 STATUS_MESSAGE = NOT_CONFIGURED
@@ -43,9 +58,16 @@ _TABS = (
 )
 
 
-def render(streamlit: Any) -> None:
+def render(streamlit: Any, config_root: object = None) -> None:
     streamlit.subheader("Positional Options")
     streamlit.warning(NOT_CONFIGURED)
+    # config_root is accepted (matching every other page's render() shape)
+    # but deliberately not passed to discover_strategy_options below — see
+    # the module docstring for why config-based discovery would fabricate
+    # membership for this runtime today.
+    del config_root
+    options = discover_strategy_options(None, None, "positional_options")
+    render_strategy_selector(streamlit, options, key="po_strategy")
     tabs = streamlit.tabs([label for label, _ in _TABS])
     for tab, (label, detail) in zip(tabs, _TABS, strict=True):
         with tab:
@@ -55,11 +77,13 @@ def render(streamlit: Any) -> None:
 def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
     import streamlit as st
 
+    from common.config import load_paths
+
     st.set_page_config(
         page_title="algo_trading — Positional Options", layout="wide", page_icon="📅"
     )
     st.title("Positional Options")
-    render(st)
+    render(st, load_paths().config_root)
 
 
 if __name__ == "__main__":  # pragma: no cover

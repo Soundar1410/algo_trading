@@ -57,7 +57,13 @@ def test_retained_tables_are_exactly_the_five_the_plan_names():
 
 
 def test_never_purged_tables_are_exactly_the_trading_tables():
-    assert {"orders", "fills", "positions", "order_intents"} == NEVER_PURGED_TABLES
+    assert {
+        "orders",
+        "fills",
+        "positions",
+        "order_intents",
+        "trade_ledger",
+    } == NEVER_PURGED_TABLES
 
 
 # --------------------------------------------------------------- fixtures

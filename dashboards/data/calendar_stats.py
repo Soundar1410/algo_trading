@@ -74,6 +74,32 @@ class DailyOutcome:
     net_pnl: float
 
 
+def merge_daily_outcomes(outcomes: tuple[DailyOutcome, ...]) -> tuple[DailyOutcome, ...]:
+    """Combine per-strategy ``DailyOutcome`` rows into one platform-wide
+    series, one row per date.
+
+    Necessary before handing a multi-strategy outcome list to
+    :func:`execution_day_stats` or :func:`build_thirty_day_rollup`: both
+    key their internal lookup on ``trading_date`` alone, so a flat list
+    with two strategies' rows for the same date would silently let the
+    later one overwrite the earlier rather than combining them. ``ran`` is
+    true if *any* contributing strategy ran that day; ``trade_count``/
+    ``net_pnl`` sum across all of them.
+    """
+    by_date: dict[date, list[DailyOutcome]] = {}
+    for outcome in outcomes:
+        by_date.setdefault(outcome.trading_date, []).append(outcome)
+    return tuple(
+        DailyOutcome(
+            trading_date=day,
+            ran=any(o.ran for o in rows),
+            trade_count=sum(o.trade_count for o in rows),
+            net_pnl=sum(o.net_pnl for o in rows),
+        )
+        for day, rows in sorted(by_date.items())
+    )
+
+
 @dataclass(frozen=True)
 class ExecutionDayStats:
     eligible_trading_days: int

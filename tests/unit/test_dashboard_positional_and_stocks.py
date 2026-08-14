@@ -48,6 +48,25 @@ def test_intraday_stocks_renders_eight_tabs_each_with_its_own_message():
     assert any(stocks_page.NOT_CONFIGURED in w for w in st.warnings)
 
 
+def test_positional_options_shows_a_disabled_strategy_selector():
+    """The reusable component is wired in today, even with nothing to
+    select — spec: "the dropdown must work without restructuring the
+    dashboard" once a real runtime exists."""
+    st = FakeStreamlit()
+    positional_page.render(st)
+    assert any(label == "Strategy" for label, _options, _kwargs in st.selectbox_calls)
+    strategy_call = next(c for c in st.selectbox_calls if c[0] == "Strategy")
+    assert strategy_call[2].get("disabled") is True
+
+
+def test_intraday_stocks_shows_a_disabled_strategy_selector():
+    st = FakeStreamlit()
+    stocks_page.render(st)
+    assert any(label == "Strategy" for label, _options, _kwargs in st.selectbox_calls)
+    strategy_call = next(c for c in st.selectbox_calls if c[0] == "Strategy")
+    assert strategy_call[2].get("disabled") is True
+
+
 def test_no_fabricated_data_appears_in_either_stub():
     """Neither stub ever calls dataframe/metric — there is nothing real to
     show, so nothing tabular or numeric is rendered."""

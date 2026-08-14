@@ -148,6 +148,7 @@ def test_the_dashboards_directory_is_what_we_think_it_is():
         "data/intraday_options.py",
         "data/positional.py",
         "data/stocks.py",
+        "data/strategy_scope.py",
         "pages/1_Intraday_Options.py",
         "pages/2_Positional_Options.py",
         "pages/3_Intraday_Stocks.py",

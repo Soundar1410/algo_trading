@@ -51,6 +51,17 @@ class FakeStreamlit:
         self.download_buttons: list[tuple[str, bytes]] = []
         self.page_links: list[tuple[str, str]] = []
         self.selectbox_return: object = "—"
+        #: Per-key override, checked before the shared ``selectbox_return``
+        #: fallback — set this when a page renders more than one selectbox
+        #: and a test needs to distinguish them.
+        self.selectbox_returns: dict[str, object] = {}
+        self.multiselect_return: list[object] | None = None
+        self.multiselect_calls: list[tuple[str, list[object]]] = []
+        self.selectbox_calls: list[tuple[str, list[object], dict[str, object]]] = []
+        #: Set before calling render() to simulate a dataframe row click —
+        #: consumed by the next dataframe() call made with on_select set.
+        self.dataframe_selection: dict[str, object] = {"selection": {"rows": []}}
+        self.json_values: list[object] = []
         self.tab_labels: list[list[str]] = []
         self.expander_labels: list[str] = []
         self.charts: list[object] = []
@@ -108,8 +119,14 @@ class FakeStreamlit:
     def metric(self, label: str, value: object, *args: object, **kwargs: object) -> None:
         self.metrics.append((label, value))
 
-    def dataframe(self, data: object, **kwargs: object) -> None:
+    def dataframe(self, data: object, **kwargs: object) -> object:
         self.dataframes.append(data)  # type: ignore[arg-type]
+        if kwargs.get("on_select", "ignore") != "ignore":
+            return self.dataframe_selection
+        return None
+
+    def json(self, value: object, **kwargs: object) -> None:
+        self.json_values.append(value)
 
     def line_chart(self, data: object, **kwargs: object) -> None:
         self.charts.append(data)
@@ -127,7 +144,21 @@ class FakeStreamlit:
         self.page_links.append((page, label))
 
     def selectbox(self, label: str, options: object, **kwargs: object) -> object:
+        self.selectbox_calls.append((label, list(options), dict(kwargs)))  # type: ignore[arg-type]
+        key = kwargs.get("key")
+        if key is not None and key in self.selectbox_returns:
+            return self.selectbox_returns[key]
         return self.selectbox_return
 
+    def multiselect(
+        self, label: str, options: object, default: object = None, **kwargs: object
+    ) -> list[object]:
+        values = self.multiselect_return if self.multiselect_return is not None else default or []
+        self.multiselect_calls.append((label, list(values)))
+        return list(values)
+
     def set_page_config(self, **kwargs: object) -> None:
+        return None
+
+    def rerun(self) -> None:
         return None
