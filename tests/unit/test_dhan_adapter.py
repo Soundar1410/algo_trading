@@ -39,6 +39,7 @@ from common.market_data.dhan import (
     DISCONNECT_TOKEN_EXPIRED,
     DhanFeedError,
     DhanMarketFeedAdapter,
+    build_dhan_order_client,
     reconstruct_exchange_time,
 )
 
@@ -81,6 +82,55 @@ def test_missing_credentials_are_refused_at_construction():
 def test_starting_without_a_subscription_is_refused():
     with pytest.raises(DhanFeedError, match="no subscriptions"):
         _adapter().start(lambda tick: None)
+
+
+def test_build_dhan_order_client_wraps_credentials_in_dhan_context(monkeypatch):
+    """``dhanhq==2.2.0`` takes one ``DhanContext``, not two raw credentials.
+
+    Pins the fix for ``TypeError: dhanhq.__init__() takes 2 positional
+    arguments but 3 were given``: ``DhanContext`` must receive the client id
+    and access token exactly as supplied, and ``dhanhq`` must receive that
+    context object -- not the credentials themselves -- as its sole argument.
+    """
+    import dhanhq as dhanhq_module
+
+    context_calls: list[tuple[str, str]] = []
+    client_calls: list[Any] = []
+
+    class _FakeContext:
+        def __init__(self, client_id: str, access_token: str) -> None:
+            context_calls.append((client_id, access_token))
+            self.client_id = client_id
+            self.access_token = access_token
+
+    class _FakeClient:
+        def __init__(self, context: Any) -> None:
+            client_calls.append(context)
+            self.context = context
+
+    monkeypatch.setattr(dhanhq_module, "DhanContext", _FakeContext)
+    monkeypatch.setattr(dhanhq_module, "dhanhq", _FakeClient)
+
+    result = build_dhan_order_client(client_id="test-client", access_token="test-token")
+
+    assert context_calls == [("test-client", "test-token")]
+    assert len(client_calls) == 1
+    assert isinstance(client_calls[0], _FakeContext)
+    assert isinstance(result, _FakeClient)
+    assert result.context is client_calls[0]
+
+
+def test_build_dhan_order_client_constructs_against_the_installed_sdk():
+    """End-to-end against the real installed ``dhanhq==2.2.0``, no network.
+
+    ``DhanHTTP.__init__`` only builds a ``requests.Session()``; it makes no
+    request. This is the exact call that previously raised the constructor
+    ``TypeError`` reported against the paper runtime's startup path.
+    """
+    client = build_dhan_order_client(client_id="test-client", access_token="test-token")
+
+    assert client.dhan_http.client_id == "test-client"
+    assert client.dhan_http.access_token == "test-token"
 
 
 def test_subscriptions_are_a_union_not_a_list():

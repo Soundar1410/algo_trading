@@ -111,10 +111,18 @@ def build_dhan_order_client(*, client_id: str, access_token: str) -> Any:
     import boundary: broker/runtime code depends on a narrow protocol and never
     imports ``dhanhq`` itself.  The import remains lazy, so paper workers and
     the test suite do not load the SDK order surface.
-    """
-    from dhanhq import dhanhq
 
-    return dhanhq(client_id, access_token)
+    ``dhanhq==2.2.0`` does not accept ``(client_id, access_token)`` directly —
+    its constructor is ``dhanhq(dhan_context)``, taking a single
+    :class:`~dhanhq.DhanContext` built from those two values. This mirrors the
+    same two-step construction :meth:`DhanMarketFeedAdapter.start` already uses
+    below. The credentials are passed straight through to ``DhanContext`` and
+    never logged; the logging redactor also masks them everywhere regardless.
+    """
+    from dhanhq import DhanContext, dhanhq
+
+    context = DhanContext(client_id, access_token)
+    return dhanhq(context)
 
 #: Subscription modes, as the v2 protocol numbers them. Ticker gives last price
 #: and time, which is all a candle needs. Quote adds traded quantity, volume and
