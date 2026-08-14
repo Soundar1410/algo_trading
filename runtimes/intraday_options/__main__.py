@@ -69,10 +69,15 @@ EXIT_LEGACY_SYSTEM_ACTIVE = 5
 #: path) rather than the feed finishing on its own. The supervised launcher
 #: (orchestration/process_control/supervised_launch.py) treats this as
 #: terminal — spec section 12: "no restart loop after a deliberate safety
-#: shutdown." Scope: this covers the operator-stop path only. The daily-loss
-#: halt and kill switch (common.engine.daily_guard) latch per worker inside
-#: the engine and do not end this supervisor run — see the Phase 8 runbook
-#: entry for why that is a deliberately separate, later decision.
+#: shutdown." Scope: the operator-stop path, and — since the Phase 10 feed
+#: fix — the supervisor's own stuck-subscription shutdown
+#: (SupervisorResult.stopped_by_stuck_subscription): a feed connected but
+#: delivering nothing is not a crash to hot-loop-retry either, and an
+#: immediate restart would most likely reproduce the same stuck state. The
+#: daily-loss halt and kill switch (common.engine.daily_guard) latch per
+#: worker inside the engine and do not end this supervisor run — see the
+#: Phase 8 runbook entry for why that is a deliberately separate, later
+#: decision.
 EXIT_SAFETY_SHUTDOWN = 6
 
 
@@ -439,7 +444,13 @@ def main(argv: list[str] | None = None) -> int:
     # A signal (operator stop) ended this run deliberately, as opposed to the
     # feed finishing on its own — the supervised launcher must not treat this
     # as a crash to retry. See EXIT_SAFETY_SHUTDOWN's own docstring for scope.
-    if result.stopped_by_signal:
+    #
+    # A stuck subscription (the feed connected but delivered nothing long
+    # enough that a worker's request could never be applied) is the same kind
+    # of deliberate, non-crash shutdown: the supervisor chose to end the run
+    # rather than keep presenting an ambiguously healthy RUNNING_PAPER. See
+    # SupervisorResult.stopped_by_stuck_subscription.
+    if result.stopped_by_signal or result.stopped_by_stuck_subscription:
         return EXIT_SAFETY_SHUTDOWN
     return EXIT_OK
 

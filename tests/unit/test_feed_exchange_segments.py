@@ -25,7 +25,7 @@ from collections.abc import Sequence
 
 import pytest
 
-from common.feed.hub import SharedFeedHub, WorkerChannel
+from common.feed.hub import SharedFeedHub, WorkerChannel, build_channel
 from common.feed.queues import BoundedWorkerQueue
 from common.market_data.dhan import (
     FULL_MODE,
@@ -270,6 +270,99 @@ def test_the_hub_defaults_to_the_adapter_segment_when_none_is_named():
     assert adapter.requested_segments == {}, "no segment should have been asserted"
     assert adapter.requested_modes == {}, "no mode should have been asserted"
     assert "49081" in adapter.subscribed
+
+
+# ------------------------------------------------ hub.start(): the initial subscription
+def test_hub_start_subscribes_the_underlying_on_its_own_declared_segment():
+    """The regression this whole module exists to prevent: before this,
+    ``SharedFeedHub.start()`` sent the *entire* union through one
+    ``adapter.subscribe(sorted(union))`` call with no segment at all, so a
+    channel's underlying went out under the adapter's own default — tuned for
+    its *option* subscriptions — and silently received nothing."""
+    adapter = RecordedFeedAdapter([])
+    hub = SharedFeedHub(adapter)
+    hub.register(
+        WorkerChannel(
+            strategy_id="s1",
+            security_ids=frozenset({"13"}),
+            queue=BoundedWorkerQueue.in_process("s1"),
+            segment=IDX_I,
+        )
+    )
+
+    hub.start()
+
+    assert adapter.requested_segments == {"13": IDX_I}
+
+
+def test_hub_start_groups_two_channels_by_their_declared_segment():
+    """Two channels naming different segments must reach the adapter as two
+    separate calls, not one flattened under whichever segment happened to be
+    named last."""
+    adapter = RecordedFeedAdapter([])
+    hub = SharedFeedHub(adapter)
+    hub.register(
+        WorkerChannel(
+            strategy_id="s1",
+            security_ids=frozenset({"13"}),
+            queue=BoundedWorkerQueue.in_process("s1"),
+            segment=IDX_I,
+        )
+    )
+    hub.register(
+        WorkerChannel(
+            strategy_id="s2",
+            security_ids=frozenset({"49081"}),
+            queue=BoundedWorkerQueue.in_process("s2"),
+            segment=NSE_FNO,
+            mode=FULL_MODE,
+        )
+    )
+
+    hub.start()
+
+    assert adapter.requested_segments == {"13": IDX_I, "49081": NSE_FNO}
+    assert adapter.requested_modes == {"49081": FULL_MODE}
+    assert adapter.subscribed == frozenset({"13", "49081"})
+
+
+def test_hub_start_with_no_declared_segments_is_one_call_as_before():
+    """Every channel leaving segment/mode unset must collapse to exactly the
+    call this module's fix replaces — the union, one call, no kwargs asserted."""
+    adapter = RecordedFeedAdapter([])
+    hub = SharedFeedHub(adapter)
+    hub.register(build_channel("s1", ["A", "B"], in_process=True))
+    hub.register(build_channel("s2", ["B", "C"], in_process=True))
+
+    hub.start()
+
+    assert adapter.subscribed == frozenset({"A", "B", "C"})
+    assert adapter.requested_segments == {}
+    assert adapter.requested_modes == {}
+
+
+def test_hub_start_refuses_one_instrument_under_two_segments():
+    adapter = RecordedFeedAdapter([])
+    hub = SharedFeedHub(adapter)
+    hub.register(
+        WorkerChannel(
+            strategy_id="s1",
+            security_ids=frozenset({"13"}),
+            queue=BoundedWorkerQueue.in_process("s1"),
+            segment=IDX_I,
+        )
+    )
+    hub.register(
+        WorkerChannel(
+            strategy_id="s2",
+            security_ids=frozenset({"13"}),
+            queue=BoundedWorkerQueue.in_process("s2"),
+            segment=NSE_FNO,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="conflicting"):
+        hub.start()
 
 
 # ------------------------------------------------------- through the reconnect layer

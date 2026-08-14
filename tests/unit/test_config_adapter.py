@@ -18,6 +18,7 @@ from common.config.models import (
     RuntimeConfig,
     StrategyConfig,
 )
+from common.market_data.scrip_master import segment_code
 from runtimes.intraday_options.config_adapter import build_worker_config
 
 #: Phase 10: a ``mode: live`` StrategyConfig requires a complete
@@ -97,6 +98,42 @@ def test_missing_instrument_raises_config_error(tmp_path: Path):
     cfg = _cfg(parameters={"security_id": "99926000"})
     with pytest.raises(ConfigError, match="instrument"):
         _build(cfg, tmp_path)
+
+
+def test_a_nifty_strategy_resolves_the_index_segment_for_the_initial_subscription(
+    tmp_path: Path,
+):
+    """Phase 10 feed fix: the initial hub subscription must go out under the
+    underlying's real segment (IDX_I), not the feed adapter's own default
+    (tuned for option contracts) — see common.feed.hub.WorkerChannel.segment."""
+    worker = _build(_cfg(), tmp_path)
+    assert worker.security_segment == segment_code("IDX_I")
+    assert worker.security_mode is None
+
+
+def test_an_unresolvable_instrument_raises_config_error_rather_than_guessing(
+    tmp_path: Path,
+):
+    """No entry in INDEX_REGISTRY and no override — a real feed subscription
+    needs a real segment, so this fails at config load rather than silently
+    subscribing the underlying under whatever segment the adapter defaults to."""
+    cfg = _cfg(parameters={"instrument": "NOT_A_REAL_INDEX", "security_id": "1"})
+    with pytest.raises(ConfigError, match="exchange segment"):
+        _build(cfg, tmp_path)
+
+
+def test_an_unresolvable_instrument_with_explicit_overrides_resolves(tmp_path: Path):
+    cfg = _cfg(
+        parameters={
+            "instrument": "NOT_A_REAL_INDEX",
+            "security_id": "1",
+            "index_security_id": "1",
+            "index_segment": "NSE_CURRENCY",
+            "fno_segment": "NSE_CURRENCY",
+        }
+    )
+    worker = _build(cfg, tmp_path)
+    assert worker.security_segment == segment_code("NSE_CURRENCY")
 
 
 def test_optional_parameters_default_like_workerconfig(tmp_path: Path):

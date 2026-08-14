@@ -7,7 +7,7 @@
 # `enabled: false` until the Phase 1 walking skeleton exists to be started.
 
 runtime_id: intraday_options
-enabled: false
+enabled: true
 live_execution_allowed: false
 shared_market_feed: true
 database: data/operational/intraday_options.db

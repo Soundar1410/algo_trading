@@ -200,6 +200,13 @@ class SupervisorResult:
     #: run is still shut down in every other respect; this records that the
     #: connection was left for process exit to reclaim rather than closed.
     clean_feed_shutdown: bool = True
+    #: True when the run was ended because a runtime subscription sat unapplied
+    #: past ``STUCK_SUBSCRIPTION_SECONDS`` (see ``_check_stuck_subscription``) —
+    #: proof the feed was connected but delivering nothing. Distinct from
+    #: ``stopped_by_signal``: no operator asked for this: the supervisor
+    #: refused to keep presenting an ambiguously running group once it could no
+    #: longer apply what a worker asked for.
+    stopped_by_stuck_subscription: bool = False
 
 
 class IntradayOptionsSupervisor:
@@ -368,6 +375,8 @@ class IntradayOptionsSupervisor:
             max_depth=self._config.queue_depth,
             tick_channel=tick_channel,
             tick_max_depth=self._config.tick_queue_depth,
+            segment=worker_config.security_segment,
+            mode=worker_config.security_mode,
         )
         self._hub.register(channel)
         self._workers.append((worker_config, channel))
@@ -719,7 +728,12 @@ class IntradayOptionsSupervisor:
         if result.clean_feed_shutdown:
             heartbeat.beat(HealthState.STOPPING, force=True)
             heartbeat.beat(HealthState.STOPPED, force=True)
-            reason = "signal" if result.stopped_by_signal else "clean_shutdown"
+            if result.stopped_by_signal:
+                reason = "signal"
+            elif result.stopped_by_stuck_subscription:
+                reason = "stuck_subscription"
+            else:
+                reason = "clean_shutdown"
             # The group-level counterpart to "runtime_started" above. The
             # unclean case already has its own notification
             # (feed_shutdown_unclean, _raise_silent_feed_alarm) — this is not
@@ -788,7 +802,18 @@ class IntradayOptionsSupervisor:
             while not wake.wait(timeout=HEARTBEAT_POLL_SECONDS):
                 self._drain_control_queues()
                 self._drain_feed_health_events(repository)
-                self._check_stuck_subscription(heartbeat, repository)
+                if self._check_stuck_subscription(heartbeat, repository):
+                    # The feed is connected but has delivered nothing for long
+                    # enough that a worker's own subscription request cannot be
+                    # applied. Ask the feed to finish rather than let the group
+                    # sit RUNNING_PAPER indefinitely with no engine able to
+                    # enter — see SupervisorResult.stopped_by_stuck_subscription.
+                    result.stopped_by_stuck_subscription = True
+                    _log.info(
+                        "stuck subscription threshold crossed; asking the feed to finish"
+                    )
+                    self._hub.request_stop()
+                    break
                 self._check_stale_instruments(repository)
                 self._beat_running(heartbeat)
             # Once more after the wake: a request — or a health event — that
@@ -888,7 +913,7 @@ class IntradayOptionsSupervisor:
         self,
         heartbeat: HeartbeatWriter,
         repository: ExecutionRepository,
-    ) -> None:
+    ) -> bool:
         """Alarm when a runtime subscription has not been applied (limitation 15).
 
         The hub applies a pending subscription at the top of ``on_tick``, on the
@@ -907,12 +932,17 @@ class IntradayOptionsSupervisor:
         Raised **once per run**, not once per poll: this is a condition that
         persists, and a notification every second would be noise rather than an
         alarm. The heartbeat is left `DEGRADED` for as long as it holds.
+
+        Returns ``True`` exactly once — on the poll that first crosses the
+        threshold — so the caller can end the run rather than leave the group
+        idling forever, ambiguously ``RUNNING_PAPER`` while nothing is
+        delivered. See ``_run_feed``'s use of the return value.
         """
         age = self._hub.pending_subscription_age_seconds()
         if age < STUCK_SUBSCRIPTION_SECONDS:
-            return
+            return False
         if self._stuck_subscription_alarmed:
-            return
+            return False
         self._stuck_subscription_alarmed = True
 
         message = (
@@ -920,7 +950,8 @@ class IntradayOptionsSupervisor:
             f"(threshold {STUCK_SUBSCRIPTION_SECONDS:.0f}s). The hub applies one only "
             "when a tick arrives, so the feed is delivering nothing for this group. "
             "Any engine waiting on a contract it just chose will not enter — it wants "
-            "a fresh tick and will not use a cached price. Check the feed connection."
+            "a fresh tick and will not use a cached price. Ending the run rather than "
+            "continuing to present it as healthy; check the feed connection."
         )
         _log.error("%s", message)
         heartbeat.beat(HealthState.DEGRADED, force=True)
@@ -943,6 +974,7 @@ class IntradayOptionsSupervisor:
                 execution_mode=ExecutionMode.PAPER,
             )
         )
+        return True
 
     def _check_stale_instruments(self, repository: ExecutionRepository) -> None:
         """Write a ``feed_events`` row for each newly-stale instrument.

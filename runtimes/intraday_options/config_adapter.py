@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any
 
 from common.config import ConfigError, ExecutionMode, ResolvedConfig, StrategyConfig, fingerprint
+from common.market_data.scrip_master import resolve_index_meta, segment_code
 from common.risk import SquareOffPolicy
 
 from .worker import EngineWorkerConfig, WorkerConfig
@@ -68,6 +69,45 @@ def _time_from_hhmm(value: str, *, field: str, strategy_id: str) -> time:
     except (ValueError, AttributeError) as exc:
         raise ConfigError(
             f"strategies/{strategy_id}.yaml risk.{field} must be 'HH:MM', got {value!r}"
+        ) from exc
+
+
+def _resolve_security_segment(
+    parameters: dict[str, Any], *, strategy_id: str
+) -> int:
+    """The numeric MarketFeed exchange segment ``parameters['security_id']`` lives in.
+
+    Needed so the *initial* hub subscription for the underlying goes out under
+    its real segment (e.g. ``IDX_I``/0 for an index) rather than the feed
+    adapter's own default, which is tuned for its *option* subscriptions
+    (``NSE_FNO``/2) — see ``common.feed.hub.WorkerChannel.segment``. Reuses the
+    same override parameters (``index_security_id``/``index_segment``/
+    ``fno_segment``) the engine path already exposes for a live/dynamic
+    contract resolution, so one underlying is described in exactly one place.
+
+    Raises:
+        ConfigError: the instrument is not in
+            ``common.market_data.scrip_master.INDEX_REGISTRY`` and no override
+            was supplied — a real feed subscription needs a real segment, so
+            this fails at config load rather than silently subscribing nothing.
+    """
+    instrument = str(parameters["instrument"])
+    try:
+        meta = resolve_index_meta(
+            instrument,
+            index_security_id=str(parameters.get("index_security_id") or "") or None,
+            index_segment=str(parameters.get("index_segment") or "") or None,
+            fno_segment=str(parameters.get("fno_segment") or "") or None,
+        )
+        return segment_code(meta.segment)
+    except (ValueError, KeyError) as exc:
+        raise ConfigError(
+            f"strategies/{strategy_id}.yaml: cannot resolve the market-feed "
+            f"exchange segment for instrument {instrument!r}: {exc}. The initial "
+            "underlying subscription needs a real segment to avoid silently "
+            "subscribing on the wrong one — set parameters.index_segment/"
+            "fno_segment/index_security_id explicitly for an underlying not in "
+            "common.market_data.scrip_master.INDEX_REGISTRY."
         ) from exc
 
 
@@ -143,6 +183,7 @@ def build_worker_config(
         log_dir=log_dir,
         trading_date=trading_date,
         execution_mode=cfg.strategy.mode,
+        security_segment=_resolve_security_segment(parameters, strategy_id=strategy_id),
         quantity=int(parameters.get("quantity", 50)),
         entry_on_candle=int(parameters.get("entry_on_candle", 1)),
         exit_on_candle=int(parameters.get("exit_on_candle", 3)),

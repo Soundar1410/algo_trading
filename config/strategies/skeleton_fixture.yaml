@@ -8,7 +8,7 @@
 # file as a template for one.
 
 strategy_id: skeleton_fixture
-enabled: true
+enabled: false
 
 # Paper only. Setting this to `live` will not start a live strategy: the broker
 # factory consults the live gate and refuses, and live order placement does not

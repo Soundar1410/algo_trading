@@ -144,6 +144,84 @@ def test_stopping_an_unstarted_adapter_is_safe():
     _adapter().stop()  # must not raise
 
 
+# --------------------------------------- start(): staged failure observability
+def test_a_construction_failure_is_logged_with_its_own_stage(monkeypatch, caplog):
+    """Before this, a construction failure raised past a bare 'starting' info
+    line with nothing at error level naming what failed."""
+    import dhanhq.marketfeed as marketfeed_module
+
+    class _ExplodingFeed:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("boom: construction")
+
+    monkeypatch.setattr(marketfeed_module, "MarketFeed", _ExplodingFeed)
+
+    adapter = _adapter()
+    adapter.subscribe(["13"])
+    with caplog.at_level("ERROR"), pytest.raises(DhanFeedError, match="Cannot construct"):
+        adapter.start(lambda tick: None)
+
+    assert any("dhan feed construction failed" in r.getMessage() for r in caplog.records)
+
+
+def test_a_connect_failure_before_any_success_names_the_handshake_stage(monkeypatch, caplog):
+    """A failure before the socket ever connected/authenticated/subscribed must
+    be distinguishable from one after — an operator needs to know whether to
+    look at credentials/entitlement or at the network."""
+    import dhanhq.marketfeed as marketfeed_module
+
+    class _NeverConnectsFeed:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.server_disconnection = lambda data: None
+
+        def run_forever(self) -> None:
+            raise RuntimeError("boom: handshake")
+
+    monkeypatch.setattr(marketfeed_module, "MarketFeed", _NeverConnectsFeed)
+
+    adapter = _adapter()
+    adapter.subscribe(["13"])
+    with caplog.at_level("ERROR"), pytest.raises(RuntimeError, match="boom: handshake"):
+        adapter.start(lambda tick: None)
+
+    assert any(
+        "dhan feed connect/authenticate/subscribe failed" in r.getMessage() for r in caplog.records
+    )
+
+
+def test_a_failure_after_a_successful_connect_is_logged_as_a_connection_failure(
+    monkeypatch, caplog
+):
+    """Once the handshake has succeeded once this run, a later failure is a
+    connection drop, not a bad credential/entitlement -- logged distinctly."""
+    import dhanhq.marketfeed as marketfeed_module
+
+    class _ConnectsOnceThenDropsFeed:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.calls = 0
+            self.server_disconnection = lambda data: None
+
+        def run_forever(self) -> None:
+            self.calls += 1
+            if self.calls > 1:
+                raise RuntimeError("boom: dropped")
+
+        def get_data(self) -> None:
+            return None  # a benign non-tick frame
+
+    monkeypatch.setattr(marketfeed_module, "MarketFeed", _ConnectsOnceThenDropsFeed)
+
+    adapter = _adapter()
+    adapter.subscribe(["13"])
+    with caplog.at_level("INFO"), pytest.raises(RuntimeError, match="boom: dropped"):
+        adapter.start(lambda tick: None)
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("dhan feed connected and subscribed" in m for m in messages)
+    assert any("dhan feed connection failed" in m for m in messages)
+    assert not any("connect/authenticate/subscribe failed" in m for m in messages)
+
+
 # ---------------------------------------- the synthesised fixture's shape
 def test_the_synthesised_fixture_carries_the_sdk_shape_not_a_guess():
     """Guards the assumptions every branch-coverage test here rests on.

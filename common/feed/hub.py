@@ -104,6 +104,16 @@ class WorkerChannel:
     #: Instruments subscribed at runtime. Mutated only on the feed thread, from
     #: :meth:`SharedFeedHub._apply_pending_subscriptions`.
     dynamic_ids: set[str] = field(default_factory=set)
+    #: The exchange segment/mode ``security_ids`` (the *initial*, configured
+    #: registration — never ``dynamic_ids``) should be subscribed under.
+    #: ``None`` means "the adapter's default", which is what every caller before
+    #: Phase 10's feed fix meant and is still correct for a recorded/fixture
+    #: channel. An options runtime must set ``segment`` explicitly: the
+    #: adapter's own default segment serves its *option* subscriptions, and an
+    #: underlying index subscribed under it silently receives nothing — see
+    #: :meth:`SharedFeedHub._grouped_initial_subscriptions`.
+    segment: int | None = None
+    mode: int | None = None
 
     def wants(self, security_id: str) -> bool:
         return security_id in self.security_ids or security_id in self.dynamic_ids
@@ -162,13 +172,57 @@ class SharedFeedHub:
             union.update(channel.security_ids)
         return frozenset(union)
 
+    def _grouped_initial_subscriptions(
+        self,
+    ) -> list[tuple[int | None, int | None, list[str]]]:
+        """Group every channel's *initial* ids by their declared segment/mode.
+
+        A single flat ``adapter.subscribe(sorted(union))`` call cannot express
+        that the underlying index and its option contracts live in different
+        exchange segments — the whole set would go out under one segment, and
+        whichever instrument does not actually live there would silently
+        receive nothing (see :meth:`~common.market_data.adapter.
+        MarketFeedAdapter.subscribe`'s docstring; this is exactly the bug that
+        left the group's own underlying subscription silent while the adapter
+        itself connected, authenticated and stayed open).
+
+        Every channel that leaves ``segment``/``mode`` unset (``None``, the
+        default) collapses into a single ``(None, None)`` group holding the
+        whole union — byte-identical to the call this replaces, so a fixture
+        or recorded-tape channel that never named a segment is unaffected.
+        """
+        resolved: dict[str, tuple[int | None, int | None]] = {}
+        for channel in self._channels:
+            key = (channel.segment, channel.mode)
+            for security_id in channel.security_ids:
+                existing = resolved.get(security_id)
+                if existing is not None and existing != key:
+                    raise RuntimeError(
+                        f"Instrument {security_id!r} is registered under conflicting "
+                        f"segment/mode pairs {existing} and {key}; one instrument "
+                        "cannot live in two segments at once."
+                    )
+                resolved[security_id] = key
+
+        groups: dict[tuple[int | None, int | None], list[str]] = {}
+        for security_id, key in resolved.items():
+            groups.setdefault(key, []).append(security_id)
+        return [(segment, mode, sorted(ids)) for (segment, mode), ids in groups.items()]
+
     # ------------------------------------------------------------ running
     def start(self) -> None:
         """Subscribe the union and run the adapter until it stops."""
         union = self.subscription_union()
         if not union:
             raise RuntimeError("Refusing to start the feed hub with no registered workers")
-        self._adapter.subscribe(sorted(union))
+        for segment, mode, security_ids in self._grouped_initial_subscriptions():
+            if segment is None and mode is None:
+                # Byte-identical to the call this replaces: a minimal test
+                # double implementing only subscribe(ids), the pre-Phase-10
+                # shape, still works unchanged.
+                self._adapter.subscribe(security_ids)
+            else:
+                self._adapter.subscribe(security_ids, segment=segment, mode=mode)
         _log.info(
             "feed hub starting instruments=%d workers=%d",
             len(union),
@@ -428,11 +482,19 @@ def build_channel(
     in_process: bool = False,
     tick_channel: bool = False,
     tick_max_depth: int = DEFAULT_TICK_MAX_DEPTH,
+    segment: int | None = None,
+    mode: int | None = None,
 ) -> WorkerChannel:
     """Create a worker channel with its own bounded queue.
 
     ``tick_channel=True`` adds the opt-in raw-tick queue the ported engine reads;
     the default leaves the channel exactly as Phase 1 built it.
+
+    ``segment``/``mode`` name the exchange segment/subscription mode
+    ``security_ids`` should be registered under — see
+    :attr:`WorkerChannel.segment` for why an options runtime must set these
+    explicitly for its underlying. ``None`` (the default) preserves the
+    adapter's own default, unchanged from before this parameter existed.
     """
     q = (
         BoundedWorkerQueue.in_process(strategy_id, max_depth)
@@ -452,4 +514,6 @@ def build_channel(
         security_ids=frozenset(security_ids),
         queue=q,
         tick_queue=tick_q,
+        segment=segment,
+        mode=mode,
     )

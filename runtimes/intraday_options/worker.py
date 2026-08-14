@@ -226,6 +226,17 @@ class WorkerConfig:
     log_dir: Path
     trading_date: str
     execution_mode: ExecutionMode = ExecutionMode.PAPER
+    #: The exchange segment ``security_id`` (the underlying, not any option
+    #: contract) lives in, as a numeric MarketFeed code — e.g. ``0`` for
+    #: ``IDX_I``. Resolved by ``config_adapter.py::build_worker_config`` from
+    #: ``common.market_data.scrip_master.resolve_index_meta``. ``None`` means
+    #: "the adapter's default", which is wrong for a real index subscription —
+    #: see ``common.feed.hub.WorkerChannel.segment`` for why this must be set
+    #: explicitly rather than left to default.
+    security_segment: int | None = None
+    #: The subscription mode for ``security_id``. ``None`` keeps the adapter's
+    #: default (Ticker), which is correct for an index — it has no order book.
+    security_mode: int | None = None
     quantity: int = 50
     entry_on_candle: int = 1
     exit_on_candle: int = 3

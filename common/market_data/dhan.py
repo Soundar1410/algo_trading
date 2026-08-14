@@ -124,6 +124,28 @@ def build_dhan_order_client(*, client_id: str, access_token: str) -> Any:
     context = DhanContext(client_id, access_token)
     return dhanhq(context)
 
+
+def fetch_dhan_profile(*, client_id: str, access_token: str) -> dict[str, Any]:
+    """Read-only ``GET /profile`` — proves a token is valid for REST, nothing more.
+
+    Kept here rather than in the diagnostic script that is this function's only
+    caller, for the same reason :func:`build_dhan_order_client` is: this module
+    is the repository's only importer of ``dhanhq`` (see the module docstring
+    and ``test_only_the_dhan_adapter_imports_the_sdk``), so a second caller
+    reaching for ``dhanhq.DhanLogin`` directly would quietly break that
+    invariant. Places no order and changes no account state — ``DhanLogin.
+    user_profile`` is a bare ``requests.get``.
+
+    **Does not by itself prove WebSocket market-data entitlement** — Dhan's
+    feed-side rejection (disconnect code 806, "data APIs not subscribed on
+    this account") only ever appears after a WebSocket has connected and
+    subscribed, which this REST call never does. Callers must not treat a
+    successful profile fetch as proof the live feed will work.
+    """
+    from dhanhq import DhanLogin
+
+    return dict(DhanLogin(client_id).user_profile(access_token))
+
 #: Subscription modes, as the v2 protocol numbers them. Ticker gives last price
 #: and time, which is all a candle needs. Quote adds traded quantity, volume and
 #: session OHLC — **not** depth, despite what this comment claimed before Phase 4
@@ -469,15 +491,45 @@ class DhanMarketFeedAdapter:
                 version="v2",
             )
         except Exception as exc:
+            _log.error("dhan feed construction failed: %s: %s", type(exc).__name__, exc)
             raise DhanFeedError(f"Cannot construct the Dhan market feed: {exc}") from exc
 
         self._install_disconnect_probe()
         self._running = True
         self._owner_thread = threading.get_ident()
         _log.info("dhan feed starting instruments=%d", len(self._security_ids))
+        #: Whether the socket has ever completed connect+auth+subscribe this
+        #: run. Distinguishes "never got past the handshake" from "was
+        #: delivering fine and then dropped" in the log below — the two need
+        #: different operator responses (a config/entitlement problem versus a
+        #: transient network one), and before this both surfaced identically as
+        #: a bare traceback past the one "starting" line. A tick is still the
+        #: only thing that clears ``ReconnectingFeed``'s degraded flag; this
+        #: only makes the handshake itself observable.
+        connected_this_run = False
         try:
             while self._running:
-                self._feed.run_forever()
+                try:
+                    self._feed.run_forever()
+                except Exception as exc:
+                    stage = (
+                        "connect/authenticate/subscribe"
+                        if not connected_this_run
+                        else "connection"
+                    )
+                    _log.error(
+                        "dhan feed %s failed: %s: %s",
+                        stage,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    raise
+                if not connected_this_run:
+                    connected_this_run = True
+                    _log.info(
+                        "dhan feed connected and subscribed instruments=%d",
+                        len(self._security_ids),
+                    )
                 payload = self._feed.get_data()
                 tick = self.normalise(payload)
                 if tick is not None:
