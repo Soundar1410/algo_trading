@@ -93,6 +93,7 @@ def _write(path: Path, text: str) -> None:
 def _strategy_yaml(strategy_id: str, security_id: str) -> str:
     return (
         f"strategy_id: {strategy_id}\n"
+        f"runtime_id: {RUNTIME_ID}\n"
         "enabled: true\n"
         "parameters:\n"
         "  instrument: NIFTY\n"
@@ -139,7 +140,7 @@ def test_disabled_strategy_is_checked_as_a_disable_transition(
 ):
     _write(
         populated_config / "strategies" / "io_bravo.yaml",
-        "strategy_id: io_bravo\nenabled: false\nparameters:\n"
+        f"strategy_id: io_bravo\nruntime_id: {RUNTIME_ID}\nenabled: false\nparameters:\n"
         "  instrument: NIFTY\n  security_id: '222'\n",
     )
     seen: dict[str, object] = {}

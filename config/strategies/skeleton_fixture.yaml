@@ -8,6 +8,7 @@
 # file as a template for one.
 
 strategy_id: skeleton_fixture
+runtime_id: intraday_options
 enabled: false
 
 # Paper only. Setting this to `live` will not start a live strategy: the broker

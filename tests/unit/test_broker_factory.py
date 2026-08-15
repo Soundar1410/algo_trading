@@ -90,6 +90,7 @@ def _config(
         ),
         strategy=StrategyConfig(
             strategy_id="st01",
+            runtime_id="intraday_options",
             enabled=strategy_enabled,
             mode=mode,
             live_approved=live_approved,

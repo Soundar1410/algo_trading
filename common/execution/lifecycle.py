@@ -137,6 +137,7 @@ class OrderLifecycle:
         target_price: float | None = None,
         basket_id: str | None = None,
         leg_id: str | None = None,
+        cycle_id: str | None = None,
     ) -> ExecutionResult:
         """Take one signal all the way to a persisted position.
 
@@ -145,6 +146,19 @@ class OrderLifecycle:
         ``order_intents.basket_id``/``.leg_id`` already have columns for
         this (added ahead of any consumer); this is the first real writer.
         ``None`` for every existing single-leg caller, unchanged.
+
+        ``cycle_id`` (optional, spec review correction 4): a positional
+        caller's durable cycle identity. Threaded through only to
+        :meth:`~common.execution.repository.ExecutionRepository.apply_fill`,
+        which is where a cycle-scoped position lookup actually differs from
+        the ``trading_date``-scoped default — every other write this method
+        makes (``signals``, ``order_intents``, ``orders``, ``fills``) stays
+        keyed on ``trading_date`` exactly as before, unaffected by this
+        parameter. The positional engine passes its own cycle's ``cycle_id``
+        here *and* as ``basket_id`` above — the same value, two different
+        reasons: ``basket_id`` is the generic multi-leg correlation identity
+        (``order_intents``/``orders``/``fills``), ``cycle_id`` is what makes
+        ``positions`` itself cross-day-resolvable.
         """
         signal_id = self._repo.record_signal(
             session_id=self._session_id,
@@ -270,6 +284,7 @@ class OrderLifecycle:
                 stop_price=stop_price,
                 target_price=target_price,
                 last_candle_end_at=signal.candle.end_at.isoformat(),
+                cycle_id=cycle_id,
             )
             if self._account_reservation_gate is not None and self._account_key is not None:
                 self._account_reservation_gate.record_fill(

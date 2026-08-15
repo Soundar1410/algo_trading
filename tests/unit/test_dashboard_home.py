@@ -42,11 +42,13 @@ def _seed_config(config_root: Path, *, positional_enabled: bool = False) -> None
     )
     _write(
         config_root / "strategies" / "ema_cross_9_21_buy.yaml",
-        "strategy_id: ema_cross_9_21_buy\nenabled: true\nmode: paper\nlive_approved: false\n",
+        "strategy_id: ema_cross_9_21_buy\nruntime_id: intraday_options\n"
+        "enabled: true\nmode: paper\nlive_approved: false\n",
     )
     _write(
         config_root / "strategies" / "skeleton_fixture.yaml",
-        "strategy_id: skeleton_fixture\nenabled: false\nmode: paper\nlive_approved: false\n",
+        "strategy_id: skeleton_fixture\nruntime_id: intraday_options\n"
+        "enabled: false\nmode: paper\nlive_approved: false\n",
     )
 
 

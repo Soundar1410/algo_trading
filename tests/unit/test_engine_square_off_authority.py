@@ -486,7 +486,9 @@ def _resolved() -> ResolvedConfig:
     return ResolvedConfig(
         global_config=GlobalConfig(live_trading_enabled=False),
         runtime=RuntimeConfig(runtime_id=RUNTIME_ID, enabled=True),
-        strategy=StrategyConfig(strategy_id=STRATEGY_ID, enabled=True, mode=ExecutionMode.PAPER),
+        strategy=StrategyConfig(
+            strategy_id=STRATEGY_ID, runtime_id=RUNTIME_ID, enabled=True, mode=ExecutionMode.PAPER
+        ),
     )
 
 

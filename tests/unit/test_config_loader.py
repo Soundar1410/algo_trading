@@ -26,6 +26,7 @@ from common.config import (
     apply_env_overrides,
     deep_merge,
     discover_enabled_strategies,
+    discover_strategies,
     effective_live_gate,
     fingerprint,
     load_resolved_config,
@@ -65,7 +66,8 @@ def populated_config(config_root: Path) -> Path:
     )
     _write(
         config_root / "strategies" / "io_fixture_v1.yaml",
-        "strategy_id: io_fixture_v1\nenabled: true\nengine: trading_engine\n",
+        "strategy_id: io_fixture_v1\nruntime_id: intraday_options\n"
+        "enabled: true\nengine: trading_engine\n",
     )
     return config_root
 
@@ -195,7 +197,8 @@ def test_strategy_file_overrides_runtime_defaults(populated_config: Path):
     )
     _write(
         populated_config / "strategies" / "io_fixture_v1.yaml",
-        "strategy_id: io_fixture_v1\nenabled: true\nrisk:\n  max_daily_loss: 750\n",
+        "strategy_id: io_fixture_v1\nruntime_id: intraday_options\n"
+        "enabled: true\nrisk:\n  max_daily_loss: 750\n",
     )
     strategy = load_strategy_config(
         populated_config, "io_fixture_v1", runtime_id="intraday_options"
@@ -219,7 +222,8 @@ def test_unknown_key_is_rejected_not_ignored(populated_config: Path):
     """A typo in a safety flag must fail loudly, not read as False."""
     _write(
         populated_config / "strategies" / "io_fixture_v1.yaml",
-        "strategy_id: io_fixture_v1\nenabled: true\nlive_aproved: true\n",
+        "strategy_id: io_fixture_v1\nruntime_id: intraday_options\n"
+        "enabled: true\nlive_aproved: true\n",
     )
     with pytest.raises(ConfigError, match="Invalid configuration"):
         load_strategy_config(populated_config, "io_fixture_v1")
@@ -228,7 +232,7 @@ def test_unknown_key_is_rejected_not_ignored(populated_config: Path):
 def test_invalid_execution_mode_is_rejected(populated_config: Path):
     _write(
         populated_config / "strategies" / "io_fixture_v1.yaml",
-        "strategy_id: io_fixture_v1\nmode: simulated\n",
+        "strategy_id: io_fixture_v1\nruntime_id: intraday_options\nmode: simulated\n",
     )
     with pytest.raises(ConfigError):
         load_strategy_config(populated_config, "io_fixture_v1")
@@ -249,7 +253,7 @@ def test_malformed_yaml_raises_config_error(config_root: Path):
 def test_id_mismatch_between_filename_and_body_is_rejected(populated_config: Path):
     _write(
         populated_config / "strategies" / "io_fixture_v1.yaml",
-        "strategy_id: something_else\nenabled: true\n",
+        "strategy_id: something_else\nruntime_id: intraday_options\nenabled: true\n",
     )
     with pytest.raises(ConfigError, match="mismatch"):
         load_strategy_config(populated_config, "io_fixture_v1")
@@ -266,7 +270,8 @@ def test_simulate_exchange_settlement_is_refused_at_load(populated_config: Path)
     """Spec section 11: only permitted 'after settlement tests pass'. None exist."""
     _write(
         populated_config / "strategies" / "io_fixture_v1.yaml",
-        "strategy_id: io_fixture_v1\nenabled: true\nexpiry_policy: simulate_exchange_settlement\n",
+        "strategy_id: io_fixture_v1\nruntime_id: intraday_options\n"
+        "enabled: true\nexpiry_policy: simulate_exchange_settlement\n",
     )
     with pytest.raises(ConfigError, match="settlement tests pass"):
         load_strategy_config(populated_config, "io_fixture_v1")
@@ -275,7 +280,8 @@ def test_simulate_exchange_settlement_is_refused_at_load(populated_config: Path)
 def test_an_unknown_expiry_policy_value_is_rejected(populated_config: Path):
     _write(
         populated_config / "strategies" / "io_fixture_v1.yaml",
-        "strategy_id: io_fixture_v1\nenabled: true\nexpiry_policy: hold_forever\n",
+        "strategy_id: io_fixture_v1\nruntime_id: intraday_options\n"
+        "enabled: true\nexpiry_policy: hold_forever\n",
     )
     with pytest.raises(ConfigError):
         load_strategy_config(populated_config, "io_fixture_v1")
@@ -284,7 +290,8 @@ def test_an_unknown_expiry_policy_value_is_rejected(populated_config: Path):
 def test_a_negative_square_off_before_expiry_days_is_rejected(populated_config: Path):
     _write(
         populated_config / "strategies" / "io_fixture_v1.yaml",
-        "strategy_id: io_fixture_v1\nenabled: true\nsquare_off_before_expiry_days: -1\n",
+        "strategy_id: io_fixture_v1\nruntime_id: intraday_options\n"
+        "enabled: true\nsquare_off_before_expiry_days: -1\n",
     )
     with pytest.raises(ConfigError):
         load_strategy_config(populated_config, "io_fixture_v1")
@@ -293,7 +300,8 @@ def test_a_negative_square_off_before_expiry_days_is_rejected(populated_config: 
 def test_a_configured_expiry_lead_is_loaded(populated_config: Path):
     _write(
         populated_config / "strategies" / "io_fixture_v1.yaml",
-        "strategy_id: io_fixture_v1\nenabled: true\nsquare_off_before_expiry_days: 2\n",
+        "strategy_id: io_fixture_v1\nruntime_id: intraday_options\n"
+        "enabled: true\nsquare_off_before_expiry_days: 2\n",
     )
     strategy = load_strategy_config(populated_config, "io_fixture_v1")
     assert strategy.square_off_before_expiry_days == 2
@@ -365,6 +373,7 @@ def _resolved(
         ),
         strategy=StrategyConfig(
             strategy_id="io_fixture_v1",
+            runtime_id="intraday_options",
             enabled=strategy_enabled,
             mode=mode,
             live_approved=live_approved,
@@ -472,7 +481,7 @@ def test_fingerprint_is_deterministic_across_calls(populated_config: Path):
 def test_discovery_returns_only_enabled_strategies(populated_config: Path):
     _write(
         populated_config / "strategies" / "io_disabled_v1.yaml",
-        "strategy_id: io_disabled_v1\nenabled: false\n",
+        "strategy_id: io_disabled_v1\nruntime_id: intraday_options\nenabled: false\n",
     )
     resolved = discover_enabled_strategies(
         populated_config, "intraday_options", settings=Settings()
@@ -485,7 +494,7 @@ def test_discovery_resolves_every_enabled_strategy_against_the_given_runtime(
 ):
     _write(
         populated_config / "strategies" / "io_second_v1.yaml",
-        "strategy_id: io_second_v1\nenabled: true\n",
+        "strategy_id: io_second_v1\nruntime_id: intraday_options\nenabled: true\n",
     )
     resolved = discover_enabled_strategies(
         populated_config, "intraday_options", settings=Settings()
@@ -504,7 +513,87 @@ def test_discovery_propagates_a_broken_strategy_file(populated_config: Path):
     start short one strategy nobody noticed."""
     _write(
         populated_config / "strategies" / "io_broken_v1.yaml",
-        "strategy_id: io_broken_v1\nenabled: true\nlive_aproved: true\n",
+        "strategy_id: io_broken_v1\nruntime_id: intraday_options\n"
+        "enabled: true\nlive_aproved: true\n",
     )
     with pytest.raises(ConfigError, match="Invalid configuration"):
         discover_enabled_strategies(populated_config, "intraday_options", settings=Settings())
+
+
+# ------------------------------------------------- runtime_id, required and exact
+def test_a_strategy_file_missing_runtime_id_fails_to_load(populated_config: Path):
+    _write(
+        populated_config / "strategies" / "io_fixture_v1.yaml",
+        "strategy_id: io_fixture_v1\nenabled: true\n",
+    )
+    with pytest.raises(ConfigError, match="runtime_id"):
+        load_strategy_config(populated_config, "io_fixture_v1")
+
+
+def test_a_strategy_file_with_a_blank_runtime_id_fails_to_load(populated_config: Path):
+    _write(
+        populated_config / "strategies" / "io_fixture_v1.yaml",
+        "strategy_id: io_fixture_v1\nruntime_id: ''\nenabled: true\n",
+    )
+    with pytest.raises(ConfigError, match="runtime_id"):
+        load_strategy_config(populated_config, "io_fixture_v1")
+
+
+def test_a_strategy_file_naming_an_unknown_runtime_fails_to_load(populated_config: Path):
+    _write(
+        populated_config / "strategies" / "io_fixture_v1.yaml",
+        "strategy_id: io_fixture_v1\nruntime_id: no_such_runtime\nenabled: true\n",
+    )
+    with pytest.raises(ConfigError, match="no_such_runtime"):
+        load_strategy_config(populated_config, "io_fixture_v1")
+
+
+def test_a_strategy_config_object_with_a_blank_runtime_id_is_rejected():
+    with pytest.raises(Exception, match="runtime_id"):
+        StrategyConfig(strategy_id="x", runtime_id="   ")
+
+
+def test_a_resolved_config_whose_strategy_declares_a_different_runtime_is_rejected():
+    """Defense in depth (models.py's own cross-field validator), independent
+    of the loader's own check."""
+    with pytest.raises(Exception, match="does not match"):
+        ResolvedConfig(
+            global_config=GlobalConfig(),
+            runtime=RuntimeConfig(runtime_id="intraday_options"),
+            strategy=StrategyConfig(strategy_id="x", runtime_id="positional_options"),
+        )
+
+
+def test_discover_strategies_returns_only_an_exact_runtime_match(populated_config: Path):
+    """A strategy belonging to a different, valid runtime is not an error —
+    it is simply absent from this runtime's discovery."""
+    _write(
+        populated_config / "runtimes" / "positional_options.yaml",
+        "runtime_id: positional_options\nenabled: false\n",
+    )
+    _write(
+        populated_config / "strategies" / "po_other.yaml",
+        "strategy_id: po_other\nruntime_id: positional_options\nenabled: true\n",
+    )
+    resolved = discover_strategies(populated_config, "intraday_options", settings=Settings())
+    assert [cfg.strategy.strategy_id for cfg in resolved] == ["io_fixture_v1"]
+
+    resolved_other = discover_strategies(
+        populated_config, "positional_options", settings=Settings()
+    )
+    assert [cfg.strategy.strategy_id for cfg in resolved_other] == ["po_other"]
+
+
+def test_discover_strategies_fails_closed_on_any_file_with_an_unknown_runtime(
+    populated_config: Path,
+):
+    """Even a strategy file that does not belong to the runtime being
+    discovered must not be able to silently name a nonexistent runtime —
+    a typo'd runtime_id must not make a strategy quietly invisible to every
+    runtime group."""
+    _write(
+        populated_config / "strategies" / "po_other.yaml",
+        "strategy_id: po_other\nruntime_id: no_such_runtime\nenabled: true\n",
+    )
+    with pytest.raises(ConfigError, match="no_such_runtime"):
+        discover_strategies(populated_config, "intraday_options", settings=Settings())

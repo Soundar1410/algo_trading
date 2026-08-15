@@ -245,6 +245,18 @@ class StrategyConfig(_StrictModel):
     """
 
     strategy_id: str
+    #: Which runtime group this strategy belongs to. **Required and
+    #: non-empty for every real strategy configuration** — never optional,
+    #: never inherited from a defaults block, never left to a naming
+    #: convention. ``common.config.loader.discover_strategies`` filters on an
+    #: exact match against this field; a strategy file that omits it, leaves
+    #: it blank, or names a runtime with no ``config/runtimes/<id>.yaml`` on
+    #: disk fails to load rather than being silently included in or excluded
+    #: from a runtime group's strategy set. Before this field existed, a
+    #: second runtime group could not safely call ``discover_strategies``
+    #: against the shared ``config/strategies/`` directory at all — see that
+    #: function's own former docstring, now closed by this field.
+    runtime_id: str
     enabled: bool = False
     mode: ExecutionMode = ExecutionMode.PAPER
     live_approved: bool = False
@@ -263,9 +275,16 @@ class StrategyConfig(_StrictModel):
 
     @field_validator("strategy_id")
     @classmethod
-    def _non_empty(cls, v: str) -> str:
+    def _non_empty_strategy_id(cls, v: str) -> str:
         if not v.strip():
             raise ValueError("strategy_id must not be empty")
+        return v
+
+    @field_validator("runtime_id")
+    @classmethod
+    def _non_empty_runtime_id(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("runtime_id must not be empty")
         return v
 
     @model_validator(mode="after")
@@ -305,6 +324,20 @@ class ResolvedConfig(_StrictModel):
     global_config: GlobalConfig
     runtime: RuntimeConfig
     strategy: StrategyConfig
+
+    @model_validator(mode="after")
+    def _strategy_runtime_id_matches_the_resolved_runtime(self) -> ResolvedConfig:
+        """Defense in depth alongside the loader's own check
+        (``common.config.loader.load_strategy_config``): a ``ResolvedConfig``
+        assembled any other way (tests, a future caller) still cannot pair a
+        strategy with a runtime it does not declare itself to belong to."""
+        if self.strategy.runtime_id != self.runtime.runtime_id:
+            raise ValueError(
+                f"strategy {self.strategy.strategy_id!r} declares runtime_id="
+                f"{self.strategy.runtime_id!r}, which does not match the resolved "
+                f"runtime {self.runtime.runtime_id!r}."
+            )
+        return self
 
     @model_validator(mode="after")
     def _live_requires_a_complete_preflight_contract(self) -> ResolvedConfig:

@@ -93,11 +93,31 @@ class LegRole(StrEnum):
     ``GENERIC`` is the escape hatch for a future multi-leg strategy whose legs
     are not CE/PE (e.g. a calendar spread) — nothing in this module or the
     engine requires exactly CE+PE.
+
+    ``SHORT_CALL``/``SHORT_PUT``/``HEDGE_CALL``/``HEDGE_PUT`` were added for
+    the positional multi-leg engine's iron-condor-shaped strategies (weekly
+    delta-neutral) — a purely additive extension of this one shared,
+    persistence-facing enum, never a second, parallel one. ``CE``, ``PE`` and
+    ``GENERIC`` keep their exact values and every existing behaviour:
+    :mod:`~common.engine.multi_leg_engine` and :mod:`~common.engine.
+    multi_leg_state` (``straddle_920``'s engine) never construct or see the
+    four new members — their own ``_ROLE_TO_OPTION_TYPE`` mappings stay
+    exactly ``{CE: CE, PE: PE}``, structurally unable to resolve them, which
+    is correct: that engine has no use for them. The positional engine's own
+    option-type mapping (``common.engine.positional.positional_state``) is
+    the only place that maps the four new members to a real
+    :class:`~common.engine.models.OptionType`. See
+    ``tests/unit/test_leg_role_extension_is_additive.py`` for the regression
+    proof that this extension changed nothing about the pre-existing three.
     """
 
     CE = "CE"
     PE = "PE"
     GENERIC = "GENERIC"
+    SHORT_CALL = "SHORT_CALL"
+    SHORT_PUT = "SHORT_PUT"
+    HEDGE_CALL = "HEDGE_CALL"
+    HEDGE_PUT = "HEDGE_PUT"
 
 
 class LegState(StrEnum):

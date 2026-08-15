@@ -362,12 +362,20 @@ class ExecutionRepository:
         stop_price: float | None = None,
         target_price: float | None = None,
         last_candle_end_at: str | None = None,
+        cycle_id: str | None = None,
     ) -> Position:
         """Insert the fill and move the position — atomically.
 
         Returns the resulting position. Idempotent: replaying a fill whose
         ``broker_fill_id`` is already recorded leaves everything unchanged and
         returns the current position.
+
+        ``cycle_id``, when given (a positional strategy's durable cycle
+        identity — spec review correction 4), changes how the *position row*
+        is resolved: through ``cycle_position_bindings`` rather than through
+        ``(trading_date, security_id)`` — see :meth:`_upsert_position`. Every
+        existing intraday caller passes ``None`` and this method is
+        byte-identical to before that parameter existed.
         """
         with self._db.transaction() as conn:
             existing = conn.execute(
@@ -381,6 +389,7 @@ class ExecutionRepository:
                     execution_mode=fill.execution_mode,
                     trading_date=trading_date,
                     security_id=security_id,
+                    cycle_id=cycle_id,
                 )
                 if position is None:  # pragma: no cover - fill without position
                     raise RuntimeError(
@@ -449,6 +458,7 @@ class ExecutionRepository:
                 trading_date=trading_date,
                 stop_price=stop_price,
                 target_price=target_price,
+                cycle_id=cycle_id,
             )
             self._touch_strategy_state(
                 conn,
@@ -507,6 +517,7 @@ class ExecutionRepository:
         trading_date: str,
         stop_price: float | None,
         target_price: float | None,
+        cycle_id: str | None = None,
     ) -> tuple[Position, float]:
         """Apply one fill to its position row. Returns ``(position, realised_delta)``.
 
@@ -515,6 +526,33 @@ class ExecutionRepository:
         what :meth:`_touch_strategy_state` accumulates into the strategy-day's
         running figure; passing the row's cumulative total there instead was the
         Phase 6 Part 1 bug (see that method's docstring).
+
+        **``cycle_id`` (spec review correction 4).** ``positions.trading_date``
+        is written once, on the row's own creation, and is never rewritten by a
+        later-day fill — a Friday fill against a Wednesday-opened leg updates
+        this same row's ``quantity``/``average_price``/... in place and leaves
+        ``trading_date`` at Wednesday's date; Friday's own event date is
+        recorded where the event actually happened (the caller's
+        ``order_intents``/``orders``/``fills``/``trade_ledger`` rows, all
+        still keyed on the ``trading_date`` this call was given). What changes
+        with ``cycle_id`` is purely *which row* a fill lands on: resolved
+        through ``cycle_position_bindings`` (keyed ``(cycle_id, security_id)``)
+        instead of ``(strategy_id, execution_mode, trading_date, security_id)``,
+        so a security's position row is the *same* row across every trading
+        date this cycle spans, including a close-and-reopen (the "reopening a
+        fully-closed identity from flat" branch below fires against that same
+        row rather than creating a new one).
+
+        The binding write happens on the *same* ``conn``, inside this call's
+        own already-open transaction (never a second one) — so a binding
+        failure (e.g. a UNIQUE violation from a genuinely contradictory
+        concurrent write) rolls back the position mutation this call just made,
+        and a position mutation can never commit without its binding. No
+        binding is ever rewritten to point at a different ``position_id``
+        once created; :func:`~runtimes.positional_options.
+        positional_multi_leg_engine_worker.recover_cycle`'s reconciliation is
+        what detects a missing, duplicate, or contradictory binding at
+        restart and fails closed.
         """
         current = self._read_position(
             conn,
@@ -522,12 +560,13 @@ class ExecutionRepository:
             execution_mode=fill.execution_mode,
             trading_date=trading_date,
             security_id=security_id,
+            cycle_id=cycle_id,
         )
         signed = side.sign * fill.quantity
         now = _now()
 
         if current is None:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 INSERT INTO positions
                     (runtime_id, strategy_id, execution_mode, trading_date, instrument,
@@ -553,6 +592,16 @@ class ExecutionRepository:
                 ),
             )
             realised_delta = 0.0
+            if cycle_id is not None:
+                new_position_id = int(cursor.lastrowid or 0)
+                conn.execute(
+                    """
+                    INSERT INTO cycle_position_bindings
+                        (cycle_id, security_id, position_id, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (cycle_id, security_id, new_position_id, now),
+                )
         else:
             new_quantity = current.quantity + signed
             realised = current.realised_pnl
@@ -605,35 +654,58 @@ class ExecutionRepository:
 
             realised_delta = realised - current.realised_pnl
             status = PositionStatus.CLOSED if new_quantity == 0 else PositionStatus.OPEN
-            conn.execute(
-                """
-                UPDATE positions
-                SET quantity = ?, average_price = ?, realised_pnl = ?, charges = ?,
-                    stop_price = COALESCE(?, stop_price),
-                    target_price = COALESCE(?, target_price),
-                    status = ?, closed_at = ?, updated_at = ?,
-                    opened_at = ?, entry_correlation_id = ?
-                WHERE strategy_id = ? AND execution_mode = ? AND trading_date = ?
-                  AND security_id = ?
-                """,
-                (
-                    new_quantity,
-                    average,
-                    realised,
-                    current.charges + fill.charges,
-                    stop_price,
-                    target_price,
-                    status.value,
-                    now if status is PositionStatus.CLOSED else None,
-                    now,
-                    opened_at,
-                    entry_correlation_id,
-                    fill.strategy_id,
-                    fill.execution_mode.value,
-                    trading_date,
-                    security_id,
-                ),
+            update_values = (
+                new_quantity,
+                average,
+                realised,
+                current.charges + fill.charges,
+                stop_price,
+                target_price,
+                status.value,
+                now if status is PositionStatus.CLOSED else None,
+                now,
+                opened_at,
+                entry_correlation_id,
             )
+            if cycle_id is not None:
+                # Located through the binding, never through trading_date —
+                # this is what lets a later-day fill reach a row opened on an
+                # earlier trading_date (spec review correction 4).
+                conn.execute(
+                    """
+                    UPDATE positions
+                    SET quantity = ?, average_price = ?, realised_pnl = ?, charges = ?,
+                        stop_price = COALESCE(?, stop_price),
+                        target_price = COALESCE(?, target_price),
+                        status = ?, closed_at = ?, updated_at = ?,
+                        opened_at = ?, entry_correlation_id = ?
+                    WHERE id = (
+                        SELECT position_id FROM cycle_position_bindings
+                        WHERE cycle_id = ? AND security_id = ?
+                    )
+                    """,
+                    (*update_values, cycle_id, security_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE positions
+                    SET quantity = ?, average_price = ?, realised_pnl = ?, charges = ?,
+                        stop_price = COALESCE(?, stop_price),
+                        target_price = COALESCE(?, target_price),
+                        status = ?, closed_at = ?, updated_at = ?,
+                        opened_at = ?, entry_correlation_id = ?
+                    WHERE strategy_id = ? AND execution_mode = ? AND trading_date = ?
+                      AND security_id = ?
+                    """,
+                    (
+                        *update_values,
+                        fill.strategy_id,
+                        fill.execution_mode.value,
+                        trading_date,
+                        security_id,
+                    ),
+                )
             if ledger_entry is not None:
                 conn.execute(
                     """
@@ -654,6 +726,7 @@ class ExecutionRepository:
             execution_mode=fill.execution_mode,
             trading_date=trading_date,
             security_id=security_id,
+            cycle_id=cycle_id,
         )
         assert result is not None
         return result, realised_delta
@@ -819,6 +892,26 @@ class ExecutionRepository:
         )
         return [_row_to_position(row) for row in rows]
 
+    def open_positions_for_cycle(self, *, cycle_id: str) -> list[Position]:
+        """Every open position bound to one positional cycle — the
+        cycle-scoped sibling of :meth:`open_positions`, joined through
+        ``cycle_position_bindings`` rather than ``trading_date``.
+        """
+        rows = (
+            self._db.connect()
+            .execute(
+                """
+                SELECT p.* FROM positions p
+                JOIN cycle_position_bindings b ON b.position_id = p.id
+                WHERE b.cycle_id = ? AND p.status = 'OPEN' AND p.quantity != 0
+                ORDER BY p.id
+                """,
+                (cycle_id,),
+            )
+            .fetchall()
+        )
+        return [_row_to_position(row) for row in rows]
+
     def positions_all_dates(
         self, *, strategy_id: str, execution_mode: ExecutionMode
     ) -> list[Position]:
@@ -908,7 +1001,31 @@ class ExecutionRepository:
         execution_mode: ExecutionMode,
         trading_date: str,
         security_id: str,
+        cycle_id: str | None = None,
     ) -> Position | None:
+        """The current position row for this identity.
+
+        ``cycle_id``, when given, resolves exclusively through
+        ``cycle_position_bindings`` — never falls back to the
+        ``(trading_date, security_id)`` lookup, so a cycle-scoped caller can
+        never accidentally adopt an unrelated row that happens to share
+        today's date and security id. No binding yet means no position yet
+        (``None``), which is exactly right for a leg's very first fill: the
+        caller's INSERT branch creates both the row and its binding together.
+        """
+        if cycle_id is not None:
+            binding = conn.execute(
+                "SELECT position_id FROM cycle_position_bindings "
+                "WHERE cycle_id = ? AND security_id = ?",
+                (cycle_id, security_id),
+            ).fetchone()
+            if binding is None:
+                return None
+            row = conn.execute(
+                "SELECT * FROM positions WHERE id = ?",
+                (int(binding["position_id"]),),
+            ).fetchone()
+            return None if row is None else _row_to_position(row)
         row = conn.execute(
             """
             SELECT * FROM positions
@@ -1499,6 +1616,480 @@ class ExecutionRepository:
                 LIMIT ?
                 """,
                 (strategy_id, execution_mode.value, limit),
+            )
+            .fetchall()
+        )
+
+    # ------------------------------------------------------ positional cycles
+    # Migration 0010 (strategy-weekly-delta-neutral). Generic to any
+    # positional multi-leg strategy — see that migration's own docstring for
+    # why cycle_id exists alongside (never replacing) trading_date. Returns
+    # raw rows, same discipline as the multi-leg basket methods above: this
+    # module must not import common.engine; the row <-> Cycle/CycleLeg
+    # conversion lives in common.engine.positional.positional_state.
+    def upsert_cycle(
+        self,
+        *,
+        runtime_id: str,
+        strategy_id: str,
+        execution_mode: ExecutionMode,
+        cycle_id: str,
+        underlying: str,
+        resolved_expiry_date: str,
+        state: str,
+        entries_consumed: bool,
+        day_blocked_reason: str | None,
+        original_net_credit: float | None,
+        original_max_loss: float | None,
+        original_wing_width: float | None,
+        adjustments_today: int,
+        adjustments_today_date: str | None,
+        adjustments_this_cycle: int,
+        last_adjustment_at: str | None,
+        pending_adjustment_role: str | None,
+        pending_adjustment_state: str | None,
+        square_off_state: str,
+        opened_trading_date: str,
+    ) -> None:
+        with self._db.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO strategy_cycles
+                    (runtime_id, strategy_id, execution_mode, cycle_id, underlying,
+                     resolved_expiry_date, state, entries_consumed, day_blocked_reason,
+                     original_net_credit, original_max_loss, original_wing_width,
+                     adjustments_today, adjustments_today_date, adjustments_this_cycle,
+                     last_adjustment_at, pending_adjustment_role, pending_adjustment_state,
+                     square_off_state, opened_trading_date, version, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                ON CONFLICT (cycle_id) DO UPDATE SET
+                    state = excluded.state,
+                    entries_consumed = excluded.entries_consumed,
+                    day_blocked_reason = excluded.day_blocked_reason,
+                    original_net_credit = excluded.original_net_credit,
+                    original_max_loss = excluded.original_max_loss,
+                    original_wing_width = excluded.original_wing_width,
+                    adjustments_today = excluded.adjustments_today,
+                    adjustments_today_date = excluded.adjustments_today_date,
+                    adjustments_this_cycle = excluded.adjustments_this_cycle,
+                    last_adjustment_at = excluded.last_adjustment_at,
+                    pending_adjustment_role = excluded.pending_adjustment_role,
+                    pending_adjustment_state = excluded.pending_adjustment_state,
+                    square_off_state = excluded.square_off_state,
+                    version = strategy_cycles.version + 1,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    runtime_id,
+                    strategy_id,
+                    execution_mode.value,
+                    cycle_id,
+                    underlying,
+                    resolved_expiry_date,
+                    state,
+                    int(entries_consumed),
+                    day_blocked_reason,
+                    original_net_credit,
+                    original_max_loss,
+                    original_wing_width,
+                    adjustments_today,
+                    adjustments_today_date,
+                    adjustments_this_cycle,
+                    last_adjustment_at,
+                    pending_adjustment_role,
+                    pending_adjustment_state,
+                    square_off_state,
+                    opened_trading_date,
+                    _now(),
+                    _now(),
+                ),
+            )
+
+    def load_cycle(self, *, cycle_id: str) -> sqlite3.Row | None:
+        row: sqlite3.Row | None = (
+            self._db.connect()
+            .execute("SELECT * FROM strategy_cycles WHERE cycle_id = ?", (cycle_id,))
+            .fetchone()
+        )
+        return row
+
+    def load_open_cycle(
+        self, *, runtime_id: str, strategy_id: str, execution_mode: ExecutionMode
+    ) -> sqlite3.Row | None:
+        """The one non-terminal cycle for this strategy/mode, if any — the
+        restart-recovery entrypoint. Relies on the same terminal-state
+        vocabulary ``idx_one_open_cycle`` (migration 0010) enforces in the
+        database itself, so this can never disagree with what the schema
+        actually permits to coexist."""
+        row: sqlite3.Row | None = (
+            self._db.connect()
+            .execute(
+                """
+                SELECT * FROM strategy_cycles
+                WHERE runtime_id = ? AND strategy_id = ? AND execution_mode = ?
+                  AND state NOT IN ('COMPLETED', 'FAILED', 'ABANDONED')
+                """,
+                (runtime_id, strategy_id, execution_mode.value),
+            )
+            .fetchone()
+        )
+        return row
+
+    def load_cycles(
+        self,
+        *,
+        runtime_id: str,
+        strategy_id: str,
+        execution_mode: ExecutionMode,
+        limit: int = 200,
+    ) -> list[sqlite3.Row]:
+        """Cycles for a strategy, most recently opened first — the
+        dashboard's cycle-history query."""
+        return list(
+            self._db.connect()
+            .execute(
+                """
+                SELECT * FROM strategy_cycles
+                WHERE runtime_id = ? AND strategy_id = ? AND execution_mode = ?
+                ORDER BY opened_trading_date DESC, id DESC
+                LIMIT ?
+                """,
+                (runtime_id, strategy_id, execution_mode.value, limit),
+            )
+            .fetchall()
+        )
+
+    def upsert_cycle_leg(
+        self,
+        *,
+        runtime_id: str,
+        strategy_id: str,
+        execution_mode: ExecutionMode,
+        cycle_id: str,
+        leg_id: str,
+        leg_role: str,
+        option_type: str | None,
+        leg_sequence: int,
+        is_replacement: bool,
+        replaces_leg_id: str | None,
+        security_id: str | None,
+        symbol: str | None,
+        strike: float | None,
+        expiry: str | None,
+        lot_size: int | None,
+        side: str | None,
+        quantity: int | None,
+        entry_price: float | None,
+        entry_time: str | None,
+        entry_correlation_id: str | None,
+        exit_price: float | None,
+        exit_time: str | None,
+        exit_reason: str | None,
+        exit_correlation_id: str | None,
+        realized_gross_pnl: float | None,
+        state: str,
+    ) -> None:
+        with self._db.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO strategy_cycle_legs
+                    (runtime_id, strategy_id, execution_mode, cycle_id, leg_id, leg_role,
+                     option_type, leg_sequence, is_replacement, replaces_leg_id, security_id,
+                     symbol, strike, expiry, lot_size, side, quantity, entry_price, entry_time,
+                     entry_correlation_id, exit_price, exit_time, exit_reason, exit_correlation_id,
+                     realized_gross_pnl, state, version, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, 1, ?, ?)
+                ON CONFLICT (cycle_id, leg_id) DO UPDATE SET
+                    leg_role = excluded.leg_role,
+                    option_type = excluded.option_type,
+                    leg_sequence = excluded.leg_sequence,
+                    is_replacement = excluded.is_replacement,
+                    replaces_leg_id = excluded.replaces_leg_id,
+                    security_id = excluded.security_id,
+                    symbol = excluded.symbol,
+                    strike = excluded.strike,
+                    expiry = excluded.expiry,
+                    lot_size = excluded.lot_size,
+                    side = excluded.side,
+                    quantity = excluded.quantity,
+                    entry_price = excluded.entry_price,
+                    entry_time = excluded.entry_time,
+                    entry_correlation_id = excluded.entry_correlation_id,
+                    exit_price = excluded.exit_price,
+                    exit_time = excluded.exit_time,
+                    exit_reason = excluded.exit_reason,
+                    exit_correlation_id = excluded.exit_correlation_id,
+                    realized_gross_pnl = excluded.realized_gross_pnl,
+                    state = excluded.state,
+                    version = strategy_cycle_legs.version + 1,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    runtime_id,
+                    strategy_id,
+                    execution_mode.value,
+                    cycle_id,
+                    leg_id,
+                    leg_role,
+                    option_type,
+                    leg_sequence,
+                    int(is_replacement),
+                    replaces_leg_id,
+                    security_id,
+                    symbol,
+                    strike,
+                    expiry,
+                    lot_size,
+                    side,
+                    quantity,
+                    entry_price,
+                    entry_time,
+                    entry_correlation_id,
+                    exit_price,
+                    exit_time,
+                    exit_reason,
+                    exit_correlation_id,
+                    realized_gross_pnl,
+                    state,
+                    _now(),
+                    _now(),
+                ),
+            )
+
+    def load_cycle_legs(self, *, cycle_id: str) -> list[sqlite3.Row]:
+        return list(
+            self._db.connect()
+            .execute(
+                "SELECT * FROM strategy_cycle_legs WHERE cycle_id = ? "
+                "ORDER BY leg_role, leg_sequence",
+                (cycle_id,),
+            )
+            .fetchall()
+        )
+
+    def cycle_order_history(self, *, cycle_id: str) -> list[sqlite3.Row]:
+        """Every ``order_intents`` row ever reserved for one cycle, across
+        every leg — the ``basket_id``-keyed sibling of :meth:`leg_order_history`
+        (``order_intents.basket_id`` is set to the cycle's own ``cycle_id`` by
+        the positional engine's gateway calls, reusing the identity space
+        migration 0009's own docstring already established rather than adding
+        a dedicated binding table for it)."""
+        return list(
+            self._db.connect()
+            .execute(
+                """
+                SELECT
+                    oi.leg_id, oi.correlation_id, oi.side, oi.quantity, oi.risk_decision,
+                    oi.risk_reason, oi.sequence_number, oi.submission_reserved,
+                    o.status AS order_status,
+                    o.filled_quantity AS order_filled_quantity,
+                    o.average_fill_price AS order_average_fill_price,
+                    o.broker_order_id AS order_broker_order_id,
+                    o.rejection_reason AS order_rejection_reason
+                FROM order_intents oi
+                LEFT JOIN orders o ON o.intent_id = oi.id
+                WHERE oi.basket_id = ?
+                ORDER BY oi.sequence_number
+                """,
+                (cycle_id,),
+            )
+            .fetchall()
+        )
+
+    def append_cycle_adjustment(
+        self,
+        *,
+        runtime_id: str,
+        strategy_id: str,
+        execution_mode: ExecutionMode,
+        cycle_id: str,
+        adjustment_sequence: int,
+        trigger_reason: str,
+        target_leg_id: str,
+        replacement_leg_id: str | None,
+        claimed_at: str,
+        pre_adjustment_net_delta: float | None,
+        post_adjustment_net_delta: float | None,
+        realized_pnl: float | None,
+        charges: float | None,
+        lifecycle_state: str,
+    ) -> None:
+        """Append-only: one row per adjustment attempt, written once it
+        reaches a terminal outcome. ``ON CONFLICT ... DO NOTHING`` on
+        ``(cycle_id, adjustment_sequence)`` makes a restart replaying the
+        same durable claim idempotent rather than raising."""
+        with self._db.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO strategy_cycle_adjustments
+                    (runtime_id, strategy_id, execution_mode, cycle_id, adjustment_sequence,
+                     trigger_reason, target_leg_id, replacement_leg_id, claimed_at,
+                     pre_adjustment_net_delta, post_adjustment_net_delta, realized_pnl,
+                     charges, lifecycle_state, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (cycle_id, adjustment_sequence) DO UPDATE SET
+                    replacement_leg_id = excluded.replacement_leg_id,
+                    post_adjustment_net_delta = excluded.post_adjustment_net_delta,
+                    realized_pnl = excluded.realized_pnl,
+                    charges = excluded.charges,
+                    lifecycle_state = excluded.lifecycle_state
+                """,
+                (
+                    runtime_id,
+                    strategy_id,
+                    execution_mode.value,
+                    cycle_id,
+                    adjustment_sequence,
+                    trigger_reason,
+                    target_leg_id,
+                    replacement_leg_id,
+                    claimed_at,
+                    pre_adjustment_net_delta,
+                    post_adjustment_net_delta,
+                    realized_pnl,
+                    charges,
+                    lifecycle_state,
+                    _now(),
+                ),
+            )
+
+    def load_cycle_adjustments(self, *, cycle_id: str) -> list[sqlite3.Row]:
+        return list(
+            self._db.connect()
+            .execute(
+                "SELECT * FROM strategy_cycle_adjustments WHERE cycle_id = ? "
+                "ORDER BY adjustment_sequence",
+                (cycle_id,),
+            )
+            .fetchall()
+        )
+
+    def append_cycle_event(
+        self,
+        *,
+        runtime_id: str,
+        strategy_id: str,
+        execution_mode: ExecutionMode,
+        cycle_id: str,
+        event_type: str,
+        detail: str | None,
+        trading_date: str,
+    ) -> None:
+        with self._db.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO strategy_cycle_events
+                    (runtime_id, strategy_id, execution_mode, cycle_id, event_type, detail,
+                     trading_date, occurred_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    runtime_id,
+                    strategy_id,
+                    execution_mode.value,
+                    cycle_id,
+                    event_type,
+                    detail,
+                    trading_date,
+                    _now(),
+                ),
+            )
+
+    def load_cycle_events(self, *, cycle_id: str, limit: int = 200) -> list[sqlite3.Row]:
+        return list(
+            self._db.connect()
+            .execute(
+                "SELECT * FROM strategy_cycle_events WHERE cycle_id = ? "
+                "ORDER BY occurred_at DESC LIMIT ?",
+                (cycle_id, limit),
+            )
+            .fetchall()
+        )
+
+    def record_cycle_decision_snapshot(
+        self,
+        *,
+        runtime_id: str,
+        strategy_id: str,
+        execution_mode: ExecutionMode,
+        cycle_id: str,
+        decision_type: str,
+        leg_role: str | None,
+        security_id: str,
+        option_type: str | None,
+        strike: float | None,
+        spot: float | None,
+        bid: float | None,
+        ask: float | None,
+        quote_age_ms: float | None,
+        quote_source_timestamp: str | None,
+        delta: float | None,
+        gamma: float | None,
+        theta: float | None,
+        vega: float | None,
+        implied_volatility: float | None,
+        greek_source: str | None,
+        greek_source_timestamp: str | None,
+        risk_free_rate: float | None,
+        dividend_yield: float | None,
+        evaluation_timestamp: str,
+        time_to_expiry_years: float | None,
+    ) -> None:
+        """Append-only. One row per candidate leg evaluated for one decision
+        (spec section 4: every Greek carries a source timestamp; every
+        candidate in one entry/adjustment evaluation shares one snapshot)."""
+        with self._db.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO cycle_decision_snapshots
+                    (runtime_id, strategy_id, execution_mode, cycle_id, decision_type, leg_role,
+                     security_id, option_type, strike, spot, bid, ask, quote_age_ms,
+                     quote_source_timestamp, delta, gamma, theta, vega, implied_volatility,
+                     greek_source, greek_source_timestamp, risk_free_rate, dividend_yield,
+                     evaluation_timestamp, time_to_expiry_years, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?)
+                """,
+                (
+                    runtime_id,
+                    strategy_id,
+                    execution_mode.value,
+                    cycle_id,
+                    decision_type,
+                    leg_role,
+                    security_id,
+                    option_type,
+                    strike,
+                    spot,
+                    bid,
+                    ask,
+                    quote_age_ms,
+                    quote_source_timestamp,
+                    delta,
+                    gamma,
+                    theta,
+                    vega,
+                    implied_volatility,
+                    greek_source,
+                    greek_source_timestamp,
+                    risk_free_rate,
+                    dividend_yield,
+                    evaluation_timestamp,
+                    time_to_expiry_years,
+                    _now(),
+                ),
+            )
+
+    def load_cycle_decision_snapshots(
+        self, *, cycle_id: str, limit: int = 200
+    ) -> list[sqlite3.Row]:
+        return list(
+            self._db.connect()
+            .execute(
+                "SELECT * FROM cycle_decision_snapshots WHERE cycle_id = ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (cycle_id, limit),
             )
             .fetchall()
         )

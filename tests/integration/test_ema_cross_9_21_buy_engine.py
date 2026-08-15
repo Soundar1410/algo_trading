@@ -533,6 +533,7 @@ def test_paper_mode_config_is_refused_by_the_live_gate():
         runtime=RuntimeConfig(runtime_id="intraday_options", enabled=True),
         strategy=StrategyConfig(
             strategy_id="ema_cross_9_21_buy",
+            runtime_id="intraday_options",
             enabled=True,
             mode=ExecutionMode.PAPER,
             live_approved=False,

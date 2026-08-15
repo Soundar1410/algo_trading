@@ -51,7 +51,8 @@ def project_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     )
     _write(
         tmp_path / "config" / "strategies" / "ema_cross_9_21_buy.yaml",
-        "strategy_id: ema_cross_9_21_buy\nenabled: true\nmode: paper\nlive_approved: false\n",
+        "strategy_id: ema_cross_9_21_buy\nruntime_id: intraday_options\n"
+        "enabled: true\nmode: paper\nlive_approved: false\n",
     )
     database = Database(tmp_path / "data" / "operational" / "intraday_options.db")
     MigrationRunner(database).run_pending()
@@ -87,11 +88,13 @@ def project_root_with_two_strategies(
     )
     _write(
         tmp_path / "config" / "strategies" / "alpha_strategy.yaml",
-        "strategy_id: alpha_strategy\nenabled: true\nmode: paper\nlive_approved: false\n",
+        "strategy_id: alpha_strategy\nruntime_id: intraday_options\n"
+        "enabled: true\nmode: paper\nlive_approved: false\n",
     )
     _write(
         tmp_path / "config" / "strategies" / "beta_strategy.yaml",
-        "strategy_id: beta_strategy\nenabled: true\nmode: paper\nlive_approved: false\n",
+        "strategy_id: beta_strategy\nruntime_id: intraday_options\n"
+        "enabled: true\nmode: paper\nlive_approved: false\n",
     )
 
     database_path = tmp_path / "data" / "operational" / "intraday_options.db"
@@ -287,8 +290,8 @@ def project_root_with_a_straddle_920_basket(
     )
     _write(
         tmp_path / "config" / "strategies" / "straddle_920.yaml",
-        "strategy_id: straddle_920\nenabled: true\nmode: paper\nlive_approved: false\n"
-        "engine: multi_leg_engine\n",
+        "strategy_id: straddle_920\nruntime_id: intraday_options\n"
+        "enabled: true\nmode: paper\nlive_approved: false\nengine: multi_leg_engine\n",
     )
 
     from datetime import datetime

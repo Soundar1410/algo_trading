@@ -32,6 +32,7 @@ def _cfg(**strategy_overrides) -> ResolvedConfig:
     parameters.update(strategy_overrides.pop("parameters", {}))
     strategy_kwargs = {
         "strategy_id": "ema_cross_9_21_buy",
+        "runtime_id": "intraday_options",
         "enabled": True,
         "parameters": parameters,
         "risk": {"entry_start": "09:15", "entry_cutoff": "14:45", "square_off_at": "15:15"},
@@ -257,6 +258,7 @@ def test_multi_leg_engine_refuses_live_mode(tmp_path: Path):
 
     strategy = StrategyConfig(
         strategy_id="straddle_920",
+        runtime_id="intraday_options",
         mode=ExecutionMode.LIVE,
         live_approved=True,
         live_quantity_lots=1,

@@ -296,6 +296,7 @@ def test_shipped_migrations_start_at_the_walking_skeleton():
         "0007",
         "0008",
         "0009",
+        "0010",
     ]
     assert shipped[0].name == "walking_skeleton"
     assert shipped[1].name == "feed_and_auth_health"
@@ -309,6 +310,8 @@ def test_shipped_migrations_start_at_the_walking_skeleton():
     assert shipped[7].name == "trade_ledger"
     # strategy-straddle-920: generic multi-leg basket/leg support.
     assert shipped[8].name == "multi_leg_baskets"
+    # strategy-weekly-delta-neutral: durable cross-day cycle support (D69).
+    assert shipped[9].name == "positional_cycles"
 
 
 def test_shipped_migrations_apply_to_a_fresh_database(tmp_path: Path):
@@ -335,6 +338,7 @@ def test_shipped_migrations_apply_to_a_fresh_database(tmp_path: Path):
         "0007",
         "0008",
         "0009",
+        "0010",
     ]
     assert database.integrity_check() == []
     assert database.foreign_key_check() == []
@@ -349,6 +353,14 @@ def test_shipped_migrations_apply_to_a_fresh_database(tmp_path: Path):
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
     assert {"strategy_baskets", "strategy_legs"} <= tables
+    assert {
+        "strategy_cycles",
+        "strategy_cycle_legs",
+        "strategy_cycle_adjustments",
+        "strategy_cycle_events",
+        "cycle_position_bindings",
+        "cycle_decision_snapshots",
+    } <= tables
 
 
 def test_later_migrations_upgrade_a_database_created_by_0001_alone(tmp_path: Path):
@@ -393,6 +405,7 @@ def test_later_migrations_upgrade_a_database_created_by_0001_alone(tmp_path: Pat
         "0007",
         "0008",
         "0009",
+        "0010",
     ]
     with database.connect() as conn:
         survivors = conn.execute("SELECT COUNT(*) FROM runtime_sessions").fetchone()[0]
@@ -405,6 +418,7 @@ def test_later_migrations_upgrade_a_database_created_by_0001_alone(tmp_path: Pat
     assert "paper_fill_quotes" in tables
     assert "audit_events" in tables
     assert {"strategy_baskets", "strategy_legs"} <= tables
+    assert {"strategy_cycles", "strategy_cycle_legs"} <= tables
     assert database.integrity_check() == []
 
 
@@ -841,3 +855,215 @@ def test_migration_0009_upgrades_a_database_created_by_0008_with_real_rows(tmp_p
     # A second startup must not attempt to reapply 0009.
     second_run = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
     assert second_run == []
+
+
+# --------------------------------------------- 0010 (strategy-weekly-delta-neutral)
+def test_migration_0010_upgrades_a_database_created_by_0009_with_real_rows(tmp_path: Path):
+    """The real upgrade path for 0010: seed a database through 0001-0009 only,
+    insert a real ``strategy_baskets`` row exactly as 0009 already shipped it,
+    then apply 0010 and prove that row survives completely untouched, the six
+    new tables exist with working constraints, and a second run does not
+    re-apply anything."""
+    from common.persistence.migrations import VERSIONS_DIR
+
+    up_to_0009 = tmp_path / "up_to_0009"
+    up_to_0009.mkdir()
+    for migration in discover_migrations(VERSIONS_DIR):
+        if migration.version == "0010":
+            continue
+        (up_to_0009 / migration.path.name).write_text(
+            migration.path.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+
+    database = Database(tmp_path / "operational" / "positional_options.db")
+    MigrationRunner(database, versions_dir=up_to_0009).run_pending()
+
+    with database.transaction() as conn:
+        conn.execute(
+            "INSERT INTO strategy_baskets (runtime_id, strategy_id, execution_mode, "
+            "trading_date, basket_id, entries_consumed, adjustment_count, "
+            "square_off_state, created_at, updated_at) VALUES "
+            "('intraday_options', 'straddle_920', 'paper', '2026-08-17', "
+            "'straddle_920:2026-08-17', 1, 0, 'PENDING', 'now', 'now')"
+        )
+    before = dict(
+        database.connect().execute("SELECT * FROM strategy_baskets").fetchone()
+    )
+
+    applied = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
+    assert [m.version for m in applied] == ["0010"]
+
+    assert database.integrity_check() == []
+    assert database.foreign_key_check() == []
+
+    with database.connect() as conn:
+        after = dict(conn.execute("SELECT * FROM strategy_baskets").fetchone())
+        assert after == before, "0010 must not touch any existing strategy_baskets row"
+
+        tables = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        assert {
+            "strategy_cycles",
+            "strategy_cycle_legs",
+            "strategy_cycle_adjustments",
+            "strategy_cycle_events",
+            "cycle_position_bindings",
+            "cycle_decision_snapshots",
+        } <= tables
+
+    # A second startup must not attempt to reapply 0010.
+    second_run = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
+    assert second_run == []
+
+
+def _insert_cycle(conn: sqlite3.Connection, **overrides: object) -> None:
+    row = {
+        "runtime_id": "positional_options",
+        "strategy_id": "weekly_delta_neutral",
+        "execution_mode": "paper",
+        "cycle_id": "wdn:2026-08-19",
+        "underlying": "NIFTY",
+        "resolved_expiry_date": "2026-08-21",
+        "state": "ENTERING",
+        "opened_trading_date": "2026-08-19",
+        "created_at": "now",
+        "updated_at": "now",
+    }
+    row.update(overrides)
+    columns = ", ".join(row)
+    placeholders = ", ".join("?" for _ in row)
+    conn.execute(
+        f"INSERT INTO strategy_cycles ({columns}) VALUES ({placeholders})",
+        tuple(row.values()),
+    )
+
+
+def test_only_one_non_terminal_cycle_per_strategy_mode_is_permitted(tmp_path: Path):
+    from common.persistence.migrations import VERSIONS_DIR
+
+    database = Database(tmp_path / "operational" / "positional_options.db")
+    MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
+
+    with database.transaction() as conn:
+        _insert_cycle(conn, cycle_id="wdn:2026-08-19", resolved_expiry_date="2026-08-21")
+    with database.transaction() as conn, pytest.raises(sqlite3.IntegrityError):
+        _insert_cycle(conn, cycle_id="wdn:2026-08-26", resolved_expiry_date="2026-08-28")
+
+
+def test_a_terminal_cycle_permits_a_new_one(tmp_path: Path):
+    """The partial unique index excludes COMPLETED/FAILED/ABANDONED — a
+    finished cycle must never block the next one."""
+    from common.persistence.migrations import VERSIONS_DIR
+
+    database = Database(tmp_path / "operational" / "positional_options.db")
+    MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
+
+    with database.transaction() as conn:
+        _insert_cycle(
+            conn,
+            cycle_id="wdn:2026-08-19",
+            resolved_expiry_date="2026-08-21",
+            state="COMPLETED",
+        )
+    with database.transaction() as conn:
+        _insert_cycle(conn, cycle_id="wdn:2026-08-26", resolved_expiry_date="2026-08-28")
+
+    with database.connect() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM strategy_cycles").fetchone()[0]
+    assert count == 2
+
+
+def test_critical_unresolved_still_blocks_a_new_cycle(tmp_path: Path):
+    """CRITICAL_UNRESOLVED is deliberately non-terminal for this index."""
+    from common.persistence.migrations import VERSIONS_DIR
+
+    database = Database(tmp_path / "operational" / "positional_options.db")
+    MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
+
+    with database.transaction() as conn:
+        _insert_cycle(
+            conn,
+            cycle_id="wdn:2026-08-19",
+            resolved_expiry_date="2026-08-21",
+            state="CRITICAL_UNRESOLVED",
+        )
+    with database.transaction() as conn, pytest.raises(sqlite3.IntegrityError):
+        _insert_cycle(conn, cycle_id="wdn:2026-08-26", resolved_expiry_date="2026-08-28")
+
+
+def test_no_same_expiry_re_entry_even_after_the_cycle_failed(tmp_path: Path):
+    """Spec section 9.3: one consumed cycle per resolved expiry, for every
+    outcome — a FAILED cycle must not free its expiry for a retry."""
+    from common.persistence.migrations import VERSIONS_DIR
+
+    database = Database(tmp_path / "operational" / "positional_options.db")
+    MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
+
+    with database.transaction() as conn:
+        _insert_cycle(
+            conn,
+            cycle_id="wdn:2026-08-19",
+            resolved_expiry_date="2026-08-21",
+            state="FAILED",
+        )
+    with database.transaction() as conn, pytest.raises(sqlite3.IntegrityError):
+        _insert_cycle(
+            conn,
+            cycle_id="wdn:2026-08-19-retry",
+            resolved_expiry_date="2026-08-21",
+        )
+
+
+def test_strategy_cycle_legs_check_constraint_accepts_every_positional_role(
+    tmp_path: Path,
+):
+    from common.persistence.migrations import VERSIONS_DIR
+
+    database = Database(tmp_path / "operational" / "positional_options.db")
+    MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
+
+    with database.transaction() as conn:
+        _insert_cycle(conn)
+        for role, option_type, leg_id in (
+            ("HEDGE_PUT", "PE", "leg-1"),
+            ("HEDGE_CALL", "CE", "leg-2"),
+            ("SHORT_PUT", "PE", "leg-3"),
+            ("SHORT_CALL", "CE", "leg-4"),
+        ):
+            conn.execute(
+                "INSERT INTO strategy_cycle_legs (runtime_id, strategy_id, execution_mode, "
+                "cycle_id, leg_id, leg_role, option_type, leg_sequence, state, created_at, "
+                "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'PENDING_CONTRACT', 'now', 'now')",
+                (
+                    "positional_options",
+                    "weekly_delta_neutral",
+                    "paper",
+                    "wdn:2026-08-19",
+                    leg_id,
+                    role,
+                    option_type,
+                ),
+            )
+    with database.connect() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM strategy_cycle_legs").fetchone()[0]
+    assert count == 4
+
+
+def test_cycle_position_bindings_enforce_one_position_per_cycle_security(tmp_path: Path):
+    from common.persistence.migrations import VERSIONS_DIR
+
+    database = Database(tmp_path / "operational" / "positional_options.db")
+    MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
+
+    with database.transaction() as conn:
+        conn.execute(
+            "INSERT INTO cycle_position_bindings (cycle_id, security_id, position_id, "
+            "created_at) VALUES ('wdn:2026-08-19', '54321', 1, 'now')"
+        )
+    with database.transaction() as conn, pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO cycle_position_bindings (cycle_id, security_id, position_id, "
+            "created_at) VALUES ('wdn:2026-08-19', '54321', 2, 'now')"
+        )

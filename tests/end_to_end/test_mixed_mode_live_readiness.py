@@ -91,6 +91,7 @@ _PAPER_EXECUTION_BLOCK = """
 
 PAPER_FIXTURE_YAML = f"""
 strategy_id: paper_fixture_mixed_mode
+runtime_id: {RUNTIME_ID}
 enabled: true
 mode: paper
 live_approved: false
@@ -107,8 +108,9 @@ parameters:
 {_PAPER_EXECUTION_BLOCK}
 """
 
-LIVE_FIXTURE_YAML = """
+LIVE_FIXTURE_YAML = f"""
 strategy_id: live_fixture_mixed_mode
+runtime_id: {RUNTIME_ID}
 enabled: true
 mode: live
 live_approved: true

@@ -13,6 +13,7 @@
 # regardless.
 
 strategy_id: straddle_920
+runtime_id: intraday_options
 # P1-3 correction: shipped disabled. Enabling for the first paper session
 # is a deliberate, explicit operator action, taken only after: (1) a
 # bounded, read-only, market-hours verification that vix_security_id "21"

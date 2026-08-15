@@ -115,23 +115,24 @@ def discover_strategy_options(
     """Every selectable strategy for one runtime group, status-labelled.
 
     ``conn=None`` means no database exists yet for this runtime (skips (2)
-    and (3) above — nothing to read). ``config_root=None`` means config-
-    based discovery is deliberately skipped: ``config/strategies/*.yaml``
-    carries no real per-runtime membership (the same "single-runtime
-    limitation" ``common.config.discover_enabled_strategies`` already
-    documents), so attributing every configured strategy to a stub runtime
-    with no real association mechanism — Positional Options, Intraday
-    Stocks, today — would show ``intraday_options``'s own strategies on a
-    page they have nothing to do with. Pass a real ``config_root`` only for
-    a runtime where "every configured strategy belongs to it" is already
-    the accepted, documented behaviour (``intraday_options`` today).
+    and (3) above — nothing to read). ``config_root=None`` skips config-based
+    discovery entirely — appropriate only when there genuinely is no
+    ``config/`` tree to read (a bare fixture, an early test). Whenever a real
+    ``config_root`` is passed, discovery is filtered to files that declare
+    exactly this ``runtime_id`` — every strategy carries one, required
+    (``common.config.models.StrategyConfig.runtime_id``), so a strategy
+    belonging to a different runtime group can no longer appear here by
+    accident. Before that field existed, passing a real ``config_root`` for a
+    stub runtime (Positional Options, Intraday Stocks) would have shown
+    ``intraday_options``'s own strategies on a page they had nothing to do
+    with — closed now, not merely worked around.
     """
     # settings is accepted (not yet used) for a future multi-runtime config
     # layering, matching the same forward-compatible shape every other
     # config-reading function in this package already takes.
     configured: dict[str, bool] = {}
     if config_root is not None:
-        for data in _raw_strategy_files(Path(config_root)):
+        for data in _raw_strategy_files(Path(config_root), runtime_id=runtime_id):
             strategy_id = data.get("strategy_id")
             if isinstance(strategy_id, str):
                 configured[strategy_id] = bool(data.get("enabled", False))

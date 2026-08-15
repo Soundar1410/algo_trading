@@ -1077,6 +1077,7 @@ def resolved_config_from_worker(config: WorkerConfig) -> Any:
         ),
         strategy=StrategyConfig(
             strategy_id=config.strategy_id,
+            runtime_id=config.runtime_id,
             enabled=config.strategy_enabled,
             mode=config.execution_mode,
             live_approved=config.strategy_live_approved,

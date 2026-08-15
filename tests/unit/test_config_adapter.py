@@ -48,6 +48,7 @@ _COMPLETE_LIVE_PREFLIGHT = LivePreflightConfig(
 def _cfg(**strategy_overrides) -> ResolvedConfig:
     strategy_kwargs = {
         "strategy_id": "io_fixture_v1",
+        "runtime_id": "intraday_options",
         "enabled": True,
         "engine": EngineKind.TRADING_ENGINE,
         "parameters": {"instrument": "NIFTY", "security_id": "99926000"},

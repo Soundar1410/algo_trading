@@ -66,6 +66,7 @@ def _resolved(
         ),
         strategy=StrategyConfig(
             strategy_id="st01",
+            runtime_id="intraday_options",
             enabled=True,
             mode=mode,
             live_approved=True,
@@ -87,7 +88,12 @@ def test_live_mode_without_live_quantity_lots_is_refused():
 
 def test_live_quantity_lots_must_be_positive():
     with pytest.raises(ValidationError):
-        StrategyConfig(strategy_id="st01", mode=ExecutionMode.LIVE, live_quantity_lots=0)
+        StrategyConfig(
+            strategy_id="st01",
+            runtime_id="intraday_options",
+            mode=ExecutionMode.LIVE,
+            live_quantity_lots=0,
+        )
 
 
 def test_live_quantity_lots_is_a_field_distinct_from_paper_sizing():

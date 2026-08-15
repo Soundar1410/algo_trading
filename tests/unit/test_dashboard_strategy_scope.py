@@ -54,7 +54,8 @@ def test_a_configured_strategy_with_no_trades_appears_as_stopped(
     config_root = tmp_path / "config"
     _write(
         config_root / "strategies" / "brand_new.yaml",
-        "strategy_id: brand_new\nenabled: true\nmode: paper\nlive_approved: false\n",
+        "strategy_id: brand_new\nruntime_id: intraday_options\n"
+        "enabled: true\nmode: paper\nlive_approved: false\n",
     )
     conn = _ro(database_path)
     options = discover_strategy_options(conn, config_root, RUNTIME_ID)
@@ -72,7 +73,8 @@ def test_a_running_strategy_appears_as_running(
     config_root = tmp_path / "config"
     _write(
         config_root / "strategies" / "st01.yaml",
-        "strategy_id: st01\nenabled: true\nmode: paper\nlive_approved: false\n",
+        "strategy_id: st01\nruntime_id: intraday_options\n"
+        "enabled: true\nmode: paper\nlive_approved: false\n",
     )
     session = repository.open_session(
         runtime_id=RUNTIME_ID, strategy_id="st01", execution_mode=ExecutionMode.PAPER,
@@ -98,7 +100,8 @@ def test_a_disabled_strategy_appears_as_disabled(
     config_root = tmp_path / "config"
     _write(
         config_root / "strategies" / "disabled_strategy.yaml",
-        "strategy_id: disabled_strategy\nenabled: false\nmode: paper\nlive_approved: false\n",
+        "strategy_id: disabled_strategy\nruntime_id: intraday_options\n"
+        "enabled: false\nmode: paper\nlive_approved: false\n",
     )
     conn = _ro(database_path)
     options = discover_strategy_options(conn, config_root, RUNTIME_ID)
@@ -154,8 +157,8 @@ def test_a_strategy_needs_no_dashboard_code_change_to_appear(
     config_root = tmp_path / "config"
     _write(
         config_root / "strategies" / "totally_new_strategy_xyz.yaml",
-        "strategy_id: totally_new_strategy_xyz\nenabled: true\nmode: paper\n"
-        "live_approved: false\n",
+        "strategy_id: totally_new_strategy_xyz\nruntime_id: intraday_options\n"
+        "enabled: true\nmode: paper\nlive_approved: false\n",
     )
     conn = _ro(database_path)
     options = discover_strategy_options(conn, config_root, RUNTIME_ID)

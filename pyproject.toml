@@ -55,9 +55,19 @@ algo-intraday-options = "runtimes.intraday_options.__main__:main"
 algo-dashboard = "scripts.start_dashboard:main"
 
 [project.optional-dependencies]
-# NOT installed by default: py_lets_be_rational can be awkward to build on some
-# macOS/Python combinations. Add only when a named strategy needs Greek
-# estimation between Dhan Option Chain snapshots (spec section 17).
+# weekly_delta_neutral (strategy-weekly-delta-neutral branch) is the first named
+# strategy that needs Greek estimation between Dhan Option Chain snapshots (spec
+# section 17), so this is no longer speculative — but it stays a genuine "extra"
+# rather than a core dependency: the intraday-only platform (ema_cross_9_21_buy,
+# straddle_920) never needs it. Verified on this Mac (arm64/cp311) to resolve to
+# prebuilt wheels with no compilation via its `vollib` dependency, compatible
+# with the pandas<3.0/numpy<2.4 pins above. Pinned exactly in requirements.lock
+# (the documented install path installs it unconditionally, extras marker or
+# not) so `common.greeks.model`'s fallback path is always exercised in CI.
+# common.greeks.model imports the underlying `vollib` package directly (py_vollib
+# itself is a deprecated compatibility shim over it, per its own DeprecationWarning)
+# — `py_vollib` is named here only because it is the dependency that pulls `vollib`
+# in; nothing in this repository calls `py_vollib.*` at runtime.
 greeks = ["py_vollib>=1.0"]
 
 dev = [
@@ -121,4 +131,12 @@ ignore_missing_imports = true
 # than trusting this comment.
 [[tool.mypy.overrides]]
 module = ["pandas_ta_classic.*"]
+ignore_missing_imports = true
+
+# vollib (the py_vollib extra's actual runtime dependency — see the extras
+# comment above) ships no py.typed marker. Scoped to that package alone: its
+# only importer is common/greeks/model.py, the one place this repository is
+# permitted to call a third-party option-pricing function from.
+[[tool.mypy.overrides]]
+module = ["vollib.*"]
 ignore_missing_imports = true

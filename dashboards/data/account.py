@@ -341,14 +341,25 @@ class LiveGateMatrix:
         return sum(1 for row in self.rows if row.strategy_enabled)
 
 
-def _raw_strategy_files(config_root: Path) -> list[dict[str, object]]:
+def _raw_strategy_files(
+    config_root: Path, *, runtime_id: str | None = None
+) -> list[dict[str, object]]:
     """Every ``config/strategies/*.yaml`` file's own ``strategy_id``/
-    ``enabled``/``mode``/``live_approved`` fields, parsed directly rather
-    than through :func:`~common.config.discover_enabled_strategies` — that
-    function returns only *enabled* strategies (by design; see its own
+    ``runtime_id``/``enabled``/``mode``/``live_approved`` fields, parsed
+    directly rather than through :func:`~common.config.discover_enabled_strategies`
+    — that function returns only *enabled* strategies (by design; see its own
     docstring), so it cannot answer "how many are disabled" either. A file
     that fails to parse is skipped, not guessed at — this table is a
-    completeness view, not a safety gate."""
+    completeness view, not a safety gate.
+
+    ``runtime_id``, when given, filters to files declaring exactly that
+    ``runtime_id`` — every strategy now carries one, required
+    (``common.config.models.StrategyConfig.runtime_id``), so this is real
+    per-runtime membership, not a naming convention. ``None`` (the default)
+    returns every configured strategy regardless of runtime, for a caller
+    that itself iterates per runtime (see :func:`load_live_gate_matrix`,
+    which always passes its own ``runtime_id``).
+    """
     strategies_dir = config_root / "strategies"
     if not strategies_dir.is_dir():
         return []
@@ -359,6 +370,8 @@ def _raw_strategy_files(config_root: Path) -> list[dict[str, object]]:
         except (yaml.YAMLError, OSError):
             continue
         if not isinstance(data, dict) or "strategy_id" not in data:
+            continue
+        if runtime_id is not None and data.get("runtime_id") != runtime_id:
             continue
         rows.append(data)
     return rows
@@ -386,7 +399,7 @@ def load_live_gate_matrix(
         return ConfigUnavailable(str(exc))
 
     rows = []
-    for data in _raw_strategy_files(config_root):
+    for data in _raw_strategy_files(config_root, runtime_id=runtime_id):
         strategy_id = str(data.get("strategy_id"))
         enabled = bool(data.get("enabled", False))
         mode = str(data.get("mode", "paper"))
