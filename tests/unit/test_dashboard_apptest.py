@@ -180,7 +180,7 @@ def test_strategy_comparison_multiselect_defaults_to_every_strategy(
     compare_box = at.multiselect(key="io_compare_strategies")
     assert set(compare_box.value) == {"alpha_strategy", "beta_strategy"}
 
-    comparison_tables = at.tabs[5].get("dataframe")
+    comparison_tables = at.tabs[6].get("dataframe")
     assert comparison_tables
     strategies_shown = set(comparison_tables[0].value["Strategy"])
     assert strategies_shown == {"alpha_strategy", "beta_strategy"}
@@ -218,6 +218,7 @@ def test_intraday_options_page_loads_and_every_tab_is_present(project_root: Path
     assert tab_labels == [
         "Overview",
         "Live Positions",
+        "Baskets",
         "Orders & Fills",
         "Closed Trades",
         "Performance",
@@ -266,3 +267,132 @@ def test_no_page_writes_to_the_database(project_root: Path, page: str):
     after_sessions = _row_count(database_path, "runtime_sessions")
     assert after_migrations == before
     assert after_sessions == 0
+
+
+@pytest.fixture
+def project_root_with_a_straddle_920_basket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """One straddle_920 basket with an open CE leg and a closed (adjusted)
+    PE leg — enough to exercise the Baskets tab's drill-down for real."""
+    _write(
+        tmp_path / "config" / "global.yaml",
+        "global:\n  live_trading_enabled: false\n  timezone: Asia/Kolkata\n"
+        "runtime_defaults:\n  enabled: false\n  live_execution_allowed: false\n"
+        "strategy_defaults:\n  enabled: false\n  mode: paper\n  live_approved: false\n",
+    )
+    _write(
+        tmp_path / "config" / "runtimes" / "intraday_options.yaml",
+        "runtime_id: intraday_options\nenabled: true\nlive_execution_allowed: false\n",
+    )
+    _write(
+        tmp_path / "config" / "strategies" / "straddle_920.yaml",
+        "strategy_id: straddle_920\nenabled: true\nmode: paper\nlive_approved: false\n"
+        "engine: multi_leg_engine\n",
+    )
+
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from common.config.models import ExecutionMode
+    from common.execution import ExecutionRepository
+
+    database_path = tmp_path / "data" / "operational" / "intraday_options.db"
+    database = Database(database_path)
+    MigrationRunner(database).run_pending()
+    repository = ExecutionRepository(database)
+    ist = ZoneInfo("Asia/Kolkata")
+    trading_date = datetime.now(ist).date().isoformat()
+    basket_id = f"straddle_920:{trading_date}"
+
+    repository.upsert_strategy_basket(
+        runtime_id="intraday_options",
+        strategy_id="straddle_920",
+        execution_mode=ExecutionMode.PAPER,
+        trading_date=trading_date,
+        basket_id=basket_id,
+        lifecycle_state="OPEN",
+        entries_consumed=True,
+        day_blocked_reason=None,
+        adjustment_count=1,
+        pending_replacement_role=None,
+        pending_replacement_state=None,
+        original_combined_basis=195.0,
+        square_off_state="PENDING",
+    )
+    repository.upsert_strategy_leg(
+        runtime_id="intraday_options",
+        strategy_id="straddle_920",
+        execution_mode=ExecutionMode.PAPER,
+        trading_date=trading_date,
+        basket_id=basket_id,
+        leg_id=f"{basket_id}:PE:1",
+        leg_role="PE",
+        leg_sequence=1,
+        is_replacement=False,
+        replaces_leg_id=None,
+        security_id="SIM:24000:PE",
+        symbol="NIFTY 24000 PE",
+        strike=24000.0,
+        expiry="2026-08-21",
+        lot_size=75,
+        side="SELL",
+        quantity=750,
+        entry_price=95.0,
+        entry_time=f"{trading_date}T09:21:00",
+        entry_correlation_id="corr_pe_entry",
+        exit_price=200.0,
+        exit_time=f"{trading_date}T09:30:00",
+        exit_reason="ADJUSTMENT",
+        realized_gross_pnl=-78750.0,
+        state="CLOSED",
+    )
+    repository.upsert_strategy_leg(
+        runtime_id="intraday_options",
+        strategy_id="straddle_920",
+        execution_mode=ExecutionMode.PAPER,
+        trading_date=trading_date,
+        basket_id=basket_id,
+        leg_id=f"{basket_id}:CE:1",
+        leg_role="CE",
+        leg_sequence=1,
+        is_replacement=False,
+        replaces_leg_id=None,
+        security_id="SIM:24000:CE",
+        symbol="NIFTY 24000 CE",
+        strike=24000.0,
+        expiry="2026-08-21",
+        lot_size=75,
+        side="SELL",
+        quantity=750,
+        entry_price=100.0,
+        entry_time=f"{trading_date}T09:21:00",
+        entry_correlation_id="corr_ce_entry",
+        exit_price=None,
+        exit_time=None,
+        exit_reason=None,
+        realized_gross_pnl=None,
+        state="OPEN",
+    )
+
+    monkeypatch.setenv("PROJECT_ROOT", str(tmp_path))
+    return tmp_path
+
+
+def test_the_baskets_tab_shows_a_basket_and_its_legs(
+    project_root_with_a_straddle_920_basket: Path,
+):
+    at = AppTest.from_file(str(DASHBOARDS_DIR / "intraday_options.py"), default_timeout=30)
+    at.run()
+    assert list(at.exception) == []
+
+    strategy_box = at.selectbox(key="io_strategy")
+    label = next(opt for opt in strategy_box.options if "straddle_920" in opt)
+    strategy_box.select(label).run()
+    assert list(at.exception) == []
+
+    baskets_tab = at.tabs[2]
+    tables = baskets_tab.get("dataframe")
+    assert tables, "the Baskets tab rendered no leg table for a real basket/leg fixture"
+    rendered_roles = {row["Role"] for table in tables for row in table.value.to_dict("records")}
+    assert rendered_roles == {"CE", "PE"}

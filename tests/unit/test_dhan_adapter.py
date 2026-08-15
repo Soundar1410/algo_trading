@@ -196,17 +196,30 @@ def test_a_failure_after_a_successful_connect_is_logged_as_a_connection_failure(
     connection drop, not a bad credential/entitlement -- logged distinctly."""
     import dhanhq.marketfeed as marketfeed_module
 
+    class _FakeWS:
+        async def recv(self) -> bytes:
+            return b"benign-non-tick-frame"
+
     class _ConnectsOnceThenDropsFeed:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
+            import asyncio
+
             self.calls = 0
             self.server_disconnection = lambda data: None
+            # _receive_with_timeout reaches .loop/.ws/.process_data directly
+            # (the same shape MarketFeed.get_instrument_data() itself uses) —
+            # a real loop plus a minimal fake socket, so it drives the real
+            # asyncio.wait_for path rather than needing get_data() at all.
+            self.loop = asyncio.new_event_loop()
+            self.ws = _FakeWS()
+            self.data: object = None
 
         def run_forever(self) -> None:
             self.calls += 1
             if self.calls > 1:
                 raise RuntimeError("boom: dropped")
 
-        def get_data(self) -> None:
+        def process_data(self, response: object) -> None:
             return None  # a benign non-tick frame
 
     monkeypatch.setattr(marketfeed_module, "MarketFeed", _ConnectsOnceThenDropsFeed)
@@ -220,6 +233,59 @@ def test_a_failure_after_a_successful_connect_is_logged_as_a_connection_failure(
     assert any("dhan feed connected and subscribed" in m for m in messages)
     assert any("dhan feed connection failed" in m for m in messages)
     assert not any("connect/authenticate/subscribe failed" in m for m in messages)
+
+
+# --------------------------- on_idle: the dynamic-subscription wake fix
+def test_start_calls_on_idle_on_a_genuinely_silent_socket(monkeypatch):
+    """The adapter-facing half of the dynamic-subscription fix, proven
+    against a real ``asyncio`` loop: a socket that never delivers a frame at
+    all must still wake the loop on its own, on the bounded poll interval —
+    not depend on a tick that will never come. Mirrors the installed SDK's
+    own shape (``self.loop.run_until_complete(coro)``,
+    ``await self.ws.recv()``) exactly, not a simplified stand-in."""
+    import asyncio
+
+    import dhanhq.marketfeed as marketfeed_module
+
+    from common.market_data import dhan as dhan_module
+
+    monkeypatch.setattr(dhan_module, "IDLE_POLL_SECONDS", 0.02)
+
+    class _NeverDeliversWS:
+        async def recv(self) -> bytes:
+            # Outlives every timeout this test uses; asyncio.wait_for cancels
+            # this cleanly rather than letting it complete.
+            await asyncio.sleep(10.0)
+            return b"unreachable"
+
+    class _SilentSocketFeed:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.server_disconnection = lambda data: None
+            self.loop = asyncio.new_event_loop()
+            self.ws = _NeverDeliversWS()
+            self.data: object = None
+            self._connected = False
+
+        def run_forever(self) -> None:
+            self._connected = True  # idempotent; models an already-open socket
+
+        def process_data(self, response: object) -> None:  # pragma: no cover - unreachable
+            return None
+
+    monkeypatch.setattr(marketfeed_module, "MarketFeed", _SilentSocketFeed)
+
+    adapter = _adapter()
+    adapter.subscribe(["13"])
+    idle_calls: list[int] = []
+
+    def _on_idle() -> None:
+        idle_calls.append(1)
+        if len(idle_calls) >= 3:
+            adapter.request_stop()
+
+    adapter.start(lambda tick: None, on_idle=_on_idle)
+
+    assert len(idle_calls) >= 3, "on_idle must fire repeatedly with zero incoming frames"
 
 
 # ---------------------------------------- the synthesised fixture's shape

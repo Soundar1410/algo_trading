@@ -350,7 +350,7 @@ class _LiveishAdapter:
     def stop(self) -> None:
         self.request_stop()
 
-    def start(self, on_tick) -> None:
+    def start(self, on_tick, *, on_idle=None) -> None:
         self._running = True
         for tick in self._ticks:
             if not self._running:

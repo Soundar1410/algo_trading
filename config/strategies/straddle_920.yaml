@@ -1,0 +1,119 @@
+# straddle_920 — the 9:20 Morning Straddle, exact legacy port. Full spec:
+# strategies/intraday_options/straddle_920/MORNING_STRADDLE_ALGO_TRADING_SPEC.md.
+# Do not copy config/strategies/skeleton_fixture.yaml as a template.
+#
+# PAPER ONLY at delivery. Setting mode to `live` will NOT start a live
+# strategy: runtimes/intraday_options/config_adapter.py's
+# _build_multi_leg_engine_worker_config refuses mode: live outright for the
+# multi-leg engine (see that function and multi_leg_engine_worker.py's own
+# docstring — the exact legacy partial-execution behaviour can leave one open
+# short option leg, and any live proposal needs a separate written risk
+# review this repository has not done). The broker factory's own live gate
+# (common.config.models.effective_live_gate) would refuse it a second time
+# regardless.
+
+strategy_id: straddle_920
+enabled: true
+
+mode: paper
+live_approved: false
+
+# The real discriminator (straddle_920 port): config_adapter.py now routes by
+# EngineKind, additively — this strategy is the first (and, at delivery, only)
+# consumer of the multi_leg_engine branch. ema_cross_9_21_buy.yaml's own
+# `engine: trading_engine` line, and that whole routing path, are untouched.
+engine: multi_leg_engine
+
+risk:
+  # Spec section 5/9.2/12.3/13.1: new entries and adjustment/replacement
+  # permitted 09:15 -> 15:00; hard square-off at 15:15. One configured pair,
+  # not two independently configured times that can drift apart — see
+  # common.engine.config.SessionConfig.from_square_off_policy.
+  entry_start: "09:15"
+  entry_cutoff: "15:00"
+  square_off_at: "15:15"
+
+parameters:
+  # ------------------------------------------------------- required, both paths
+  instrument: NIFTY
+  # NIFTY index security id (common.market_data.scrip_master.INDEX_REGISTRY).
+  security_id: "13"
+
+  # ------------------------------------------------- engine-path discriminator
+  strategy_ref: "strategies.intraday_options.straddle_920.strategy:Straddle920Strategy"
+
+  # Straddle920Strategy's own constructor kwargs (spec sections 4, 9, 12, 13).
+  # Travels through config_adapter.py verbatim.
+  strategy_kwargs:
+    lots_per_leg: 10
+    entry_evaluation_time: "09:20"
+    last_entry_time: "15:00"
+    vix_threshold: 20.0
+    leg_adjustment_multiplier: 2.0
+    max_adjustments_per_day: 1
+    # Spec section 13.2: 3% x capital_base (Rs 20,00,000) = Rs 60,000,
+    # precomputed and passed through as the already-computed absolute rupee
+    # amount — the strategy's own risk formulas compare gross P&L against
+    # this directly (spec's exact legacy formula), never against a percentage
+    # recomputed at runtime, and never against net (post-charge) P&L.
+    daily_loss_amount: 60000.0
+    combined_stop_percentage: 0.30
+    profit_target_percentage: 0.50
+    # Manually configured news-blackout trading dates (spec section 9.4,
+    # "YYYY-MM-DD"). Empty by default; add real dates here as they are known.
+    blackout_dates: []
+
+  # ------------------------------------------------------------- candle/session
+  timeframe: "5m"
+
+  # --------------------------------------------------------- option resolution
+  # "dhan" resolves real NIFTY weekly CE/PE contracts (strike, expiry AND lot
+  # size) from the exchange's own daily instrument master at runtime — spec
+  # section 7. Never hardcode a lot size, expiry or security id.
+  contract_resolver: dhan
+  strike_step: 50
+  # Fallback lot size, used ONLY if contract_resolver is switched to
+  # "simulated". Ignored entirely by the "dhan" resolver above.
+  lot_size: 75
+  expiry: null
+  index_security_id: ""
+  index_segment: ""
+  fno_segment: ""
+  scrip_master_cache_dir: ""
+
+  # --------------------------------------------------------------- India VIX
+  # Auxiliary market-data-only instrument (spec section 6/9.3) — resolved as a
+  # common.market_data.instruments.MarketDataInstrument, never a fake
+  # IndexMeta.fno_segment (VIX has no option chain). security_id "21" is
+  # corroborated independently in two places in the legacy Trading_Automation
+  # reference tree's own "verified constants" (framework/market_data/
+  # scrip_master.py and stock_intraday_orb/data/scrip_master.py both record
+  # INDIAVIX security_id="21" on IDX_I) — the same category of fact as
+  # NIFTY's own "13"/BANKNIFTY's "25" already in this repo's INDEX_REGISTRY,
+  # not a hardcoded option contract id. Re-confirm against the live Dhan
+  # instrument master before the first paper run that actually streams VIX
+  # (a wrong id only degrades the VIX filter to its documented fail-open
+  # "unavailable" path — spec section 9.3 — never a wrong trade).
+  vix_security_id: "21"
+  vix_index_segment: "IDX_I"
+
+  # ----------------------------------------------------- strategy's own risk
+  # straddle_920 computes and durably persists its own R/U/T/bases (spec
+  # sections 11-13) inside its Basket state — the generic engine-level daily
+  # guard (common.engine.daily_guard.DailyRiskGuard) stays OFF for this
+  # strategy so there is exactly one daily-loss decider, matching the exact
+  # legacy formula above rather than a second, differently-shaped one.
+  capital_base: 2000000
+  daily_max_loss_pct: null
+
+  paper_execution:
+    slippage:
+      options:
+        mode: ticks
+        # Spec section 10: zero slippage for exact legacy parity.
+        market_order_ticks: 0
+    submission_latency_ms: 0
+    tick_size: 0.05
+    allow_ltp_fallback: true
+    ltp_fallback_extra_ticks: 0
+    max_quote_age_ms: 2000

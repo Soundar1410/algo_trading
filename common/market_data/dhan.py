@@ -90,7 +90,7 @@ from __future__ import annotations
 
 import struct
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -159,6 +159,20 @@ FULL_MODE = 21
 #: subscription rather than inside the SDK's batching, where the message names no
 #: instrument.
 FEED_MODES = frozenset({TICKER_MODE, QUOTE_MODE, FULL_MODE})
+
+#: How long :meth:`DhanMarketFeedAdapter._receive_with_timeout` waits for the
+#: next frame before giving up and calling ``on_idle`` instead. Bounds how
+#: long a dynamic subscription request can wait with zero incoming ticks —
+#: the fix for the class of failure recorded against commit bcd2d5a and the
+#: straddle_920 port's own correction record: "subscription becomes pending;
+#: no unrelated tick arrives; option subscription is never sent". One second
+#: is comfortably below any operational alarm threshold (the supervisor's own
+#: ``STUCK_SUBSCRIPTION_SECONDS = 30.0``, kept as defence-in-depth on top of
+#: this) while keeping the SDK's own liveness ping
+#: (``MarketFeed.connect()``'s ``else: await self.ws.ping()`` branch, run
+#: once per outer-loop iteration) to a modest, steady cadence rather than
+#: firing on every tick during an active session.
+IDLE_POLL_SECONDS = 1.0
 
 
 def _is_feed_mode(value: object) -> bool:
@@ -468,12 +482,34 @@ class DhanMarketFeedAdapter:
         return [(self._segment_for(sid), sid, self._mode_for(sid)) for sid in sorted(security_ids)]
 
     # ---------------------------------------------------------------- lifecycle
-    def start(self, on_tick: TickCallback) -> None:
+    def start(
+        self,
+        on_tick: TickCallback,
+        *,
+        on_idle: Callable[[], None] | None = None,
+    ) -> None:
         """Connect and pump ticks into ``on_tick`` until stopped.
 
         Blocks for the life of the feed, and the calling thread becomes the owner
         of the SDK's event loop: only it may close the socket. Another thread
         stops this loop with :meth:`request_stop`, never :meth:`stop`.
+
+        ``on_idle`` (optional): called on **this** thread — the loop's own,
+        never a foreign one — every :data:`IDLE_POLL_SECONDS` while nothing
+        arrives, and after every non-tick frame. This is the real fix for a
+        dynamic subscription (:class:`~common.feed.hub.SharedFeedHub.
+        request_subscription`) needing to be applied without waiting for an
+        unrelated tick: rather than call ``self._feed.get_data()``, which
+        blocks indefinitely on ``ws.recv()`` with no way to interleave other
+        work, this reimplements that one call
+        (:meth:`_receive_with_timeout`) with a bounded ``asyncio.wait_for``,
+        so the loop wakes on its own — on the same thread, through the same
+        SDK-owned event loop ``get_data()`` itself drives — even during a
+        completely silent market. The hub wires this to its own
+        ``_apply_pending_subscriptions``, so any subscription a worker
+        requested (via the existing thread-safe queue — no other thread ever
+        touches this adapter directly) is applied within one poll interval
+        regardless of tick arrival, not merely alarmed about after 30 seconds.
         """
         if not self._security_ids:
             raise DhanFeedError("Refusing to start the Dhan feed with no subscriptions")
@@ -530,10 +566,16 @@ class DhanMarketFeedAdapter:
                         "dhan feed connected and subscribed instruments=%d",
                         len(self._security_ids),
                     )
-                payload = self._feed.get_data()
+                payload = self._receive_with_timeout(IDLE_POLL_SECONDS)
+                if payload is None:
+                    if on_idle is not None:
+                        on_idle()
+                    continue
                 tick = self.normalise(payload)
                 if tick is not None:
                     on_tick(tick)
+                elif on_idle is not None:
+                    on_idle()
         finally:
             self._running = False
             # This thread owns the SDK's event loop, so this thread closes the
@@ -543,6 +585,41 @@ class DhanMarketFeedAdapter:
             # docstring of common.market_data.adapter.
             self.stop()
             self._owner_thread = None
+
+    def _receive_with_timeout(self, timeout: float) -> object:
+        """Reimplements ``MarketFeed.get_data()``
+        (``self.loop.run_until_complete(self.get_instrument_data())``) with a
+        bounded wait, so ``start()``'s loop wakes on its own rather than
+        blocking indefinitely on ``ws.recv()``. Returns ``None`` on a timeout
+        (nothing arrived), never raises for that case.
+
+        Reaches ``self._feed.ws``/``.process_data`` directly — the same
+        controlled reliance on SDK internals :meth:`_install_disconnect_probe`
+        already has, and the exact two calls ``get_instrument_data()`` itself
+        makes (``await self.ws.recv()``, ``self.process_data(response)``) —
+        nothing more.
+        """
+        import asyncio
+
+        feed = self._feed
+        assert feed is not None
+
+        async def _recv() -> object:
+            ws = feed.ws
+            if ws is None:
+                # Between reconnect attempts: nothing to receive from yet.
+                # Treated as idle rather than an error — connect() itself
+                # decides whether/when to reconnect, on its own next call.
+                await asyncio.sleep(min(timeout, 0.05))
+                return None
+            try:
+                response = await asyncio.wait_for(ws.recv(), timeout=timeout)
+            except TimeoutError:
+                return None
+            feed.data = feed.process_data(response)
+            return feed.data
+
+        return feed.loop.run_until_complete(_recv())
 
     def request_stop(self) -> None:
         """Ask the feed loop to finish. Safe from any thread; closes nothing.

@@ -14,7 +14,7 @@ means the hub's fan-out logic is tested against clean input.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from pathlib import Path
 
@@ -127,9 +127,24 @@ class RecordedFeedAdapter:
     def stop(self) -> None:
         self._running = False
 
-    def start(self, on_tick: TickCallback) -> None:
-        """Replay the tape once, in order, to ``on_tick``."""
+    def start(
+        self,
+        on_tick: TickCallback,
+        *,
+        on_idle: Callable[[], None] | None = None,
+    ) -> None:
+        """Replay the tape once, in order, to ``on_tick``.
+
+        ``on_idle`` (optional): a deterministic replay has no real "idle"
+        period, so this is called once before replay begins and once after
+        it ends — enough for a caller relying on the Protocol's contract (see
+        :class:`~common.market_data.adapter.MarketFeedAdapter`) to service
+        pending work at least once per run, without inventing a fake
+        wall-clock wait a replay-based test would then have to account for.
+        """
         self._running = True
+        if on_idle is not None:
+            on_idle()
         for tick in self._ticks:
             if not self._running:
                 break
@@ -141,6 +156,8 @@ class RecordedFeedAdapter:
             self.delivered_count += 1
             on_tick(tick)
         self._running = False
+        if on_idle is not None:
+            on_idle()
 
     def _is_stale(self, tick: Tick) -> bool:
         """Reject a repeat or a backwards tick, counting each separately."""

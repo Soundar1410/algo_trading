@@ -46,14 +46,30 @@ The engine picks an option contract at runtime and subscribes to it mid-session,
 but the hub subscribes a fixed union at :meth:`start`. :meth:`request_subscription`
 closes that gap the same way Part 1's ``request_stop()`` and Part 2b-i's
 ``request_square_off()`` close theirs: it appends to a queue and returns, never
-touching the adapter. The actual ``adapter.subscribe()`` happens at the top of
-:meth:`on_tick`, on the thread that owns the connection.
+touching the adapter. The actual ``adapter.subscribe()`` happens on
+:meth:`_apply_pending_subscriptions`, on the thread that owns the connection —
+never from the calling thread.
 
 That restraint is deliberate. ``dhanhq`` 2.2.0's ``subscribe_symbols`` does route
 through ``asyncio.run_coroutine_threadsafe`` and so *would* tolerate a
 cross-thread call, unlike ``close_connection`` — but relying on that would put
 this repository's ownership rule back in the SDK's hands, where an upgrade could
-quietly revoke it.
+quietly revoke it. This hub never takes that dependency: every thread other than
+the feed-owning one only ever touches the thread-safe ``deque`` below.
+
+**Applied without depending on an unrelated tick (straddle_920 port
+correction).** Before this fix, ``_apply_pending_subscriptions`` ran only at
+the top of :meth:`on_tick` — so a request made while the market stream was
+silent (or an instrument's own first tick simply hadn't arrived yet) sat
+unapplied for as long as the stream stayed quiet, the exact class of failure
+recorded against commit ``bcd2d5a`` and reproducible again for any dynamically
+selected contract. It is now **also** wired as the adapter's ``on_idle``
+callback (see :meth:`~common.market_data.dhan.DhanMarketFeedAdapter.start`),
+invoked on this same feed-owning thread on a bounded poll cadence
+(:data:`~common.market_data.dhan.IDLE_POLL_SECONDS`, 1 second) regardless of
+whether any tick arrives — a genuine wake-up, not merely the supervisor's
+``STUCK_SUBSCRIPTION_SECONDS`` alarm, which stays wired as defence-in-depth on
+top of this, not as the mechanism itself.
 
 The hub deliberately does no strategy work on the callback path. It validates,
 aggregates and publishes — anything slower belongs in a worker.
@@ -153,7 +169,17 @@ class SharedFeedHub:
         self.ticks_published = 0
         self.gap_candles_discarded = 0
         self.subscriptions_applied = 0
+        #: A pending subscription the adapter rejected (e.g. a genuine
+        #: conflicting-segment reassignment) — observable rather than a silent
+        #: drop, and isolated per-request so one bad request cannot take the
+        #: whole feed down. See :meth:`_apply_pending_subscriptions`.
+        self.subscriptions_rejected = 0
         self.last_tick_at: datetime | None = None
+        #: Monotonic timestamp of the last time a pending subscription was
+        #: actually applied (successfully or rejected) — distinct from
+        #: ``last_tick_at``, so a caller/test can prove application happened
+        #: on an idle poll with no tick at all. ``None`` until the first one.
+        self.last_subscription_service_at: float | None = None
 
     # ------------------------------------------------------------ wiring
     def register(self, channel: WorkerChannel) -> None:
@@ -232,7 +258,14 @@ class SharedFeedHub:
         # position on startup, say — is applied here rather than waiting for a
         # tick that may be a minute away. This is still the feed thread.
         self._apply_pending_subscriptions()
-        self._adapter.start(self.on_tick)
+        # ``on_idle``: the real fix for a request made mid-session, while the
+        # market stream is silent. The adapter calls this on the same
+        # feed-owning thread on a bounded poll cadence regardless of whether
+        # any tick arrives — see ``DhanMarketFeedAdapter.start``'s own
+        # docstring. A minimal test double whose ``start`` does not accept
+        # ``on_idle`` at all is not supported here; every adapter this hub
+        # ships against (Dhan, recorded, reconnecting) does.
+        self._adapter.start(self.on_tick, on_idle=self._apply_pending_subscriptions)
 
     def request_stop(self) -> None:
         """Ask the feed to finish, without flushing. Safe from another thread.
@@ -304,13 +337,14 @@ class SharedFeedHub:
         :meth:`request_stop` never closes the connection: the thread that called
         ``start()`` owns the loop, and this one may be a supervisor thread or —
         via the control queue — another process entirely. The request is applied
-        at the top of :meth:`on_tick`, which the feed's own loop invokes.
-
-        **Residual, and it is the shape of limitation 13.** A request made while
-        no ticks are arriving is not applied until one does. :meth:`start` drains
-        once before the adapter loop, and during market hours frames are
-        continuous, so the exposure is a silent feed — which is already an
-        incident by itself.
+        by :meth:`_apply_pending_subscriptions`, which the feed's own loop calls
+        both at the top of :meth:`on_tick` (a real tick) and as the adapter's
+        ``on_idle`` callback (a bounded poll, regardless of tick arrival — see
+        the module docstring's "Applied without depending on an unrelated tick"
+        section). A request is therefore applied within one poll interval
+        (:data:`~common.market_data.dhan.IDLE_POLL_SECONDS`, 1 second for the
+        live adapter) even on a completely silent market — no longer only "when
+        the next tick happens to arrive".
         """
         if self._pending_since is None:
             self._pending_since = time.monotonic()
@@ -330,7 +364,25 @@ class SharedFeedHub:
         return max(0.0, time.monotonic() - started)
 
     def _apply_pending_subscriptions(self) -> None:
-        """Drain the request queue into the adapter. **Feed thread only.**"""
+        """Drain the request queue into the adapter. **Feed thread only.**
+
+        Called from two places: at the top of :meth:`on_tick` (unchanged,
+        applies promptly on a real tick) and, since the dynamic-subscription
+        fix, as the adapter's ``on_idle`` callback — invoked on this same
+        thread on a bounded poll cadence regardless of whether any tick
+        arrives (see :meth:`~common.market_data.dhan.DhanMarketFeedAdapter.
+        start`). That is what makes a request applied without depending on an
+        unrelated tick a real, tested property rather than an alarm about its
+        absence.
+
+        Each request is applied **independently** — a rejection (a genuine
+        conflicting-segment reassignment; see
+        :meth:`~common.market_data.dhan.DhanMarketFeedAdapter.subscribe`) is
+        caught, counted in :attr:`subscriptions_rejected` and logged, rather
+        than left to propagate and tear down the whole feed thread over one
+        bad request while other, unrelated pending requests are still queued.
+        """
+        applied_any = False
         while True:
             try:
                 (
@@ -343,8 +395,9 @@ class SharedFeedHub:
                 # Drained. Clear the clock so the next request times from itself
                 # rather than from a request that has already been served.
                 self._pending_since = None
-                return
+                break
 
+            applied_any = True
             channel = next(
                 (c for c in self._channels if c.strategy_id == strategy_id),
                 None,
@@ -359,10 +412,23 @@ class SharedFeedHub:
             if channel.wants(security_id):
                 continue  # already routed to this worker
 
+            try:
+                # Union semantics in the adapter mean a second worker asking for
+                # an instrument the group already holds sends nothing to the
+                # broker.
+                self._adapter.subscribe([security_id], segment=segment, mode=mode)
+            except Exception:
+                self.subscriptions_rejected += 1
+                _log.exception(
+                    "subscription rejected strategy_id=%s security_id=%s segment=%s mode=%s",
+                    strategy_id,
+                    security_id,
+                    "default" if segment is None else segment,
+                    "default" if mode is None else mode,
+                )
+                continue
+
             channel.dynamic_ids.add(security_id)
-            # Union semantics in the adapter mean a second worker asking for an
-            # instrument the group already holds sends nothing to the broker.
-            self._adapter.subscribe([security_id], segment=segment, mode=mode)
             self.subscriptions_applied += 1
             _log.info(
                 "subscribed at runtime strategy_id=%s security_id=%s segment=%s mode=%s",
@@ -371,6 +437,8 @@ class SharedFeedHub:
                 "default" if segment is None else segment,
                 "default" if mode is None else mode,
             )
+        if applied_any:
+            self.last_subscription_service_at = time.monotonic()
 
     def drop_subscription(self, strategy_id: str, security_id: str) -> None:
         """Stop routing an instrument to one worker. **Feed thread only.**

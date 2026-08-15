@@ -76,8 +76,22 @@ class MarketFeedAdapter(Protocol):
         """
         ...
 
-    def start(self, on_tick: TickCallback) -> None:
-        """Begin delivering ticks to ``on_tick``."""
+    def start(self, on_tick: TickCallback, *, on_idle: Callable[[], None] | None = None) -> None:
+        """Begin delivering ticks to ``on_tick``.
+
+        ``on_idle`` (optional, keyword-only): called on the feed-owning
+        thread whenever the adapter wakes with nothing to deliver — a bounded
+        poll timeout for a live socket, or simply once for a deterministic
+        replay. This is what lets a caller (:class:`~common.feed.hub.
+        SharedFeedHub`) service pending work (a dynamic subscription request)
+        promptly, without depending on an unrelated tick ever arriving. An
+        adapter that never goes idle (a replay with ticks throughout) may
+        call it as rarely as once; the contract is only that it is called
+        from the same thread that calls ``on_tick``, on a bounded cadence
+        while the feed is otherwise quiet — never that it is called at any
+        particular rate. ``None`` (the default) means the caller does not
+        want it.
+        """
         ...
 
     def request_stop(self) -> None:

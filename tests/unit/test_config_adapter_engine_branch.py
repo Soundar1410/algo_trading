@@ -169,3 +169,115 @@ def test_malformed_strategy_ref_raises_config_error(tmp_path: Path):
 def test_execution_mode_paper_is_carried_through_for_the_engine_path(tmp_path: Path):
     worker = _build(_cfg(mode=ExecutionMode.PAPER, live_approved=False), tmp_path)
     assert worker.execution_mode is ExecutionMode.PAPER
+
+
+# --------------------------------------------- EngineKind routing (straddle_920)
+def test_the_trading_engine_kind_is_the_default_and_unaffected_by_the_new_branch(
+    tmp_path: Path,
+):
+    """``EngineKind`` defaults to ``TRADING_ENGINE`` on every existing strategy
+    config, ``ema_cross_9_21_buy.yaml`` included — the additive multi-leg
+    routing must not change one byte of what this produces."""
+    from common.config import EngineKind
+
+    worker = _build(_cfg(), tmp_path)
+    assert worker.engine is not None
+    assert worker.multi_leg_engine is None
+
+    explicit = _cfg(engine=EngineKind.TRADING_ENGINE)
+    worker_explicit = _build(explicit, tmp_path)
+    assert worker_explicit.engine == worker.engine
+    assert worker_explicit.multi_leg_engine is None
+
+
+def test_multi_leg_engine_kind_builds_a_multi_leg_worker_config(tmp_path: Path):
+    from common.config import EngineKind
+
+    cfg = _cfg(
+        strategy_id="straddle_920",
+        engine=EngineKind.MULTI_LEG_ENGINE,
+        parameters={
+            "strategy_ref": (
+                "strategies.intraday_options.straddle_920.strategy:Straddle920Strategy"
+            ),
+            "strategy_kwargs": {"lots_per_leg": 10},
+            "vix_security_id": "21",
+            "vix_index_segment": "IDX_I",
+        },
+    )
+    worker = _build(cfg, tmp_path)
+
+    assert worker.engine is None
+    assert worker.multi_leg_engine is not None
+    assert worker.multi_leg_engine.strategy_ref.endswith("Straddle920Strategy")
+    assert worker.multi_leg_engine.lots == 10
+    assert worker.multi_leg_engine.vix_security_id == "21"
+    assert worker.multi_leg_engine.vix_segment == "IDX_I"
+
+
+def test_multi_leg_engine_requires_a_strategy_ref(tmp_path: Path):
+    from common.config import EngineKind
+
+    cfg = _cfg(strategy_id="straddle_920", engine=EngineKind.MULTI_LEG_ENGINE, parameters={})
+    # _cfg's defaults already set strategy_ref to the EMA class; strip it.
+    cfg.strategy.parameters.pop("strategy_ref", None)
+    with pytest.raises(ConfigError, match="strategy_ref"):
+        _build(cfg, tmp_path)
+
+
+def test_multi_leg_engine_rejects_an_unknown_vix_segment(tmp_path: Path):
+    from common.config import EngineKind
+
+    cfg = _cfg(
+        strategy_id="straddle_920",
+        engine=EngineKind.MULTI_LEG_ENGINE,
+        parameters={
+            "strategy_ref": (
+                "strategies.intraday_options.straddle_920.strategy:Straddle920Strategy"
+            ),
+            "vix_security_id": "21",
+            "vix_index_segment": "NOT_A_REAL_SEGMENT",
+        },
+    )
+    with pytest.raises(ConfigError, match="exchange segment"):
+        _build(cfg, tmp_path)
+
+
+def test_multi_leg_engine_refuses_live_mode(tmp_path: Path):
+    """Calls the builder directly rather than through a full live
+    ``ResolvedConfig`` (which needs a complete live-preflight block just to
+    construct) — this is specifically pinning
+    ``_build_multi_leg_engine_worker_config``'s own belt-and-suspenders
+    refusal, on top of (never instead of) ``ResolvedConfig``'s own
+    cross-field live-preflight validator and ``effective_live_gate``."""
+    from common.config import EngineKind
+    from runtimes.intraday_options.config_adapter import (
+        _build_multi_leg_engine_worker_config,
+    )
+
+    strategy = StrategyConfig(
+        strategy_id="straddle_920",
+        mode=ExecutionMode.LIVE,
+        live_approved=True,
+        live_quantity_lots=1,
+        engine=EngineKind.MULTI_LEG_ENGINE,
+        parameters={
+            "strategy_ref": (
+                "strategies.intraday_options.straddle_920.strategy:Straddle920Strategy"
+            ),
+        },
+    )
+    with pytest.raises(ConfigError, match="not supported for the multi-leg engine"):
+        _build_multi_leg_engine_worker_config(strategy, strategy.parameters)
+
+
+def test_an_unsupported_engine_kind_fails_construction_rather_than_falling_back(
+    tmp_path: Path,
+):
+    """Spec section 14.1: unsupported engine types must fail validation, never
+    silently fall back to the single-leg engine."""
+    from common.config import EngineKind
+
+    cfg = _cfg(engine=EngineKind.FIXED_STRIKE_ENGINE)
+    with pytest.raises(ConfigError, match="no construction path"):
+        _build(cfg, tmp_path)

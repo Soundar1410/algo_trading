@@ -146,6 +146,7 @@ def test_the_dashboards_directory_is_what_we_think_it_is():
         "data/calendar_stats.py",
         "data/incidents.py",
         "data/intraday_options.py",
+        "data/multi_leg.py",
         "data/positional.py",
         "data/stocks.py",
         "data/strategy_scope.py",

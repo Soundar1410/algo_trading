@@ -153,7 +153,7 @@ class _PacedAdapter:
     def stop(self) -> None:
         self._running = False
 
-    def start(self, on_tick: TickCallback) -> None:
+    def start(self, on_tick: TickCallback, *, on_idle: object = None) -> None:
         self._running = True
         for tick in self._first:
             if not self._running:

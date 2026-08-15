@@ -245,7 +245,7 @@ class _BlockingAdapter:
     ) -> None:
         self.subscribed_ids.update(str(s) for s in security_ids)
 
-    def start(self, on_tick: Any) -> None:
+    def start(self, on_tick: Any, *, on_idle: Any = None) -> None:
         self._running = True
         self._stop_event.wait()
         self._running = False

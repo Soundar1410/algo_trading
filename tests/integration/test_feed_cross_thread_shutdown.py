@@ -115,7 +115,7 @@ class _BlockingFeedAdapter:
     def subscribe(self, security_ids: Sequence[str], *, segment: int | None = None) -> None:
         self._security_ids.update(str(s) for s in security_ids)
 
-    def start(self, on_tick: TickCallback) -> None:
+    def start(self, on_tick: TickCallback, *, on_idle: object = None) -> None:
         self.start_calls += 1
         self.owner_thread = threading.get_ident()
         self._running = True

@@ -209,6 +209,57 @@ class EngineWorkerConfig:
 
 
 @dataclass
+class MultiLegEngineWorkerConfig:
+    """The generic multi-leg engine's configuration, as plain picklable values.
+
+    Present on a :class:`WorkerConfig` means "drive
+    :class:`~common.engine.multi_leg_engine.MultiLegEngine` off the tick
+    channel"; mirrors :class:`EngineWorkerConfig` field-for-field where the
+    single-leg and multi-leg engines share a concept, and adds only what a
+    multi-leg strategy needs beyond that — an auxiliary market-data
+    instrument (India VIX for ``straddle_920``) alongside the underlying.
+
+    **Every field here is a primitive**, for the same spawn-boundary reason
+    :class:`EngineWorkerConfig` documents: the child unpickles this before any
+    ``common.engine`` code is imported.
+    """
+
+    #: ``"package.module:ClassName"``, resolved by
+    #: :func:`runtimes.intraday_options.multi_leg_engine_worker.
+    #: load_multi_leg_strategy`.
+    strategy_ref: str
+    strategy_kwargs: dict[str, Any] = field(default_factory=dict)
+    timeframe: str = "5m"
+    underlying_instrument: str = ""
+    lots: int = 1
+    strike_step: int = 50
+    lot_size: int = 50
+    expiry: str | None = None
+    contract_resolver: str = "simulated"
+    scrip_master_cache_dir: str = ""
+    index_security_id: str = ""
+    index_segment: str = ""
+    fno_segment: str = ""
+    #: Auxiliary market-data-only instrument (e.g. India VIX). Empty
+    #: ``vix_security_id`` means "this strategy has none" — a multi-leg
+    #: strategy that needs no auxiliary index (a future one) simply leaves
+    #: these unset.
+    vix_security_id: str = ""
+    #: Named segment (e.g. ``"IDX_I"``), resolved to a numeric code by the
+    #: worker via :func:`common.market_data.scrip_master.segment_code` —
+    #: never a fake ``fno_segment``, see
+    #: :mod:`common.market_data.instruments`.
+    vix_segment: str = "IDX_I"
+    vix_mode: int | None = None
+    starting_capital: float = 100_000.0
+    max_daily_loss_percent: float | None = None
+    parameters: dict[str, Any] = field(default_factory=dict)
+    session_start_time: str = "09:15"
+    holidays: tuple[str, ...] = ()
+    feed_poll_seconds: float = 0.5
+
+
+@dataclass
 class WorkerConfig:
     """Everything a worker needs, and nothing that cannot be pickled.
 
@@ -249,6 +300,12 @@ class WorkerConfig:
     #: Set to drive the ported engine instead of the fixture strategy. See the module
     #: docstring for why the code behind it is imported lazily.
     engine: EngineWorkerConfig | None = None
+    #: Set to drive the generic multi-leg engine instead. Mutually exclusive
+    #: with ``engine`` in practice — ``config_adapter.py::build_worker_config``
+    #: routes by ``StrategyConfig.engine`` (``EngineKind``) and only ever
+    #: populates one of the two — but nothing here enforces that structurally;
+    #: the worker checks ``multi_leg_engine is not None`` first.
+    multi_leg_engine: MultiLegEngineWorkerConfig | None = None
     #: From ``RuntimeConfig.health.heartbeat_interval_seconds`` — see
     #: :mod:`common.config.models`. A primitive, like every other field here,
     #: so this stays picklable for the spawned child (module docstring).
@@ -455,14 +512,15 @@ def _run_locked(
         return outcome
 
     repository = ExecutionRepository(database)
-    # Deferred only when the engine is driving: engine.py's on_tick calls
-    # notifier.send() from what would otherwise be this same thread, and a
-    # 5s Telegram timeout there is the tick-thread stall spec 2554's "small
-    # internal queue" exists to prevent. The fixture path's own sends happen
-    # between candle_queue.get() calls, never inside a callback a feed is
-    # waiting on, so it stays synchronous — simpler, and deterministic for
-    # every existing test that asserts on notifications right after a run.
-    deferred = config.engine is not None
+    # Deferred only when an engine (single-leg or multi-leg) is driving:
+    # engine.py's/multi_leg_engine.py's on_tick calls notifier.send() from
+    # what would otherwise be this same thread, and a 5s Telegram timeout
+    # there is the tick-thread stall spec 2554's "small internal queue"
+    # exists to prevent. The fixture path's own sends happen between
+    # candle_queue.get() calls, never inside a callback a feed is waiting on,
+    # so it stays synchronous — simpler, and deterministic for every existing
+    # test that asserts on notifications right after a run.
+    deferred = config.engine is not None or config.multi_leg_engine is not None
     safe_notifier = SafeNotifier(
         notifier or NullNotifier(),
         deferred=deferred,
@@ -528,6 +586,30 @@ def _run_locked(
             # Order matters: close() drains any queued deferred sends and can
             # still call on_failure (repository.record_notification) while
             # doing so, so the database must still be open when it runs.
+            safe_notifier.close()
+            database.close()
+
+    if config.multi_leg_engine is not None:
+        # Same deferred-import discipline as the ``config.engine`` branch
+        # above, and for the identical reason — ``common.engine`` (which
+        # ``multi_leg_engine_worker`` also reaches into) must never load on
+        # the fixture or single-leg-engine paths.
+        from .multi_leg_engine_worker import run_multi_leg_engine
+
+        try:
+            return run_multi_leg_engine(
+                config,
+                config.multi_leg_engine,
+                repository=repository,
+                session_id=session.id,
+                heartbeat=heartbeat,
+                notifier=safe_notifier,
+                outcome=outcome,
+                candle_queue=candle_queue,
+                tick_queue=tick_queue,
+                control_queue=control_queue,
+            )
+        finally:
             safe_notifier.close()
             database.close()
 

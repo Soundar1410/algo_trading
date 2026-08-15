@@ -295,6 +295,7 @@ def test_shipped_migrations_start_at_the_walking_skeleton():
         "0006",
         "0007",
         "0008",
+        "0009",
     ]
     assert shipped[0].name == "walking_skeleton"
     assert shipped[1].name == "feed_and_auth_health"
@@ -306,6 +307,8 @@ def test_shipped_migrations_start_at_the_walking_skeleton():
     assert shipped[6].name == "reconciliation_tables"
     # Dashboard corrective pass.
     assert shipped[7].name == "trade_ledger"
+    # strategy-straddle-920: generic multi-leg basket/leg support.
+    assert shipped[8].name == "multi_leg_baskets"
 
 
 def test_shipped_migrations_apply_to_a_fresh_database(tmp_path: Path):
@@ -331,6 +334,7 @@ def test_shipped_migrations_apply_to_a_fresh_database(tmp_path: Path):
         "0006",
         "0007",
         "0008",
+        "0009",
     ]
     assert database.integrity_check() == []
     assert database.foreign_key_check() == []
@@ -339,6 +343,12 @@ def test_shipped_migrations_apply_to_a_fresh_database(tmp_path: Path):
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='orders'"
         ).fetchone()["sql"]
     assert "EXPIRED" in status_check_sql
+    with database.connect() as conn:
+        tables = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+    assert {"strategy_baskets", "strategy_legs"} <= tables
 
 
 def test_later_migrations_upgrade_a_database_created_by_0001_alone(tmp_path: Path):
@@ -382,6 +392,7 @@ def test_later_migrations_upgrade_a_database_created_by_0001_alone(tmp_path: Pat
         "0006",
         "0007",
         "0008",
+        "0009",
     ]
     with database.connect() as conn:
         survivors = conn.execute("SELECT COUNT(*) FROM runtime_sessions").fetchone()[0]
@@ -393,6 +404,7 @@ def test_later_migrations_upgrade_a_database_created_by_0001_alone(tmp_path: Pat
     assert {"auth_events", "feed_events", "option_chain_snapshots"} <= tables
     assert "paper_fill_quotes" in tables
     assert "audit_events" in tables
+    assert {"strategy_baskets", "strategy_legs"} <= tables
     assert database.integrity_check() == []
 
 
@@ -754,3 +766,78 @@ def test_migration_0006_detects_an_interrupted_previous_attempt_and_refuses_to_g
         MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending(
             require_fresh_backup_for_destructive=True
         )
+
+
+# --------------------------------------------------- 0009 (strategy-straddle-920)
+def test_migration_0009_upgrades_a_database_created_by_0008_with_real_rows(tmp_path: Path):
+    """The real upgrade path for 0009: seed a database through 0001-0008 only
+    (the actual prior head at the time this migration was authored — see
+    ``0009_multi_leg_baskets.sql``'s own docstring), insert a real
+    ``trade_ledger`` row exactly as 0008 already shipped it, then apply 0009
+    and prove that row survives completely untouched (0009 adds no columns to
+    ``trade_ledger`` at all — see that migration's docstring for why), the two
+    new tables exist with a working unique constraint, and a second run does
+    not re-apply anything."""
+    from common.persistence.migrations import VERSIONS_DIR
+
+    up_to_0008 = tmp_path / "up_to_0008"
+    up_to_0008.mkdir()
+    for migration in discover_migrations(VERSIONS_DIR):
+        if migration.version == "0009":
+            continue
+        (up_to_0008 / migration.path.name).write_text(
+            migration.path.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+
+    database = Database(tmp_path / "operational" / "intraday_options.db")
+    MigrationRunner(database, versions_dir=up_to_0008).run_pending()
+
+    with database.transaction() as conn:
+        conn.execute(
+            "INSERT INTO trade_ledger (runtime_id, strategy_id, execution_mode, trading_date, "
+            "instrument, security_id, entry_side, quantity, entry_price, exit_price, "
+            "gross_pnl, entry_correlation_id, exit_correlation_id, exit_broker_fill_id, "
+            "opened_at, closed_at, created_at) VALUES "
+            "('intraday_options', 'st01', 'paper', '2026-08-17', 'NIFTY', '1', 'SELL', 750, "
+            "100.0, 10.0, 67500.0, 'corr_entry', 'corr_exit', 'bf_001', "
+            "'2026-08-17T09:21:00Z', '2026-08-17T10:00:00Z', '2026-08-17T10:00:00Z')"
+        )
+    before = dict(
+        database.connect().execute("SELECT * FROM trade_ledger").fetchone()
+    )
+
+    applied = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
+    assert [m.version for m in applied] == ["0009"]
+
+    assert database.integrity_check() == []
+    assert database.foreign_key_check() == []
+
+    with database.connect() as conn:
+        after = dict(conn.execute("SELECT * FROM trade_ledger").fetchone())
+        assert after == before, "0009 must not touch any existing trade_ledger row"
+
+        tables = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        assert {"strategy_baskets", "strategy_legs"} <= tables
+
+        conn.execute(
+            "INSERT INTO strategy_baskets (runtime_id, strategy_id, execution_mode, "
+            "trading_date, basket_id, entries_consumed, adjustment_count, "
+            "square_off_state, created_at, updated_at) VALUES "
+            "('intraday_options', 'straddle_920', 'paper', '2026-08-17', "
+            "'straddle_920:2026-08-17', 1, 0, 'PENDING', 'now', 'now')"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO strategy_baskets (runtime_id, strategy_id, execution_mode, "
+                "trading_date, basket_id, entries_consumed, adjustment_count, "
+                "square_off_state, created_at, updated_at) VALUES "
+                "('intraday_options', 'straddle_920', 'paper', '2026-08-17', "
+                "'straddle_920:2026-08-17', 1, 0, 'PENDING', 'now', 'now')"
+            )
+
+    # A second startup must not attempt to reapply 0009.
+    second_run = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
+    assert second_run == []

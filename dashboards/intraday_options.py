@@ -74,6 +74,12 @@ from dashboards.data.intraday_options import (  # noqa: E402
     pnl_by_day,
     pnl_by_month,
 )
+from dashboards.data.multi_leg import (  # noqa: E402
+    BasketRow,
+    LegRow,
+    load_baskets,
+    load_legs_for_basket,
+)
 from dashboards.data.strategy_scope import (  # noqa: E402
     StrategyOption,
     discover_strategy_options,
@@ -91,9 +97,11 @@ from dashboards.formatting import (  # noqa: E402
 )
 
 NOT_YET_AVAILABLE = (
-    "Engine type, open legs/baskets, selected strikes/expiry, per-leg P&L "
-    "and roll count are not shown: MultiLegEngine/FixedStrikeEngine are not "
-    "ported into this codebase yet (runbook D56/D34)."
+    "Open legs/baskets, selected strikes/expiry, per-leg P&L and adjustment "
+    "count for a multi-leg strategy (e.g. straddle_920) are shown in the "
+    "Baskets tab instead of here — this Overview row stays single-position-"
+    "shaped. FixedStrikeEngine is still not ported into this codebase "
+    "(runbook D34)."
 )
 
 _PRESETS = ("Today", "Last 7 trading days", "Last 30 trading days", "Custom")
@@ -236,6 +244,80 @@ def _render_live_positions(streamlit: Any, rows: tuple[Any, ...]) -> None:
         "Current price / points / MTM are not shown: no mark-to-market is "
         "persisted for paper positions today. A stale value is never shown "
         "as current."
+    )
+
+
+# =================================================================== Baskets
+def _render_baskets(
+    streamlit: Any, baskets: tuple[BasketRow, ...], legs_by_basket: dict[str, tuple[LegRow, ...]]
+) -> None:
+    """Generic multi-leg basket/leg drill-down — reusable by any multi-leg
+    strategy, not specific to straddle_920. Read-only, typed data only."""
+    if not baskets:
+        streamlit.info("No basket for a multi-leg strategy on this date.")
+        return
+    for basket in baskets:
+        with streamlit.expander(
+            f"{basket.basket_id} — {basket.lifecycle_state} "
+            f"(adjustments: {basket.adjustment_count})",
+            expanded=True,
+        ):
+            top = streamlit.columns(4)
+            top[0].metric("Entries consumed", "Yes" if basket.entries_consumed else "No")
+            top[1].metric("Adjustment count", basket.adjustment_count)
+            top[2].metric("Square-off", basket.square_off_state)
+            top[3].metric(
+                "Original basis",
+                format_inr(basket.original_combined_basis)
+                if basket.original_combined_basis is not None
+                else MISSING,
+            )
+            if basket.day_blocked_reason:
+                streamlit.warning(f"Day blocked: {basket.day_blocked_reason}")
+            if basket.pending_replacement_role:
+                streamlit.info(
+                    f"Pending replacement: {basket.pending_replacement_role} "
+                    f"({basket.pending_replacement_state or 'unknown state'})"
+                )
+
+            legs = legs_by_basket.get(basket.basket_id, ())
+            if not legs:
+                streamlit.caption("No leg recorded yet.")
+                continue
+            table = [
+                {
+                    "Leg": leg.leg_id,
+                    "Role": leg.leg_role,
+                    "Seq": leg.leg_sequence,
+                    "Replacement": "Yes" if leg.is_replacement else "No",
+                    "Security ID": leg.security_id or MISSING,
+                    "Strike": leg.strike if leg.strike is not None else MISSING,
+                    "Expiry": leg.expiry or MISSING,
+                    "Side": leg.side or MISSING,
+                    "Qty": leg.quantity if leg.quantity is not None else MISSING,
+                    "Entry": (
+                        format_inr(leg.entry_price) if leg.entry_price is not None else MISSING
+                    ),
+                    "Exit": format_inr(leg.exit_price) if leg.exit_price is not None else MISSING,
+                    "State": leg.state,
+                    "Exit reason": leg.exit_reason or MISSING,
+                    "Gross realised": (
+                        format_inr(leg.realized_gross_pnl)
+                        if leg.realized_gross_pnl is not None
+                        else MISSING
+                    ),
+                    "Charges": format_inr(leg.charges) if leg.charges is not None else MISSING,
+                    "Net": format_inr(leg.net_pnl) if leg.net_pnl is not None else MISSING,
+                }
+                for leg in legs
+            ]
+            streamlit.dataframe(table, hide_index=True, width="stretch")
+    streamlit.caption(
+        "Gross unrealised P&L for a currently OPEN leg is not shown: no live "
+        "mark-to-market is persisted for paper positions today, matching the "
+        "same documented gap Live Positions has. Charges/net are read from "
+        "the append-only trade ledger for a CLOSED leg only, for reporting — "
+        "never used in the strategy's own gross-P&L risk triggers."
     )
 
 
@@ -613,6 +695,7 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
         [
             "Overview",
             "Live Positions",
+            "Baskets",
             "Orders & Fills",
             "Closed Trades",
             "Performance",
@@ -654,6 +737,37 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
         _positions()
 
     with tabs[2]:
+
+        @st.fragment(run_every=5)
+        def _baskets(strategy_id: str | None = selected_strategy) -> None:
+            if strategy_id is None:
+                st.info("Select a strategy to see its baskets.")
+                return
+            baskets_result = run_bounded(
+                database_path,
+                lambda conn: load_baskets(
+                    conn,
+                    strategy_id=strategy_id,
+                    execution_mode="paper",
+                    trading_date=trading_date,
+                ),
+            )
+            baskets = () if isinstance(baskets_result, SnapshotUnavailable) else baskets_result
+
+            def _load_all_legs(
+                conn: Any, basket_ids: tuple[str, ...] = tuple(b.basket_id for b in baskets)
+            ) -> dict[str, tuple[LegRow, ...]]:
+                return {bid: load_legs_for_basket(conn, basket_id=bid) for bid in basket_ids}
+
+            legs_result = run_bounded(database_path, _load_all_legs)
+            legs_by_basket: dict[str, tuple[LegRow, ...]] = (
+                {} if isinstance(legs_result, SnapshotUnavailable) else legs_result
+            )
+            _render_baskets(st, baskets, legs_by_basket)
+
+        _baskets()
+
+    with tabs[3]:
         orders_mode = _resolve_mode(st, "io_orders_mode")
 
         @st.fragment(run_every=5)
@@ -674,7 +788,7 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
 
         _orders()
 
-    with tabs[3]:
+    with tabs[4]:
         start, end = _resolve_date_range(st, "closed_trades", today)
         closed_mode = _resolve_mode(st, "io_closed_mode")
 
@@ -700,7 +814,7 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
 
         _closed()
 
-    with tabs[4]:
+    with tabs[5]:
         start, end = _resolve_date_range(st, "performance", today)
         performance_mode = _resolve_mode(st, "io_performance_mode")
 
@@ -753,7 +867,7 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
 
         _performance()
 
-    with tabs[5]:
+    with tabs[6]:
         start, end = _resolve_date_range(st, "comparison", today)
         compare_key = "io_compare_strategies"
         default_selection = list(all_strategy_ids)
@@ -799,7 +913,7 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
 
         _comparison()
 
-    with tabs[6]:
+    with tabs[7]:
 
         @st.fragment(run_every=30)
         def _signals(strategy_id: str | None = selected_strategy) -> None:
@@ -826,7 +940,7 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
 
         _signals()
 
-    with tabs[7]:
+    with tabs[8]:
 
         @st.fragment(run_every=5)
         def _health(strategy_id: str | None = selected_strategy) -> None:

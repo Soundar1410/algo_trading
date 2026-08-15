@@ -192,3 +192,49 @@ def test_the_engine_config_carries_no_engine_owned_type():
             f"EngineWorkerConfig.{spec.name} is annotated {annotation!r}, which is "
             "an engine-owned type; keep every field primitive."
         )
+
+
+def test_the_multi_leg_engine_config_carries_no_engine_owned_type():
+    """The multi-leg counterpart of the check above — same reasoning,
+    ``MultiLegEngineWorkerConfig`` instead."""
+    from runtimes.intraday_options.worker import MultiLegEngineWorkerConfig
+
+    for spec in MultiLegEngineWorkerConfig.__dataclass_fields__.values():
+        annotation = str(spec.type)
+        assert not annotation.startswith(FORBIDDEN_PREFIXES), (
+            f"MultiLegEngineWorkerConfig.{spec.name} is annotated {annotation!r}, "
+            "which is an engine-owned type; keep every field primitive."
+        )
+
+
+def test_the_multi_leg_engine_seam_is_imported_only_inside_a_function():
+    """The multi-leg counterpart of ``test_the_engine_seam_is_imported_only_
+    inside_a_function`` — the deferred-import discipline applies identically
+    to ``multi_leg_engine_worker``."""
+    seam = f"{WORKER_PACKAGE}.multi_leg_engine_worker"
+    assert seam not in _imports(module_level=True), (
+        "multi_leg_engine_worker imports the whole engine package; hoisting this "
+        "import to module level defeats the entire boundary."
+    )
+    assert seam in _imports(module_level=False), (
+        "the deferred import of multi_leg_engine_worker has disappeared from "
+        "worker.py — the multi-leg engine branch cannot be reachable."
+    )
+
+
+def test_a_clean_interpreter_loads_no_engine_module_for_the_multi_leg_worker_either():
+    """The multi-leg counterpart of
+    ``test_a_clean_interpreter_loads_no_engine_module_for_a_worker``."""
+    loaded = _modules_after(f"import {WORKER_PACKAGE}.worker")
+    assert loaded == set()
+
+
+def test_the_multi_leg_engine_branch_really_does_load_the_engine():
+    """The positive half for the multi-leg seam — without it, the boundary
+    tests above would be satisfied by a dead branch."""
+    seam = f"{WORKER_PACKAGE}.multi_leg_engine_worker"
+    loaded = _modules_after(f"import {seam}")
+    assert "common.engine.multi_leg_engine" in loaded, (
+        f"importing {seam} did not load the multi-leg engine, so the branch "
+        "guarded by the deferred import cannot be doing anything."
+    )

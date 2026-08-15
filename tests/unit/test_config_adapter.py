@@ -181,14 +181,27 @@ def test_execution_mode_is_carried_through(tmp_path: Path):
     assert worker.execution_mode is ExecutionMode.LIVE
 
 
-def test_engine_is_none_without_a_strategy_ref_regardless_of_engine_kind(tmp_path: Path):
-    """EngineKind alone is not the discriminator (Phase 9): every strategy,
-    fixture included, defaults ``engine: trading_engine`` — see
-    config_adapter.py's module docstring. Only ``parameters.strategy_ref``
-    (absent here) switches on the ported-engine path."""
-    cfg = _cfg(engine=EngineKind.MULTI_LEG_ENGINE)
+def test_engine_is_none_without_a_strategy_ref_for_the_trading_engine_kind(tmp_path: Path):
+    """For ``EngineKind.TRADING_ENGINE`` (the default), ``parameters.
+    strategy_ref`` absent means the Phase 1 fixture path, unchanged since
+    Phase 9 — see config_adapter.py's module docstring."""
+    cfg = _cfg(engine=EngineKind.TRADING_ENGINE)
     worker = _build(cfg, tmp_path)
     assert worker.engine is None
+    assert worker.multi_leg_engine is None
+
+
+def test_multi_leg_engine_kind_without_a_strategy_ref_is_a_config_error(tmp_path: Path):
+    """The straddle_920 port's own correction to the note the test above used
+    to (incorrectly) generalise: ``EngineKind`` **is** now the real
+    discriminator (spec section 14.1) — a strategy that declares
+    ``engine: multi_leg_engine`` but supplies no ``strategy_ref`` is a
+    genuine misconfiguration (it names an engine but not what to run on it)
+    and must fail loudly at config load, never silently fall back to the
+    Phase 1 fixture path the way the pre-correction code did."""
+    cfg = _cfg(engine=EngineKind.MULTI_LEG_ENGINE)
+    with pytest.raises(ConfigError, match="strategy_ref"):
+        _build(cfg, tmp_path)
 
 
 def test_config_fingerprint_is_set(tmp_path: Path):

@@ -76,7 +76,7 @@ class _ScriptedAdapter:
     def resubscribe_all(self) -> None:
         self.resubscribe_calls += 1
 
-    def start(self, on_tick: TickCallback) -> None:
+    def start(self, on_tick: TickCallback, *, on_idle: object = None) -> None:
         self.start_calls += 1
         self._running = True
         try:

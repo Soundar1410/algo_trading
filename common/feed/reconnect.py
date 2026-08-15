@@ -291,13 +291,21 @@ class ReconnectingFeed:
         self._adapter.subscribe(incoming, segment=segment, mode=mode)
 
     # ---------------------------------------------------------------- running
-    def start(self, on_tick: TickCallback) -> None:
+    def start(
+        self,
+        on_tick: TickCallback,
+        *,
+        on_idle: Callable[[], None] | None = None,
+    ) -> None:
         """Run the feed, reconnecting until stopped or the budget is exhausted.
 
         Blocks for the life of the feed. **This thread becomes the owner** of the
         adapter's loop and is the only one that will close its connection —
         including on the way out of an exception, and including when the stop was
         requested from somewhere else entirely.
+
+        ``on_idle`` is forwarded to the wrapped adapter unchanged on every
+        (re)connect attempt — this class adds no polling of its own.
         """
         if not self._security_ids:
             raise FeedUnavailableError("Refusing to start the feed with no subscriptions")
@@ -313,7 +321,7 @@ class ReconnectingFeed:
             self._closed = False
         self._finished.clear()
         try:
-            self._run(on_tick)
+            self._run(on_tick, on_idle)
         finally:
             # Whatever happened — clean end, stop request, or a failure that blew
             # the attempt budget — the socket is released here, on the thread that
@@ -323,12 +331,12 @@ class ReconnectingFeed:
                 self._owner_thread = None
             self._finished.set()
 
-    def _run(self, on_tick: TickCallback) -> None:
+    def _run(self, on_tick: TickCallback, on_idle: Callable[[], None] | None = None) -> None:
         """The reconnect loop itself. Always called with ownership established."""
         while not self.stopped():
             try:
                 self._mark_connected()
-                self._adapter.start(self._wrap(on_tick))
+                self._adapter.start(self._wrap(on_tick), on_idle=on_idle)
             except Exception as exc:
                 if self.stopped():
                     break

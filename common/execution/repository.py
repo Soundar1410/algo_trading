@@ -1219,6 +1219,251 @@ class ExecutionRepository:
                 ),
             )
 
+    # ------------------------------------------------------ multi-leg baskets
+    # Migration 0009. Generic to any multi-leg strategy — see that migration's
+    # own module docstring for why these two tables exist alongside (never
+    # competing with) `positions`/`trade_ledger`. Returns raw rows rather than
+    # a `common.engine` dataclass: this module must not import `common.engine`
+    # (the same layering rule `gateway.py`/`square_off.py` keep via
+    # `TYPE_CHECKING`-only imports) — the row <-> `Basket`/`LegInstance`
+    # conversion lives in `common.engine.multi_leg_state`, the caller of these
+    # methods.
+    def upsert_strategy_basket(
+        self,
+        *,
+        runtime_id: str,
+        strategy_id: str,
+        execution_mode: ExecutionMode,
+        trading_date: str,
+        basket_id: str,
+        lifecycle_state: str,
+        entries_consumed: bool,
+        day_blocked_reason: str | None,
+        adjustment_count: int,
+        pending_replacement_role: str | None,
+        pending_replacement_state: str | None,
+        original_combined_basis: float | None,
+        square_off_state: str,
+    ) -> None:
+        with self._db.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO strategy_baskets
+                    (runtime_id, strategy_id, execution_mode, trading_date, basket_id,
+                     lifecycle_state, entries_consumed, day_blocked_reason, adjustment_count,
+                     pending_replacement_role, pending_replacement_state,
+                     original_combined_basis, square_off_state, version, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                ON CONFLICT (strategy_id, execution_mode, trading_date, basket_id) DO UPDATE SET
+                    lifecycle_state = excluded.lifecycle_state,
+                    entries_consumed = excluded.entries_consumed,
+                    day_blocked_reason = excluded.day_blocked_reason,
+                    adjustment_count = excluded.adjustment_count,
+                    pending_replacement_role = excluded.pending_replacement_role,
+                    pending_replacement_state = excluded.pending_replacement_state,
+                    original_combined_basis = excluded.original_combined_basis,
+                    square_off_state = excluded.square_off_state,
+                    version = strategy_baskets.version + 1,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    runtime_id,
+                    strategy_id,
+                    execution_mode.value,
+                    trading_date,
+                    basket_id,
+                    lifecycle_state,
+                    int(entries_consumed),
+                    day_blocked_reason,
+                    adjustment_count,
+                    pending_replacement_role,
+                    pending_replacement_state,
+                    original_combined_basis,
+                    square_off_state,
+                    _now(),
+                    _now(),
+                ),
+            )
+
+    def load_strategy_basket(
+        self, *, strategy_id: str, execution_mode: ExecutionMode, trading_date: str
+    ) -> sqlite3.Row | None:
+        row: sqlite3.Row | None = (
+            self._db.connect()
+            .execute(
+                """
+                SELECT * FROM strategy_baskets
+                WHERE strategy_id = ? AND execution_mode = ? AND trading_date = ?
+                """,
+                (strategy_id, execution_mode.value, trading_date),
+            )
+            .fetchone()
+        )
+        return row
+
+    def upsert_strategy_leg(
+        self,
+        *,
+        runtime_id: str,
+        strategy_id: str,
+        execution_mode: ExecutionMode,
+        trading_date: str,
+        basket_id: str,
+        leg_id: str,
+        leg_role: str,
+        leg_sequence: int,
+        is_replacement: bool,
+        replaces_leg_id: str | None,
+        security_id: str | None,
+        symbol: str | None,
+        strike: float | None,
+        expiry: str | None,
+        lot_size: int | None,
+        side: str | None,
+        quantity: int | None,
+        entry_price: float | None,
+        entry_time: str | None,
+        entry_correlation_id: str | None,
+        exit_price: float | None,
+        exit_time: str | None,
+        exit_reason: str | None,
+        realized_gross_pnl: float | None,
+        state: str,
+    ) -> None:
+        with self._db.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO strategy_legs
+                    (runtime_id, strategy_id, execution_mode, trading_date, basket_id, leg_id,
+                     leg_role, leg_sequence, is_replacement, replaces_leg_id, security_id,
+                     symbol, strike, expiry, lot_size, side, quantity, entry_price, entry_time,
+                     entry_correlation_id, exit_price, exit_time, exit_reason,
+                     realized_gross_pnl, state, version, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        1, ?, ?)
+                ON CONFLICT (strategy_id, execution_mode, trading_date, leg_id) DO UPDATE SET
+                    leg_role = excluded.leg_role,
+                    leg_sequence = excluded.leg_sequence,
+                    is_replacement = excluded.is_replacement,
+                    replaces_leg_id = excluded.replaces_leg_id,
+                    security_id = excluded.security_id,
+                    symbol = excluded.symbol,
+                    strike = excluded.strike,
+                    expiry = excluded.expiry,
+                    lot_size = excluded.lot_size,
+                    side = excluded.side,
+                    quantity = excluded.quantity,
+                    entry_price = excluded.entry_price,
+                    entry_time = excluded.entry_time,
+                    entry_correlation_id = excluded.entry_correlation_id,
+                    exit_price = excluded.exit_price,
+                    exit_time = excluded.exit_time,
+                    exit_reason = excluded.exit_reason,
+                    realized_gross_pnl = excluded.realized_gross_pnl,
+                    state = excluded.state,
+                    version = strategy_legs.version + 1,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    runtime_id,
+                    strategy_id,
+                    execution_mode.value,
+                    trading_date,
+                    basket_id,
+                    leg_id,
+                    leg_role,
+                    leg_sequence,
+                    int(is_replacement),
+                    replaces_leg_id,
+                    security_id,
+                    symbol,
+                    strike,
+                    expiry,
+                    lot_size,
+                    side,
+                    quantity,
+                    entry_price,
+                    entry_time,
+                    entry_correlation_id,
+                    exit_price,
+                    exit_time,
+                    exit_reason,
+                    realized_gross_pnl,
+                    state,
+                    _now(),
+                    _now(),
+                ),
+            )
+
+    def load_strategy_legs(
+        self, *, strategy_id: str, execution_mode: ExecutionMode, trading_date: str
+    ) -> list[sqlite3.Row]:
+        return list(
+            self._db.connect()
+            .execute(
+                """
+                SELECT * FROM strategy_legs
+                WHERE strategy_id = ? AND execution_mode = ? AND trading_date = ?
+                ORDER BY leg_role, leg_sequence
+                """,
+                (strategy_id, execution_mode.value, trading_date),
+            )
+            .fetchall()
+        )
+
+    def load_strategy_legs_for_basket(self, *, basket_id: str) -> list[sqlite3.Row]:
+        """Every leg instance for one basket, across strategy/mode/date scope
+        boundaries — used by the dashboard's basket drill-down, which already
+        has ``basket_id`` from a prior query and does not need to re-supply
+        the scope that produced it."""
+        return list(
+            self._db.connect()
+            .execute(
+                "SELECT * FROM strategy_legs WHERE basket_id = ? ORDER BY leg_role, leg_sequence",
+                (basket_id,),
+            )
+            .fetchall()
+        )
+
+    def load_strategy_baskets(
+        self,
+        *,
+        strategy_id: str,
+        execution_mode: ExecutionMode,
+        trading_date: str | None = None,
+        limit: int = 200,
+    ) -> list[sqlite3.Row]:
+        """Baskets for a strategy, most recent trading date first — the
+        dashboard's basket-list query. ``trading_date=None`` lists every date
+        on record (bounded by ``limit``); a caller wanting "today only" passes
+        it explicitly, same as every other scoped query in this class."""
+        if trading_date is not None:
+            return list(
+                self._db.connect()
+                .execute(
+                    """
+                    SELECT * FROM strategy_baskets
+                    WHERE strategy_id = ? AND execution_mode = ? AND trading_date = ?
+                    ORDER BY basket_id
+                    """,
+                    (strategy_id, execution_mode.value, trading_date),
+                )
+                .fetchall()
+            )
+        return list(
+            self._db.connect()
+            .execute(
+                """
+                SELECT * FROM strategy_baskets
+                WHERE strategy_id = ? AND execution_mode = ?
+                ORDER BY trading_date DESC, basket_id
+                LIMIT ?
+                """,
+                (strategy_id, execution_mode.value, limit),
+            )
+            .fetchall()
+        )
+
 
 def _row_to_position(row: sqlite3.Row) -> Position:
     return Position(

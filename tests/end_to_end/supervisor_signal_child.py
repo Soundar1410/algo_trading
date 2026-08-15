@@ -77,7 +77,7 @@ class EndlessFeedAdapter:
     def subscribe(self, security_ids: list[str], *, segment: int | None = None) -> None:
         self._security_ids.update(str(s) for s in security_ids)
 
-    def start(self, on_tick: TickCallback) -> None:
+    def start(self, on_tick: TickCallback, *, on_idle: object = None) -> None:
         self.owner_thread = threading.get_ident()
         self._running = True
         sequence = 0

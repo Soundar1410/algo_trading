@@ -85,7 +85,7 @@ class _ScriptedAdapter:
     def stop(self) -> None:
         self.is_running = False
 
-    def start(self, on_tick) -> None:
+    def start(self, on_tick, *, on_idle=None) -> None:
         self.is_running = True
         try:
             for tick in self._ticks:

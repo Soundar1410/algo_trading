@@ -61,6 +61,120 @@ the next phase. Updated after every phase.
   without a strategy specification, no production egress-IP provider was chosen,
   and no committed live gate was changed.
 
+### `strategy-straddle-920` branch addendum — 15 August 2026 (unmerged)
+
+Cut from `phase-10-controlled-live` at `017b202` onto a dedicated feature
+branch, `strategy-straddle-920` — **not merged into `phase-10-controlled-live`
+or `main`.** Ports the `Trading_Automation` legacy 9:20 morning-straddle
+strategy exactly, as `straddle_920`, onto a new generic multi-leg engine.
+`ema_cross_9_21_buy` and its Rev 3.1 acceptance matrix are unchanged; every
+committed live gate remains disabled (`mode: paper`, `live_approved: false`
+for `straddle_920`, confirmed by `scripts.assert_no_live_config_committed`).
+
+- **Generic multi-leg engine, sibling to `TradingEngine`** (never a
+  modification of it — confirmed by a new AST-level negative-space test,
+  `tests/unit/test_no_straddle_920_branches.py`): `common/engine/
+  multi_leg_models.py` (`Basket`, `LegInstance`, `BasketSignal`, leg
+  role/state vocabulary), `common/engine/multi_leg_strategy.py`
+  (`BaseMultiLegStrategy`, a new registry, sibling to `BaseStrategy`'s),
+  `common/engine/multi_leg_engine.py` (`MultiLegEngine`). Reuses
+  `PositionManager`, `LifecycleGateway`, `HubTickFeed`,
+  `SquareOffAuthority`/`PersistedSquareOffAuthority`, `OptionSelector`,
+  `HeartbeatEngineReporter`/`RepositoryReportWriter` **unmodified** —
+  `PositionManager`'s multi-leg/short-side fitness is proven, not assumed, by
+  `tests/unit/test_position_manager_short_multi_leg.py` (11 tests).
+- **`EngineKind` becomes the real, additive routing discriminator**
+  (`runtimes/intraday_options/config_adapter.py`): `TRADING_ENGINE` +
+  `strategy_ref` present is the exact, byte-identical Phase 9 path;
+  `MULTI_LEG_ENGINE` builds a new `MultiLegEngineWorkerConfig` and drives
+  `MultiLegEngine`; any other kind raises `ConfigError` at load time rather
+  than silently falling back to the single-leg engine. New worker module
+  `runtimes/intraday_options/multi_leg_engine_worker.py`, deferred-imported
+  from `worker.py` under the same import-cost discipline
+  `engine_worker.py` established (`tests/unit/test_worker_import_boundary.py`
+  extended with the multi-leg seam's own boundary tests). Live mode is
+  refused outright for the multi-leg engine (exact legacy partial-execution
+  behaviour can leave one open short leg; a live proposal needs a separate
+  written risk review this repository has not done).
+- **Dynamic subscriptions are now genuinely applied without waiting for an
+  unrelated tick** — not merely alarmed about after 30s. `common/market_data/
+  dhan.py`'s `DhanMarketFeedAdapter.start()` gained an `on_idle` callback,
+  invoked on the feed-owning thread on a bounded ~1s poll
+  (`IDLE_POLL_SECONDS`) regardless of tick arrival, via a real reimplementation
+  of the SDK's blocking receive (`_receive_with_timeout`, `asyncio.wait_for`
+  against the same loop/socket the installed `dhanhq==2.2.0` SDK already
+  owns — verified by reading the installed package, not assumed).
+  `common/feed/hub.py::SharedFeedHub` wires `_apply_pending_subscriptions` to
+  it, and that function now isolates each pending request's failure
+  (`subscriptions_rejected` counter) so one rejected request cannot crash the
+  whole feed thread or block the rest of the queue. The `MarketFeedAdapter`
+  Protocol, `RecordedFeedAdapter` and `ReconnectingFeed` were all widened to
+  carry the new optional `on_idle` parameter (backward compatible — every
+  existing test double updated to accept and, where relevant, exercise it).
+  New tests: `tests/integration/test_dynamic_subscription_wake.py` (applied
+  with zero ticks, concurrent requests, shutdown with a pending request,
+  rejection isolation) and a `DhanMarketFeedAdapter`-level unit test against
+  a real `asyncio` loop in `tests/unit/test_dhan_adapter.py`.
+- **India VIX modeled without fake option-chain metadata.** New
+  `common/market_data/instruments.py::MarketDataInstrument` — security_id +
+  numeric segment/mode + a role label, structurally incapable of being passed
+  where an `IndexMeta` (which always implies an option chain) is expected.
+  `straddle_920.yaml` supplies VIX's security id (`"21"`, corroborated
+  independently in two places in the legacy `Trading_Automation` reference
+  tree's own "verified constants" — the same category of fact as this
+  repo's own `INDEX_REGISTRY` entries, not a hardcoded option contract id;
+  re-confirm against the live Dhan instrument master before the first paper
+  run that actually streams VIX) and its `IDX_I` segment explicitly; missing
+  or unknown values fail config load. VIX ticks update `MultiLegEngine`'s
+  `_last_vix_price` only — never fed to the underlying candle builder, so a
+  VIX tick structurally cannot become a "NIFTY candle".
+- **Durable basket/leg state — migration `0009`** (`multi_leg_baskets.sql`,
+  current head at the time this was authored: `0008`): two new, purely
+  additive (`CREATE TABLE IF NOT EXISTS`, no `ALTER TABLE`) tables,
+  `strategy_baskets` and `strategy_legs` — the mutable current-lifecycle
+  projection for any multi-leg strategy, generic and reusable, integrated
+  with (never competing with) the existing append-only `trade_ledger`
+  (migration `0008`). `basket_id`/`leg_id` reuse the identity space
+  `order_intents.basket_id`/`.leg_id` already carried, unused, since before
+  this branch. `common/engine/multi_leg_state.py` is the row <-> `Basket`/
+  `LegInstance` bridge (kept out of `common.execution`, which must not import
+  `common.engine`). Migration tests extended in `tests/unit/test_migrations.py`
+  (fresh-database apply, upgrade-from-the-actual-prior-head-0008 with a real
+  pre-existing `trade_ledger` row proven untouched, second-startup idempotency).
+- **Restart recovery**: `recover_basket()`
+  (`multi_leg_engine_worker.py`) mirrors `engine_worker.recover_position()`'s
+  conservative posture exactly — any row it cannot safely interpret raises
+  `UnmanageableBasketState` rather than guessing, blocking new entries and
+  leaving genuine exposure visibly `OPEN` for manual handling. Proven against
+  two real, sequential `run_worker` calls in
+  `tests/integration/test_straddle_920_restart.py`: the second run adopts the
+  open basket and does not duplicate the primary entry.
+- **`straddle_920` strategy** (`strategies/intraday_options/straddle_920/`):
+  exact legacy rules — one primary attempt/day consumed before VIX/news
+  filters, VIX `>20` skip with fail-open on missing, single-tick leg-doubling
+  adjustment (max 1/day) replacing only the doubled leg on the next completed
+  candle, exact 5-step risk priority (square-off, adjustment, daily loss,
+  combined stop, profit target), gross-only P&L, original-basis profit
+  target never rebased, current-open-leg combined-stop basis that rebases on
+  replacement, zero paper slippage, 15:15 hard square-off. 13 acceptance
+  tests in `tests/integration/test_straddle_920_engine.py` against a real
+  `MultiLegEngine` + `SimulatedFeed` (entry, VIX x3, blackout, CE/PE
+  doubling, one-adjustment-per-day, square-off, profit target, combined
+  stop, daily loss).
+- **Dashboard**: generic `dashboards/data/multi_leg.py` (`BasketRow`,
+  `LegRow`, filtered by `strategy_id` as data — reusable by the next
+  multi-leg strategy unchanged), a new "Baskets" tab in
+  `dashboards/intraday_options.py`, read-only (typed read-model only, no
+  inline SQL — the existing AST boundary tests extended to cover it), proven
+  end to end with a seeded basket/leg fixture in
+  `tests/unit/test_dashboard_apptest.py`.
+- **Verification**: targeted straddle_920/dynamic-subscription/dashboard
+  suites green; full `pytest` green (exact counts in the phase's final
+  report); `ruff check .` clean; `mypy common strategies runtimes dashboards
+  scripts` clean over 197 source files; `scripts.assert_no_live_config_committed`
+  passes. No live order API was called; every committed live gate stays
+  disabled.
+
 ---
 
 ## 1. Phase status
