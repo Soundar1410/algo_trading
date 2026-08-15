@@ -83,6 +83,11 @@ class ExitReason(StrEnum):
     HIGHEST_CLOSE_TRAIL = "HIGHEST_CLOSE_TRAIL"
     LOWEST_CLOSE_TRAIL = "LOWEST_CLOSE_TRAIL"
     MOMENTUM_AND_TRAIL = "MOMENTUM_AND_TRAIL"
+    # Positional multi-leg strategies (weekly_delta_neutral and any future
+    # sibling): the actual-expiry-day planned/hard exit — distinct from
+    # SQUARE_OFF (an operator/runtime-level request) because it is triggered
+    # by the persisted resolved_expiry_date, never by wall-clock session end.
+    EXPIRY = "EXPIRY"
 
 
 class OrderType(StrEnum):
