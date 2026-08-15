@@ -185,9 +185,14 @@ class WeeklyDeltaNeutralStrategy(BasePositionalMultiLegStrategy):
 
         resolved_expiry = self._resolve_actual_expiry(local_day)
         resolver = DhanOptionChainResolver(self._scrip_master, expiry=resolved_expiry)
-        lot_size = resolver.lot_size
-        if not lot_size:
-            return None  # spec 3.1: never hardcode; block if metadata is unavailable
+        # Cheap pre-check only — the scrip master carries no lot size
+        # metadata at all (e.g. never loaded). The authoritative check is
+        # select_iron_condor's own: it verifies the four *actually selected*
+        # contracts' own lot sizes agree and are non-zero, never trusting a
+        # single scrip-master-wide value (spec 3.1: never hardcode/configure
+        # lot size; resolve it from each selected contract's own metadata).
+        if not resolver.lot_size:
+            return None
 
         try:
             chain = context.greeks_service.chain_snapshot(
@@ -207,7 +212,6 @@ class WeeklyDeltaNeutralStrategy(BasePositionalMultiLegStrategy):
             expiry_at=expiry_at,
             now=context.now,
             lots=self._params.lots,
-            lot_size=lot_size,
             config=self._params.selection,
         )
         if candidate is None:

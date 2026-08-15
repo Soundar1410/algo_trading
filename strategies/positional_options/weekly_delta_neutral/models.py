@@ -41,6 +41,11 @@ class IronCondorCandidate:
     credit_to_width_ratio: float
     net_delta_per_lot: float
     maximum_theoretical_loss: float
+    #: The one lot size every leg's own resolved contract metadata agreed
+    #: on (verified, not configured — see ``select_iron_condor``'s own
+    #: consistency check). Never a hardcoded or configured constant: NIFTY's
+    #: exchange-set lot size has changed before and will again.
+    lot_size: int
 
     def legs(self) -> tuple[LegCandidate, LegCandidate, LegCandidate, LegCandidate]:
         """Hedge-first order — matches spec section 5.2's required entry

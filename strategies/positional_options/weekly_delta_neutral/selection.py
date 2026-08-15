@@ -110,14 +110,17 @@ def select_iron_condor(
     expiry_at: datetime,
     now: datetime,
     lots: int,
-    lot_size: int,
     config: SelectionConfig,
 ) -> IronCondorCandidate | None:
     """The complete, atomic four-leg search. Returns ``None`` — never a
     partial or relaxed result — when any role has no qualifying candidate,
     when the assembled combination fails the combined-spread/credit/width/
-    delta gates (spec section 3.6/3.7), or when hedge width is invalid for
-    every hedge candidate near the chosen short.
+    delta gates (spec section 3.6/3.7), when hedge width is invalid for
+    every hedge candidate near the chosen short, or when the four resolved
+    contracts' own lot sizes are not all equal and non-zero (spec section
+    3.1: lot size is resolved from each selected Dhan contract's own
+    metadata, never a single external value trusted on its own — see the
+    consistency check below).
     """
     short_put_candidates = rank_role_candidates(
         chain=chain, resolver=resolver, greeks=greeks, option_type=OptionType.PE,
@@ -149,6 +152,26 @@ def select_iron_condor(
         tolerance=config.hedge_delta_tolerance,
     )
     if hedge_put is None or hedge_call is None:
+        return None
+
+    # Spec section 3.1: lot size comes exclusively from each selected
+    # contract's own resolved metadata — never a single value trusted from
+    # the scrip master as a whole, and never a hardcoded/configured
+    # constant (there is deliberately no lot_size field anywhere in this
+    # strategy's config model). All four legs share one underlying and
+    # expiry, so their exchange-set lot size should always agree in
+    # practice; verified here rather than assumed, and refused — not
+    # guessed at — if it does not.
+    leg_lot_sizes = {
+        hedge_put.contract.lot_size,
+        hedge_call.contract.lot_size,
+        short_put.contract.lot_size,
+        short_call.contract.lot_size,
+    }
+    if len(leg_lot_sizes) != 1:
+        return None
+    lot_size = next(iter(leg_lot_sizes))
+    if lot_size <= 0:
         return None
 
     combined_spread = sum(
@@ -213,6 +236,7 @@ def select_iron_condor(
         credit_to_width_ratio=credit_to_width_ratio,
         net_delta_per_lot=net_delta_per_lot,
         maximum_theoretical_loss=maximum_theoretical_loss,
+        lot_size=lot_size,
     )
 
 
