@@ -72,6 +72,7 @@ class _RaisingOnLegGateway:
         target_price: float | None = None,
         basket_id: str | None = None,
         leg_id: str | None = None,
+        cycle_id: str | None = None,
     ) -> FillOutcome:
         self.buy_calls.append(leg_id)
         if leg_id in self._raise_for:
@@ -79,6 +80,7 @@ class _RaisingOnLegGateway:
         return self._inner.buy(
             contract, lots, ref_price=ref_price, ts=ts, stop_price=stop_price,
             target_price=target_price, basket_id=basket_id, leg_id=leg_id,
+            cycle_id=cycle_id,
         )
 
     def sell(
@@ -92,10 +94,12 @@ class _RaisingOnLegGateway:
         target_price: float | None = None,
         basket_id: str | None = None,
         leg_id: str | None = None,
+        cycle_id: str | None = None,
     ) -> FillOutcome:
         return self._inner.sell(
             contract, lots, ref_price=ref_price, ts=ts, stop_price=stop_price,
             target_price=target_price, basket_id=basket_id, leg_id=leg_id,
+            cycle_id=cycle_id,
         )
 
 

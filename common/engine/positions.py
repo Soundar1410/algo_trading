@@ -87,6 +87,7 @@ class ExecutionGateway(Protocol):
         target_price: float | None = None,
         basket_id: str | None = None,
         leg_id: str | None = None,
+        cycle_id: str | None = None,
     ) -> FillOutcome: ...
 
     def sell(
@@ -100,6 +101,7 @@ class ExecutionGateway(Protocol):
         target_price: float | None = None,
         basket_id: str | None = None,
         leg_id: str | None = None,
+        cycle_id: str | None = None,
     ) -> FillOutcome: ...
 
 
@@ -136,11 +138,12 @@ class InMemoryGateway:
         target_price: float | None = None,
         basket_id: str | None = None,
         leg_id: str | None = None,
+        cycle_id: str | None = None,
     ) -> FillOutcome:
         # Adverse by construction: a buy fills above the reference price.
-        # stop_price/target_price/basket_id/leg_id: nowhere to persist them
-        # offline (no database, no order); accepted only to satisfy
-        # ExecutionGateway. correlation_id stays None — there is no
+        # stop_price/target_price/basket_id/leg_id/cycle_id: nowhere to
+        # persist them offline (no database, no order); accepted only to
+        # satisfy ExecutionGateway. correlation_id stays None — there is no
         # persisted order to name one.
         return self._fill(Side.BUY, ref_price + self._slippage, lots * contract.lot_size)
 
@@ -155,6 +158,7 @@ class InMemoryGateway:
         target_price: float | None = None,
         basket_id: str | None = None,
         leg_id: str | None = None,
+        cycle_id: str | None = None,
     ) -> FillOutcome:
         # Never below zero: a deep slippage setting must not mint a negative price.
         return self._fill(Side.SELL, max(ref_price - self._slippage, 0.0), lots * contract.lot_size)
@@ -223,6 +227,7 @@ class PositionManager:
         target_price: float | None = None,
         basket_id: str | None = None,
         leg_id: str | None = None,
+        cycle_id: str | None = None,
     ) -> OpenPosition:
         """Open a position: BUY to go long the option, SELL to write it.
 
@@ -240,6 +245,13 @@ class PositionManager:
         bookkeeping uses — the join key restart reconciliation needs. A
         single-leg caller that never passes them gets exactly today's
         behaviour: both stay ``None`` end to end.
+
+        ``cycle_id`` (optional, the positional multi-leg engine only): a
+        cross-day cycle's durable identity, passed straight to the gateway so
+        the resulting position row is resolved through
+        ``cycle_position_bindings`` rather than ``trading_date`` — see
+        ``ExecutionRepository._upsert_position``. ``None`` for every other
+        caller, unaffected.
         """
         position_id = contract.security_id
         if position_id in self._positions:
@@ -255,6 +267,7 @@ class PositionManager:
                 target_price=target_price,
                 basket_id=basket_id,
                 leg_id=leg_id,
+                cycle_id=cycle_id,
             )
         else:
             result = self._gateway.sell(
@@ -266,6 +279,7 @@ class PositionManager:
                 target_price=target_price,
                 basket_id=basket_id,
                 leg_id=leg_id,
+                cycle_id=cycle_id,
             )
 
         position = OpenPosition(
@@ -370,6 +384,7 @@ class PositionManager:
         session_tags: str = "",
         basket_id: str | None = None,
         leg_id: str | None = None,
+        cycle_id: str | None = None,
     ) -> Trade:
         """Close the position identified by ``position_id`` (inverse of entry).
 
@@ -379,6 +394,10 @@ class PositionManager:
         :class:`Trade` alongside the entry correlation ID the position
         already carries, so a caller can find both orders for this exact
         round trip without approximating by ``(security_id, time)``.
+
+        ``cycle_id`` (optional): see :meth:`open`'s own note — must match
+        whatever ``cycle_id`` the position was opened under, so the closing
+        fill resolves to the same cross-day row.
         """
         pos = self._positions.get(position_id)
         if pos is None:
@@ -392,6 +411,7 @@ class PositionManager:
                 ts=ts,
                 basket_id=basket_id,
                 leg_id=leg_id,
+                cycle_id=cycle_id,
             )
             gross = (result.fill_price - pos.entry_price) * pos.quantity
         else:
@@ -402,6 +422,7 @@ class PositionManager:
                 ts=ts,
                 basket_id=basket_id,
                 leg_id=leg_id,
+                cycle_id=cycle_id,
             )
             gross = (pos.entry_price - result.fill_price) * pos.quantity
 

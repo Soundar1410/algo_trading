@@ -117,6 +117,7 @@ class LifecycleGateway:
         target_price: float | None = None,
         basket_id: str | None = None,
         leg_id: str | None = None,
+        cycle_id: str | None = None,
     ) -> FillOutcome:
         return self._execute(
             OrderSide.BUY,
@@ -128,6 +129,7 @@ class LifecycleGateway:
             target_price=target_price,
             basket_id=basket_id,
             leg_id=leg_id,
+            cycle_id=cycle_id,
         )
 
     def sell(
@@ -141,6 +143,7 @@ class LifecycleGateway:
         target_price: float | None = None,
         basket_id: str | None = None,
         leg_id: str | None = None,
+        cycle_id: str | None = None,
     ) -> FillOutcome:
         return self._execute(
             OrderSide.SELL,
@@ -152,6 +155,7 @@ class LifecycleGateway:
             target_price=target_price,
             basket_id=basket_id,
             leg_id=leg_id,
+            cycle_id=cycle_id,
         )
 
     # ------------------------------------------------------------- the plumbing
@@ -167,6 +171,7 @@ class LifecycleGateway:
         target_price: float | None = None,
         basket_id: str | None = None,
         leg_id: str | None = None,
+        cycle_id: str | None = None,
     ) -> FillOutcome:
         quantity = lots * contract.lot_size
         start_at, end_at = self._window(contract.symbol, ts)
@@ -203,6 +208,7 @@ class LifecycleGateway:
             target_price=target_price,
             basket_id=basket_id,
             leg_id=leg_id,
+            cycle_id=cycle_id,
         )
         self._require_a_fill(result, side, contract)
         self.executions += 1
