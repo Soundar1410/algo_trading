@@ -1,0 +1,148 @@
+"""``scripts._runtimes`` and the ``start_runtime.py``/``start_strategy.py``
+delegation it fixed: before this, both scripts always called
+``runtimes.intraday_options.__main__.main`` regardless of ``--runtime-id``,
+so ``scripts.start_runtime positional_options`` would have driven
+``positional_options``'s strategies through intraday's own composition
+root. These tests prove the registry resolves the *right* entrypoint and
+that a positional-runtime strategy start is verified against what is
+actually enabled before anything runs."""
+
+from __future__ import annotations
+
+import scripts._runtimes as runtimes_registry
+import scripts.start_runtime as start_runtime
+import scripts.start_strategy as start_strategy
+
+
+def test_resolve_entrypoint_knows_both_runtimes() -> None:
+    assert runtimes_registry.resolve_entrypoint("intraday_options") is (
+        runtimes_registry.ENTRYPOINTS["intraday_options"]
+    )
+    assert runtimes_registry.resolve_entrypoint("positional_options") is (
+        runtimes_registry.ENTRYPOINTS["positional_options"]
+    )
+
+
+def test_resolve_entrypoint_fails_closed_on_an_unknown_runtime() -> None:
+    try:
+        runtimes_registry.resolve_entrypoint("not_a_real_runtime")
+    except KeyError as exc:
+        assert "not_a_real_runtime" in str(exc)
+        assert "intraday_options" in str(exc)
+        assert "positional_options" in str(exc)
+    else:
+        raise AssertionError("expected KeyError")
+
+
+def test_start_runtime_calls_the_registered_entrypoint_for_positional(
+    monkeypatch, tmp_path
+) -> None:
+    calls: list[list[str]] = []
+
+    def _fake_positional_main(argv: list[str] | None) -> int:
+        calls.append(list(argv or []))
+        return 0
+
+    monkeypatch.setitem(
+        runtimes_registry.ENTRYPOINTS, "positional_options", _fake_positional_main
+    )
+    exit_code = start_runtime.main(["positional_options", "--config-root", str(tmp_path)])
+    assert exit_code == 0
+    assert calls == [["--runtime-id", "positional_options", "--config-root", str(tmp_path)]]
+
+
+def test_start_runtime_refuses_an_unknown_runtime(tmp_path, capsys) -> None:
+    exit_code = start_runtime.main(["not_a_real_runtime", "--config-root", str(tmp_path)])
+    assert exit_code == start_runtime.EXIT_UNKNOWN_RUNTIME
+    assert "not_a_real_runtime" in capsys.readouterr().out
+
+
+def test_start_strategy_still_uses_the_strategy_id_flag_for_intraday(
+    monkeypatch, tmp_path
+) -> None:
+    calls: list[list[str]] = []
+
+    def _fake_intraday_main(argv: list[str] | None) -> int:
+        calls.append(list(argv or []))
+        return 0
+
+    monkeypatch.setitem(
+        runtimes_registry.ENTRYPOINTS, "intraday_options", _fake_intraday_main
+    )
+    exit_code = start_strategy.main(
+        ["ema_cross_9_21_buy", "--runtime-id", "intraday_options", "--config-root", str(tmp_path)]
+    )
+    assert exit_code == 0
+    assert calls == [
+        [
+            "--runtime-id", "intraday_options",
+            "--strategy-id", "ema_cross_9_21_buy",
+            "--config-root", str(tmp_path),
+        ]
+    ]
+
+
+def test_start_strategy_refuses_a_strategy_not_enabled_under_positional(
+    tmp_path, monkeypatch
+) -> None:
+    """positional_options has no --strategy-id flag to filter with, so this
+    is verified up front, against real discovery, before anything starts."""
+    _write_positional_config_root(tmp_path)
+
+    exit_code = start_strategy.main(
+        [
+            "not_the_configured_strategy",
+            "--runtime-id", "positional_options",
+            "--config-root", str(tmp_path / "config"),
+        ]
+    )
+    assert exit_code == start_strategy.EXIT_STRATEGY_NOT_FOUND
+
+
+def test_start_strategy_delegates_a_correctly_named_positional_strategy(
+    tmp_path, monkeypatch
+) -> None:
+    _write_positional_config_root(tmp_path)
+    calls: list[list[str]] = []
+
+    def _fake_positional_main(argv: list[str] | None) -> int:
+        calls.append(list(argv or []))
+        return 0
+
+    monkeypatch.setitem(
+        runtimes_registry.ENTRYPOINTS, "positional_options", _fake_positional_main
+    )
+    exit_code = start_strategy.main(
+        [
+            "weekly_delta_neutral",
+            "--runtime-id", "positional_options",
+            "--config-root", str(tmp_path / "config"),
+        ]
+    )
+    assert exit_code == 0
+    # No --strategy-id: positional_options's own main() has no such flag.
+    assert calls == [
+        ["--runtime-id", "positional_options", "--config-root", str(tmp_path / "config")]
+    ]
+
+
+def _write_positional_config_root(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    config_root = tmp_path / "config"
+    (config_root / "runtimes").mkdir(parents=True)
+    (config_root / "strategies").mkdir(parents=True)
+    (config_root / "global.yaml").write_text(
+        "global:\n  live_trading_enabled: false\n  timezone: Asia/Kolkata\n"
+        "runtime_defaults:\n  enabled: false\n  live_execution_allowed: false\n"
+        "strategy_defaults:\n  enabled: false\n  mode: paper\n  live_approved: false\n",
+        encoding="utf-8",
+    )
+    (config_root / "runtimes" / "positional_options.yaml").write_text(
+        "runtime_id: positional_options\nenabled: true\nlive_execution_allowed: false\n",
+        encoding="utf-8",
+    )
+    (config_root / "strategies" / "weekly_delta_neutral.yaml").write_text(
+        "strategy_id: weekly_delta_neutral\nruntime_id: positional_options\n"
+        "enabled: true\nmode: paper\nlive_approved: false\n"
+        "engine: positional_multi_leg_engine\n",
+        encoding="utf-8",
+    )

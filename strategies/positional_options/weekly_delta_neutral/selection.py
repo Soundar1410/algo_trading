@@ -183,10 +183,18 @@ def select_iron_condor(
     if credit_to_width_ratio < config.minimum_credit_to_width_ratio:
         return None
 
+    # Signed portfolio delta, in the *same* convention strategy.py's own
+    # _signed_delta uses post-entry (long => +raw delta, short => -raw
+    # delta; chain deltas are natively signed, negative for puts): a long
+    # put/call's position delta is its own raw delta, and a short
+    # put/call's is the negation of it. Getting this convention wrong here
+    # while _signed_delta uses the correct one would silently reject
+    # perfectly balanced condors (or admit lopsided ones) — this net_delta
+    # and _net_delta_per_lot must always agree on a held cycle's own legs.
     net_delta = (
-        -hedge_put.greeks.delta * quantity
+        hedge_put.greeks.delta * quantity
         + hedge_call.greeks.delta * quantity
-        + short_put.greeks.delta * quantity
+        - short_put.greeks.delta * quantity
         - short_call.greeks.delta * quantity
     )
     net_delta_per_lot = net_delta / lots if lots else net_delta

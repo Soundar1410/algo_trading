@@ -13,8 +13,8 @@ reaches a broker, no order endpoint or verb appears in any of them, and
 
 Phase 7 Part 4 added a second, different kind of script: **the control
 tier** (``stop_runtime.py``, ``stop_strategy.py``, ``square_off.py``,
-``start_runtime.py``, ``start_strategy.py``, and the ``_operator_common.py``
-plumbing they share). These are not read-only — a stop sends ``SIGTERM``, a
+``start_runtime.py``, ``start_strategy.py``, and the ``_operator_common.py``/
+``_runtimes.py`` plumbing they share). These are not read-only — a stop sends ``SIGTERM``, a
 square-off asks a worker to close a position, a start spawns a supervisor
 that trades. What has to hold instead is the plan's own constraint: **no
 control script opens a second writer against a trading table.** Every write
@@ -95,6 +95,7 @@ LAUNCHER_SCRIPTS = {
 #: that audit event.
 CONTROL_SCRIPTS = {
     "_operator_common.py",
+    "_runtimes.py",
     "square_off.py",
     "start_runtime.py",
     "start_strategy.py",

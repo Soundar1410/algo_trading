@@ -1,17 +1,16 @@
-# Positional options strategy group — inert scaffolding only.
+# Positional options strategy group.
 #
 # Named in the spec's own configuration-organisation example (section 9) and
 # in Phase 5's own instrument-class-rollout bullet ("add positional options
-# and intraday stocks one at a time"). This file is the "one at a time" first
-# step: it makes the runtime_id a real, loadable configuration, and nothing
-# more. There is no `runtimes/positional_options/` supervisor or worker to
-# start it — see that package's `__init__.py` for why, and D56 in the runbook
-# for the full reasoning.
+# and intraday stocks one at a time"). `runtimes/positional_options/` is now
+# a real, single-process supervisor/worker (weekly_delta_neutral) — see that
+# package's own module docstrings for the single-process design decision.
 #
-# `enabled: false` until there is something to enable. Nothing in this
-# repository currently scans config/runtimes/*.yaml on its own, so this file
-# is inert: it exists to be loadable by `load_runtime_config`, not to be
-# discovered automatically.
+# `enabled: false` until a 30-day paper evaluation and separate approval
+# clear it for operational start (CLAUDE.md). Nothing in this repository
+# auto-starts a runtime from this file; an operator runs
+# `python -m runtimes.positional_options` explicitly, and that entrypoint
+# itself refuses to start while this stays false.
 
 runtime_id: positional_options
 enabled: false

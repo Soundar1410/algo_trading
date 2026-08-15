@@ -63,16 +63,31 @@ class _OpeningFilterState:
     reference_at: datetime | None = None
 
 
+#: Keys ``runtimes.positional_options.config_adapter.build_worker_config``
+#: reads out of the *same* ``parameters:`` YAML block for the worker's own
+#: use (order-fill simulation, strategy resolution, evaluation cadence) —
+#: never strategy-decision inputs. ``WeeklyDeltaNeutralParameters`` uses
+#: ``extra="forbid"`` deliberately, to catch a genuine parameter typo; these
+#: are excluded before construction so the one YAML file both reader owns
+#: can coexist, rather than requiring two separate parameter blocks for what
+#: is operationally one strategy configuration.
+_WORKER_ONLY_PARAMETER_KEYS = frozenset(
+    {"strategy_ref", "paper_execution", "cost_rates", "evaluation_interval_seconds"}
+)
+
+
 @register_positional_strategy("weekly_delta_neutral")
 class WeeklyDeltaNeutralStrategy(BasePositionalMultiLegStrategy):
     def __init__(self, cfg: Any = None, **kwargs: Any) -> None:
         super().__init__(cfg)
         raw_params = kwargs.get("parameters", self.params)
-        self._params = (
-            raw_params
-            if isinstance(raw_params, WeeklyDeltaNeutralParameters)
-            else WeeklyDeltaNeutralParameters(**raw_params)
-        )
+        if isinstance(raw_params, WeeklyDeltaNeutralParameters):
+            self._params = raw_params
+        else:
+            strategy_params = {
+                k: v for k, v in raw_params.items() if k not in _WORKER_ONLY_PARAMETER_KEYS
+            }
+            self._params = WeeklyDeltaNeutralParameters(**strategy_params)
         self._scrip_master: ScripMaster = kwargs["scrip_master"]
         self._timezone: str = kwargs.get("timezone", "Asia/Kolkata")
         self._opening = _OpeningFilterState()

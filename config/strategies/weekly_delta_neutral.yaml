@@ -1,0 +1,135 @@
+# weekly_delta_neutral — the one weekly NIFTY defined-risk delta-neutral
+# iron condor this repository is approved to implement (CLAUDE.md). Full
+# spec: strategies/positional_options/weekly_delta_neutral/
+# WEEKLY_DELTA_NEUTRAL_ALGO_TRADING_SPEC.md.
+#
+# PAPER ONLY at delivery, and the positional_options runtime does not
+# support live execution at all (runtimes/positional_options/config_adapter.py
+# refuses mode: live outright, before any worker exists — see that module's
+# own docstring). Shipped disabled: enabling for the first paper session is
+# a deliberate, explicit operator action, taken only after the 30-day paper
+# evaluation and separate approvals CLAUDE.md's "OPERATIONAL LIVE ACTIVATION
+# ELIGIBLE" section requires. Do not flip `enabled: true` without those.
+
+strategy_id: weekly_delta_neutral
+runtime_id: positional_options
+enabled: false
+
+mode: paper
+live_approved: false
+
+# The positional-engine discriminator (parallel to straddle_920's own
+# `engine: multi_leg_engine` line) — routes runtimes/positional_options at
+# every layer that reads EngineKind.
+engine: positional_multi_leg_engine
+
+parameters:
+  underlying: NIFTY
+  lots: 1
+  # Spec section 6.3: 1% of allocated capital is the maximum-cycle-loss
+  # basis every stop multiple in `exits:` below is measured against.
+  allocated_capital: 500000.0
+  risk_free_rate: 0.065
+  dividend_yield: 0.0
+
+  # ------------------------------------------------- market-data resolution
+  # Blank means "use common.market_data.scrip_master.INDEX_REGISTRY's own
+  # NIFTY entry" — mirrors straddle_920.yaml's own convention exactly; never
+  # hardcode a security id/segment here when the registry already has one.
+  index_security_id: ""
+  index_segment: ""
+  fno_segment: ""
+  scrip_master_cache_dir: ""
+
+  # ---------------------------------------------------------- worker-only
+  # Read by runtimes/positional_options/config_adapter.py and worker.py,
+  # never by WeeklyDeltaNeutralParameters itself (see that class's own
+  # extra="forbid" and strategy.py's _WORKER_ONLY_PARAMETER_KEYS).
+  evaluation_interval_seconds: 5.0
+
+  # Spec section 3.2/3.3: Wednesday-only, 09:25-09:40 primary window,
+  # opening-stability delay up to 10:15; adjustment window 09:25-14:45 with
+  # the expiry-day cutoff at 14:30; expiry-day phase ladder
+  # 12:00 (tighten) -> 14:30 (no new adjustment) -> 15:05 (planned exit) ->
+  # 15:15 (hard exit, never disabled by market_fallback_enabled below).
+  schedule:
+    entry_day: WEDNESDAY
+    entry_window_start: "09:25"
+    entry_window_end: "09:40"
+    adjustment_start: "09:25"
+    adjustment_end: "14:45"
+    expiry_tighten_at: "12:00"
+    expiry_adjustment_cutoff: "14:30"
+    planned_exit: "15:05"
+    hard_exit: "15:15"
+
+  # Spec section 3.5/3.6: entry candidate deltas/tolerances, hedge-width
+  # bounds, combined-spread/credit-to-width/entry-delta gates. No candidate
+  # clearing every filter -> no relaxation, no entry (never configured to
+  # loosen automatically).
+  selection:
+    short_call_delta: 0.20
+    short_put_delta: -0.20
+    short_delta_tolerance: 0.03
+    hedge_call_delta: 0.06
+    hedge_put_delta: -0.06
+    hedge_delta_tolerance: 0.03
+    minimum_hedge_width_points: 250
+    maximum_hedge_width_points: 500
+    maximum_entry_delta_per_lot: 3.0
+    maximum_combined_spread_points: 8.0
+    minimum_volume: 1
+    minimum_open_interest: 1
+    quote_max_age_seconds: 5.0
+    minimum_credit_to_width_ratio: 0.18
+
+  # Spec section 3.2/3.3: opening-stability filter — skip today's cycle
+  # (never a Thursday shift) if the underlying has moved more than
+  # maximum_move_percent since the reference tick by skip_after.
+  opening_filter:
+    maximum_move_percent: 0.80
+    delay_minutes: 20
+    skip_after: "10:15"
+
+  # Spec section 7.1/7.2: three consecutive confirmations before rolling,
+  # roll only the untested short, at most 1/day and 3/cycle, 90 minutes
+  # apart.
+  adjustment:
+    warning_delta_per_lot: 8.0
+    trigger_delta_per_lot: 12.0
+    confirmation_checks: 3
+    target_delta_per_lot: 3.0
+    minimum_minutes_between: 90
+    maximum_per_day: 1
+    maximum_per_cycle: 3
+
+  # Spec section 6.2/6.3: fill-based, credit-basis stop ladder — strictly
+  # increasing soft/hard/emergency credit multiples, plus the allocated-
+  # capital and margin-utilization backstops.
+  exits:
+    profit_credit_capture_percent: 55.0
+    soft_loss_credit_multiple: 1.25
+    hard_loss_credit_multiple: 1.50
+    emergency_loss_credit_multiple: 1.75
+    maximum_cycle_loss_capital_percent: 1.0
+    maximum_margin_utilization_percent: 50.0
+
+  # Spec section 9/10: LIMIT-intent only, no market fallback, persist
+  # before submit, cancel before retry. market_fallback_enabled: false
+  # never disables the engine's own hard-exit deadline (spec section 8) —
+  # that net reprices a bounded, aggressive limit, never a market order.
+  execution:
+    order_type: LIMIT
+    market_fallback_enabled: false
+    persist_before_submit: true
+    cancel_before_retry: true
+
+  # Every leg is priced off a real bid/ask Full-mode quote
+  # (has_depth == true, from common.broker.quotes.QuoteBook) — never an
+  # LTP fallback, matching execution.order_type: LIMIT above structurally,
+  # not merely by convention: with allow_ltp_fallback: false a depth-less
+  # fill is impossible, not just discouraged.
+  paper_execution:
+    allow_ltp_fallback: false
+    submission_latency_ms: 250
+    tick_size: 0.05

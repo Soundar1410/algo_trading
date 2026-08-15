@@ -292,9 +292,11 @@ class Cycle:
 
 
 def next_entry_role(cycle: Cycle) -> LegRole | None:
-    """The next original-entry role still needing an order, or ``None`` if
-    entry is complete, blocked (a role already failed/is unresolved), or a
-    role is already in flight (never start a second while one is pending).
+    """The role whose order still needs attempting (or retrying), in
+    hedge-first order — the earliest non-``OPEN`` role, so a later role is
+    never even considered while an earlier one remains pending: sequential,
+    never parallel. ``None`` means entry is complete or blocked (the
+    earliest non-``OPEN`` role has failed or is unresolved).
 
     Purely a function of persisted leg state — the entry "stage" is never
     stored as a separate value, so a restart re-derives exactly where it
@@ -304,11 +306,18 @@ def next_entry_role(cycle: Cycle) -> LegRole | None:
         leg = cycle.original_leg(role)
         if leg is None:
             return role
-        if leg.state in PENDING_LEG_STATES:
-            return None
         if leg.state is LegState.OPEN:
             continue
-        return None
+        if leg.state in PENDING_LEG_STATES:
+            # Still needs an order attempted — including a *retry* of this
+            # same role (``_open_leg_now`` is designed to be called again on
+            # a still-PENDING_ORDER leg once a fresh quote arrives; every
+            # role starts PENDING_ORDER the instant _enter_cycle creates its
+            # row, before any order has actually been attempted, so treating
+            # PENDING as "already in flight, skip it" would mean no role's
+            # first attempt could ever happen).
+            return role
+        return None  # FAILED / CLOSE_SUBMISSION_UNKNOWN / anything else: blocked
     return None
 
 

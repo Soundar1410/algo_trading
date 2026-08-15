@@ -4541,26 +4541,37 @@ start/stop/crash/restart tests pass.
     needs re-deriving before binding it to a fingerprint. Closes if a
     fingerprint *version* or schema-generation marker is ever introduced.
 
-30. **A position or strategy-state row still cannot survive across a
+30. **CLOSED (2026-08-15, `strategy-weekly-delta-neutral` branch).** ~~A
+    position or strategy-state row still cannot survive across a
     `trading_date` boundary — D56's gap, still open by design, now with a
-    written candidate direction rather than none.** `positions`,
-    `strategy_state` and `order_intents` all key their identity on
-    `trading_date` (migration `0001`), so a position held across sessions
-    would fragment across unrelated rows under the current schema. Not a
-    live risk today: nothing in this repository holds a position across a
-    `trading_date` boundary — square-off (including Part 4's expiry
-    trigger) always resolves within the trading date it started in, and no
-    positional strategy or worker exists to need otherwise. Becomes a real
-    risk the day a positional strategy is built (Phase 9) without first
-    revisiting this. **D69** records the candidate direction (an
-    additional `cycle_id` column, `trading_date` untouched) but explicitly
-    stops short of building it — the blast radius (6+ `ExecutionRepository`
-    methods, every recovery function, dozens of existing tests) and the
-    unanswered question of what "a cycle" operationally means make
-    building it now speculative rather than incremental. Closes when
-    Phase 9 supplies a real positional strategy whose actual session/
-    rollover/adjustment shape can validate the candidate direction — or
-    replace it.
+    written candidate direction rather than none.~~ `weekly_delta_neutral`
+    is the real positional strategy D69 said this needed before the
+    candidate direction could be validated or replaced — it validated it.
+    Migration `0010` adds a durable `cycle_id` identity
+    (`strategy_cycles`/`strategy_cycle_legs`/`strategy_cycle_adjustments`/
+    `strategy_cycle_events`) plus `cycle_position_bindings`, exactly as
+    D69 sketched: `trading_date` on `positions`/`order_intents`/`orders`/
+    `fills`/`trade_ledger` is untouched and still records the *event*
+    date; what changed is that `ExecutionRepository._read_position`/
+    `_upsert_position`/`apply_fill`/`reserve_intent` now accept an
+    **optional** `cycle_id` that resolves the mutable position row through
+    `cycle_position_bindings` instead of `(trading_date, security_id)` —
+    every existing intraday call site, which never passes one, is
+    byte-identical to before. A binding write shares the exact transaction
+    the position mutation it guards is written in
+    (`ExecutionRepository.apply_fill`), so a binding failure rolls back the
+    position write and vice versa — proven, not asserted, by
+    `tests/unit/test_cycle_position_bindings_are_atomic.py` and by
+    `tests/integration/test_weekly_delta_neutral_restart.py`, which enters
+    a real four-leg cycle, closes the process, reopens a second
+    `ExecutionRepository` against the same database file, and confirms the
+    same cycle/legs/positions are adopted with no duplicate row and
+    `positions.trading_date` still the *opening* date after a restart on a
+    later trading date. See section 3's positional-options entry and
+    `common/engine/positional/`'s own module docstrings for the full
+    design (sequential hedge-first entry, the expiry-day lifecycle ladder,
+    restart reconciliation). D56/D69 stay in section 2.3 as the historical
+    record of the decision to defer, not rewritten.
 
 31. **A pre-database authentication failure is not persisted to
     `auth_events`.** `IntradayOptionsSupervisor.set_startup_auth_outcome`
@@ -7364,3 +7375,278 @@ actual completion — nothing is deferred or marked not-performed.
 | Test, lint, format, type-check output | **Delivered** | Section 4 verification table: **533 passed, 6 skipped**, ruff clean, mypy clean, after the fixture split (see "What Phase 2 Block 2 delivered") |
 | New deviations recorded | **Delivered** | D12–D15 in section 2.3 |
 | Real cross-thread shutdown hang found, diagnosed and fixed | **Delivered, scoped to one file** | `scripts/capture_live_tape.py` only; the identical untested flaw in `common/feed/reconnect.py`'s `ReconnectingFeed` and the complete absence of a live-feed shutdown path in `runtimes/intraday_options/supervisor.py` were found, deliberately **not** fixed this session, and recorded as limitation 1 — blocking live readiness until addressed. **Both closed in Phase 3 Part 1** (30 July 2026); see section 1 |
+
+---
+
+## 11. Weekly Delta-Neutral Positional Options (2026-08-15, `strategy-weekly-delta-neutral` branch)
+
+Closes **D69**/limitation 30: `positional_options` is now a real,
+single-process runtime driving `weekly_delta_neutral` — the one weekly
+NIFTY defined-risk delta-neutral iron condor CLAUDE.md approves — in paper
+mode only. Every committed live gate stays disabled; no live order API is
+constructed anywhere in the new code. Full rule set:
+`strategies/positional_options/weekly_delta_neutral/
+WEEKLY_DELTA_NEUTRAL_ALGO_TRADING_SPEC.md`.
+
+### 11.1 Architecture — a sibling, not a modification
+
+`common/engine/positional/` (`positional_models.py`, `positional_engine.py`,
+`positional_state.py`, `positional_strategy.py`, `lifecycle.py`) is a
+sibling of `common/engine/multi_leg_engine.py`, exactly as that module is a
+sibling of `common/engine/engine.py` — never a branch inside an existing
+one. `MultiLegEngine` is structurally intraday (`_start_day()` rebuilds a
+fresh `Basket` every start; `run()`'s `finally` forces square-off on every
+stop), both wrong for a position meant to survive across trading days.
+`PositionalMultiLegEngine` instead: adopts a durable `Cycle` on restart
+(`_adopt_recovered_cycle`), never forces an exit on its own stop (only an
+explicit trigger — strategy-signalled, operator square-off, or the
+engine's own hard-expiry-deadline net — closes a leg), and drives a
+sequential, hedge-first staged entry (`next_entry_role`/`entry_is_complete`/
+`entry_has_blocking_leg` in `positional_models.py`) rather than
+`MultiLegEngine`'s parallel one, because no short may exist without its
+hedge already confirmed.
+
+`LegRole` (`common/engine/multi_leg_models.py`) gained four additive
+members — `SHORT_CALL`, `SHORT_PUT`, `HEDGE_CALL`, `HEDGE_PUT` — alongside
+the unchanged `CE`/`PE`/`GENERIC`. `MultiLegEngine`'s own
+`_ROLE_TO_OPTION_TYPE` mapping is untouched (`{CE: CE, PE: PE}`,
+structurally unable to see the new members); the positional engine uses its
+own separate mapping (`positional_state.ROLE_TO_OPTION_TYPE`). Proven, not
+merely stated: `tests/unit/test_leg_role_extension_is_additive.py`.
+
+`runtimes/positional_options/` is **deliberately single-process** —
+`supervisor.py`/`worker.py`/`__main__.py`/`config_adapter.py`/
+`positional_multi_leg_engine_worker.py`. `runtimes/intraday_options/`
+spawns one child process per strategy because it must isolate *several
+concurrent* strategies; CLAUDE.md and the spec restrict this runtime to
+exactly one approved strategy today, so that isolation has nothing to
+isolate from yet. `supervisor.select_one_enabled_strategy` refuses outright
+(fail-closed, not "start the first one") if more than one strategy is ever
+enabled under `config/runtimes/positional_options.yaml` — a real multi-
+process split is the documented future path if a second positional
+strategy is ever approved, and the on-disk config/database contract would
+not need to change for it. The feed is `common.engine.adapter_feed.
+AdapterFeed` — a direct, single-process `MarketDataFeed` over one
+`MarketFeedAdapter`, sibling to `common/engine/hub_feed.py`'s `HubTickFeed`
+(the multi-process/candle-aggregation feed `intraday_options` needs and
+this runtime does not).
+
+### 11.2 Greeks — chain-first, a vetted model second, never a third
+
+`common/greeks/` is the one door every Greek requirement goes through
+(`GreeksService`): Dhan chain Greeks first when complete/mapped/fresh;
+`vollib.black_scholes_merton.greeks.analytical` second (the actively
+maintained successor to the deprecated `py_vollib`, imported directly — no
+handwritten `math.erf` Black-Scholes anywhere); `GreeksUnavailable` when
+neither produces a usable value. The caller decides what "unusable" means
+for its own action — blocks entry/normal-adjustment risk, **never** blocks
+an exit (`WeeklyDeltaNeutralStrategy._evaluate_active` runs every stop/
+target check before the `context.chain is None` early-return that would
+otherwise block on missing Greeks). Every `GreekSnapshot` records its
+source, source timestamp, received time, and — for a model-sourced
+snapshot — every input the model was evaluated with (spot, strike, option
+type, IV, risk-free rate, dividend yield, evaluation timestamp,
+time-to-expiry), so a decision is always fully reconstructable regardless
+of which source answered it. Verified against golden Black-Scholes
+reference values, put-call parity, and a finite-difference delta
+cross-check: `tests/unit/test_greeks_model.py`,
+`tests/unit/test_greeks_service.py`. `common/market_data/chain_view.py`
+parses the raw Dhan option-chain payload; `common/market_data/
+dhan_option_chain.py` is the real, read-only `ChainFetcher` — no order
+capability, added to `test_scripts_are_read_only.py`'s scope.
+
+### 11.3 Persistence and recovery — see limitation 30 (closed) above
+
+Migration `0010` (`strategy_cycles`, `strategy_cycle_legs`,
+`strategy_cycle_adjustments`, `strategy_cycle_events`,
+`cycle_position_bindings`, `cycle_decision_snapshots`), and the optional
+`cycle_id` parameter now threaded through `ExecutionRepository._read_
+position`/`_upsert_position`/`apply_fill`/`reserve_intent`. Full detail
+moved to limitation 30's own entry (section 6) rather than duplicated here.
+
+### 11.4 Strategy rules implemented (spec cross-reference)
+
+- **Entry** (§3): Wednesday-only, 09:25–09:40 window; opening-stability
+  filter (skip if the underlying has moved more than
+  `opening_filter.maximum_move_percent` since the reference tick, up to
+  `skip_after`); a runtime that first observes the market at/after 09:40
+  never enters that cycle (no reference ever captured); nearest weekly
+  expiry strictly *after* entry (`ScripMaster.nearest_expiry`, bumped by
+  one day only in the rare same-day-expiry edge case) — never weekday
+  arithmetic; the deterministic four-leg search
+  (`strategies/.../selection.py`: fresh complete quote+Greeks → liquidity/
+  spread → delta distance → hedge-width validity → the post-hoc
+  `maximum_entry_delta_per_lot` portfolio-delta gate) with no relaxation —
+  no qualifying candidate anywhere in the chain means no entry, full stop.
+- **Adjustment** (§7): three consecutive over-threshold confirmations
+  before rolling; only the untested short rolls, in the direction that
+  reduces projected absolute portfolio delta; 1/day, 3/cycle, 90 minutes
+  apart; a naked short (hedge missing/closed while its short is open) is
+  repaired before any adjustment trigger is even considered
+  (`_hedge_repair_needed`, checked first in `_evaluate_active`).
+- **Exits** (§6): fill-based P&L including every closed adjustment leg and
+  all charges; the original net credit is captured once, at entry
+  confirmation, and never rebased by a later adjustment or config edit;
+  the full priority ladder (emergency/hard/capital stop → expiry-day
+  planned exit → soft stop → profit target → margin-utilization backstop,
+  margin itself deliberately unmodelled and documented as a no-op, never
+  fabricated).
+- **Expiry day** (§8): the strategy signals its own planned exit at 15:05;
+  the engine's own `PositionalLifecycle Policy`/`_evaluate`'s hard-exit net
+  fires at 15:15 **regardless of what the strategy would have signalled**,
+  and cannot be defeated by `execution.market_fallback_enabled: false` —
+  that setting only removes the market-order fallback from the paper
+  broker's own fill model (`config/strategies/weekly_delta_neutral.yaml`'s
+  `paper_execution.allow_ltp_fallback: false` makes a depth-less fill
+  structurally impossible, not merely discouraged).
+
+### 11.5 Operational commands
+
+```bash
+# Paper start (refuses while runtimes/positional_options.yaml stays
+# enabled: false, per CLAUDE.md's outstanding 30-day-evaluation gate):
+.venv/bin/python -m scripts.start_runtime positional_options
+.venv/bin/python -m scripts.start_strategy weekly_delta_neutral \
+    --runtime-id positional_options
+
+# Stop / status / square-off / environment check — all four already
+# generic over --runtime-id and needed zero code changes: paths.
+# database_path("positional_options") already matches config/runtimes/
+# positional_options.yaml's own `database:` override.
+.venv/bin/python -m scripts.stop_runtime --runtime-id positional_options
+.venv/bin/python -m scripts.status --runtime-id positional_options
+.venv/bin/python -m scripts.square_off --runtime-id positional_options \
+    --strategy-id weekly_delta_neutral --confirm
+.venv/bin/python -m scripts.validate_environment --runtime-id positional_options
+```
+
+`scripts/start_runtime.py`/`scripts/start_strategy.py` previously always
+imported `runtimes.intraday_options.__main__.main` regardless of
+`--runtime-id` — harmless while `intraday_options` was the only runtime
+with a real composition root, wrong the moment `positional_options` got
+one (a positional strategy would have been driven through intraday's
+worker/engine wiring). Fixed via `scripts/_runtimes.py`, a one-dict
+registry; `start_strategy.py` also verifies a `positional_options`
+strategy id against real discovery before delegating, since that runtime
+has no `--strategy-id` admission flag of its own to filter with (it drives
+exactly one strategy per process by design — see 11.1).
+
+**Restart / carried positions**: an overnight stop leaves any open cycle
+exactly as it is — `run_worker`'s shutdown-signal handler stops the feed,
+never calls `request_square_off`. The next start's `_adopt_recovered_cycle`
+reconciles the cycle's projected leg states against
+`order_intents`/`orders`/`positions`/`cycle_position_bindings`
+(`positional_multi_leg_engine_worker.recover_cycle`/`_reconcile_cycle`),
+correcting in place wherever authoritative data can establish the truth,
+and raises `UnmanageableCycleState` (blocks the worker from starting) on
+anything it cannot safely interpret — unknown, duplicate, orphaned, or
+contradictory exposure or binding, exactly the same fail-closed posture
+`multi_leg_engine_worker._reconcile_basket` already has. Proven end-to-end,
+not merely by code inspection:
+`tests/integration/test_weekly_delta_neutral_restart.py` enters a real
+cycle, closes the process, reopens a second `ExecutionRepository` against
+the same database file on a later trading date, and confirms exactly one
+cycle row, the same four leg rows, the same four position rows (same
+`entry_correlation_id`, `trading_date` still the opening date), and no
+re-entry.
+
+**Unresolved exposure**: `CycleState.CRITICAL_UNRESOLVED` blocks new
+entries and requires operator/reconciliation action — never silently
+retried, never silently ignored, surfaced through `record_incident` ->
+`repository.record_error` and the Health tab (11.6).
+
+### 11.6 Dashboard
+
+`dashboards/data/positional.py` and `dashboards/positional_options.py`
+went from inert placeholders (dataclasses/messages describing a runtime
+that did not exist) to a real page reading migration `0010`'s tables
+through the same `run_bounded`/typed-read-model/no-inline-SQL discipline
+every other page in this package follows. Eight tabs (unchanged shape from
+the placeholder): Overview, Active Cycles, Legs, Adjustments, Orders &
+Fills, History, Performance, Health. `render(streamlit)` called with no
+arguments still renders the identical eight-tab "not configured" stub
+(disabled selector, no fabricated table) — the *only* thing that changed
+is that `main()` now passes a real `config_root`/`database_path`, at which
+point every tab queries real data.
+`tests/unit/test_dashboard_positional_real_data.py` drives the page
+against a real migrated database (built through the exact same
+`runtimes.positional_options.worker.build_engine` production path) and
+proves real cycle/leg data renders, while `tests/unit/
+test_dashboard_positional_and_stocks.py`'s original five stub-behaviour
+tests still pass unchanged (`render(st)` with no arguments is unaffected).
+
+### 11.7 Real bugs found and fixed by this work
+
+Both found only once real integration tests drove the actual production
+wiring rather than inspecting the code — recorded because a future change
+to either module should re-run
+`tests/integration/test_weekly_delta_neutral_entry.py` before trusting a
+refactor:
+
+1. **`next_entry_role` could never attempt a role's first order.**
+   `PENDING_ORDER` is both "no order has been attempted yet for this role"
+   (the state `_enter_cycle` creates every leg row in) and "an order is
+   mid-flight, retry on the next evaluation" — the original logic treated
+   any `PENDING_LEG_STATES` leg as the latter and returned `None`,
+   which meant `_drive_entry`'s loop broke on its very first iteration,
+   every time, and no cycle could ever actually place an order. Fixed by
+   returning the role instead of `None` when it is pending — `_open_leg_now`
+   is designed to be retried against the same pending leg exactly this
+   way.
+2. **`select_iron_condor`'s net-delta formula used a sign convention
+   inconsistent with `strategy.py`'s own `_signed_delta`.** A perfectly
+   symmetric, genuinely delta-neutral condor computed a large, spurious
+   non-zero net delta at the entry gate (would have rejected valid entries
+   under real chain data, or admitted lopsided ones by coincidence) while
+   `_net_delta_per_lot` — used for every *post*-entry adjustment decision
+   on the very same legs — computed the correct near-zero figure. Fixed to
+   match `_signed_delta`'s convention (long position => +raw delta, short
+   position => −raw delta) exactly.
+
+### 11.8 Known limitations (this branch)
+
+- **Chain payload shape unverified against a live response.**
+  `common/market_data/chain_view.py`'s own docstring already says so;
+  carried forward, not newly introduced — the same category of gap
+  `verify_vix_security_id.py` exists to close for a different field, and
+  the same bounded, read-only, no-order-capability pattern should close
+  this one before the first live paper session.
+- **No genuine broker-side `LIMIT` order.** `OrderLifecycle.handle_signal`
+  always builds `OrderType.MARKET` — a structural fact of shared code
+  every strategy routes through, not something this branch could change
+  without touching every existing strategy. `execution.order_type: LIMIT`
+  in the strategy's own config is honoured through `PaperBroker`'s
+  bid/ask-crossing adverse-fill model instead (`allow_ltp_fallback: false`
+  makes a depth-less fill structurally impossible) — a deliberate,
+  documented scope boundary, not a silently dropped requirement.
+- **Margin utilization is unmodelled.** `is_margin_breach` always receives
+  `estimated_margin=None` from this strategy — a documented no-op, never a
+  fabricated pass, pending a real margin feed.
+- **Selection is not a full combinatorial search.** Each role's
+  nearest-delta, most-liquid candidate is used directly rather than
+  searching every viable four-leg combination for the lowest absolute
+  portfolio delta — documented in `selection.py`'s own module docstring as
+  a deliberate scope boundary.
+- **No auto-start.** `orchestration/launchd/generate_plists.py` gets no
+  new plist for this runtime, matching the spec's own instruction; an
+  operator starts it explicitly via 11.5's commands.
+
+### 11.9 Safety confirmation
+
+No live order API is constructed or called anywhere in this branch's new
+code (`grep -rn "DhanLiveBroker\|build_dhan_order_client" common/engine/
+positional runtimes/positional_options strategies/positional_options`
+returns nothing). Every committed live gate stays independently disabled:
+`config/runtimes/positional_options.yaml` (`enabled: false`,
+`live_execution_allowed: false`), `config/strategies/
+weekly_delta_neutral.yaml` (`enabled: false`, `mode: paper`,
+`live_approved: false`) —
+`python -m scripts.assert_no_live_config_committed` passes.
+`runtimes/positional_options/config_adapter.py::build_worker_config`
+refuses `mode: live` outright, independently of that assertion, before
+any worker is ever constructed. **`OPERATIONAL LIVE ACTIVATION ELIGIBLE`
+remains NO — BLOCKED**: this branch is paper-only infrastructure: it does
+not start the 30-day paper evaluation clock, does not constitute the
+"second real paper strategy" language elsewhere in this repository refers
+to in a different context, and every other outstanding approval CLAUDE.md
+lists remains outstanding.

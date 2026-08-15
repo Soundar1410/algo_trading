@@ -103,7 +103,7 @@ class PositionalMultiLegEngine:
         gateway: LifecycleGateway,
         repository: ExecutionRepository,
         feed: MarketDataFeed,
-        option_selector: OptionSelector,
+        option_selector: OptionSelector | None = None,
         greeks_service: GreeksService,
         quotes: QuoteBook,
         session: MarketSession,
@@ -132,6 +132,12 @@ class PositionalMultiLegEngine:
         clock: Callable[[], datetime] = now_ist,
     ) -> None:
         self.feed = feed
+        #: Unlike MultiLegEngine, this engine never resolves a contract
+        #: itself — entry/adjustment/hedge-repair candidate selection is the
+        #: strategy's own job (it needs live Greeks the engine does not
+        #: otherwise fetch). Accepted and stored only for forward
+        #: compatibility/observability; optional so a worker with nothing to
+        #: hand it need not fabricate one.
         self.selector = option_selector
         self.strategy = strategy
         self.positions = position_manager
