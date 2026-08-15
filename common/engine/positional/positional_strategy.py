@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from common.greeks import GreekSnapshot
+from common.greeks import GreekSnapshot, GreeksService
 from common.market_data.chain_view import ChainView
 
 from .positional_models import Cycle, CycleSignal
@@ -68,9 +68,10 @@ class PositionalContext:
     trading_date: str
     spot: float | None
     spot_is_fresh: bool
-    #: Fresh option-chain view for the resolved expiry, or ``None`` if the
-    #: chain could not be fetched/parsed this evaluation — the strategy must
-    #: treat ``None`` as "block risk-increasing decisions", never guess.
+    #: Fresh option-chain view for the *cycle's* resolved expiry, or
+    #: ``None`` when there is no open cycle yet, or the chain could not be
+    #: fetched/parsed this evaluation — the strategy must treat ``None`` as
+    #: "block risk-increasing decisions", never guess.
     chain: ChainView | None
     #: security_id -> current Greeks, for every currently open leg, resolved
     #: through the one shared GreeksService this evaluation used. Empty
@@ -80,6 +81,16 @@ class PositionalContext:
     can_enter: bool
     is_holiday: bool
     is_trading_day: bool
+    #: The engine's own throttled/cached chain service, and the underlying's
+    #: identity — handed through so a strategy evaluating a *new* entry (no
+    #: cycle yet, so the engine has no ``resolved_expiry_date`` to fetch a
+    #: chain for on its own) can resolve its own candidate expiry and fetch
+    #: that expiry's chain itself, through the exact same throttle/cache
+    #: every other chain access in this runtime goes through — never a
+    #: second, direct Dhan call (spec section 8.2).
+    greeks_service: GreeksService
+    underlying_security_id: str
+    underlying_segment: str
 
 
 class BasePositionalMultiLegStrategy(ABC):

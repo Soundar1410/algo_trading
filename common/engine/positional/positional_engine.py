@@ -466,6 +466,9 @@ class PositionalMultiLegEngine:
             can_enter=self.session.can_enter(ts),
             is_holiday=self.session.is_holiday(ts),
             is_trading_day=self.session.is_trading_day(ts),
+            greeks_service=self._greeks,
+            underlying_security_id=self.underlying_id,
+            underlying_segment=self.underlying_segment,
         )
 
     def _apply_signal(self, signal: CycleSignal, ts: datetime) -> None:

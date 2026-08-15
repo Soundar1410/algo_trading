@@ -37,6 +37,9 @@ class EngineKind(StrEnum):
     MULTI_LEG_ENGINE = "multi_leg_engine"
     FIXED_STRIKE_ENGINE = "fixed_strike_engine"
     STOCK_PORTFOLIO_ENGINE = "stock_portfolio_engine"
+    #: The cross-session sibling of MULTI_LEG_ENGINE (spec: weekly_delta_neutral)
+    #: — common.engine.positional.positional_engine.PositionalMultiLegEngine.
+    POSITIONAL_MULTI_LEG_ENGINE = "positional_multi_leg_engine"
 
 
 class _StrictModel(BaseModel):
