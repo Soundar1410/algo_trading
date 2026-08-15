@@ -98,13 +98,23 @@ CREATE TABLE IF NOT EXISTS strategy_legs (
     exit_price            REAL,
     exit_time             TEXT,
     exit_reason           TEXT,
+    exit_correlation_id   TEXT,
     -- Gross (pre-charge) realised P&L for this leg once CLOSED — the same
     -- gross figure the strategy's own risk formulas use; charges/net P&L are
     -- reporting-only and are read from trade_ledger/positions, not stored here.
     realized_gross_pnl    REAL,
+    -- CLOSE_SUBMISSION_UNKNOWN: a close was submitted for this leg and its
+    -- outcome could not be established (the gateway raised rather than
+    -- confirming a fill). Deliberately distinct from both OPEN (nothing
+    -- retries the close automatically) and CLOSED (no fill is confirmed) —
+    -- see MultiLegEngine._close_leg_safely. Added in the same migration file
+    -- (not a new one) because 0009 has never been applied to any real/
+    -- operational database — only disposable test databases — and this
+    -- branch remains unmerged and under active review.
     state                 TEXT    NOT NULL CHECK (state IN (
                               'PENDING_CONTRACT', 'PENDING_SUBSCRIPTION', 'PENDING_ORDER',
-                              'OPEN', 'CLOSED', 'FAILED', 'EXPIRED')),
+                              'OPEN', 'CLOSED', 'FAILED', 'EXPIRED',
+                              'CLOSE_SUBMISSION_UNKNOWN')),
     version               INTEGER NOT NULL DEFAULT 1,
     created_at            TEXT    NOT NULL,
     updated_at            TEXT    NOT NULL,

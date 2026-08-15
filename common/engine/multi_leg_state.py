@@ -88,6 +88,7 @@ def persist_leg(
         exit_price=leg.exit_price,
         exit_time=leg.exit_time.isoformat() if leg.exit_time is not None else None,
         exit_reason=leg.exit_reason.value if leg.exit_reason is not None else None,
+        exit_correlation_id=leg.exit_correlation_id,
         realized_gross_pnl=leg.realized_gross_pnl,
         state=leg.state.value,
     )
@@ -220,6 +221,7 @@ def _row_to_leg(row) -> LegInstance:  # type: ignore[no-untyped-def]
         exit_price=row["exit_price"],
         exit_time=datetime.fromisoformat(row["exit_time"]) if row["exit_time"] else None,
         exit_reason=exit_reason,
+        exit_correlation_id=row["exit_correlation_id"],
         realized_gross_pnl=row["realized_gross_pnl"],
         replaces_leg_id=row["replaces_leg_id"],
     )

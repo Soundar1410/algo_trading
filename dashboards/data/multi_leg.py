@@ -58,6 +58,7 @@ class LegRow:
     exit_price: float | None
     exit_time: str | None
     exit_reason: str | None
+    exit_correlation_id: str | None
     realized_gross_pnl: float | None
     state: str
     #: Gross unrealised P&L at the last mark this leg was updated with — only
@@ -110,10 +111,15 @@ def load_legs_for_basket(conn: sqlite3.Connection, *, basket_id: str) -> tuple[L
     replaced.
 
     Charges/net P&L come from ``trade_ledger`` when a matching closed row
-    exists (joined by ``entry_correlation_id``, the identifier
-    ``strategy_legs`` and ``trade_ledger`` both carry for the same fill) —
-    reporting-only, never fed back into the gross ``realized_gross_pnl`` the
-    strategy's own risk formulas use.
+    exists — joined by ``exit_correlation_id`` (P0-3 correction), the
+    authoritative, globally-unique identifier the closing order actually
+    persisted under (``trade_ledger.exit_correlation_id`` is ``NOT NULL
+    UNIQUE`` with ``exit_broker_fill_id`` — exactly one row per real
+    closing fill), rather than the previous ``(entry_correlation_id,
+    security_id)`` approximation, which could not distinguish two different
+    closes of the same security on the same day and had to guess the most
+    recent one. Reporting-only, never fed back into the gross
+    ``realized_gross_pnl`` the strategy's own risk formulas use.
     """
     rows = conn.execute(
         """
@@ -145,14 +151,14 @@ def _row_to_basket(row: sqlite3.Row) -> BasketRow:
 def _row_to_leg(conn: sqlite3.Connection, row: sqlite3.Row) -> LegRow:
     charges: float | None = None
     net_pnl: float | None = None
-    if row["state"] == "CLOSED" and row["entry_correlation_id"]:
+    exit_correlation_id = row["exit_correlation_id"]
+    if row["state"] == "CLOSED" and exit_correlation_id:
         ledger = conn.execute(
             """
             SELECT entry_charges, exit_charges, gross_pnl FROM trade_ledger
-            WHERE entry_correlation_id = ? AND security_id = ?
-            ORDER BY closed_at DESC LIMIT 1
+            WHERE exit_correlation_id = ?
             """,
-            (row["entry_correlation_id"], row["security_id"]),
+            (exit_correlation_id,),
         ).fetchone()
         if ledger is not None:
             charges = float(ledger["entry_charges"]) + float(ledger["exit_charges"])
@@ -176,6 +182,7 @@ def _row_to_leg(conn: sqlite3.Connection, row: sqlite3.Row) -> LegRow:
         exit_price=row["exit_price"],
         exit_time=row["exit_time"],
         exit_reason=row["exit_reason"],
+        exit_correlation_id=exit_correlation_id,
         realized_gross_pnl=row["realized_gross_pnl"],
         state=row["state"],
         # No live mark source in this read-only layer (spec's own documented

@@ -136,6 +136,13 @@ class OpenPosition:
     # before exit" figures a single entry/exit price pair can't show.
     max_favorable_pnl: float = field(init=False)
     max_adverse_pnl: float = field(init=False)
+    #: The correlation ID the entry order actually persisted under, if the
+    #: gateway reported one (``LifecycleGateway`` does; ``InMemoryGateway``
+    #: does not). ``None`` for an adopted position until restart recovery
+    #: fills it in from the persisted row. Set by ``PositionManager.open``/
+    #: ``.adopt`` after construction — not a constructor argument, so every
+    #: existing caller (positional or keyword) is unaffected.
+    entry_correlation_id: str | None = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         self.quantity = self.lots * self.contract.lot_size
@@ -251,6 +258,13 @@ class Trade:
     candle_structure_triggered: bool | None = None
     trail_triggered: bool | None = None
     trail_activated: bool | None = None
+    #: The correlation IDs the entry and exit orders actually persisted
+    #: under, when the gateway reports one — the join key a caller (e.g.
+    #: multi-leg restart reconciliation) uses to find the authoritative
+    #: ``order_intents``/``orders``/``fills`` rows for this exact round
+    #: trip, rather than approximating by ``(security_id, time)``.
+    entry_correlation_id: str | None = None
+    exit_correlation_id: str | None = None
 
     @property
     def net_pnl(self) -> float:

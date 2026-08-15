@@ -26,10 +26,12 @@ LOT_SIZE = 65
 class _ExplodingGateway:
     """Any call is a defect, so any call fails the test that made it."""
 
-    def buy(self, contract, lots, *, ref_price, ts):
+    def buy(self, contract, lots, *, ref_price, ts, stop_price=None, target_price=None,
+             basket_id=None, leg_id=None):
         raise AssertionError("adopt must not place an order; a position already exists")
 
-    def sell(self, contract, lots, *, ref_price, ts):
+    def sell(self, contract, lots, *, ref_price, ts, stop_price=None, target_price=None,
+              basket_id=None, leg_id=None):
         raise AssertionError("adopt must not place an order; a position already exists")
 
 
@@ -41,7 +43,8 @@ class _ExitOnlyGateway(_ExplodingGateway):
         self.charges = charges
         self.sells = 0
 
-    def sell(self, contract, lots, *, ref_price, ts):
+    def sell(self, contract, lots, *, ref_price, ts, stop_price=None, target_price=None,
+              basket_id=None, leg_id=None):
         self.sells += 1
         return FillOutcome(fill_price=self.exit_price, charges=self.charges)
 

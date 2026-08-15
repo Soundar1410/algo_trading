@@ -61,12 +61,14 @@ from .config import EngineConfig
 from .daily_guard import DailyRiskConfig, DailyRiskGuard
 from .feed import MarketDataFeed
 from .multi_leg_models import (
+    AdjustmentLifecycle,
     Basket,
     BasketAction,
     BasketSignal,
     LegInstance,
     LegRole,
     LegState,
+    MultiLegDurabilityError,
     UnmanageableBasketState,
 )
 from .multi_leg_strategy import BaseMultiLegStrategy
@@ -109,6 +111,7 @@ class MultiLegEngine:
         recover_basket: Callable[[], Basket | None] | None = None,
         persist_basket: Callable[[Basket], None] | None = None,
         persist_leg: Callable[[LegInstance], None] | None = None,
+        record_incident: Callable[[str, str], None] | None = None,
         clock: Callable[[], datetime] = now_ist,
         trading_date: str = "",
     ) -> None:
@@ -141,6 +144,15 @@ class MultiLegEngine:
         self._recover_basket = recover_basket
         self._persist_basket_cb = persist_basket
         self._persist_leg_cb = persist_leg
+        # Independent of persist_basket/persist_leg deliberately: a critical
+        # incident (a durability failure, an unresolved close) must still be
+        # recorded/alerted even when the very reason it's firing is that the
+        # primary persistence path is failing. A production worker wires this
+        # to a separate write path (see runtimes.intraday_options.
+        # multi_leg_engine_worker._build) — an offline/test engine leaves it
+        # None and incidents are logged only, never silently dropped either way
+        # (see _record_incident).
+        self._record_incident_cb = record_incident
         self._trading_date = trading_date
 
         interval = parse_timeframe_minutes(cfg.timeframe)
@@ -323,6 +335,13 @@ class MultiLegEngine:
                     last_price=leg.last_price,
                     max_favorable_pnl=leg.max_favorable_pnl,
                     max_adverse_pnl=leg.max_adverse_pnl,
+                    # P0-3 correction: carry the leg's own entry_correlation_id
+                    # (already durable on the strategy_legs row) onto the
+                    # adopted OpenPosition, so an exit this same process
+                    # submits still has the original entry's correlation ID
+                    # available end to end — not just for legs opened fresh
+                    # this run.
+                    entry_correlation_id=leg.entry_correlation_id,
                 )
                 self.feed.subscribe(leg.contract.security_id)
             elif leg.is_pending and leg.contract is not None:
@@ -395,17 +414,27 @@ class MultiLegEngine:
         strat_signal = self.strategy.on_candle(
             candle, ts, basket=self._basket, vix=self._last_vix_price
         )
-        # Correction: the primary attempt must be durably consumed *before*
-        # filter evaluation can create retry ambiguity (spec section 9.2), and
-        # more generally any basket-level bookkeeping a strategy touches
-        # directly (entries_consumed, day_blocked_reason, an expired pending
-        # replacement) must be durable before the engine acts on whatever
-        # signal (or None) came back. Persisting unconditionally here, before
-        # ``_apply_signal`` does anything with an external side effect
-        # (contract resolution, subscription, order submission), is what
-        # gives that guarantee — cheap, since this runs once per closed
-        # underlying candle, not per tick.
-        self._persist_basket()
+        # Correction (P0-1): the primary attempt must be durably consumed
+        # *before* filter evaluation can create retry ambiguity (spec section
+        # 9.2), and more generally any basket-level bookkeeping a strategy
+        # touches directly (entries_consumed, day_blocked_reason, an expired
+        # pending replacement) must be durable before the engine acts on
+        # whatever signal (or None) came back — this is a genuine pre-effect
+        # checkpoint, not observability: if it cannot be persisted, no order
+        # this candle's signal implies may be submitted, because a restart
+        # could then re-derive the same "consume the primary attempt" decision
+        # and place a second, undetectable order. Critical, and cheap, since
+        # this runs once per closed underlying candle, not per tick.
+        try:
+            self._persist_basket(critical=True)
+        except MultiLegDurabilityError:
+            log.error(
+                "%s: basket bookkeeping from this candle could not be durably "
+                "persisted; suppressing any signal it produced — no order will "
+                "be submitted for this candle",
+                self.label,
+            )
+            return
 
         log.info(
             "%s bar evaluated_at=%s | %s",
@@ -469,6 +498,41 @@ class MultiLegEngine:
         if self._spot is None:
             log.warning("%s: no spot price yet; cannot select option contract(s)", self.label)
             return
+
+        if signal.action is BasketAction.ENTER_LEG:
+            # Correction (P0-2): only a basket genuinely AWAITING_NEXT_CANDLE
+            # may produce a replacement (spec section 12.3 step 5) — the
+            # engine is the last line of defence against a stray/duplicate
+            # ENTER_LEG signal, independent of whatever gate the strategy
+            # itself applies.
+            awaiting = AdjustmentLifecycle.AWAITING_NEXT_CANDLE.value
+            if self._basket.pending_replacement_state != awaiting:
+                log.error(
+                    "%s: ENTER_LEG signal received while pending_replacement_state=%s "
+                    "(expected AWAITING_NEXT_CANDLE) — refusing to enter a replacement",
+                    self.label,
+                    self._basket.pending_replacement_state,
+                )
+                return
+            # The one-shot replacement attempt is consumed *before* any
+            # contract resolution/subscription — durably, so a crash between
+            # "decided to replace" and "leg pending" cannot leave this basket
+            # able to retry the replacement on a later candle (spec section
+            # 12.3 step 5: the attempt happens once, on this candle, never
+            # again). Critical: this is the same "consume before acting"
+            # pre-effect checkpoint as the primary entry's in _on_candle_close.
+            self._basket.pending_replacement_role = None
+            self._basket.pending_replacement_state = AdjustmentLifecycle.REPLACEMENT_PENDING.value
+            try:
+                self._persist_basket(critical=True)
+            except MultiLegDurabilityError:
+                log.error(
+                    "%s: could not durably consume the replacement attempt; "
+                    "refusing to enter a replacement leg this candle",
+                    self.label,
+                )
+                return
+
         for intent in signal.legs:
             option_type = _ROLE_TO_OPTION_TYPE.get(intent.role)
             if option_type is None:
@@ -502,11 +566,30 @@ class MultiLegEngine:
                     "%s: could not resolve a contract for %s: %s", self.label, intent.role, exc
                 )
                 leg.state = LegState.FAILED
+                # Best-effort: no order was ever possible without a resolved
+                # contract, so there is no pre-effect claim to fail closed on.
                 self._persist_leg(leg)
                 continue
             leg.contract = contract
             leg.state = LegState.PENDING_ORDER
-            self._persist_leg(leg)
+            try:
+                # Pre-effect checkpoint (P0-1): the pending leg's identity and
+                # contract must be durable *before* it is subscribed — a
+                # subscription leads directly to an order on the next fresh
+                # tick (_try_fill_pending -> _open_leg), so a crash here must
+                # never be able to leave an order placed with no durable
+                # record it was ever intended.
+                self._persist_leg(leg, critical=True)
+            except MultiLegDurabilityError:
+                log.error(
+                    "%s: could not durably persist pending leg %s (%s) before "
+                    "subscribing; refusing to subscribe/enter it this candle",
+                    self.label,
+                    leg_id,
+                    contract.symbol,
+                )
+                leg.state = LegState.FAILED
+                continue
             self.feed.subscribe(contract.security_id)
             self._pending_by_security[contract.security_id] = leg_id
             log.info(
@@ -516,17 +599,17 @@ class MultiLegEngine:
                 intent.side.value,
                 contract.symbol,
             )
-        if signal.action is BasketAction.ENTER_LEG:
-            # The one-shot replacement attempt has now been made (queued, or
-            # every intent failed to resolve above) — spec section 12.3 step
-            # 5: resolved once, on this candle, never retried on a later one.
-            self._basket.pending_replacement_role = None
-            self._basket.pending_replacement_state = None
-            self._persist_basket()
 
     def _open_leg(self, leg: LegInstance, price: float, ts: datetime) -> None:
         assert leg.contract is not None
-        self.positions.open(leg.contract, leg.side, price, ts)
+        self.positions.open(
+            leg.contract,
+            leg.side,
+            price,
+            ts,
+            basket_id=self._basket.basket_id,
+            leg_id=leg.leg_id,
+        )
         position = self.positions.get(leg.contract.security_id)
         assert position is not None
         leg.state = LegState.OPEN
@@ -534,7 +617,14 @@ class MultiLegEngine:
         leg.quantity = position.quantity
         leg.entry_time = ts
         leg.last_price = position.entry_price
+        leg.entry_correlation_id = position.entry_correlation_id
         self._pending_by_security.pop(leg.contract.security_id, None)
+        # Best-effort (P0-1): the entry order has already executed
+        # (positions.open() above completed) — a projection-write failure
+        # here changes only what this process's own read-model shows, not
+        # what happened. Recorded as an incident and reconciled by restart
+        # recovery (see multi_leg_engine_worker.recover_basket), never raised
+        # — there is nothing left to abort.
         self._persist_leg(leg)
         self._maybe_capture_original_basis()
         self._notify("fill", f"{leg.side.value} {leg.contract.symbol} @ {price:.2f}")
@@ -564,31 +654,100 @@ class MultiLegEngine:
             return
         reason = signal.exit_reason or ExitReason.STRATEGY_EXIT
         if reason is ExitReason.ADJUSTMENT:
-            # Correction: the sole permitted adjustment is durably claimed
-            # *before* submitting the adjustment exit (spec section 12.3
-            # steps 1-2) — never after, so a crash between the two cannot
-            # leave a second adjustment possible on restart.
-            self._basket.adjustment_count += 1
-            self._basket.pending_replacement_role = leg.role
-            self._basket.pending_replacement_state = "AWAITING_NEXT_CANDLE"
-            self._persist_basket()
-        self._close_leg(leg, leg.last_price if leg.last_price is not None else 0.0, ts, reason)
+            self._close_adjusted_leg(leg, ts)
+        else:
+            self._close_leg_safely(
+                leg, leg.last_price if leg.last_price is not None else 0.0, ts, reason
+            )
+
+    def _close_adjusted_leg(self, leg: LegInstance, ts: datetime) -> None:
+        """The corrected adjustment-close state machine (P0-2, spec section
+        12.3 steps 1-4), in the required order:
+
+        1. durably claim the sole adjustment (``adjustment_count`` + 1)
+        2. persist that this leg's exit must now be resolved
+           (``EXIT_SUBMISSION_PENDING``) — 1 and 2 land in one durable
+           checkpoint, critical: if this cannot be persisted, the leg stays
+           untouched and open, and the day is blocked, rather than risking a
+           second, undetectable adjustment on restart.
+        3. submit/reconcile the close (:meth:`_close_leg_safely`)
+        4. only a *confirmed* closing fill may reach
+           ``AWAITING_NEXT_CANDLE`` — the only state
+           :meth:`_enter_legs` will accept a replacement from. An unresolved
+           close instead reaches ``EXIT_UNKNOWN`` and blocks entries, so an
+           open-or-unknown adjusted leg can never coexist with a newly
+           entered replacement (correction requirement 6).
+        """
+        self._basket.adjustment_count += 1
+        self._basket.pending_replacement_role = leg.role
+        self._basket.pending_replacement_state = AdjustmentLifecycle.EXIT_SUBMISSION_PENDING.value
+        try:
+            self._persist_basket(critical=True)
+        except MultiLegDurabilityError:
+            log.error(
+                "%s: could not durably claim the day's one adjustment; leg %s "
+                "stays open, no close attempted",
+                self.label,
+                leg.leg_id,
+            )
+            return
+
+        closed = self._close_leg_safely(
+            leg, leg.last_price if leg.last_price is not None else 0.0, ts, ExitReason.ADJUSTMENT
+        )
+        if closed:
+            self._basket.pending_replacement_state = AdjustmentLifecycle.AWAITING_NEXT_CANDLE.value
+        else:
+            self._basket.pending_replacement_state = AdjustmentLifecycle.EXIT_UNKNOWN.value
+            # _close_leg_safely already blocked entries and recorded the
+            # incident for the leg itself; this basket-level state is what
+            # _enter_legs' AWAITING_NEXT_CANDLE gate reads, so it must be set
+            # even though entries are already blocked for the day regardless.
+        # Best-effort: the close either genuinely happened (a real fill — the
+        # trade is already durable via the order/fill tables) or definitively
+        # did not resolve (CLOSE_SUBMISSION_UNKNOWN, itself already made
+        # durable — best-effort — inside _close_leg_safely). This write is
+        # bookkeeping about *which* of those two happened, not the trading
+        # event itself.
+        self._persist_basket()
 
     def _exit_all_signal(self, signal: BasketSignal, ts: datetime) -> None:
         reason = signal.exit_reason or ExitReason.STRATEGY_EXIT
         self._basket.day_blocked_reason = signal.reason or reason.value
+        # Best-effort, deliberately: this only records *why* the basket is
+        # blocked; the actual closes below happen unconditionally regardless
+        # of whether this bookkeeping write succeeds — never let an
+        # observability write block an emergency exit.
         self._persist_basket()
         self._close_all(ts, reason)
 
     def _close_leg(self, leg: LegInstance, price: float, ts: datetime, reason: ExitReason) -> None:
+        """Raising primitive: closes ``leg`` or raises.
+
+        Callers that must never duplicate-close and must never propagate a
+        gateway failure use :meth:`_close_leg_safely` instead — this exists
+        underneath it (and is exercised directly by tests) so a genuine
+        close failure is observable rather than swallowed here.
+        """
         if leg.contract is None:
-            return
-        trade = self.positions.close(leg.contract.security_id, price, ts, reason)
+            raise RuntimeError(f"leg {leg.leg_id} has no resolved contract to close")
+        trade = self.positions.close(
+            leg.contract.security_id,
+            price,
+            ts,
+            reason,
+            basket_id=self._basket.basket_id,
+            leg_id=leg.leg_id,
+        )
         leg.state = LegState.CLOSED
         leg.exit_price = trade.exit_price
         leg.exit_time = ts
         leg.exit_reason = reason
+        leg.exit_correlation_id = trade.exit_correlation_id
         leg.realized_gross_pnl = trade.gross_pnl
+        # Best-effort (P0-1): the closing fill has already happened
+        # (positions.close() above completed) — same reasoning as
+        # _open_leg's persist.
         self._persist_leg(leg)
         if self._daily_guard is not None:
             self._daily_guard.register_trade(trade.net_pnl)
@@ -600,10 +759,53 @@ class MultiLegEngine:
         )
         self.strategy.on_leg_closed(trade, leg, self._basket)
 
+    def _close_leg_safely(
+        self, leg: LegInstance, price: float, ts: datetime, reason: ExitReason
+    ) -> bool:
+        """Attempt to close ``leg``; never raises.
+
+        Returns ``True`` on a confirmed close, ``False`` if the close's
+        outcome could not be established — in which case ``leg`` is left in
+        :attr:`~common.engine.multi_leg_models.LegState.CLOSE_SUBMISSION_UNKNOWN`
+        (never plain ``OPEN``, so nothing — including a later
+        :meth:`_close_all` sweep — retries the close automatically and risks
+        a duplicate) and the day is blocked (correction requirement 8: never
+        issue a duplicate close when the first close's outcome is unknown).
+        """
+        if leg.contract is None:
+            return False
+        try:
+            self._close_leg(leg, price, ts, reason)
+            return True
+        except Exception as exc:
+            log.exception(
+                "%s: closing leg %s raised — its outcome cannot be "
+                "established; marking CLOSE_SUBMISSION_UNKNOWN rather than "
+                "retrying automatically",
+                self.label,
+                leg.leg_id,
+            )
+            leg.state = LegState.CLOSE_SUBMISSION_UNKNOWN
+            # Best-effort: there is no pending action left to abort here (the
+            # close attempt already happened, ambiguously) — unlike a
+            # pre-effect checkpoint, blocking entries below does not depend
+            # on this write succeeding.
+            self._persist_leg(leg)
+            self._block_entries(f"leg {leg.leg_id} close outcome unknown: {exc}")
+            self._record_incident(
+                self._basket.basket_id,
+                f"leg {leg.leg_id} close raised and its outcome is unknown: {exc}",
+            )
+            return False
+
     def _close_all(self, ts: datetime, reason: ExitReason) -> None:
+        # _close_leg_safely never raises, so one leg's unresolved close
+        # (P0-2) can never prevent an attempt on the rest of the basket —
+        # required for square-off/shutdown to still reduce whatever exposure
+        # it safely can.
         for leg in list(self._basket.open_legs()):
             price = leg.last_price if leg.last_price is not None else 0.0
-            self._close_leg(leg, price, ts, reason)
+            self._close_leg_safely(leg, price, ts, reason)
         for leg in list(self._basket.pending_legs()):
             self._terminate_pending_leg(leg, LegState.EXPIRED)
 
@@ -631,6 +833,9 @@ class MultiLegEngine:
             return
         self._basket.square_off_state = "IN_PROGRESS"
         self._basket.day_blocked_reason = self._basket.day_blocked_reason or "hard square-off"
+        # Best-effort, deliberately: a failed persist here must never
+        # suppress the actual square-off below — reducing real exposure
+        # always takes priority over recording that it is happening.
         self._persist_basket()
         self._close_all(ts, ExitReason.SQUARE_OFF)
         self._squared_off = True
@@ -643,19 +848,95 @@ class MultiLegEngine:
         self.feed.stop()
 
     # ------------------------------------------------------------ persistence
-    def _persist_basket(self) -> None:
-        if self._persist_basket_cb is not None:
-            try:
-                self._persist_basket_cb(self._basket)
-            except Exception:
-                log.exception("%s: could not persist basket state", self.label)
+    def _persist_basket(self, *, critical: bool = False) -> None:
+        """Persist the current basket projection.
 
-    def _persist_leg(self, leg: LegInstance) -> None:
-        if self._persist_leg_cb is not None:
-            try:
-                self._persist_leg_cb(leg)
-            except Exception:
-                log.exception("%s: could not persist leg %s", self.label, leg.leg_id)
+        ``critical=True`` marks a *pre-effect* checkpoint (P0-1): a durable
+        claim that must exist before an irreversible action is allowed to
+        proceed. On failure it blocks further entries/adjustments and raises
+        :class:`~common.engine.multi_leg_models.MultiLegDurabilityError`,
+        which the caller must catch to abort *before* taking that action.
+
+        ``critical=False`` (the default) is a best-effort projection write —
+        used only after the actual trading event (an order, a fill) has
+        already happened durably through the order/fill tables — logged and
+        reported as an incident on failure, never raised.
+
+        No-ops silently if no ``persist_basket`` callback was configured at
+        all: "no persistence configured" (an offline/test engine) is a
+        distinct, supported mode from "persistence configured but failing".
+        """
+        if self._persist_basket_cb is None:
+            return
+        try:
+            self._persist_basket_cb(self._basket)
+        except Exception as exc:
+            if critical:
+                log.error(
+                    "%s: CRITICAL — could not durably persist basket state (%s); "
+                    "blocking further entries/adjustments until resolved",
+                    self.label,
+                    exc,
+                )
+                self._block_entries(f"basket persistence failure: {exc}")
+                self._record_incident(
+                    self._basket.basket_id, f"critical basket persist failed: {exc}"
+                )
+                raise MultiLegDurabilityError(
+                    f"failed to durably persist basket {self._basket.basket_id}: {exc}"
+                ) from exc
+            log.exception("%s: could not persist basket projection (best-effort)", self.label)
+            self._record_incident(
+                self._basket.basket_id, f"basket projection persist failed (non-critical): {exc}"
+            )
+
+    def _persist_leg(self, leg: LegInstance, *, critical: bool = False) -> None:
+        """Persist one leg's projection — see :meth:`_persist_basket` for the
+        ``critical`` contract, identical here at leg granularity."""
+        if self._persist_leg_cb is None:
+            return
+        try:
+            self._persist_leg_cb(leg)
+        except Exception as exc:
+            if critical:
+                log.error(
+                    "%s: CRITICAL — could not durably persist leg %s (%s); "
+                    "blocking further entries/adjustments until resolved",
+                    self.label,
+                    leg.leg_id,
+                    exc,
+                )
+                self._block_entries(f"leg {leg.leg_id} persistence failure: {exc}")
+                self._record_incident(
+                    self._basket.basket_id,
+                    f"critical leg {leg.leg_id} persist failed: {exc}",
+                )
+                raise MultiLegDurabilityError(
+                    f"failed to durably persist leg {leg.leg_id}: {exc}"
+                ) from exc
+            log.exception(
+                "%s: could not persist leg %s projection (best-effort)", self.label, leg.leg_id
+            )
+            self._record_incident(
+                self._basket.basket_id,
+                f"leg {leg.leg_id} projection persist failed (non-critical): {exc}",
+            )
+
+    def _record_incident(self, basket_id: str, message: str) -> None:
+        """Independent, best-effort incident path (P0-1) — always logged at
+        CRITICAL regardless of whether a ``record_incident`` callback was
+        configured, and never lets a failure in that callback itself
+        propagate (there is nothing further to fail closed on beyond what the
+        caller has already done)."""
+        log.critical("%s: INCIDENT basket=%s: %s", self.label, basket_id, message)
+        if self._record_incident_cb is None:
+            return
+        try:
+            self._record_incident_cb(basket_id, message)
+        except Exception:
+            log.exception(
+                "%s: could not record incident through the independent path either", self.label
+            )
 
     def _notify(self, event_type: str, message: str) -> None:
         self.notifier.send(

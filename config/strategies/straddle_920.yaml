@@ -13,7 +13,18 @@
 # regardless.
 
 strategy_id: straddle_920
-enabled: true
+# P1-3 correction: shipped disabled. Enabling for the first paper session
+# is a deliberate, explicit operator action, taken only after: (1) a
+# bounded, read-only, market-hours verification that vix_security_id "21"
+# on IDX_I actually delivers India VIX ticks (see docs/runbook — the "21"
+# value below is corroborated against the legacy reference tree's own
+# verified constants, per the comment further down, but has not yet been
+# verified against a live Dhan feed while the market was open); (2) a
+# current NIFTY weekly option contract/lot-size spot-check against the
+# live Dhan instrument master; (3) environment validation; (4) a database
+# backup and migration validation. Do not flip this to true without all
+# four having actually happened.
+enabled: false
 
 mode: paper
 live_approved: false
@@ -72,9 +83,16 @@ parameters:
   # section 7. Never hardcode a lot size, expiry or security id.
   contract_resolver: dhan
   strike_step: 50
-  # Fallback lot size, used ONLY if contract_resolver is switched to
-  # "simulated". Ignored entirely by the "dhan" resolver above.
-  lot_size: 75
+  # No lot_size here, deliberately (P1-4 correction): the "dhan" resolver
+  # above takes lot size exclusively from the resolved contract's own
+  # metadata (spec section 7) — this key is never read for it. A hardcoded
+  # value here would be misleading (this strategy's real lot size is
+  # whatever NIFTY's current exchange-defined lot size is, not a number
+  # fixed in this file) and could silently produce a wrong simulated
+  # quantity if contract_resolver were ever switched to "simulated" without
+  # also adding an explicit lot_size — which config_adapter.py now refuses
+  # to do silently (ConfigError if contract_resolver: simulated has no
+  # explicit lot_size).
   expiry: null
   index_security_id: ""
   index_segment: ""
@@ -84,16 +102,30 @@ parameters:
   # --------------------------------------------------------------- India VIX
   # Auxiliary market-data-only instrument (spec section 6/9.3) — resolved as a
   # common.market_data.instruments.MarketDataInstrument, never a fake
-  # IndexMeta.fno_segment (VIX has no option chain). security_id "21" is
-  # corroborated independently in two places in the legacy Trading_Automation
-  # reference tree's own "verified constants" (framework/market_data/
-  # scrip_master.py and stock_intraday_orb/data/scrip_master.py both record
-  # INDIAVIX security_id="21" on IDX_I) — the same category of fact as
-  # NIFTY's own "13"/BANKNIFTY's "25" already in this repo's INDEX_REGISTRY,
-  # not a hardcoded option contract id. Re-confirm against the live Dhan
-  # instrument master before the first paper run that actually streams VIX
-  # (a wrong id only degrades the VIX filter to its documented fail-open
-  # "unavailable" path — spec section 9.3 — never a wrong trade).
+  # IndexMeta.fno_segment (VIX has no option chain). A *wrong configured* id
+  # is a config defect, not ordinary data absence (P1-2 correction) — the
+  # fail-open behaviour below covers only a genuinely unavailable VIX tick.
+  #
+  # security_id "21" was independently corroborated twice:
+  #  (a) the legacy Trading_Automation reference tree's own "verified
+  #      constants" (framework/market_data/scrip_master.py and
+  #      stock_intraday_orb/data/scrip_master.py both record INDIAVIX
+  #      security_id="21" on IDX_I) — the same category of fact as NIFTY's
+  #      own "13"/BANKNIFTY's "25" already in this repo's INDEX_REGISTRY;
+  #  (b) `scripts/verify_vix_security_id.py` — a bounded, read-only,
+  #      no-credential fetch of Dhan's live public scrip master — run for
+  #      real on 2026-08-15 (checked_at=2026-08-15T08:03:00Z), which
+  #      confirmed the row `NSE,I,21,INDEX,...,INDIA VIX,...`: security_id
+  #      "21" genuinely names INDIA VIX in the current instrument master.
+  #
+  # What (b) does NOT prove: that the live market-feed WebSocket actually
+  # delivers real-time VIX ticks for id=21/segment=IDX_I during market
+  # hours. That is a separate, still-outstanding check — run
+  # `scripts/diagnose_live_feed.py --security-id 21 --segment 0 --mode
+  # ticker` for real, during market hours, with real credentials, before
+  # this strategy is enabled (see `enabled: false` above and P1-3). Re-run
+  # verify_vix_security_id.py before every first-of-day paper session until
+  # both checks have passed and stayed stable across several runs.
   vix_security_id: "21"
   vix_index_segment: "IDX_I"
 

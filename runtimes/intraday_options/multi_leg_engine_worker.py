@@ -51,7 +51,12 @@ from common.engine.config import EngineConfig, SessionConfig
 from common.engine.gateway import LifecycleGateway
 from common.engine.hub_feed import HubTickFeed
 from common.engine.multi_leg_engine import MultiLegEngine
-from common.engine.multi_leg_models import Basket, LegInstance, UnmanageableBasketState
+from common.engine.multi_leg_models import (
+    Basket,
+    LegInstance,
+    LegState,
+    UnmanageableBasketState,
+)
 from common.engine.multi_leg_state import BasketRowInconsistent
 from common.engine.multi_leg_state import load_basket as _load_basket
 from common.engine.multi_leg_state import persist_basket as _persist_basket_row
@@ -68,6 +73,7 @@ from common.engine.square_off import PersistedSquareOffAuthority, SquareOffAutho
 from common.execution import ExecutionRepository, OrderLifecycle
 from common.health import HealthState, HeartbeatWriter
 from common.logging import get_logger
+from common.models import OrderSide
 from common.notifications import NotificationEvent, SafeNotifier
 from common.process import (
     clear_square_off_request,
@@ -120,17 +126,35 @@ def load_multi_leg_strategy(strategy_ref: str, kwargs: dict[str, Any]) -> BaseMu
 
 # ------------------------------------------------------------- restart recovery
 def recover_basket(config: WorkerConfig, repository: ExecutionRepository) -> Basket | None:
-    """Rebuild the basket a previous process left open, or ``None``.
+    """Rebuild the basket a previous process left open, or ``None`` — and
+    *reconcile* it (P0-2/P0-4 correction) rather than merely reconstruct it.
 
-    Mirrors ``engine_worker.recover_position``'s conservative posture exactly,
-    generalised to N legs: :func:`~common.engine.multi_leg_state.load_basket`
-    already refuses (``BasketRowInconsistent``) to guess at any row it cannot
-    safely interpret. That is re-raised here as
+    ``load_basket`` alone only replays the mutable ``strategy_baskets``/
+    ``strategy_legs`` projection — a *reconstruction*, not a reconciliation:
+    it trusts the projection was written completely and correctly, which is
+    exactly the assumption P0-1's failure-injection tests prove can be
+    false (a critical persist can still fail after the order it was
+    guarding has already happened, e.g. a best-effort post-fill write). This
+    cross-checks that projection against the authoritative execution
+    history (``order_intents``/``orders``) and the authoritative current
+    book (``positions``) for every leg — see :func:`_reconcile_basket` — and
+    only returns a basket once every leg's true state has either been
+    confirmed to match the projection or *corrected in place* from that
+    authoritative source, so already-open exposure a previous process
+    genuinely opened is never left unmanaged and never duplicated.
+
+    Mirrors ``engine_worker.recover_position``'s conservative posture:
+    :func:`~common.engine.multi_leg_state.load_basket` refuses
+    (``BasketRowInconsistent``) to guess at any row it cannot safely
+    interpret, and :func:`_reconcile_basket` refuses (returns unresolved
+    mismatches) to guess at any leg/position disagreement it cannot safely
+    resolve from the authoritative tables. Both reach
     :class:`~common.engine.multi_leg_models.UnmanageableBasketState`, which
     ``MultiLegEngine._adopt_recovered_basket`` propagates — aborting the
     worker rather than trading alongside exposure it cannot prove — while an
-    ordinary (non-corruption) failure blocks new entries only and leaves any
-    genuinely open leg visibly OPEN in the database for manual handling.
+    ordinary (non-corruption, non-mismatch) failure blocks new entries only
+    and leaves any genuinely open leg visibly OPEN in the database for
+    manual handling.
     """
     try:
         basket = _load_basket(
@@ -142,7 +166,276 @@ def recover_basket(config: WorkerConfig, repository: ExecutionRepository) -> Bas
     except BasketRowInconsistent as exc:
         _record_recovery_failure(config, repository, str(exc))
         raise UnmanageableBasketState(str(exc)) from exc
+    if basket is None:
+        return None
+
+    mismatches = _reconcile_basket(repository, basket, config)
+    if mismatches:
+        detail = "; ".join(mismatches)
+        _record_recovery_failure(config, repository, detail)
+        raise UnmanageableBasketState(detail)
     return basket
+
+
+# --------------------------------------------------------- P0-4 reconciliation
+def _reconcile_basket(
+    repository: ExecutionRepository, basket: Basket, config: WorkerConfig
+) -> list[str]:
+    """Cross-check ``basket``'s projected leg states against the
+    authoritative ``order_intents``/``orders``/``positions`` tables.
+
+    Mutates ``basket``/its legs *in place* wherever the true state can be
+    established from those authoritative tables and differs from the
+    projection (e.g. a leg the projection still shows PENDING_ORDER that
+    actually filled, or a CLOSE_SUBMISSION_UNKNOWN leg whose close never
+    actually took) — this is the "do not merely tell the operator to close
+    manually if the existing controlled reconciliation/square-off path can
+    safely manage recognized exposure" requirement: recognised exposure is
+    adopted back into a manageable state, not just reported.
+
+    Returns every discrepancy that could **not** be safely resolved this
+    way — a non-empty list means the caller must fail closed
+    (``UnmanageableBasketState``), because genuine ambiguity (an order whose
+    outcome cannot be established, contradictory rows) is present and no
+    controlled path can manage it automatically.
+    """
+    open_positions = {
+        p.security_id: p
+        for p in repository.open_positions(
+            strategy_id=config.strategy_id,
+            execution_mode=config.execution_mode,
+            trading_date=config.trading_date,
+        )
+    }
+    claimed_security_ids: dict[str, str] = {}  # security_id -> leg_id, for duplicate detection
+    mismatches: list[str] = []
+
+    for leg in basket.legs.values():
+        result = _reconcile_leg(repository, leg, open_positions)
+        if result is not None:
+            mismatches.append(result)
+            continue
+        if leg.state is LegState.OPEN and leg.contract is not None:
+            sid = leg.contract.security_id
+            other = claimed_security_ids.get(sid)
+            if other is not None:
+                mismatches.append(
+                    f"legs {other!r} and {leg.leg_id!r} are both OPEN against the same "
+                    f"position {sid} — duplicate open leg mapping"
+                )
+            else:
+                claimed_security_ids[sid] = leg.leg_id
+
+    # The reverse direction: an OPEN position with no leg claiming it at all.
+    for security_id in open_positions:
+        if security_id not in claimed_security_ids:
+            mismatches.append(
+                f"position {security_id} is OPEN but no leg in basket "
+                f"{basket.basket_id!r} claims it"
+            )
+
+    # Correction requirement: replacement awaiting entry while the
+    # adjusted-out leg is still open. AWAITING_NEXT_CANDLE/REPLACEMENT_PENDING
+    # both mean "a replacement may be entered/was entered for this role" —
+    # neither may coexist with an OPEN or unresolved leg of that same role
+    # other than the just-adopted replacement itself (sequence check: the
+    # replacement, if any, always has a higher sequence than what it replaced).
+    if basket.pending_replacement_role is not None:
+        role = basket.pending_replacement_role
+        stale_open = [
+            leg
+            for leg in basket.legs.values()
+            if leg.role is role and leg.state is LegState.OPEN and not leg.is_replacement
+        ]
+        if stale_open:
+            mismatches.append(
+                f"basket {basket.basket_id!r} has a replacement pending for {role.value} "
+                f"while leg(s) {[leg.leg_id for leg in stale_open]} of that role are still OPEN"
+            )
+
+    if not mismatches and basket.lifecycle_state == "CLOSED" and open_positions:
+        # A leg reverted back to OPEN above (a square-off close that never
+        # actually took) makes this label stale rather than wrong — correct
+        # it so the engine's own bookkeeping matches what it is about to
+        # manage, instead of leaving "CLOSED" attached to a basket with a
+        # currently-open leg.
+        basket.lifecycle_state = "OPEN"
+        basket.square_off_state = "PENDING"
+
+    return mismatches
+
+
+def _reconcile_leg(
+    repository: ExecutionRepository,
+    leg: LegInstance,
+    open_positions: dict[str, Any],
+) -> str | None:
+    """Reconcile one leg. Returns ``None`` if resolved (``leg`` mutated in
+    place where the authoritative tables disagreed with the projection), or
+    a description of an unresolved discrepancy."""
+    history = repository.leg_order_history(leg_id=leg.leg_id)
+    entry_side = leg.side.value
+    entry_rows = [r for r in history if r["side"] == entry_side]
+    exit_rows = [r for r in history if r["side"] != entry_side]
+    if len(entry_rows) > 1:
+        return f"leg {leg.leg_id!r} has {len(entry_rows)} entry order_intents rows (expected <= 1)"
+    if len(exit_rows) > 1:
+        return f"leg {leg.leg_id!r} has {len(exit_rows)} exit order_intents rows (expected <= 1)"
+    entry_row = entry_rows[0] if entry_rows else None
+    exit_row = exit_rows[0] if exit_rows else None
+    entry_outcome = _resolve_intent_outcome(entry_row)
+    exit_outcome = _resolve_intent_outcome(exit_row)
+    position = open_positions.get(leg.contract.security_id) if leg.contract is not None else None
+
+    if leg.state is LegState.OPEN:
+        if entry_outcome != "FILLED":
+            return (
+                f"leg {leg.leg_id!r} is OPEN in the projection but its entry order "
+                f"resolves to {entry_outcome}, not a confirmed fill"
+            )
+        if position is None:
+            return f"leg {leg.leg_id!r} is OPEN but no matching OPEN position exists"
+        # Side: the persisted Position.quantity's sign is the authoritative
+        # record of which direction is actually held (negative = short/SELL,
+        # positive = long/BUY — see common.execution.repository.apply_fill).
+        # It must agree with the leg's own recorded side.
+        implied_side = OrderSide.SELL if position.quantity < 0 else OrderSide.BUY
+        if implied_side is not leg.side:
+            return (
+                f"leg {leg.leg_id!r} recorded side {leg.side.value} does not match position "
+                f"{leg.contract.security_id if leg.contract else '?'}'s implied side "
+                f"{implied_side.value} (quantity={position.quantity})"
+            )
+        # LegInstance.quantity (mirrors OpenPosition.quantity) is always a
+        # positive magnitude; the persisted Position.quantity is signed
+        # (negative for a short/SELL leg) — compare magnitudes.
+        if abs(position.quantity) != leg.quantity:
+            return (
+                f"leg {leg.leg_id!r} quantity {leg.quantity} does not match position "
+                f"{leg.contract.security_id if leg.contract else '?'} quantity {position.quantity}"
+            )
+        return None
+
+    if leg.state is LegState.PENDING_CONTRACT or leg.state is LegState.PENDING_SUBSCRIPTION:
+        # No entry order is even possible yet at these states — leg.contract
+        # may be None, so there is nothing further to cross-check.
+        if entry_outcome == "FILLED":
+            return (
+                f"leg {leg.leg_id!r} is {leg.state.value} (no contract resolved yet) but an "
+                "entry order for it is FILLED — this cannot happen without a code defect"
+            )
+        return None
+
+    if leg.state is LegState.PENDING_ORDER:
+        if entry_outcome == "FILLED":
+            _upgrade_pending_leg_to_open(leg, entry_row, position)
+            return None
+        if entry_outcome == "UNKNOWN":
+            return (
+                f"leg {leg.leg_id!r} is PENDING_ORDER and its entry order's outcome cannot be "
+                "established (reserved but never confirmed submitted/rejected)"
+            )
+        # NEVER_PLACED or TERMINAL_NO_FILL: nothing happened at the broker
+        # for this leg yet — safe to leave PENDING_ORDER; the engine places
+        # a fresh, legitimate order on the next tick.
+        return None
+
+    if leg.state is LegState.CLOSE_SUBMISSION_UNKNOWN:
+        if exit_outcome == "FILLED":
+            _resolve_unknown_close(leg, exit_row)
+            return None
+        if position is not None:
+            # The close never actually took (rejected/cancelled/never even
+            # submitted/still ambiguous) and the position is still OPEN at
+            # the authoritative table — real exposure remains. Adopt it back
+            # as OPEN so square-off can manage it, rather than leaving it
+            # invisible to this process.
+            _revert_unresolved_close_to_open(leg, position)
+            return None
+        return (
+            f"leg {leg.leg_id!r}'s close outcome is unresolved ({exit_outcome}) and no open "
+            "position exists to adopt back — cannot establish whether real exposure remains"
+        )
+
+    # Terminal states (CLOSED/FAILED/EXPIRED): the one contradiction that
+    # matters is real exposure the projection believes is gone.
+    if leg.state is LegState.CLOSED and position is not None:
+        return (
+            f"leg {leg.leg_id!r} is CLOSED in the projection but position "
+            f"{leg.contract.security_id if leg.contract else '?'} is still OPEN"
+        )
+    return None
+
+
+def _resolve_intent_outcome(row: Any) -> str:
+    """Classify one ``leg_order_history`` row (or ``None``) into the outcome
+    :func:`_reconcile_leg` needs to decide what, if anything, to do.
+
+    ``"NEVER_PLACED"``: no intent row at all for this side.
+    ``"TERMINAL_NO_FILL"``: risk-blocked, or the order reached a terminal
+    non-fill state (REJECTED/CANCELLED/EXPIRED) — nothing happened at the
+    broker, safe to treat as if no attempt occurred.
+    ``"FILLED"``: a confirmed fill.
+    ``"UNKNOWN"``: reserved but the submission outcome was never recorded
+    (a crash between ``reserve_intent`` and ``record_submission``), still
+    non-terminal (SUBMITTED/ACKNOWLEDGED/PENDING/UNKNOWN), or partially
+    filled — genuinely ambiguous, never guessed through.
+    """
+    if row is None:
+        return "NEVER_PLACED"
+    if row["risk_decision"] == "BLOCKED":
+        return "TERMINAL_NO_FILL"
+    status = row["order_status"]
+    if status is None:
+        return "UNKNOWN"
+    if status == "FILLED":
+        return "FILLED"
+    if status in ("REJECTED", "CANCELLED", "EXPIRED"):
+        return "TERMINAL_NO_FILL"
+    return "UNKNOWN"  # PENDING, SUBMITTED, ACKNOWLEDGED, PARTIALLY_FILLED, UNKNOWN
+
+
+def _upgrade_pending_leg_to_open(leg: LegInstance, entry_row: Any, position: Any) -> None:
+    """P0-1's own exact scenario, resolved: the entry order genuinely
+    filled but the best-effort projection write that would have advanced
+    the leg to OPEN never landed. Uses the authoritative ``positions`` row
+    when one exists (it carries the real entry price/quantity/correlation
+    ID), falling back to the order row's own fill figures otherwise."""
+    if position is not None:
+        leg.entry_price = position.average_price
+        leg.quantity = abs(position.quantity)
+        leg.entry_correlation_id = position.entry_correlation_id
+        leg.last_price = position.average_price
+    else:
+        leg.entry_price = entry_row["order_average_fill_price"]
+        leg.quantity = entry_row["order_filled_quantity"] or leg.quantity
+        leg.entry_correlation_id = entry_row["correlation_id"]
+        leg.last_price = leg.entry_price
+    leg.state = LegState.OPEN
+
+
+def _resolve_unknown_close(leg: LegInstance, exit_row: Any) -> None:
+    """A CLOSE_SUBMISSION_UNKNOWN leg whose exit order is, in fact, FILLED —
+    the close happened, only the projection's confirmation write failed."""
+    leg.state = LegState.CLOSED
+    leg.exit_price = exit_row["order_average_fill_price"]
+    leg.exit_correlation_id = exit_row["correlation_id"]
+
+
+def _revert_unresolved_close_to_open(leg: LegInstance, position: Any) -> None:
+    """A CLOSE_SUBMISSION_UNKNOWN leg whose close did not, in fact, resolve
+    to a fill — real exposure remains. Adopted back as OPEN from the
+    authoritative position row so normal management (including square-off)
+    resumes rather than leaving it invisible."""
+    leg.state = LegState.OPEN
+    leg.entry_price = position.average_price
+    leg.quantity = abs(position.quantity)
+    leg.entry_correlation_id = position.entry_correlation_id
+    leg.last_price = position.average_price
+    leg.exit_price = None
+    leg.exit_time = None
+    leg.exit_reason = None
+    leg.exit_correlation_id = None
 
 
 def _record_recovery_failure(
@@ -427,6 +720,23 @@ def _build(
             trading_date=config.trading_date,
         )
 
+    def _record_incident_cb(basket_id: str, message: str) -> None:
+        # Independent write path (P0-1): a separate repository call from the
+        # basket/leg persistence the incident is often reporting a failure
+        # of, so an incident about "persistence is failing" is not itself
+        # silently lost to the same failure. record_error has its own
+        # transaction; nothing here catches a failure of *this* call — that
+        # is deliberately left to MultiLegEngine._record_incident's own
+        # try/except, which already logs at CRITICAL regardless.
+        repository.record_error(
+            runtime_id=config.runtime_id,
+            strategy_id=config.strategy_id,
+            execution_mode=config.execution_mode,
+            severity="CRITICAL",
+            component="multi_leg_engine.incident",
+            message=f"basket={basket_id}: {message}",
+        )
+
     engine = MultiLegEngine(
         cfg,
         feed=feed,
@@ -454,6 +764,7 @@ def _build(
         recover_basket=_recover,
         persist_basket=_persist_basket_cb,
         persist_leg=_persist_leg_cb,
+        record_incident=_record_incident_cb,
         trading_date=config.trading_date,
     )
     holder.append(engine)

@@ -344,6 +344,7 @@ def project_root_with_a_straddle_920_basket(
         exit_price=200.0,
         exit_time=f"{trading_date}T09:30:00",
         exit_reason="ADJUSTMENT",
+        exit_correlation_id="corr_pe_exit",
         realized_gross_pnl=-78750.0,
         state="CLOSED",
     )
@@ -371,6 +372,7 @@ def project_root_with_a_straddle_920_basket(
         exit_price=None,
         exit_time=None,
         exit_reason=None,
+        exit_correlation_id=None,
         realized_gross_pnl=None,
         state="OPEN",
     )

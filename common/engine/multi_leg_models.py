@@ -39,7 +39,10 @@ from common.models import ExitReason, OrderSide
 from .models import OptionContract, OptionSelection
 
 __all__ = [
+    "PENDING_LEG_STATES",
     "TERMINAL_LEG_STATES",
+    "UNRESOLVED_LEG_STATES",
+    "AdjustmentLifecycle",
     "Basket",
     "BasketAction",
     "BasketSignal",
@@ -47,6 +50,7 @@ __all__ = [
     "LegIntent",
     "LegRole",
     "LegState",
+    "MultiLegDurabilityError",
     "UnmanageableBasketState",
 ]
 
@@ -58,6 +62,28 @@ class UnmanageableBasketState(RuntimeError):
     UnmanageablePositionState` — raising this must reach the engine's restart path
     and latch new entries off for the day rather than guess at a premium basis or
     an adjustment count. See :mod:`runtimes.intraday_options.multi_leg_engine_worker`.
+    """
+
+
+class MultiLegDurabilityError(RuntimeError):
+    """A required basket/leg persistence write failed while persistence was
+    configured (a production worker) — never swallowed.
+
+    Raised only at *pre-effect* checkpoints, where the durable claim must
+    exist before an irreversible action (an order submission) is allowed to
+    proceed — the primary-attempt consumption, a pending leg's identity
+    before it is subscribed, and the sole adjustment's claim before its
+    exit is submitted. A *post-effect* projection write (recording that an
+    already-executed fill closed a leg) failing is a different, lesser
+    problem — the trade already happened durably through the order/fill
+    tables — and is handled as best-effort plus an incident, never by
+    raising this and never by undoing the trade.
+
+    An engine constructed with no persistence callbacks at all (an offline
+    or test engine — see :class:`~common.engine.multi_leg_engine.
+    MultiLegEngine`'s ``persist_basket``/``persist_leg`` parameters) never
+    raises this: "no persistence configured" is an explicit, supported mode,
+    distinct from "persistence configured but failing".
     """
 
 
@@ -91,6 +117,15 @@ class LegState(StrEnum):
     FAILED = "FAILED"
     #: Never reached OPEN before the cutoff that permits it passed.
     EXPIRED = "EXPIRED"
+    #: A close was submitted for this leg and its outcome could not be
+    #: established (the gateway raised rather than confirming a fill).
+    #: Deliberately **not** ``OPEN`` (so nothing retries the close
+    #: automatically — see :meth:`~common.engine.multi_leg_engine.
+    #: MultiLegEngine._close_leg_safely`) and **not** ``CLOSED`` (the fill
+    #: is not confirmed). Only an operator or a future reconciliation pass
+    #: that actually queries broker/execution state may resolve this —
+    #: never a guess.
+    CLOSE_SUBMISSION_UNKNOWN = "CLOSE_SUBMISSION_UNKNOWN"
 
 
 #: States a leg cannot leave — used by :meth:`Basket.open_legs`/``pending_legs``
@@ -99,6 +134,48 @@ TERMINAL_LEG_STATES = frozenset({LegState.CLOSED, LegState.FAILED, LegState.EXPI
 PENDING_LEG_STATES = frozenset(
     {LegState.PENDING_CONTRACT, LegState.PENDING_SUBSCRIPTION, LegState.PENDING_ORDER}
 )
+#: Neither open, pending, nor terminal — needs an operator or reconciliation,
+#: never an automatic retry. Excluded from both ``open_legs()`` and
+#: ``pending_legs()`` by construction (neither filter matches this state).
+UNRESOLVED_LEG_STATES = frozenset({LegState.CLOSE_SUBMISSION_UNKNOWN})
+
+
+class AdjustmentLifecycle(StrEnum):
+    """``Basket.pending_replacement_state``'s vocabulary once an adjustment
+    has been triggered (spec section 12.3) — explicit states so a crash at
+    any point is distinguishable, at restart, from a healthy one.
+
+    Required ordering (never skipped, never reordered):
+
+    1. ``CLAIMED`` — the sole adjustment is durably claimed (``adjustment_
+       count`` incremented and persisted) but the adjusted leg's close has
+       not been submitted yet.
+    2. ``EXIT_SUBMISSION_PENDING`` — about to submit / submitting the close.
+       Written in the same durable checkpoint as ``CLAIMED`` in practice
+       (nothing observable happens between deciding to claim and attempting
+       the close), so the engine writes this value directly rather than two
+       separate states for the same instant.
+    3. ``EXIT_UNKNOWN`` — the close was attempted and its outcome could not
+       be established. Terminal for the day: no replacement is attempted
+       while this holds, and it is never silently resolved by a guess.
+    4. ``EXIT_CONFIRMED`` — the closing fill is confirmed.
+    5. ``AWAITING_NEXT_CANDLE`` — the **only** state from which a replacement
+       signal may be produced (spec section 12.3 step 5).
+    6. ``REPLACEMENT_PENDING`` — the one-shot replacement attempt has been
+       made (a leg is pending or the attempt failed) and will not be retried.
+    7. ``REPLACEMENT_FILLED`` / ``REPLACEMENT_FAILED`` / ``REPLACEMENT_EXPIRED``
+       — terminal outcomes for the day's one adjustment cycle.
+    """
+
+    CLAIMED = "CLAIMED"
+    EXIT_SUBMISSION_PENDING = "EXIT_SUBMISSION_PENDING"
+    EXIT_UNKNOWN = "EXIT_UNKNOWN"
+    EXIT_CONFIRMED = "EXIT_CONFIRMED"
+    AWAITING_NEXT_CANDLE = "AWAITING_NEXT_CANDLE"
+    REPLACEMENT_PENDING = "REPLACEMENT_PENDING"
+    REPLACEMENT_FILLED = "REPLACEMENT_FILLED"
+    REPLACEMENT_FAILED = "REPLACEMENT_FAILED"
+    REPLACEMENT_EXPIRED = "REPLACEMENT_EXPIRED"
 
 
 class BasketAction(StrEnum):
@@ -168,6 +245,7 @@ class LegInstance:
     exit_price: float | None = None
     exit_time: datetime | None = None
     exit_reason: ExitReason | None = None
+    exit_correlation_id: str | None = None
     realized_gross_pnl: float | None = None
     max_favorable_pnl: float = 0.0
     max_adverse_pnl: float = 0.0

@@ -175,6 +175,134 @@ for `straddle_920`, confirmed by `scripts.assert_no_live_config_committed`).
   passes. No live order API was called; every committed live gate stays
   disabled.
 
+### `strategy-straddle-920` correction pass — 15 August 2026 (P0-1 through P1-4, still unmerged)
+
+An independent review of commit `66234b7` found the durability/correlation/
+reconciliation/test-coverage claims above were not accurate: persistence
+failures were swallowed rather than fail-closed, the adjustment-close state
+machine could leave a replacement coexisting with an unresolved close,
+`order_intents.basket_id`/`.leg_id` were never actually populated despite
+the claim, restart recovery only replayed the projection rather than
+cross-checking it, several acceptance rows were inspection-only despite the
+prompt requiring tests, VIX's id was asserted "corroborated" without a
+current check, the strategy shipped `enabled: true`, and a misleading
+hardcoded `lot_size: 75` sat in the "dhan" resolver's own config block. All
+eight corrections below were made on the same branch; still not merged into
+`phase-10-controlled-live` or `main`.
+
+- **P0-1 (fail-closed persistence)**: `MultiLegEngine._persist_basket`/
+  `._persist_leg` gained a `critical: bool` parameter. Critical (pre-effect)
+  checkpoints — the primary-attempt consumption, a pending leg's identity
+  before it is subscribed, the sole adjustment's claim before its exit is
+  submitted — now raise a new `MultiLegDurabilityError` on failure, which
+  the caller catches to abort *before* the guarded action; entries are also
+  latched off. Post-effect projection writes (recording an already-executed
+  fill/close) stay best-effort, reported through a new independent
+  `record_incident` callback (wired to `repository.record_error` in
+  production), and never undo or block the trade that already happened —
+  `_close_all`/`_handle_square_off` always attempt every leg regardless of
+  a persist failure. 5 dedicated failure-injection tests in
+  `tests/integration/test_straddle_920_durability.py`.
+- **P0-2 (corrected adjustment-close state machine)**: new
+  `common/engine/multi_leg_models.py::AdjustmentLifecycle` StrEnum (`CLAIMED`
+  → `EXIT_SUBMISSION_PENDING` → `EXIT_UNKNOWN`/`EXIT_CONFIRMED` →
+  `AWAITING_NEXT_CANDLE` → `REPLACEMENT_PENDING` → terminal). The claim is
+  now durably critical-persisted *before* the close is even attempted (never
+  after); a new `LegState.CLOSE_SUBMISSION_UNKNOWN` (migration `0009`
+  widened in place — never applied to any real database, still unmerged)
+  and a `_close_leg`/`_close_leg_safely` split mean a close whose outcome
+  cannot be established is never retried and never silently treated as
+  `CLOSED`. Both the strategy's own replacement gate and the engine's
+  `_enter_legs` independently require
+  `pending_replacement_state == AWAITING_NEXT_CANDLE` — a `CLAIMED`/
+  `EXIT_UNKNOWN` adjusted leg can no longer coexist with a newly entered
+  replacement. 3 boundary tests alongside P0-1's in the same file.
+- **P0-3 (real basket/leg correlation, threaded end to end)**: `OpenPosition.
+  entry_correlation_id`, `Trade.entry_correlation_id`/`.exit_correlation_id`,
+  `FillOutcome.correlation_id`, and `basket_id`/`leg_id` parameters on
+  `ExecutionGateway`/`PositionManager.open`/`.close`/`.adopt`/
+  `OrderLifecycle.handle_signal` are the actual writers now — `order_intents.
+  basket_id`/`.leg_id` were already columns but nothing had ever set them
+  before this pass. `_adopt_recovered_basket` was also found not threading
+  `entry_correlation_id` into `positions.adopt()` at all and was fixed.
+  `dashboards/data/multi_leg.py` now joins `trade_ledger` by the
+  authoritative, unique `exit_correlation_id` rather than approximating with
+  `(security_id, time)`. Proven end to end (original CE/PE entry, adjusted
+  leg exit, replacement entry/exit, hard square-off, restart adoption)
+  against a real database in `tests/integration/test_straddle_920_correlation.py`.
+- **P0-4 (real restart reconciliation, not reconstruction)**: `recover_basket`
+  now calls a new `_reconcile_basket`/`_reconcile_leg`
+  (`multi_leg_engine_worker.py`) that cross-checks the projection against
+  `order_intents`/`orders` (via a new `ExecutionRepository.leg_order_history`)
+  and the authoritative `positions` table for every leg, and detects: an
+  unconfirmed OPEN-leg entry, a position with no claiming leg, quantity/side
+  mismatch, duplicate open-leg mappings, a replacement awaiting entry while
+  the adjusted-out leg is still open, and an unresolved exit submission with
+  no exposure to fall back on — all fail closed (`UnmanageableBasketState`).
+  Where the authoritative tables *can* establish the true state — a
+  `PENDING_ORDER` leg that actually filled, or a `CLOSE_SUBMISSION_UNKNOWN`
+  leg whose close did or did not really take — the basket is corrected in
+  place (adopted as `OPEN`/`CLOSED` as the evidence shows) rather than
+  merely reported, per the explicit "the controlled square-off path can
+  safely manage recognised exposure" instruction; a stale `lifecycle_state:
+  CLOSED` label is corrected too. 12 tests in
+  `tests/integration/test_straddle_920_reconciliation.py`, built against a
+  real migrated database through the repository's own write API (never raw
+  SQL against the authoritative tables).
+- **P1-1 (the acceptance rows that were inspection-only)**: 10 dedicated
+  tests added in `tests/integration/test_straddle_920_acceptance_gaps.py` —
+  weekend blocking, configured-holiday blocking, expiry-day entry permitted,
+  a late-starting process still entering on its first candle, a replacement
+  leg never filling on an unrelated tick, adjustment priority over the
+  combined stop on the same tick, the adjusted-out leg's realised loss
+  excluded from the combined-stop check, charges excluded from every
+  trigger (proven with an inflated `CostRates.brokerage_per_order` so net
+  and gross diverge past the threshold), a never-filled primary leg
+  reaching `EXPIRED` (not left `PENDING_ORDER`) at square-off, and exact
+  zero-slippage fill prices.
+- **P1-2 (VIX verification)**: new `scripts/verify_vix_security_id.py` — a
+  bounded, read-only, no-credential fetch of Dhan's public daily scrip
+  master (the same file `ScripMaster` already downloads), never constructing
+  a broker/order client, added to the read-only script tier
+  (`tests/unit/test_scripts_are_read_only.py`). **Run for real** against the
+  live source on 2026-08-15 (`checked_at=2026-08-15T08:03:00Z`): confirmed
+  row `NSE,I,21,INDEX,...,INDIA VIX,...` — security id `"21"` genuinely
+  names India VIX in the current instrument master, corroborating the
+  config value against a live source for the first time (previously only
+  corroborated against the legacy reference tree's own recorded constants).
+  **What remains unverified**: whether the live market-feed WebSocket
+  actually delivers VIX ticks for id `21`/segment `IDX_I` during market
+  hours — `scripts/diagnose_live_feed.py --security-id 21 --segment 0
+  --mode ticker` is the existing, already-generic tool for that, but it
+  needs real credentials and market hours, neither available in this
+  session (2026-08-15 is a Saturday). `config/strategies/straddle_920.yaml`
+  records both facts and stays disabled until the feed check also passes.
+- **P1-3 (ship disabled)**: `config/strategies/straddle_920.yaml` now reads
+  `enabled: false`, with the four remaining pre-enable steps recorded in
+  the file itself (VIX feed verification, current contract/lot-size
+  spot-check, environment validation, database backup/migration
+  validation).
+- **P1-4 (no hardcoded lot-size fallback)**: the committed config's
+  `lot_size: 75` line is gone. `_build_multi_leg_engine_worker_config`
+  (`config_adapter.py`) now raises `ConfigError` if `contract_resolver:
+  simulated` has no explicit `parameters.lot_size` (a test/fixture value is
+  required, never defaulted); the `"dhan"` resolver never reads this key at
+  all — lot size comes exclusively from the resolved contract's own
+  metadata, exactly as `_build_option_selector` already behaved, now
+  reflected in validation rather than only in a comment.
+- **Verification (this pass)**: every new test green (durability,
+  correlation, reconciliation, acceptance-gaps, the VIX script's own unit
+  tests); the full existing straddle_920/dynamic-subscription/dashboard/
+  EMA-Rev-3.1 suites green; **full `pytest` green — 2306 collected, 0
+  failed, 18 skipped (all pre-existing, environment-gated: live-feed-smoke
+  credential/opt-in skips and one legacy-plist skip — none related to this
+  branch)**; `ruff check .` clean; `mypy common strategies runtimes
+  dashboards scripts` clean over 198 source files;
+  `scripts.assert_no_live_config_committed` passes. No live order API was
+  called; every committed live gate stays disabled; `enabled: false` for
+  `straddle_920` specifically until the outstanding feed verification and
+  the other three P1-3 steps are complete.
+
 ---
 
 ## 1. Phase status

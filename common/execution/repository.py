@@ -1327,6 +1327,7 @@ class ExecutionRepository:
         exit_price: float | None,
         exit_time: str | None,
         exit_reason: str | None,
+        exit_correlation_id: str | None,
         realized_gross_pnl: float | None,
         state: str,
     ) -> None:
@@ -1337,10 +1338,10 @@ class ExecutionRepository:
                     (runtime_id, strategy_id, execution_mode, trading_date, basket_id, leg_id,
                      leg_role, leg_sequence, is_replacement, replaces_leg_id, security_id,
                      symbol, strike, expiry, lot_size, side, quantity, entry_price, entry_time,
-                     entry_correlation_id, exit_price, exit_time, exit_reason,
+                     entry_correlation_id, exit_price, exit_time, exit_reason, exit_correlation_id,
                      realized_gross_pnl, state, version, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        1, ?, ?)
+                        ?, 1, ?, ?)
                 ON CONFLICT (strategy_id, execution_mode, trading_date, leg_id) DO UPDATE SET
                     leg_role = excluded.leg_role,
                     leg_sequence = excluded.leg_sequence,
@@ -1359,6 +1360,7 @@ class ExecutionRepository:
                     exit_price = excluded.exit_price,
                     exit_time = excluded.exit_time,
                     exit_reason = excluded.exit_reason,
+                    exit_correlation_id = excluded.exit_correlation_id,
                     realized_gross_pnl = excluded.realized_gross_pnl,
                     state = excluded.state,
                     version = strategy_legs.version + 1,
@@ -1388,6 +1390,7 @@ class ExecutionRepository:
                     exit_price,
                     exit_time,
                     exit_reason,
+                    exit_correlation_id,
                     realized_gross_pnl,
                     state,
                     _now(),
@@ -1421,6 +1424,42 @@ class ExecutionRepository:
             .execute(
                 "SELECT * FROM strategy_legs WHERE basket_id = ? ORDER BY leg_role, leg_sequence",
                 (basket_id,),
+            )
+            .fetchall()
+        )
+
+    def leg_order_history(self, *, leg_id: str) -> list[sqlite3.Row]:
+        """Every ``order_intents`` row ever reserved for ``leg_id``, each
+        joined with its ``orders`` row if the broker call was ever recorded
+        (``LEFT JOIN`` — a row with ``order_status IS NULL`` means the intent
+        was reserved but no submission outcome was ever persisted, the P0-1/
+        P0-4 "crashed between reserve and record" case).
+
+        This — never the mutable ``strategy_legs`` projection alone — is what
+        restart reconciliation (:mod:`runtimes.intraday_options.
+        multi_leg_engine_worker`'s ``recover_basket``) cross-checks a leg's
+        projected state against: the authoritative execution history for
+        *this exact leg instance*, ordered by ``sequence_number`` so the
+        entry attempt (if any) sorts before a later exit attempt.
+        """
+        return list(
+            self._db.connect()
+            .execute(
+                """
+                SELECT
+                    oi.correlation_id, oi.side, oi.quantity, oi.risk_decision,
+                    oi.risk_reason, oi.sequence_number, oi.submission_reserved,
+                    o.status AS order_status,
+                    o.filled_quantity AS order_filled_quantity,
+                    o.average_fill_price AS order_average_fill_price,
+                    o.broker_order_id AS order_broker_order_id,
+                    o.rejection_reason AS order_rejection_reason
+                FROM order_intents oi
+                LEFT JOIN orders o ON o.intent_id = oi.id
+                WHERE oi.leg_id = ?
+                ORDER BY oi.sequence_number
+                """,
+                (leg_id,),
             )
             .fetchall()
         )

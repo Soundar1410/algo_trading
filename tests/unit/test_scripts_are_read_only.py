@@ -5,7 +5,8 @@ read-only and cannot place, modify or cancel an order — worth a test rather
 than a comment, because it is exactly the sort of thing a later refactor
 erodes quietly. That claim still holds for the **read-only tier**
 (``auth_bootstrap.py``/``authenticate.py``, ``capture_live_tape.py``,
-``diagnose_live_feed.py``, ``status.py``, ``validate_environment.py``): no
+``diagnose_live_feed.py``, ``status.py``, ``validate_environment.py``,
+``verify_vix_security_id.py``): no
 import path from any of them
 reaches a broker, no order endpoint or verb appears in any of them, and
 ``--status`` is proven offline by making the socket layer raise.
@@ -75,6 +76,7 @@ READ_ONLY_SCRIPTS = {
     "start_dashboard.py",
     "status.py",
     "validate_environment.py",
+    "verify_vix_security_id.py",
 }
 
 #: Phase 8's launcher tier: wraps a supervisor entrypoint with a bounded

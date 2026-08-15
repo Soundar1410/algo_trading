@@ -394,6 +394,28 @@ def _build_multi_leg_engine_worker_config(
                 f"{vix_segment!r} is not a known exchange segment: {exc}"
             ) from exc
 
+    # P1-4 correction: lot size must never come from a silent, hardcoded
+    # production fallback. The "dhan" resolver always takes it from the
+    # resolved contract's own metadata (spec section 7) — this config value
+    # is never read for it, matching _build_option_selector's own behaviour.
+    # The "simulated" resolver has no contract metadata of its own, so it
+    # requires an explicit fixture/test lot_size; a strategy config that
+    # leaves it out fails to load rather than silently trading a made-up
+    # quantity.
+    contract_resolver = str(parameters.get("contract_resolver", "simulated"))
+    lot_size_raw = parameters.get("lot_size")
+    if contract_resolver == "simulated":
+        if lot_size_raw is None:
+            raise ConfigError(
+                f"strategies/{strategy_id}.yaml: parameters.contract_resolver is "
+                "'simulated', which requires an explicit parameters.lot_size "
+                "(a test/simulated fixture value) — there is no silent production "
+                "fallback for it"
+            )
+        lot_size = int(lot_size_raw)
+    else:
+        lot_size = 0  # unused: the resolved contract supplies the real lot size.
+
     return MultiLegEngineWorkerConfig(
         strategy_ref=strategy_ref,
         strategy_kwargs=strategy_kwargs,
@@ -401,9 +423,9 @@ def _build_multi_leg_engine_worker_config(
         underlying_instrument=str(parameters.get("underlying_instrument", "")),
         lots=lots,
         strike_step=int(parameters.get("strike_step", 50)),
-        lot_size=int(parameters.get("lot_size", 50)),
+        lot_size=lot_size,
         expiry=parameters.get("expiry"),
-        contract_resolver=str(parameters.get("contract_resolver", "simulated")),
+        contract_resolver=contract_resolver,
         scrip_master_cache_dir=str(parameters.get("scrip_master_cache_dir", "")),
         index_security_id=str(parameters.get("index_security_id", "")),
         index_segment=str(parameters.get("index_segment", "")),

@@ -54,6 +54,12 @@ class FillOutcome:
     fill_price: float
     charges: float = 0.0
     charges_breakdown: dict[str, float] = field(default_factory=dict)
+    #: The correlation ID this fill's order actually persisted under, when
+    #: the gateway can report one. ``LifecycleGateway`` always can (every
+    #: fill that reaches ``PositionManager`` came from a real, persisted
+    #: order); ``InMemoryGateway`` never does (there is no persisted order
+    #: to name) — ``None`` there is honest, not a gap.
+    correlation_id: str | None = None
 
 
 @runtime_checkable
@@ -79,6 +85,8 @@ class ExecutionGateway(Protocol):
         ts: datetime,
         stop_price: float | None = None,
         target_price: float | None = None,
+        basket_id: str | None = None,
+        leg_id: str | None = None,
     ) -> FillOutcome: ...
 
     def sell(
@@ -90,6 +98,8 @@ class ExecutionGateway(Protocol):
         ts: datetime,
         stop_price: float | None = None,
         target_price: float | None = None,
+        basket_id: str | None = None,
+        leg_id: str | None = None,
     ) -> FillOutcome: ...
 
 
@@ -124,10 +134,14 @@ class InMemoryGateway:
         ts: datetime,
         stop_price: float | None = None,
         target_price: float | None = None,
+        basket_id: str | None = None,
+        leg_id: str | None = None,
     ) -> FillOutcome:
         # Adverse by construction: a buy fills above the reference price.
-        # stop_price/target_price: nowhere to persist them offline; accepted only
-        # to satisfy ExecutionGateway.
+        # stop_price/target_price/basket_id/leg_id: nowhere to persist them
+        # offline (no database, no order); accepted only to satisfy
+        # ExecutionGateway. correlation_id stays None — there is no
+        # persisted order to name one.
         return self._fill(Side.BUY, ref_price + self._slippage, lots * contract.lot_size)
 
     def sell(
@@ -139,6 +153,8 @@ class InMemoryGateway:
         ts: datetime,
         stop_price: float | None = None,
         target_price: float | None = None,
+        basket_id: str | None = None,
+        leg_id: str | None = None,
     ) -> FillOutcome:
         # Never below zero: a deep slippage setting must not mint a negative price.
         return self._fill(Side.SELL, max(ref_price - self._slippage, 0.0), lots * contract.lot_size)
@@ -205,6 +221,8 @@ class PositionManager:
         regime_features: str = "{}",
         stop_price: float | None = None,
         target_price: float | None = None,
+        basket_id: str | None = None,
+        leg_id: str | None = None,
     ) -> OpenPosition:
         """Open a position: BUY to go long the option, SELL to write it.
 
@@ -215,6 +233,13 @@ class PositionManager:
         ``stop_price``/``target_price`` (Phase 6 Part 2, optional) are passed
         straight to the gateway for persistence — observability only, this class
         does not read them back for any decision.
+
+        ``basket_id``/``leg_id`` (optional, multi-leg engines only) are passed
+        straight to the gateway too, so the persisted ``order_intents`` row
+        for this fill carries the same identity a caller's own basket/leg
+        bookkeeping uses — the join key restart reconciliation needs. A
+        single-leg caller that never passes them gets exactly today's
+        behaviour: both stay ``None`` end to end.
         """
         position_id = contract.security_id
         if position_id in self._positions:
@@ -228,6 +253,8 @@ class PositionManager:
                 ts=ts,
                 stop_price=stop_price,
                 target_price=target_price,
+                basket_id=basket_id,
+                leg_id=leg_id,
             )
         else:
             result = self._gateway.sell(
@@ -237,6 +264,8 @@ class PositionManager:
                 ts=ts,
                 stop_price=stop_price,
                 target_price=target_price,
+                basket_id=basket_id,
+                leg_id=leg_id,
             )
 
         position = OpenPosition(
@@ -246,6 +275,7 @@ class PositionManager:
             entry_price=result.fill_price,
             entry_time=ts,
         )
+        position.entry_correlation_id = result.correlation_id
         self._positions[position_id] = position
         self._entry_charges[position_id] = result.charges
         self._entry_breakdown[position_id] = result.charges_breakdown or {}
@@ -273,6 +303,7 @@ class PositionManager:
         last_price: float | None = None,
         max_favorable_pnl: float = 0.0,
         max_adverse_pnl: float = 0.0,
+        entry_correlation_id: str | None = None,
     ) -> OpenPosition:
         """Take ownership of a position this process did not open.
 
@@ -310,6 +341,7 @@ class PositionManager:
         )
         position.max_favorable_pnl = max_favorable_pnl
         position.max_adverse_pnl = max_adverse_pnl
+        position.entry_correlation_id = entry_correlation_id
         if last_price is not None:
             position.update_price(last_price)
         self._positions[position_id] = position
@@ -336,17 +368,41 @@ class PositionManager:
         *,
         exit_regime: str | None = None,
         session_tags: str = "",
+        basket_id: str | None = None,
+        leg_id: str | None = None,
     ) -> Trade:
-        """Close the position identified by ``position_id`` (inverse of entry)."""
+        """Close the position identified by ``position_id`` (inverse of entry).
+
+        ``basket_id``/``leg_id`` (optional): the same identity the position
+        was opened under — passed to the gateway so the closing order's own
+        ``order_intents`` row carries it too, and copied onto the resulting
+        :class:`Trade` alongside the entry correlation ID the position
+        already carries, so a caller can find both orders for this exact
+        round trip without approximating by ``(security_id, time)``.
+        """
         pos = self._positions.get(position_id)
         if pos is None:
             raise RuntimeError(f"Cannot close: no open position for {position_id}.")
 
         if pos.side is OrderSide.BUY:
-            result = self._gateway.sell(pos.contract, pos.lots, ref_price=ref_price, ts=ts)
+            result = self._gateway.sell(
+                pos.contract,
+                pos.lots,
+                ref_price=ref_price,
+                ts=ts,
+                basket_id=basket_id,
+                leg_id=leg_id,
+            )
             gross = (result.fill_price - pos.entry_price) * pos.quantity
         else:
-            result = self._gateway.buy(pos.contract, pos.lots, ref_price=ref_price, ts=ts)
+            result = self._gateway.buy(
+                pos.contract,
+                pos.lots,
+                ref_price=ref_price,
+                ts=ts,
+                basket_id=basket_id,
+                leg_id=leg_id,
+            )
             gross = (pos.entry_price - result.fill_price) * pos.quantity
 
         entry_charges = self._entry_charges.pop(position_id, 0.0)
@@ -381,6 +437,8 @@ class PositionManager:
             exit_regime=exit_regime,
             session_tags=session_tags,
             entry_regime_features=entry_regime_features,
+            entry_correlation_id=pos.entry_correlation_id,
+            exit_correlation_id=result.correlation_id,
         )
         self._trades.append(trade)
         log.info(

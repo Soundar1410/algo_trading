@@ -36,6 +36,7 @@ from datetime import time as time_
 from typing import Any
 
 from common.engine.multi_leg_models import (
+    AdjustmentLifecycle,
     Basket,
     BasketAction,
     BasketSignal,
@@ -134,7 +135,18 @@ class Straddle920Strategy(BaseMultiLegStrategy):
         # very next completed candle after an adjustment, whatever time of
         # day that candle lands at, as long as it is still within the same
         # cutoff a fresh entry would need.
-        if basket.pending_replacement_role is not None:
+        #
+        # Correction (P0-2): gated on AWAITING_NEXT_CANDLE specifically, not
+        # merely "a role is pending" — pending_replacement_role is already
+        # set the moment the adjustment is durably claimed, before the
+        # adjusted leg's close is even submitted (see MultiLegEngine.
+        # _close_adjusted_leg). Reacting to that here would let a replacement
+        # be attempted while the adjusted-out leg is still open or its close
+        # outcome is unknown (EXIT_SUBMISSION_PENDING/EXIT_UNKNOWN) — exactly
+        # the "open-or-unknown adjusted leg coexisting with a newly entered
+        # replacement" the correction forbids. Only a *confirmed* closing
+        # fill reaches AWAITING_NEXT_CANDLE.
+        if basket.pending_replacement_state == AdjustmentLifecycle.AWAITING_NEXT_CANDLE.value:
             return self._replacement_signal(basket, timestamp, t)
 
         # --- Primary entry (spec sections 9.1-9.5) -------------------------
@@ -179,7 +191,7 @@ class Straddle920Strategy(BaseMultiLegStrategy):
             # could be attempted. Recorded as expired — never reopen the
             # closed adjusted leg using stale data, never auto-close the
             # surviving leg; normal risk management stays active for it.
-            basket.pending_replacement_state = "EXPIRED"
+            basket.pending_replacement_state = AdjustmentLifecycle.REPLACEMENT_EXPIRED.value
             basket.pending_replacement_role = None
             return None
 

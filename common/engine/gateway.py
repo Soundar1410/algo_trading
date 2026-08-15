@@ -115,6 +115,8 @@ class LifecycleGateway:
         ts: datetime,
         stop_price: float | None = None,
         target_price: float | None = None,
+        basket_id: str | None = None,
+        leg_id: str | None = None,
     ) -> FillOutcome:
         return self._execute(
             OrderSide.BUY,
@@ -124,6 +126,8 @@ class LifecycleGateway:
             ts=ts,
             stop_price=stop_price,
             target_price=target_price,
+            basket_id=basket_id,
+            leg_id=leg_id,
         )
 
     def sell(
@@ -135,6 +139,8 @@ class LifecycleGateway:
         ts: datetime,
         stop_price: float | None = None,
         target_price: float | None = None,
+        basket_id: str | None = None,
+        leg_id: str | None = None,
     ) -> FillOutcome:
         return self._execute(
             OrderSide.SELL,
@@ -144,6 +150,8 @@ class LifecycleGateway:
             ts=ts,
             stop_price=stop_price,
             target_price=target_price,
+            basket_id=basket_id,
+            leg_id=leg_id,
         )
 
     # ------------------------------------------------------------- the plumbing
@@ -157,6 +165,8 @@ class LifecycleGateway:
         ts: datetime,
         stop_price: float | None = None,
         target_price: float | None = None,
+        basket_id: str | None = None,
+        leg_id: str | None = None,
     ) -> FillOutcome:
         quantity = lots * contract.lot_size
         start_at, end_at = self._window(contract.symbol, ts)
@@ -191,6 +201,8 @@ class LifecycleGateway:
             trading_date=self._trading_date,
             stop_price=stop_price,
             target_price=target_price,
+            basket_id=basket_id,
+            leg_id=leg_id,
         )
         self._require_a_fill(result, side, contract)
         self.executions += 1
@@ -349,4 +361,10 @@ class LifecycleGateway:
             # split ``InMemoryGateway`` reports is unavailable here, and inventing
             # one by recomputing from rates could disagree with what was persisted.
             charges_breakdown={},
+            # The correlation ID this exact order persisted under — read back
+            # off the result, never invented, so a caller (PositionManager,
+            # and through it a multi-leg engine's leg/basket bookkeeping) can
+            # find the authoritative order_intents/orders/fills rows for this
+            # fill without approximating by (security_id, time).
+            correlation_id=result.correlation_id,
         )

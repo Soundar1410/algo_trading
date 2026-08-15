@@ -135,8 +135,17 @@ class OrderLifecycle:
         trading_date: str,
         stop_price: float | None = None,
         target_price: float | None = None,
+        basket_id: str | None = None,
+        leg_id: str | None = None,
     ) -> ExecutionResult:
-        """Take one signal all the way to a persisted position."""
+        """Take one signal all the way to a persisted position.
+
+        ``basket_id``/``leg_id`` (optional): a multi-leg caller's basket/leg
+        identity, carried straight onto the persisted ``OrderIntent`` —
+        ``order_intents.basket_id``/``.leg_id`` already have columns for
+        this (added ahead of any consumer); this is the first real writer.
+        ``None`` for every existing single-leg caller, unchanged.
+        """
         signal_id = self._repo.record_signal(
             session_id=self._session_id,
             runtime_id=self._runtime_id,
@@ -188,6 +197,8 @@ class OrderLifecycle:
             product_type=self._product_type,
             created_at=datetime.now(UTC),
             signal_id=signal_id,
+            basket_id=basket_id,
+            leg_id=leg_id,
             config_fingerprint=self._fingerprint,
             risk_decision=risk_decision,
             risk_reason=risk_reason,

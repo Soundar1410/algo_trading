@@ -17,6 +17,7 @@ from common.config.models import ExecutionMode
 from common.engine.config import EngineConfig, SessionConfig
 from common.engine.feed import SimulatedFeed
 from common.engine.multi_leg_engine import MultiLegEngine
+from common.engine.multi_leg_models import AdjustmentLifecycle
 from common.engine.positions import InMemoryGateway, PositionManager
 from common.engine.selection import OptionSelector, SimulatedOptionChainResolver
 from common.models import ExitReason, Tick
@@ -350,7 +351,7 @@ def test_replacement_is_prohibited_after_the_1500_cutoff() -> None:
     assert pe_trades[0].exit_reason is ExitReason.SQUARE_OFF
 
     basket = engine._basket
-    assert basket.pending_replacement_state == "EXPIRED"
+    assert basket.pending_replacement_state == AdjustmentLifecycle.REPLACEMENT_EXPIRED.value
     assert basket.pending_replacement_role is None
 
 
