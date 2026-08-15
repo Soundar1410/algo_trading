@@ -320,6 +320,119 @@ def test_combined_stop_closes_both_legs() -> None:
 
 
 # ---------------------------------------------------------- 10. daily loss
+def test_replacement_is_prohibited_after_the_1500_cutoff() -> None:
+    """Spec section 12.4: the cutoff is reached before a replacement can be
+    attempted — no replacement leg is created, the surviving leg (PE) is
+    never auto-closed for it, and normal risk/square-off stays active."""
+    engine, positions = _build_engine()
+    ce1 = "SIM:NIFTY:WEEKLY:24000:CE"
+    pe1 = "SIM:NIFTY:WEEKLY:24000:PE"
+    ticks = [
+        _tick(NIFTY, 24000.0, _ts(9, 16)),
+        _tick(NIFTY, 24000.0, _ts(9, 21)),
+        _tick(ce1, 100.0, _ts(9, 21, 5)),
+        _tick(pe1, 95.0, _ts(9, 21, 10)),
+        _tick(ce1, 205.0, _ts(14, 58)),  # CE doubles just before the cutoff
+        _tick(NIFTY, 24050.0, _ts(14, 59)),
+        _tick(NIFTY, 24050.0, _ts(15, 4)),  # next candle closes AFTER 15:00
+        _tick(NIFTY, 24050.0, _ts(15, 16)),  # hard square-off
+    ]
+    _run(engine, ticks)
+
+    # No replacement CE was ever created.
+    ce_trades = [t for t in positions.trades if t.contract.option_type.value == "CE"]
+    assert len(ce_trades) == 1
+    assert ce_trades[0].exit_reason is ExitReason.ADJUSTMENT
+
+    # PE was never touched by the expired replacement and is squared off normally.
+    pe_trades = [t for t in positions.trades if t.contract.option_type.value == "PE"]
+    assert len(pe_trades) == 1
+    assert pe_trades[0].exit_reason is ExitReason.SQUARE_OFF
+
+    basket = engine._basket
+    assert basket.pending_replacement_state == "EXPIRED"
+    assert basket.pending_replacement_role is None
+
+
+def test_a_missing_replacement_tick_does_not_flatten_the_surviving_leg() -> None:
+    """Spec section 12.4: replacement contract subscribed but never receives a
+    fresh tick before square-off — the pending leg is terminally resolved
+    (never a phantom fill on stale data) and PE stays open and risk-managed
+    throughout, closed only by the ordinary hard square-off.
+
+    daily_loss_amount is raised well above what the adjusted-out CE's own
+    realised loss produces, so only the property under test — the
+    surviving leg's own fate — decides the outcome, not an unrelated
+    daily-loss trip.
+    """
+    engine, positions = _build_engine(daily_loss_amount=10_000_000.0)
+    ce1 = "SIM:NIFTY:WEEKLY:24000:CE"
+    pe1 = "SIM:NIFTY:WEEKLY:24000:PE"
+    ce2 = "SIM:NIFTY:WEEKLY:24050:CE"  # subscribed, but never ticks
+    ticks = [
+        _tick(NIFTY, 24000.0, _ts(9, 16)),
+        _tick(NIFTY, 24000.0, _ts(9, 21)),
+        _tick(ce1, 100.0, _ts(9, 21, 5)),
+        _tick(pe1, 95.0, _ts(9, 21, 10)),
+        _tick(ce1, 205.0, _ts(9, 30)),  # CE doubles
+        _tick(NIFTY, 24050.0, _ts(9, 31)),
+        _tick(NIFTY, 24050.0, _ts(9, 36)),  # replacement queued (PENDING_ORDER)
+        # ce2 never ticks; PE keeps trading normally until square-off.
+        _tick(pe1, 90.0, _ts(10, 0)),
+        _tick(NIFTY, 24050.0, _ts(15, 16)),  # hard square-off
+    ]
+    _run(engine, ticks)
+
+    assert not positions.has_position()
+    pe_trades = [t for t in positions.trades if t.contract.option_type.value == "PE"]
+    assert len(pe_trades) == 1
+    assert pe_trades[0].exit_reason is ExitReason.SQUARE_OFF
+    # ce2 was never opened — it never received a fresh tick — so it never
+    # appears in positions.trades (no fill occurred) at all.
+    assert all(t.contract.security_id != ce2 for t in positions.trades)
+
+    leg = engine._basket.legs[f"{engine._basket.basket_id}:CE:2"]
+    assert leg.state.value == "EXPIRED"
+
+
+def test_combined_stop_after_replacement_uses_the_rebased_basis() -> None:
+    """Spec section 13.3: after a replacement fills, the combined-stop basis
+    is the *retained* leg's entry premium plus the *replacement*'s — not the
+    original (now-closed) leg's. Constructed so the rebased threshold
+    (retained PE + replacement CE) trips while the stale, un-rebased
+    threshold (original CE + PE) would not have — proving the engine is
+    genuinely using the rebased basis, not the original one."""
+    engine, positions = _build_engine(daily_loss_amount=10_000_000.0)
+    ce1 = "SIM:NIFTY:WEEKLY:24000:CE"
+    pe1 = "SIM:NIFTY:WEEKLY:24000:PE"
+    ce2 = "SIM:NIFTY:WEEKLY:24050:CE"
+    ticks = [
+        _tick(NIFTY, 24000.0, _ts(9, 16)),
+        _tick(NIFTY, 24000.0, _ts(9, 21)),
+        _tick(ce1, 100.0, _ts(9, 21, 5)),
+        _tick(pe1, 95.0, _ts(9, 21, 10)),
+        _tick(ce1, 205.0, _ts(9, 30)),  # CE doubles and closes (realised -78750)
+        _tick(NIFTY, 24050.0, _ts(9, 31)),
+        _tick(NIFTY, 24050.0, _ts(9, 36)),  # replacement queued
+        _tick(ce2, 90.0, _ts(9, 36, 5)),  # replacement fills
+        # Rebased open basis = (PE 95 + CE2 90) * 750 = 138,750; 30% = 41,625.
+        # Original (stale) basis would have been (CE 100 + PE 95) * 750 =
+        # 146,250; 30% = 43,875. U = -42,000 crosses the rebased threshold
+        # but not the stale one.
+        _tick(ce2, 146.0, _ts(9, 40)),  # CE2: (90-146)*750 = -42,000
+    ]
+    _run(engine, ticks)
+
+    assert not positions.has_position()
+    ce_trades = [t for t in positions.trades if t.contract.option_type.value == "CE"]
+    pe_trades = [t for t in positions.trades if t.contract.option_type.value == "PE"]
+    assert len(ce_trades) == 2  # the adjusted-out original + the replacement
+    assert ce_trades[1].exit_reason is ExitReason.STOP_LOSS
+    assert ce_trades[1].contract.security_id == ce2
+    assert len(pe_trades) == 1
+    assert pe_trades[0].exit_reason is ExitReason.STOP_LOSS
+
+
 def test_daily_loss_limit_closes_both_legs() -> None:
     engine, positions = _build_engine(daily_loss_amount=1_000.0)  # tiny cap, easy to trip
     ce1 = "SIM:NIFTY:WEEKLY:24000:CE"
