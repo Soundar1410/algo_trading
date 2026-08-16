@@ -29,19 +29,40 @@ API reference, section "Option Chain"):
     }
 
 The strike key is Dhan's own stringified-float format (``"24000.000000"``).
-This module has not been proven against a live response in this environment
-(no network/credentials here — see ``scripts/verify_vix_security_id.py`` for
-the established pattern of a bounded, read-only, real-source check); it must
-be re-verified against a live ``/v2/optionchain`` response, the same way the
-runbook records for the VIX security id, before this parser is trusted for a
-real paper session. Every field this module reads is named explicitly below
-so that verification is a direct diff against this docstring, not a hunt
-through the code.
+**Verified against a real, live ``/v2/optionchain`` response** by
+``scripts/verify_dhan_option_chain.py`` on 2026-08-16 (Phase 4 of the
+gap-closing session; see ``docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md``
+section 11.10) — the envelope, every field this module reads, and the
+sign/range of the greeks all matched this docstring exactly. A permanent
+regression fixture derived from that verified shape lives at
+``tests/fixtures/dhan_option_chain_sample.json`` (loaded by
+``tests/unit/test_option_chain_view.py::
+test_parses_the_sanitized_real_shaped_fixture``), so a later drift in
+Dhan's own response shape is caught without needing network access. Every
+field this module reads is named explicitly below so that a re-verification
+is a direct diff against this docstring, not a hunt through the code. One
+real-response quirk that verification surfaced: a strike with no book at
+all reports ``top_bid_price``/``top_ask_price`` (and every other numeric
+field) as literal ``0``, not an absent key — already handled correctly
+below (see "Never synthesizes"), just not previously confirmed live.
 
 **Never synthesizes.** A missing ``top_bid_price``/``top_ask_price`` is
 ``None``, not zero and not the last price — spec section 3.6 forbids
 synthesizing a bid/ask spread from LTP, and this is the one place that rule
-could be violated by accident.
+could be violated by accident. In practice a real response represents "no
+book" as the field literally being ``0`` rather than absent (see above);
+either way this module never treats a zero/absent bid or ask as anything
+but "no complete quote" — ``ChainQuote.has_complete_quote`` requires a
+strictly positive bid.
+
+**Fields present in a real response but not read here.** A real leg also
+carries ``average_price``, ``previous_close_price``, ``previous_oi``,
+``previous_volume``, ``security_id`` and ``top_bid_quantity``/
+``top_ask_quantity`` — all confirmed present by the same 2026-08-16
+verification above, all deliberately ignored (this module reads exactly the
+fields listed above and nothing else); a future consumer that needs one of
+these should add it explicitly rather than assume ``_quote_from_leg``
+already captures it.
 """
 
 from __future__ import annotations

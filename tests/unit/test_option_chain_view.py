@@ -3,7 +3,9 @@ payload — no synthetic bid/ask, fails closed on a malformed structure."""
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
@@ -11,6 +13,8 @@ from common.market_data.chain_view import ChainPayloadError, parse_chain_payload
 from common.models import OptionType
 
 NOW = datetime(2026, 8, 19, 9, 25, tzinfo=UTC)
+
+_FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 
 _VALID_PAYLOAD = {
     "status": "success",
@@ -141,3 +145,62 @@ def test_an_empty_but_structurally_valid_chain_is_not_an_error():
     payload = {"data": {"oc": {}}}
     view = parse_chain_payload(payload, snapshot_at=NOW, received_at=NOW)
     assert view.strikes == ()
+
+
+# ============== Phase 4 gap-closing session: real-shape regression fixture
+def test_parses_the_sanitized_real_shaped_fixture():
+    """Permanent parser regression test (spec 4.2/11.3, Phase 4): loads
+    ``tests/fixtures/dhan_option_chain_sample.json``, a sanitized payload
+    whose envelope/field shape was verified against a *real* Dhan
+    ``/v2/optionchain`` response by ``scripts/verify_dhan_option_chain.py``
+    on 2026-08-16 (see that fixture's own ``_fixture_note`` and
+    ``docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md`` section 11.10 Phase 4)
+    — not a hand-typed shape this module merely hopes matches production.
+    """
+    payload = json.loads((_FIXTURES / "dhan_option_chain_sample.json").read_text())
+    view = parse_chain_payload(payload, snapshot_at=NOW, received_at=NOW)
+
+    assert view.underlying_last_price == 24350.0
+    assert len(view.strikes) == 5, "every raw 'oc' strike key must parse, none dropped"
+
+    # A liquid, near-the-money strike: complete two-sided quote and greeks,
+    # every extra field the real response carries (average_price,
+    # previous_close_price/_oi/_volume, security_id, top_*_quantity) simply
+    # ignored rather than tripping the parser.
+    row = view.strike(24350.0)
+    assert row is not None
+    ce = row.side(OptionType.CE)
+    assert ce.has_complete_quote is True
+    assert ce.has_complete_greeks is True
+    assert 0.0 <= ce.delta <= 1.0  # type: ignore[operator]
+    assert ce.bid is not None and ce.ask is not None and ce.bid <= ce.ask
+    pe = row.side(OptionType.PE)
+    assert pe.has_complete_quote is True
+    assert -1.0 <= pe.delta <= 0.0  # type: ignore[operator]
+
+    # A deep-OTM strike the real chain reports with an all-zero book
+    # (bid/ask/oi/volume/greeks literally 0, never absent) — has_complete_
+    # quote correctly rejects a zero bid rather than treating 0 as "no
+    # data" (spec section 3.6: never synthesize a spread), and this is the
+    # one place a real Dhan quirk (0, not null/missing, for "no book")
+    # would have silently broken that guarantee if the parser assumed
+    # "missing" meant an absent key.
+    far = view.strike(18500.0)
+    assert far is not None
+    far_ce = far.side(OptionType.CE)
+    assert far_ce.bid == 0.0
+    assert far_ce.has_complete_quote is False
+    # has_complete_greeks only means "no field is None" — an all-zero
+    # greeks set (this strike's real shape) still counts as "complete" by
+    # that definition, even though it is economically meaningless. Callers
+    # needing "has a real, liquid book" must keep checking
+    # has_complete_quote too, exactly as the strategy/selection code
+    # already does; this is not itself a parser defect.
+    assert far_ce.has_complete_greeks is True
+    # Dhan's own real response can carry a nonzero IV on a strike whose
+    # book/greeks are otherwise all zero (observed on the live PE leg this
+    # fixture mirrors) — parsed as-is, never discarded or treated as an
+    # error by this module.
+    far_pe = far.side(OptionType.PE)
+    assert far_pe.implied_volatility == 10.5
+    assert far_pe.has_complete_quote is False

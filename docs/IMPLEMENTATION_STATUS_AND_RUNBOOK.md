@@ -8081,3 +8081,110 @@ this phase touched). `python -m scripts.assert_no_live_config_committed` —
 OK. No order-capable Dhan endpoint referenced anywhere in this phase's new
 code; every injected failure is a Python-level callback/method patch, never
 a real network call.
+
+### Phase 4 — Real Dhan option-chain diagnostic (spec 4.2/11.3, 16 August 2026)
+
+New `scripts/verify_dhan_option_chain.py`, following `scripts/verify_vix_
+security_id.py`'s exact shape (argparse, explicit exit codes, no secret ever
+printed, added to `tests/unit/test_scripts_are_read_only.py`'s
+`READ_ONLY_SCRIPTS` tier — no broker import, no order endpoint reference, no
+mutating HTTP verb, all proven by that file's existing parametrized checks).
+Authenticates via the existing `common.authentication.AuthBootstrap` (reused,
+not re-implemented); resolves NIFTY through the existing
+`common.market_data.scrip_master.INDEX_REGISTRY`/`resolve_index_meta`
+mapping (`security_id="13"`, `segment="IDX_I"`), never a hardcoded id in the
+script itself; calls `fetch_dhan_expiry_list` then `OptionChainService.get`
+(so Dhan's 3-second throttle is honoured even for this one-shot use) against
+the nearest listed expiry; feeds the raw payload through the real
+`parse_chain_payload` and validates envelope shape, expiry-list ordering,
+every CE/PE field `chain_view.py` reads (bid/ask/last_price/oi/volume/
+implied_volatility/greeks), plausible delta/gamma/IV ranges, a raw-vs-parsed
+round-trip for the near-the-money sample, and the timestamp/freshness
+derivation (`snapshot_at`/`received_at`, `OptionChainService.is_stale`) —
+printing a structured PASS/FAIL/INFO report. Constructs no broker/order
+client; imports nothing order-capable.
+
+**I actually ran it against the real Dhan endpoint** (2026-08-16, a Sunday —
+market closed) using the repository's own `.env` credentials, bounded and
+read-only. Per the task's own instruction, structural and market-hours
+freshness are reported **separately**, and market-hours freshness is
+reported as observed-or-not, never assumed:
+
+**1. Structural payload validation — PASS, no defect found.**
+- `/optionchain/expirylist` returned 18 expiries, correctly ISO-dated and in
+  ascending exchange-published order.
+- `/optionchain` for the nearest expiry (2026-08-18) returned
+  `status="success"`, a `data.last_price`, and 231 strikes under `data.oc`.
+  `parse_chain_payload` parsed all 231 with **zero** `ChainPayloadError` and
+  an exact strike-count match against the raw response.
+- Every field `chain_view.py` reads — `top_bid_price`/`top_ask_price`/
+  `last_price`/`oi`/`volume`/`implied_volatility`/`greeks.{delta,gamma,theta,
+  vega}` — was present with the documented types on every sampled leg;
+  round-tripping the near-the-money sample against the parsed `ChainQuote`
+  found no field-mapping mismatch anywhere. Delta/gamma/IV all fell inside
+  their plausible ranges (CE delta in [0,1], PE delta in [-1,0], gamma >= 0,
+  IV >= 0) for every strike with a complete book.
+- **One real quirk confirmed, correctly already handled, not a defect:** a
+  strike with no book at all (e.g. deep OTM) reports `top_bid_price`/
+  `top_ask_price` (and every other numeric field) as literal `0`, never an
+  absent key. `chain_view.py`'s own docstring previously implied "missing"
+  meant "absent"; `ChainQuote.has_complete_quote`'s existing `0 < bid`
+  check already rejects this correctly (proven pre-existing by
+  `test_a_zero_bid_is_not_complete`), so no code change was needed — only
+  the docstring, corrected to describe reality precisely, plus a note that
+  `has_complete_greeks` (which only checks "no field is `None`") reports
+  `True` for an all-zero greeks set; a caller wanting "has a real, liquid
+  book" must keep checking `has_complete_quote` too, exactly as the
+  strategy/selection code already does.
+- **Timestamp semantics confirmed exactly as documented:** the real response
+  carries none of `timestamp`/`snapshotTime`/`snapshot_time`/`lastUpdated`
+  — `snapshot_at == received_at` on the real call, confirming
+  `OptionChainService`'s receive-time fallback is what actually runs in
+  production today, not merely what the code assumes.
+- **Extra fields observed, deliberately unread, now documented:** a real leg
+  also carries `average_price`, `previous_close_price`, `previous_oi`,
+  `previous_volume`, `security_id`, `top_bid_quantity`, `top_ask_quantity` —
+  none account-specific (all public per-contract market data), all noted in
+  `chain_view.py`'s own docstring as present-but-unread rather than
+  silently ignored with no record.
+- Verified programmatically before writing anything to disk: neither the
+  Dhan client id nor the access token appears anywhere in the raw response
+  text — confirming the option-chain endpoint itself carries no
+  account-sensitive field to begin with.
+
+**2. Market-hours freshness validation — SKIPPED, honestly, not claimed.**
+2026-08-16 is a Sunday; the diagnostic's own market-hours check (a plain
+09:15-15:30 IST session, independent of any strategy's configured holiday
+list) correctly reported the market CLOSED and explicitly printed "SKIPPED,
+not claimed" rather than inferring liveness from the structural PASS above.
+**This means genuine intraday freshness — that a real, moving quote stream
+during market hours resolves as fresh, non-stale — remains unverified and
+is recorded here as an explicit, named paper-enablement blocker**, not
+folded into the general "known limitations" list: re-run
+`scripts.verify_dhan_option_chain` during a live NSE session (09:15-15:30
+IST, a trading day) before `weekly_delta_neutral` is ever enabled, and
+record that result here.
+
+**New permanent regression fixture:** `tests/fixtures/
+dhan_option_chain_sample.json` — sanitized and representative, **not** a
+raw capture (its own `_fixture_note` field records exactly what was
+verified against the live response and what is illustrative), covering a
+liquid near-the-money strike (complete quote and greeks) and the deep-OTM
+all-zero-book strike, with the extra unread fields present so the fixture
+matches the real envelope exactly. Loaded by
+`tests/unit/test_option_chain_view.py::
+test_parses_the_sanitized_real_shaped_fixture` (11th test in that file) —
+a permanent, network-free regression proof that a later refactor cannot
+silently break the real shape this session verified.
+
+**Verification:** `test_option_chain_view.py` (11, +1 new),
+`test_scripts_are_read_only.py` (all read-only-tier checks, now covering
+the new script too), `test_dhan_adapter.py` — all passed. Full `pytest` —
+all passed (see the run this phase's report cites). `ruff check .` clean.
+`mypy common strategies runtimes dashboards scripts --strict` — clean, 230
+source files. `python -m scripts.assert_no_live_config_committed` — OK.
+Endpoints called: `/app/generateAccessToken`, `/v2/profile` (via
+`AuthBootstrap`), `/v2/optionchain/expirylist`, `/v2/optionchain` — no
+order-capable endpoint referenced or called anywhere in this phase.
+`weekly_delta_neutral` stays disabled; the market-hours freshness gap above
+is the recorded blocker.

@@ -76,6 +76,7 @@ READ_ONLY_SCRIPTS = {
     "start_dashboard.py",
     "status.py",
     "validate_environment.py",
+    "verify_dhan_option_chain.py",
     "verify_vix_security_id.py",
 }
 
