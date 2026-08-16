@@ -10,15 +10,31 @@ Generic to any positional multi-leg strategy; contains no
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import UTC, date, datetime, time
 from enum import StrEnum
 
-from common.utils.timeutils import local_date_in, local_time_in
+from common.utils.timeutils import combine, local_date_in, local_time_in
 
 __all__ = [
     "ExpiryDayPhase",
     "PositionalLifecyclePolicy",
+    "expiry_settlement_at",
 ]
+
+
+def expiry_settlement_at(resolved_expiry_date: str, *, timezone: str = "Asia/Kolkata") -> datetime:
+    """The actual settlement instant for one resolved expiry date — NSE
+    index-option expiry settles at session close (15:30 local) — the
+    Greeks model's time-to-expiry anchor (spec section 4.2: "time to expiry
+    uses ... the actual resolved expiry"), never any exit-timing decision
+    (those all go through :meth:`PositionalLifecyclePolicy.expiry_day_phase`'s
+    own boundary clock instead). A free function, not a method, so both the
+    generic engine (which owns a ``PositionalLifecyclePolicy``) and a
+    strategy (which does not) can compute the identical value from nothing
+    but the persisted expiry string — one definition, never duplicated.
+    """
+    expiry_date = date.fromisoformat(str(resolved_expiry_date)[:10])
+    return combine(expiry_date, time(15, 30), timezone).astimezone(UTC)
 
 
 class ExpiryDayPhase(StrEnum):

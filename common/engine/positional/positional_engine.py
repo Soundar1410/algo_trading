@@ -69,7 +69,7 @@ from ..positions import PositionManager
 from ..reporting import EngineReporter, NullReporter, NullReportWriter, ReportWriter
 from ..selection import OptionSelector
 from ..session import MarketSession
-from .lifecycle import PositionalLifecyclePolicy
+from .lifecycle import PositionalLifecyclePolicy, expiry_settlement_at
 from .positional_models import (
     ENTRY_ROLE_ORDER,
     HEDGE_ROLES,
@@ -459,6 +459,16 @@ class PositionalMultiLegEngine:
 
         leg_greeks: dict[str, GreekSnapshot] = {}
         if self._cycle is not None and chain is not None:
+            # The contract's own actual settlement instant — never the
+            # current evaluation timestamp, which would make every
+            # model-fallback Greek evaluation look like it was pricing an
+            # already-expired contract the moment chain-sourced Greeks ever
+            # went stale (found and fixed in the gap-closing session's
+            # Phase 3: a real defect, not a documented scope boundary — see
+            # docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md section 11.10).
+            expiry_at = expiry_settlement_at(
+                self._cycle.resolved_expiry_date, timezone=self._lifecycle_policy.timezone
+            )
             for leg in self._cycle.open_legs():
                 if leg.contract is None:
                     continue
@@ -469,7 +479,7 @@ class PositionalMultiLegEngine:
                         option_type=ROLE_TO_OPTION_TYPE.get(leg.role, leg.contract.option_type),
                         strike=leg.contract.strike,
                         spot=self._spot or 0.0,
-                        expiry_at=ts,
+                        expiry_at=expiry_at,
                     )
                 except Exception:
                     continue
@@ -490,6 +500,7 @@ class PositionalMultiLegEngine:
             option_segment=self.option_segment,
             margin_estimator=self._margin,
             record_pre_entry_incident=lambda message: self._record_incident("pre-entry", message),
+            total_charges=self._total_cycle_charges(),
         )
 
     def _apply_signal(self, signal: CycleSignal, ts: datetime) -> None:
@@ -748,6 +759,22 @@ class PositionalMultiLegEngine:
             return 0.0
         positions = self._repository.open_positions_for_cycle(cycle_id=self._cycle.cycle_id)
         return sum(p.charges for p in positions)
+
+    def _total_cycle_charges(self) -> float:
+        """Every real charge this cycle has accrued so far — currently
+        open legs' own accrued entry charges, plus every closed leg's real
+        entry+exit charges (spec section 6.1: "all_entry_adjustment_
+        exit_charges", not just the open legs'). Handed to the strategy via
+        ``PositionalContext.total_charges`` for its own P&L-driven exit
+        decisions (found and wired in the gap-closing session's Phase 3 —
+        this strategy's own P&L call previously always passed
+        ``charges=0.0``; see docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md
+        section 11.10)."""
+        if self._cycle is None:
+            return 0.0
+        return self._position_charges_total() + self._repository.cycle_realized_charges(
+            cycle_id=self._cycle.cycle_id
+        )
 
     # ---------------------------------------------------------- adjustment
     def _roll_short(self, signal: CycleSignal, ts: datetime) -> None:

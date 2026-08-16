@@ -111,6 +111,11 @@ class PositionalContext:
     #: own to raise one (spec section 12: "notify ... persistence failure,
     #: unknown exposure").
     record_pre_entry_incident: Callable[[str], None]
+    #: Every real charge this cycle has accrued so far — open legs' own
+    #: accrued entry charges plus every closed leg's real entry+exit
+    #: charges (spec section 6.1). Always a real, computed figure; never
+    #: fabricated or left at zero when a real charge exists.
+    total_charges: float
 
 
 class BasePositionalMultiLegStrategy(ABC):

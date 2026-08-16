@@ -912,6 +912,34 @@ class ExecutionRepository:
         )
         return [_row_to_position(row) for row in rows]
 
+    def cycle_realized_charges(self, *, cycle_id: str) -> float:
+        """Every real entry+exit charge already realised for one positional
+        cycle's *closed* legs — original and adjustment-closed alike (spec
+        section 6.1: ``net_strategy_pnl`` must net "all_entry_adjustment_
+        exit_charges", not just the currently open legs' own).
+
+        ``trade_ledger`` (migration 0008) carries no ``cycle_id``/
+        ``basket_id`` column of its own — it predates positional cycles —
+        so this joins through each closed leg's own immutable
+        ``exit_correlation_id`` (``strategy_cycle_legs``, migration 0010),
+        set once when that leg's close fill is recorded and never rewritten.
+        A currently *open* leg's own accrued entry charges are a separate,
+        already-existing read (``open_positions_for_cycle(...).charges``);
+        this method is deliberately just the closed-leg half.
+        """
+        row = self._db.connect().execute(
+            """
+            SELECT COALESCE(SUM(tl.entry_charges + tl.exit_charges), 0.0) AS total
+            FROM trade_ledger tl
+            WHERE tl.exit_correlation_id IN (
+                SELECT exit_correlation_id FROM strategy_cycle_legs
+                WHERE cycle_id = ? AND exit_correlation_id IS NOT NULL
+            )
+            """,
+            (cycle_id,),
+        ).fetchone()
+        return float(row["total"]) if row is not None else 0.0
+
     def positions_all_dates(
         self, *, strategy_id: str, execution_mode: ExecutionMode
     ) -> list[Position]:

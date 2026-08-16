@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
 
+from common.engine.positional.lifecycle import expiry_settlement_at
 from common.engine.positional.positional_models import (
     Cycle,
     CycleAction,
@@ -301,25 +302,28 @@ class WeeklyDeltaNeutralStrategy(BasePositionalMultiLegStrategy):
             return None
         return estimate
 
-    @staticmethod
-    def _expiry_close_at(resolved_expiry: str) -> datetime:
-        from datetime import UTC
-
-        from common.utils.timeutils import combine
-
-        expiry_date = date.fromisoformat(resolved_expiry[:10])
-        # NSE index-option expiry settlement is at session close (15:30 IST)
-        # — used only as the Greeks model's time-to-expiry anchor, never for
-        # any exit-timing decision (those are all evaluated against the
-        # lifecycle policy's own 15:05/15:15 clock, not this value).
-        return combine(expiry_date, __import__("datetime").time(15, 30)).astimezone(UTC)
+    def _expiry_close_at(self, resolved_expiry: str) -> datetime:
+        # NSE index-option expiry settlement is at session close (15:30
+        # local) — used only as the Greeks model's time-to-expiry anchor,
+        # never for any exit-timing decision (those are all evaluated
+        # against the lifecycle policy's own 15:05/15:15 clock, not this
+        # value). The one shared definition
+        # (common.engine.positional.lifecycle.expiry_settlement_at) is also
+        # what the generic engine itself now uses for the same purpose
+        # (gap-closing session Phase 3) — never duplicated arithmetic that
+        # could quietly drift apart from it.
+        return expiry_settlement_at(resolved_expiry, timezone=self._timezone)
 
     # ---------------------------------------------------------------- active
     def _evaluate_active(self, cycle: Cycle, context: PositionalContext) -> CycleSignal | None:
         greeks_available = context.chain is not None
 
-        # Charges are netted by the engine's own repository read, not here.
-        pnl = compute_pnl(cycle, charges=0.0)
+        # Real entry+adjustment+exit charges (spec section 6.1) — the
+        # engine's own repository read (PositionalContext.total_charges),
+        # never a hardcoded 0.0 (found and fixed in the gap-closing
+        # session's Phase 3 — see docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md
+        # section 11.10 for the real production defect this was).
+        pnl = compute_pnl(cycle, charges=context.total_charges)
         exits = self._params.exits
 
         # Spec section 6.2, steps 3-10 (steps 1-2 are engine-owned: operator
@@ -511,7 +515,18 @@ class WeeklyDeltaNeutralStrategy(BasePositionalMultiLegStrategy):
         for candidate in candidates:
             if candidate.contract.security_id == old_leg.contract.security_id:
                 continue
-            new_signed_delta = self._signed_delta(candidate.greeks.delta, target_role)
+            # The replacement opens at the same quantity as the leg it
+            # replaces (spec 7.2/7.3: one-for-one roll, not a re-sized
+            # position) — quantity=1 here (the method's own default) would
+            # compare a per-contract delta against old_signed_delta's real
+            # per-position one, making the "must reduce projected absolute
+            # delta" gate below fail almost every time a leg's quantity
+            # exceeds one (found and fixed in the gap-closing session's
+            # Phase 3 — see docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md
+            # section 11.10 for the real production defect this was).
+            new_signed_delta = self._signed_delta(
+                candidate.greeks.delta, target_role, quantity=old_leg.quantity
+            )
             projected_delta = net_delta - old_signed_delta + new_signed_delta
             if abs(projected_delta) >= abs(net_delta):
                 continue  # must reduce projected absolute delta (spec 7.2)

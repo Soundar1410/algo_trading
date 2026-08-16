@@ -7811,3 +7811,126 @@ the rewritten search produces the identical accepted candidate on every
 existing fixture (none of them exercise the divergent case the new test
 adds). `ruff check .` clean. `mypy common strategies runtimes dashboards
 scripts --strict` — clean, 229 source files.
+
+### Phase 3 — Missing acceptance tests (spec 6/7/8/13)
+
+Three new integration suites plus one unit suite, all driven through the
+*real* `runtimes.positional_options.worker.build_engine` wiring against a
+real temp SQLite database (no cycle/leg row is ever hand-crafted):
+`test_weekly_delta_neutral_adjustment.py` (11 tests),
+`test_weekly_delta_neutral_pnl_and_exits.py` (8 tests),
+`test_weekly_delta_neutral_expiry_day.py` (4 tests), and
+`test_weekly_delta_neutral_risk_boundaries.py` (5 unit tests, `risk.py`'s
+pure functions directly, for boundary math too exact to reason about
+through the full engine). A new shared, non-collected fixture module,
+`tests/integration/_weekly_delta_neutral_fixtures.py`, gives every suite a
+`ScriptedFeed` (interleaves ticks with "mutate the chain/close a leg/patch
+one call" callables — see its own module docstring) and the common
+scrip-master/chain-payload/worker-config building blocks.
+
+**Three real production defects found and fixed while building these
+tests — not documented scope boundaries, genuine bugs:**
+
+1. **The Greeks model fallback always looked like it was pricing an
+   already-expired contract.** `PositionalMultiLegEngine._build_context`
+   passed `expiry_at=ts` (the current evaluation timestamp) into
+   `GreeksService.resolve` instead of the contract's actual settlement
+   time — so the instant chain-sourced Greeks ever went stale (which
+   happens routinely: `OptionChainService`'s own 2.5s TTL is keyed off
+   real wall-clock time), the model fallback raised "cannot price an
+   expired contract" for every leg, on every evaluation, for the rest of
+   the cycle's life — silently emptying `PositionalContext.leg_greeks` and
+   blocking every hedge-repair/adjustment decision with no error anywhere.
+   Fixed with a new shared, generic helper,
+   `common.engine.positional.lifecycle.expiry_settlement_at` (module-level,
+   not a method, so both the engine — which owns a
+   `PositionalLifecyclePolicy` — and a strategy — which does not — compute
+   the identical value from nothing but the persisted expiry string);
+   `WeeklyDeltaNeutralStrategy._expiry_close_at` now delegates to it too,
+   removing a second, previously-independent copy of the same arithmetic.
+2. **A delta-adjustment replacement could never actually reduce projected
+   delta once a leg's quantity exceeded one.**
+   `WeeklyDeltaNeutralStrategy._maybe_adjust` computed the *old* leg's
+   signed delta with its real quantity (`_leg_signed_delta`, quantity=75
+   for one NIFTY lot) but the *candidate replacement*'s with the
+   `_signed_delta` method's quantity **default of 1** — a 75x unit
+   mismatch that made "the replacement must reduce projected absolute
+   delta" (spec 7.2) fail almost every time, silently discarding every
+   real candidate and resetting the confirmation counter to 0 with no
+   error. Fixed: the replacement's signed delta is now computed at
+   `old_leg.quantity` (the replacement always opens at the same size as
+   the leg it replaces — spec 7.2/7.3's one-for-one roll).
+3. **Charges were never netted into the P&L the strategy exits on.**
+   `_evaluate_active` always called `compute_pnl(cycle, charges=0.0)` —
+   real entry/adjustment/exit charges never reduced `net_strategy_pnl`,
+   contradicting spec 6.1 outright (profit/soft/hard/emergency/capital
+   thresholds were all being evaluated against a charge-free P&L). Fixed:
+   a new `ExecutionRepository.cycle_realized_charges` (sums
+   `trade_ledger.entry_charges + exit_charges` for every *closed* leg of
+   one cycle, joined through each leg's own immutable
+   `exit_correlation_id` — `trade_ledger`, migration 0008, carries no
+   `cycle_id` column of its own) plus the already-existing
+   `open_positions_for_cycle(...).charges` sum (open legs' own accrued
+   entry charges) are combined into a new
+   `PositionalMultiLegEngine._total_cycle_charges`, threaded through a new
+   `PositionalContext.total_charges` field the strategy now passes to
+   `compute_pnl` directly.
+
+**One real, unimplemented behaviour found and *disclosed*, not fixed —
+genuinely out of an "add tests" scope, recorded rather than guessed at:**
+spec section 8's "from 12:00 IST: tighten monitoring and do not make
+aggressive inward rolls" has no strategy-side consumer at all.
+`PositionalLifecyclePolicy.aggressive_inward_rolls_permitted`/
+`expiry_day_phase`'s `TIGHTEN` value are correctly computed generic engine
+infrastructure — genuinely unused by `WeeklyDeltaNeutralStrategy`, which
+only ever consults the (separately, correctly implemented) 14:30
+no-adjustment cutoff. Defining "aggressive/inward" precisely enough to
+implement and test it is a real design decision this session did not make
+unilaterally — see `test_weekly_delta_neutral_expiry_day.py`'s own module
+docstring.
+
+**Acceptance rows covered:** three consecutive confirmations and the
+correct roll direction for both signs of net delta; one/two confirmations
+never roll; the confirmation counter resetting inside the band; 1/day,
+3/cycle (isolated from the day limit) and the 90-minute cooldown; the
+daily counter resetting at a real next-trading-day restart while the cycle
+counter persists across it; an unknown close outcome blocking the
+replacement and new entries; hedge repair preceding a pending roll;
+no adjustment past the actual expiry-day 14:30 cutoff; realised P&L
+including a closed adjustment leg; `original_net_credit` never rebasing;
+exact profit/soft/hard/emergency/capital/margin boundaries (one point
+either side); exit priority beating a pending adjustment outright; missing
+chain/Greeks never blocking a hard-stop exit; real (nonzero, default) cost
+rates genuinely netted into the P&L used for exit decisions; the actual
+persisted expiry (including a Monday holiday-shift) driving every
+expiry-day control; the 15:05 planned exit and the engine's own
+independent 15:15 hard-exit net (proven to fire even when 15:05 was never
+evaluated, with no `market_fallback_enabled` path involved anywhere in
+this paper-only stack); shorts confirmed closed before hedges (via each
+leg's own *closing*-side `order_intents` row — a real bug in the test's
+first draft, comparing raw `sequence_number`s across two different
+sessions, since that counter resets per session, is documented and fixed
+in `closing_sequence_numbers`'s own docstring); incomplete flattening
+staying `CRITICAL_UNRESOLVED` and never `COMPLETED`.
+
+**Scope note on restart coverage:** "restart at every adjustment boundary"
+is proven at two real boundaries (a restart immediately after a completed
+roll, with full counter/state verification, and a restart onto the actual
+expiry day past its adjustment cutoff) via `test_weekly_delta_neutral_
+adjustment.py` and the Phase 1/2 restart tests already in place — not
+literally every conceivable crash instant (e.g. a process death after the
+old short's close is confirmed but before the replacement's own order
+even reaches `PENDING_ORDER`, mid-Python-call, which no tick-driven test
+harness can express without invasive engine surgery). `_roll_short`'s own
+`MultiLegDurabilityError` handling around each persistence step (already
+covered generically by the Phase 2/legacy `MultiLegEngine` adjustment
+tests this code path is structurally shared with) is the fail-closed net
+for that gap.
+
+**Verification:** targeted suite (all four new files) — 28 passed. Full
+regression (weekly_delta_neutral/positional/margin `-k` filter) — all
+passed. `ruff check .` clean. `mypy common strategies runtimes dashboards
+scripts --strict` — clean, 229 source files.
+`python -m scripts.assert_no_live_config_committed` — OK. Full `pytest` —
+see the final consolidated run for the exact count. No order-capable Dhan
+endpoint referenced anywhere in this phase's new code.
