@@ -29,6 +29,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
+from common.margin import MarginEstimate
 from common.models import ExitReason, OrderSide
 
 from ..models import OptionContract
@@ -193,6 +194,18 @@ class CycleSignal:
     #: strategy could not compute one.
     pre_adjustment_net_delta: float | None = None
     post_adjustment_net_delta: float | None = None
+    #: Set only on ``ENTER_CYCLE`` — the accepted basket-margin decision
+    #: (spec section 3.7) the strategy computed for this exact candidate
+    #: before returning the signal. Persisted onto
+    #: ``strategy_cycle_margin_snapshots`` (migration 0011) at the same
+    #: pre-effect checkpoint as the cycle/leg rows themselves, atomically
+    #: with the critical entry decision — never a separate best-effort
+    #: write. ``None`` is never produced by a strategy that requires a
+    #: margin gate (spec 3.7 blocks entry on an unusable estimate before a
+    #: signal is ever returned); it stays optional here only so a future
+    #: positional strategy without a margin requirement is not forced to
+    #: fabricate one.
+    margin_estimate: MarginEstimate | None = None
 
 
 @dataclass

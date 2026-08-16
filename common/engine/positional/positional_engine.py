@@ -58,6 +58,7 @@ from common.config.models import ExecutionMode
 from common.execution import ExecutionRepository
 from common.greeks import GreekSnapshot, GreeksService
 from common.logging import get_logger
+from common.margin import MarginEstimate, MarginEstimator
 from common.models import ExitReason, Tick
 from common.notifications import NotificationEvent, Notifier, NullNotifier, SafeNotifier
 from common.utils.timeutils import now_ist
@@ -105,12 +106,14 @@ class PositionalMultiLegEngine:
         feed: MarketDataFeed,
         option_selector: OptionSelector | None = None,
         greeks_service: GreeksService,
+        margin_estimator: MarginEstimator,
         quotes: QuoteBook,
         session: MarketSession,
         lifecycle_policy: PositionalLifecyclePolicy,
         underlying_security_id: str,
         underlying_instrument: str,
         underlying_segment: str,
+        option_segment: str,
         runtime_id: str,
         strategy_id: str,
         execution_mode: ExecutionMode,
@@ -128,6 +131,7 @@ class PositionalMultiLegEngine:
         recover_cycle: Callable[[], Cycle | None] | None = None,
         persist_cycle: Callable[[Cycle], None] | None = None,
         persist_cycle_leg: Callable[[LegInstance], None] | None = None,
+        persist_margin_snapshot: Callable[[str, MarginEstimate], None] | None = None,
         record_incident: Callable[[str, str], None] | None = None,
         clock: Callable[[], datetime] = now_ist,
     ) -> None:
@@ -144,12 +148,19 @@ class PositionalMultiLegEngine:
         self._gateway = gateway
         self._repository = repository
         self._greeks = greeks_service
+        self._margin = margin_estimator
         self._quotes = quotes
         self.session = session
         self._lifecycle_policy = lifecycle_policy
         self.underlying_id = underlying_security_id
         self.underlying_instrument = underlying_instrument or underlying_security_id
         self.underlying_segment = underlying_segment
+        #: The exchange segment every option leg lives in — distinct from
+        #: ``underlying_segment`` (e.g. the underlying index's ``IDX_I``).
+        #: Threaded through to ``PositionalContext`` so a strategy computing
+        #: a margin estimate (spec section 3.7) never has to re-derive it or
+        #: guess at the underlying's own segment for an option leg.
+        self.option_segment = option_segment
         self._runtime_id = runtime_id
         self._strategy_id = strategy_id
         self._mode = execution_mode
@@ -174,6 +185,7 @@ class PositionalMultiLegEngine:
         self._recover_cycle = recover_cycle
         self._persist_cycle_cb = persist_cycle
         self._persist_cycle_leg_cb = persist_cycle_leg
+        self._persist_margin_snapshot_cb = persist_margin_snapshot
         self._record_incident_cb = record_incident
         self._now = clock
 
@@ -475,6 +487,9 @@ class PositionalMultiLegEngine:
             greeks_service=self._greeks,
             underlying_security_id=self.underlying_id,
             underlying_segment=self.underlying_segment,
+            option_segment=self.option_segment,
+            margin_estimator=self._margin,
+            record_pre_entry_incident=lambda message: self._record_incident("pre-entry", message),
         )
 
     def _apply_signal(self, signal: CycleSignal, ts: datetime) -> None:
@@ -548,6 +563,8 @@ class PositionalMultiLegEngine:
             self._persist_cycle(critical=True)
             for leg in cycle.legs.values():
                 self._persist_leg(leg, critical=True)
+            if signal.margin_estimate is not None:
+                self._persist_margin_snapshot(cycle_id, signal.margin_estimate, critical=True)
         except MultiLegDurabilityError:
             log.error(
                 "%s: could not durably persist the intended entry before any order; refusing",
@@ -1062,6 +1079,21 @@ class PositionalMultiLegEngine:
             self._record_incident(
                 self._cycle.cycle_id, f"leg persist failed for {leg.leg_id}: {exc}"
             )
+
+    def _persist_margin_snapshot(
+        self, cycle_id: str, estimate: MarginEstimate, *, critical: bool = False
+    ) -> None:
+        if self._persist_margin_snapshot_cb is None:
+            return
+        try:
+            self._persist_margin_snapshot_cb(cycle_id, estimate)
+        except Exception as exc:
+            if critical:
+                self.block_entries(f"critical margin snapshot persistence failed: {exc}")
+                self._record_incident(cycle_id, f"critical margin snapshot persist failed: {exc}")
+                raise MultiLegDurabilityError(str(exc)) from exc
+            log.exception("%s: best-effort margin snapshot persistence failed", self.label)
+            self._record_incident(cycle_id, f"margin snapshot persist failed: {exc}")
 
     def _record_incident(self, cycle_id: str, message: str) -> None:
         log.critical("%s: INCIDENT cycle=%s: %s", self.label, cycle_id, message)

@@ -46,6 +46,7 @@ from common.execution import ExecutionRepository, OrderLifecycle
 from common.greeks import GreeksService, ModelAssumptions
 from common.health import HealthState, HeartbeatWriter
 from common.logging import get_logger
+from common.margin import MarginEstimate, MarginEstimator
 from common.market_data.option_chain import ChainFetcher, OptionChainService
 from common.market_data.scrip_master import ScripMaster
 from common.notifications import NotificationEvent, Notifier, NullNotifier, SafeNotifier
@@ -103,6 +104,7 @@ def build_engine(
     feed: MarketDataFeed,
     chain_fetcher: ChainFetcher,
     scrip_master: ScripMaster,
+    margin_estimator: MarginEstimator,
     notifier: Notifier | None = None,
     heartbeat: HeartbeatWriter | None = None,
     clock: Callable[[], datetime] = now_ist,
@@ -110,12 +112,19 @@ def build_engine(
     """Assemble one real :class:`PositionalMultiLegEngine`.
 
     Test-facing seam: every dependency this needs from the outside world
-    (the feed, the chain fetcher, the scrip master) is injected — a test
-    supplies a :class:`~common.engine.feed.SimulatedFeed`, a canned
-    ``ChainFetcher``, and a scrip master built from a fixture CSV, never a
-    real Dhan call. Production construction (real feed, real Dhan chain
-    fetcher, the daily-downloaded scrip master) happens once, in
-    ``__main__.py``.
+    (the feed, the chain fetcher, the scrip master, the margin estimator) is
+    injected — a test supplies a :class:`~common.engine.feed.SimulatedFeed`,
+    a canned ``ChainFetcher``, a scrip master built from a fixture CSV, and a
+    :class:`~common.margin.MarginEstimator` explicitly wired for its own
+    scenario (a fake ``margin_fetcher``, or ``margin_fetcher=None`` plus an
+    explicitly-injected ``fallback_model`` — see ``common.margin``'s own
+    module docstring), never a real Dhan call. Production construction (real
+    feed, real Dhan chain fetcher, the daily-downloaded scrip master, and a
+    ``MarginEstimator`` wired to the real
+    :func:`~common.market_data.dhan_margin.build_dhan_margin_fetcher` with
+    no fallback) happens once, in ``__main__.py`` — required, not defaulted,
+    here specifically so a production call site can never silently omit it
+    and fall through to an implicit test-only behaviour.
     """
     execution_mode = ExecutionMode.PAPER  # this runtime never constructs a live broker (spec §9.7)
     quotes = QuoteBook()
@@ -204,6 +213,21 @@ def build_engine(
             message=f"cycle={cycle_id}: {message}",
         )
 
+    def _persist_margin_snapshot(cycle_id: str, estimate: MarginEstimate) -> None:
+        repository.record_cycle_margin_snapshot(
+            runtime_id=config.runtime_id,
+            strategy_id=config.strategy_id,
+            execution_mode=execution_mode,
+            cycle_id=cycle_id,
+            decision_type="ENTRY_CANDIDATE",
+            estimated_margin=estimate.estimated_margin,
+            source=estimate.source,
+            estimated_at=estimate.estimated_at.isoformat(),
+            allocated_capital=estimate.allocated_capital,
+            utilization_percent=estimate.utilization_percent,
+            correlation_id=None,
+        )
+
     # A one-element box so the reporter's `entries_blocked` closure can read
     # the engine's own live state without the engine existing yet at the
     # point the reporter is constructed (a genuine forward reference: the
@@ -217,12 +241,14 @@ def build_engine(
         feed=feed,
         option_selector=None,  # unused by this engine — see its constructor's own note
         greeks_service=greeks_service,
+        margin_estimator=margin_estimator,
         quotes=quotes,
         session=session,
         lifecycle_policy=lifecycle_policy,
         underlying_security_id=config.underlying_security_id,
         underlying_instrument=config.underlying_instrument,
         underlying_segment=config.underlying_segment,
+        option_segment=config.option_segment,
         runtime_id=config.runtime_id,
         strategy_id=config.strategy_id,
         execution_mode=execution_mode,
@@ -244,6 +270,7 @@ def build_engine(
         recover_cycle=_recover,
         persist_cycle=_persist_cycle,
         persist_cycle_leg=_persist_leg,
+        persist_margin_snapshot=_persist_margin_snapshot,
         record_incident=_record_incident,
         clock=clock,
     )
@@ -277,6 +304,7 @@ def run_worker(
     feed: MarketDataFeed,
     chain_fetcher: ChainFetcher,
     scrip_master: ScripMaster,
+    margin_estimator: MarginEstimator,
     runtime_root: Path,
     notifier: Notifier | None = None,
     clock: Callable[[], datetime] = now_ist,
@@ -319,6 +347,7 @@ def run_worker(
             feed=feed,
             chain_fetcher=chain_fetcher,
             scrip_master=scrip_master,
+            margin_estimator=margin_estimator,
             notifier=safe_notifier,
             heartbeat=heartbeat,
             clock=clock,

@@ -33,6 +33,8 @@ from common.config import (
 )
 from common.config.secrets import read_secret
 from common.logging import get_logger, setup_logging
+from common.margin import MarginEstimator
+from common.market_data.dhan_margin import build_dhan_margin_fetcher
 from common.market_data.dhan_option_chain import build_dhan_chain_fetcher
 from common.market_data.scrip_master import ScripMaster, ScripMasterCache, resolve_index_meta
 from common.notifications import build_notifier
@@ -225,6 +227,15 @@ def main(argv: list[str] | None = None) -> int:
     chain_fetcher = build_dhan_chain_fetcher(client_id=client_id, access_token=token)
     scrip_master = _build_scrip_master(cfg, default_cache_dir=paths.cache_root)
     feed = _build_feed(cfg, adapter)
+    # Production posture (independent review correction): the real Dhan
+    # margin-calculator source only, no fallback_model. A missing/stale/
+    # invalid/failed margin estimate must block entry, never silently fall
+    # through to the offline approximation — see common.margin's own module
+    # docstring and MarginEstimator's own docstring for why fallback_model
+    # is never set here.
+    margin_estimator = MarginEstimator(
+        margin_fetcher=build_dhan_margin_fetcher(client_id=client_id, access_token=token)
+    )
 
     supervisor_outcome = run_supervisor(
         cfg=cfg,
@@ -234,6 +245,7 @@ def main(argv: list[str] | None = None) -> int:
         feed=feed,
         chain_fetcher=chain_fetcher,
         scrip_master=scrip_master,
+        margin_estimator=margin_estimator,
         notifier=build_notifier(settings),
         trading_date=local_date_in(now_ist()).isoformat(),
     )

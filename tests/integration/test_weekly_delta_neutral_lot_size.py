@@ -31,11 +31,16 @@ from common.config.models import ExecutionMode
 from common.engine.config import SessionConfig
 from common.engine.feed import SimulatedFeed
 from common.execution import ExecutionRepository
+from common.margin import LegMarginRequest, MarginEstimator
 from common.market_data.scrip_master import ScripMaster
 from common.models import Tick
 from common.persistence import Database, MigrationRunner
 from runtimes.positional_options.config_adapter import WorkerConfig
 from runtimes.positional_options.worker import build_engine
+
+
+def _fake_margin_fetcher(_leg: LegMarginRequest) -> float:
+    return 20_000.0
 
 IST = ZoneInfo("Asia/Kolkata")
 NIFTY_SECURITY_ID = "13"
@@ -219,7 +224,9 @@ def test_entry_resolves_the_current_real_lot_size_from_contract_metadata(
         built = build_engine(
             config, repository=repository, session_id=session.id,
             feed=SimulatedFeed(ticks), chain_fetcher=_chain_fetcher,
-            scrip_master=scrip_master, clock=lambda: entry_ts,
+            scrip_master=scrip_master,
+            margin_estimator=MarginEstimator(margin_fetcher=_fake_margin_fetcher),
+            clock=lambda: entry_ts,
         )
         built.engine.run()
 

@@ -1,30 +1,49 @@
 """The atomic four-leg candidate search (spec section 3.5) — deterministic,
 never relaxed. No candidate that clears every filter -> no entry, full stop.
 
-Ranking, in order, for each role independently:
+**Filters, applied before any ranking (never relaxed when nothing
+qualifies):**
 
 1. valid same expiry and required option type — guaranteed by construction
    (the chain snapshot and resolver are both already scoped to one expiry).
 2. fresh, complete quote and Greek inputs.
-3. liquidity and spread limits.
-4. delta distance from the configured target.
-5. hedge-width validity (hedges only).
-6. stable strike tie-break.
+3. liquidity and per-leg delta-tolerance limits (``rank_role_candidates``).
+4. hedge-width validity: a hedge candidate is only ever considered within
+   its own short's 250-500 point band (``_side_combos``'s ``width_bounds``).
+5. whole-basket validity: equal/positive resolved lot size, combined
+   bid/ask spread, positive credit, positive wing width, credit/width
+   ratio, and entry delta-per-lot tolerance (``_assemble_candidate``).
 
-Criterion 6 in the spec ("lowest absolute projected portfolio delta") is
-enforced as a **post-hoc entry gate** on the assembled four-leg candidate
-(``abs(net_delta_per_lot) <= maximum_entry_delta_per_lot``, spec section
-3.7) rather than a combinatorial search across every viable leg
-combination — each role's nearest-delta, most-liquid candidate is already
-the practical optimum for a retail-sized iron condor, and searching the
-full combinatorial space would trade a large amount of complexity for a
-correction that is rarely, if ever, the deciding factor once each leg is
-already within its own delta tolerance. Documented as a known scope
-boundary, not a silent gap.
+**Ranking, over every surviving complete four-leg combination** — the
+deterministic order confirmed by independent review (do not reorder without
+an authoritative spec change):
+
+1. total distance from the four legs' own configured delta targets
+   (ascending);
+2. lowest absolute projected portfolio net delta per lot (ascending);
+3. combined bid/ask spread across all four legs (ascending);
+4. a stable strike/security-id tie-break.
+
+**The search itself.** Each short role's candidate list is already small by
+construction (tolerance-filtered around its target delta), so for every
+short candidate this module enumerates every width-valid hedge candidate
+for *that specific short's own strike* — not just the single nearest short's
+hedge, which is exactly the shortcut this replaces (see
+``test_weekly_delta_neutral_selection.py`` for a fixture where the nearest
+short's own hedge fails the width band while a slightly-further-from-target
+short has a fully valid one). Put-side and call-side combinations are
+independent of each other (a put leg's width/credit does not depend on
+which call combination is chosen), so the full basket search is the
+Cartesian product of two already-bounded lists — operationally cheap even
+in the worst case (each side's list is bounded by how many strikes clear
+the configured delta tolerance, typically a handful), never a full scan of
+every strike combination in the chain.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 
 from common.engine.positional.positional_models import LegRole
@@ -101,6 +120,76 @@ def rank_role_candidates(
     return [item[3] for item in scored]
 
 
+@dataclass(frozen=True)
+class _SideCombo:
+    """One side's (short, hedge) pairing — put side or call side — with the
+    combined stats the whole-basket ranking needs. ``short``/``hedge`` are
+    kept apart, never pre-summed into the candidate, so the two independent
+    sides can be cross-joined without recomputing anything."""
+
+    short: LegCandidate
+    hedge: LegCandidate
+    delta_distance: float
+    spread: float
+
+
+def _side_combos(
+    *,
+    chain: ChainView,
+    resolver: OptionChainResolver,
+    greeks: GreeksService,
+    config: SelectionConfig,
+    spot: float,
+    expiry_at: datetime,
+    now: datetime,
+    shorts: list[LegCandidate],
+    short_target_delta: float,
+    hedge_option_type: OptionType,
+    hedge_role: LegRole,
+    hedge_target_delta: float,
+    hedge_tolerance: float,
+    width_bounds: Callable[[float], tuple[float, float]],
+) -> list[_SideCombo]:
+    """Every (short, hedge) pairing for one side — put or call — where the
+    hedge is width-valid *for that specific short's own strike*. Never just
+    the single nearest short's hedge."""
+    combos: list[_SideCombo] = []
+    for short in shorts:
+        bounds = width_bounds(short.strike)
+        hedge_candidates = rank_role_candidates(
+            chain=chain,
+            resolver=resolver,
+            greeks=greeks,
+            option_type=hedge_option_type,
+            role=hedge_role,
+            target_delta=hedge_target_delta,
+            tolerance=hedge_tolerance,
+            config=config,
+            spot=spot,
+            expiry_at=expiry_at,
+            now=now,
+            strike_bounds=bounds,
+        )
+        if not hedge_candidates:
+            continue
+        assert short.quote.bid is not None and short.quote.ask is not None
+        short_distance = abs(short.greeks.delta - short_target_delta)
+        short_spread = short.quote.ask - short.quote.bid
+        for hedge in hedge_candidates:
+            assert hedge.quote.bid is not None and hedge.quote.ask is not None
+            hedge_distance = abs(hedge.greeks.delta - hedge_target_delta)
+            hedge_spread = hedge.quote.ask - hedge.quote.bid
+            combos.append(
+                _SideCombo(
+                    short=short,
+                    hedge=hedge,
+                    delta_distance=short_distance + hedge_distance,
+                    spread=short_spread + hedge_spread,
+                )
+            )
+    return combos
+
+
 def select_iron_condor(
     *,
     chain: ChainView,
@@ -112,15 +201,13 @@ def select_iron_condor(
     lots: int,
     config: SelectionConfig,
 ) -> IronCondorCandidate | None:
-    """The complete, atomic four-leg search. Returns ``None`` — never a
-    partial or relaxed result — when any role has no qualifying candidate,
-    when the assembled combination fails the combined-spread/credit/width/
-    delta gates (spec section 3.6/3.7), when hedge width is invalid for
-    every hedge candidate near the chosen short, or when the four resolved
-    contracts' own lot sizes are not all equal and non-zero (spec section
-    3.1: lot size is resolved from each selected Dhan contract's own
-    metadata, never a single external value trusted on its own — see the
-    consistency check below).
+    """The complete, atomic four-leg search over every valid combination.
+
+    Returns ``None`` — never a partial or relaxed result — when no complete
+    combination clears every filter in this module's own docstring. Never
+    picks "the nearest short's own nearest hedge" independently per side and
+    calls it done; every width-valid hedge for every qualifying short is a
+    candidate combination, and the lowest-ranked complete one wins.
     """
     short_put_candidates = rank_role_candidates(
         chain=chain, resolver=resolver, greeks=greeks, option_type=OptionType.PE,
@@ -136,32 +223,61 @@ def select_iron_condor(
     )
     if not short_put_candidates or not short_call_candidates:
         return None
-    short_put = short_put_candidates[0]
-    short_call = short_call_candidates[0]
 
-    hedge_put = best_hedge(
-        chain=chain, resolver=resolver, greeks=greeks, option_type=OptionType.PE,
-        short_strike=short_put.strike, config=config, spot=spot, expiry_at=expiry_at, now=now,
-        role=LegRole.HEDGE_PUT, target_delta=config.hedge_put_delta,
-        tolerance=config.hedge_delta_tolerance,
+    put_combos = _side_combos(
+        chain=chain, resolver=resolver, greeks=greeks, config=config, spot=spot,
+        expiry_at=expiry_at, now=now, shorts=short_put_candidates,
+        short_target_delta=config.short_put_delta, hedge_option_type=OptionType.PE,
+        hedge_role=LegRole.HEDGE_PUT, hedge_target_delta=config.hedge_put_delta,
+        hedge_tolerance=config.hedge_delta_tolerance,
+        width_bounds=lambda strike: (
+            strike - config.maximum_hedge_width_points,
+            strike - config.minimum_hedge_width_points,
+        ),
     )
-    hedge_call = best_hedge(
-        chain=chain, resolver=resolver, greeks=greeks, option_type=OptionType.CE,
-        short_strike=short_call.strike, config=config, spot=spot, expiry_at=expiry_at, now=now,
-        role=LegRole.HEDGE_CALL, target_delta=config.hedge_call_delta,
-        tolerance=config.hedge_delta_tolerance,
+    call_combos = _side_combos(
+        chain=chain, resolver=resolver, greeks=greeks, config=config, spot=spot,
+        expiry_at=expiry_at, now=now, shorts=short_call_candidates,
+        short_target_delta=config.short_call_delta, hedge_option_type=OptionType.CE,
+        hedge_role=LegRole.HEDGE_CALL, hedge_target_delta=config.hedge_call_delta,
+        hedge_tolerance=config.hedge_delta_tolerance,
+        width_bounds=lambda strike: (
+            strike + config.minimum_hedge_width_points,
+            strike + config.maximum_hedge_width_points,
+        ),
     )
-    if hedge_put is None or hedge_call is None:
+    if not put_combos or not call_combos:
         return None
+
+    best: IronCondorCandidate | None = None
+    best_key: tuple[float, float, float, float, float, float, float, str, str, str, str] | None = (
+        None
+    )
+    for put_combo in put_combos:
+        for call_combo in call_combos:
+            candidate = _assemble_candidate(put_combo, call_combo, lots=lots, config=config)
+            if candidate is None:
+                continue
+            key = _ranking_key(candidate, put_combo, call_combo)
+            if best_key is None or key < best_key:
+                best = candidate
+                best_key = key
+    return best
+
+
+def _assemble_candidate(
+    put_combo: _SideCombo, call_combo: _SideCombo, *, lots: int, config: SelectionConfig
+) -> IronCondorCandidate | None:
+    """Every whole-basket hard filter (spec section 3.6/3.7) — reject,
+    never relax, exactly as the single-path version this replaces did."""
+    hedge_put, short_put = put_combo.hedge, put_combo.short
+    hedge_call, short_call = call_combo.hedge, call_combo.short
 
     # Spec section 3.1: lot size comes exclusively from each selected
     # contract's own resolved metadata — never a single value trusted from
     # the scrip master as a whole, and never a hardcoded/configured
-    # constant (there is deliberately no lot_size field anywhere in this
-    # strategy's config model). All four legs share one underlying and
-    # expiry, so their exchange-set lot size should always agree in
-    # practice; verified here rather than assumed, and refused — not
-    # guessed at — if it does not.
+    # constant. Verified here rather than assumed, and refused — not
+    # guessed at — if it does not agree across all four legs.
     leg_lot_sizes = {
         hedge_put.contract.lot_size,
         hedge_call.contract.lot_size,
@@ -174,11 +290,7 @@ def select_iron_condor(
     if lot_size <= 0:
         return None
 
-    combined_spread = sum(
-        (leg.quote.ask - leg.quote.bid)
-        for leg in (hedge_put, hedge_call, short_put, short_call)
-        if leg.quote.bid is not None and leg.quote.ask is not None
-    )
+    combined_spread = put_combo.spread + call_combo.spread
     if combined_spread > config.maximum_combined_spread_points:
         return None
 
@@ -208,12 +320,7 @@ def select_iron_condor(
 
     # Signed portfolio delta, in the *same* convention strategy.py's own
     # _signed_delta uses post-entry (long => +raw delta, short => -raw
-    # delta; chain deltas are natively signed, negative for puts): a long
-    # put/call's position delta is its own raw delta, and a short
-    # put/call's is the negation of it. Getting this convention wrong here
-    # while _signed_delta uses the correct one would silently reject
-    # perfectly balanced condors (or admit lopsided ones) — this net_delta
-    # and _net_delta_per_lot must always agree on a held cycle's own legs.
+    # delta; chain deltas are natively signed, negative for puts).
     net_delta = (
         hedge_put.greeks.delta * quantity
         + hedge_call.greeks.delta * quantity
@@ -240,6 +347,30 @@ def select_iron_condor(
     )
 
 
+def _ranking_key(
+    candidate: IronCondorCandidate, put_combo: _SideCombo, call_combo: _SideCombo
+) -> tuple[float, float, float, float, float, float, float, str, str, str, str]:
+    """The deterministic ranking order confirmed by independent review:
+    total delta distance, then lowest absolute projected portfolio delta,
+    then combined spread, then a stable strike/security-id tie-break. A
+    smaller tuple always wins (``min`` by lexicographic comparison)."""
+    total_delta_distance = put_combo.delta_distance + call_combo.delta_distance
+    combined_spread = put_combo.spread + call_combo.spread
+    return (
+        total_delta_distance,
+        abs(candidate.net_delta_per_lot),
+        combined_spread,
+        candidate.short_put.strike,
+        candidate.hedge_put.strike,
+        candidate.short_call.strike,
+        candidate.hedge_call.strike,
+        candidate.short_put.contract.security_id,
+        candidate.hedge_put.contract.security_id,
+        candidate.short_call.contract.security_id,
+        candidate.hedge_call.contract.security_id,
+    )
+
+
 def best_hedge(
     *,
     chain: ChainView,
@@ -255,6 +386,15 @@ def best_hedge(
     target_delta: float,
     tolerance: float,
 ) -> LegCandidate | None:
+    """The single best hedge for one already-fixed short strike — used only
+    by the hedge-repair path (spec section 7.2/12.3 step 2), which replaces
+    exactly one leg against an already-open basket, not a fresh atomic
+    four-leg search. ``select_iron_condor`` never calls this: it enumerates
+    every width-valid hedge per short candidate itself (``_side_combos``),
+    because the repair case and the entry-search case have different
+    correctness requirements — repair has no sibling short to jointly
+    optimise against.
+    """
     if option_type is OptionType.PE:
         bounds = (
             short_strike - config.maximum_hedge_width_points,

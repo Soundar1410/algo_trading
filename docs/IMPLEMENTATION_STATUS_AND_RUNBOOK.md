@@ -7619,14 +7619,15 @@ refactor:
   bid/ask-crossing adverse-fill model instead (`allow_ltp_fallback: false`
   makes a depth-less fill structurally impossible) — a deliberate,
   documented scope boundary, not a silently dropped requirement.
-- **Margin utilization is unmodelled.** `is_margin_breach` always receives
-  `estimated_margin=None` from this strategy — a documented no-op, never a
-  fabricated pass, pending a real margin feed.
-- **Selection is not a full combinatorial search.** Each role's
-  nearest-delta, most-liquid candidate is used directly rather than
-  searching every viable four-leg combination for the lowest absolute
-  portfolio delta — documented in `selection.py`'s own module docstring as
-  a deliberate scope boundary.
+- ~~**Margin utilization is unmodelled.**~~ **Closed in the gap-closing
+  session, section 11.10 Phase 1** — the entry gate now computes a real
+  basket-margin estimate and blocks entry above 50% allocated capital. The
+  *ongoing*, per-evaluation exit-priority margin-breach check (spec section
+  6.2 step 10) remains a deliberate no-op — see 11.10 Phase 1 for why.
+- ~~**Selection is not a full combinatorial search.**~~ **Closed in the
+  gap-closing session, section 11.10 Phase 2** — `select_iron_condor` now
+  searches every width-valid (short, hedge) pairing on each side and ranks
+  every complete four-leg combination.
 - **No auto-start.** `orchestration/launchd/generate_plists.py` gets no
   new plist for this runtime, matching the spec's own instruction; an
   operator starts it explicitly via 11.5's commands.
@@ -7650,3 +7651,163 @@ not start the 30-day paper evaluation clock, does not constitute the
 "second real paper strategy" language elsewhere in this repository refers
 to in a different context, and every other outstanding approval CLAUDE.md
 lists remains outstanding.
+
+## 11.10 Gap-closing session (16 August 2026) — mandatory acceptance-completeness corrections
+
+Commit `4be04f0` honestly disclosed five scope boundaries (11.8 above and
+its own commit message). This session closes all five before the
+implementation may be described as acceptance-complete. Reported phase by
+phase, per CLAUDE.md; each phase below is appended as it completes.
+
+### Phase 1 — Margin-utilization gate (spec 3.7/6.3)
+
+New generic `common/margin/` package (`models.py`, `model.py`,
+`estimator.py`), mirroring `common/greeks/`'s door-and-fallback shape but
+with one deliberate difference, added after independent review of the first
+draft: **`MarginEstimator` has no automatic production fallback.**
+`ConservativeMarginModel` (a deterministic percentage-of-notional
+approximation) exists only as an explicitly-injected offline/test double —
+`fallback_model` is consulted only when no `margin_fetcher` is configured
+at all, and a *configured* live fetcher that fails, times out, or returns
+invalid/non-finite data always raises `MarginUnavailable`, never silently
+downgrading to the offline model. `runtimes/positional_options/__main__.py`
+constructs `MarginEstimator(margin_fetcher=build_dhan_margin_fetcher(...))`
+with no `fallback_model` — proven by
+`tests/unit/test_no_margin_order_calls.py::
+test_production_composition_root_never_wires_the_offline_fallback_model`.
+
+`common/market_data/dhan_margin.py` calls Dhan's one available margin
+endpoint, `POST /v2/margincalculator` (the pinned SDK/API has no basket-
+margin endpoint), once per leg; `MarginEstimator` sums the four results — a
+documented conservative choice, since no cross-margin/hedge netting between
+legs is assumed, so the sum never understates margin relative to what real
+hedge netting would achieve. Purely a calculator call: no order is
+constructed or submitted, proven the same way
+`tests/unit/test_scripts_are_read_only.py` proves it for the read-only
+script tier (`tests/unit/test_no_margin_order_calls.py`).
+
+**Persistence, corrected per independent review.** Migration `0011`
+(`strategy_cycle_margin_snapshots`, `CREATE TABLE/INDEX IF NOT EXISTS`
+only — no `ALTER TABLE` on `strategy_cycles`, which SQLite cannot replay
+idempotently after a partial migration the way this tree's `MigrationRunner`
+requires). `ExecutionRepository.record_cycle_margin_snapshot` writes it;
+`PositionalMultiLegEngine._enter_cycle` calls it inside the **same**
+critical pre-effect block that already persists the cycle/leg rows before
+the first order — a failure there raises `MultiLegDurabilityError` and
+blocks entry exactly like a cycle/leg persistence failure already does,
+never a separate best-effort write.
+
+**Strategy wiring.** `WeeklyDeltaNeutralStrategy._entry_margin_estimate`
+builds one `LegMarginRequest` per selected leg (BUY legs priced at ask,
+SELL at bid — the same fresh quote the candidate was itself evaluated
+against) and calls `context.margin_estimator.estimate_basket(...)` before
+returning `ENTER_CYCLE`. `MarginUnavailable` (missing/stale/invalid/failed)
+blocks entry and records an operational incident via a new
+`PositionalContext.record_pre_entry_incident` callback (routes through the
+engine's own existing `record_incident` plumbing under a synthetic
+"pre-entry" label — no persistence access was added to the strategy
+itself). `utilization_percent > 50%` blocks entry as an ordinary filter (no
+incident — consistent with every other entry filter). A second,
+independent freshness check (`MarginEstimate.is_fresh` against the
+engine's own tick-driven clock) guards against clock drift between a real
+HTTP round trip and the evaluation "now" — defence in depth beyond the
+estimator's own self-stamped internal check.
+
+The *ongoing*, per-evaluation exit-priority margin-breach check (spec
+section 6.2 step 10) deliberately stays a no-op
+(`estimated_margin=None`, as before): polling the real margin-calculator
+endpoint on every evaluation tick (every few seconds, for an open cycle's
+entire life) is real operational load this task's explicit scope
+("calculate the complete four-leg basket margin before the first order")
+does not ask for. Missing/failed margin estimation already cannot block
+any exit — every exit above this step in the priority ladder is evaluated
+first regardless.
+
+**Tests:** `tests/unit/test_margin_estimator.py` (exact 50% boundary, one
+point above/below, unavailable/no-fetcher, a configured fetcher that raises
+still blocking even with a fallback set, non-finite/negative fetcher
+results, stale-estimate freshness boundary, the offline-model path only
+running when explicitly injected). `tests/unit/test_no_margin_order_calls.py`
+(no broker import, no order-endpoint token, only `/margincalculator`
+referenced, no broker/order client constructed, production wiring proof).
+`tests/unit/test_no_weekly_delta_neutral_branches.py` extended to cover
+`common/margin` and `common/market_data/dhan_margin.py`. Existing
+`test_weekly_delta_neutral_entry.py`/`_restart.py`/`_lot_size.py` and
+`test_dashboard_positional_real_data.py` updated (not weakened) to supply
+an explicit `MarginEstimator` — `build_engine` now requires one, the same
+way it already requires `chain_fetcher`/`scrip_master`, so a production
+call site can never silently omit it. `tests/unit/test_migrations.py`'s
+hardcoded shipped-migration-list assertions extended to include `0011`
+(and one loop that copied "every migration except 0010" generalised to
+"every migration numbered 0010 or later", so it keeps seeding exactly
+"through 0009" regardless of how many later migrations exist) — a required
+update, not a weakening: every assertion still checks the same things, just
+against one more real migration.
+
+**Verification:** targeted suite (`test_margin_estimator.py`,
+`test_no_margin_order_calls.py`, `test_no_weekly_delta_neutral_branches.py`,
+the three integration tests, the dashboard real-data test,
+`test_weekly_delta_neutral_config.py`, `test_weekly_delta_neutral_selection.py`,
+`test_migrations.py`) — all passed. Full `pytest` — see Phase 6 below for
+the final consolidated run. `ruff check .` clean. `mypy common strategies
+runtimes dashboards scripts --strict` — clean, 229 source files.
+`python -m scripts.assert_no_live_config_committed` — OK. No order-capable
+Dhan endpoint referenced anywhere in this phase's new code (only
+`/margincalculator`).
+
+### Phase 2 — Atomic four-leg candidate search (spec 3.5)
+
+`strategies/positional_options/weekly_delta_neutral/selection.py` rewritten:
+`select_iron_condor` no longer takes "the nearest short, then that short's
+own best hedge" independently per side. It now:
+
+1. ranks every short-put and every short-call candidate that clears its own
+   quote/liquidity/delta-tolerance filter (`rank_role_candidates`, unchanged
+   — already the bounded, bounded-by-tolerance candidate list the spec asks
+   for);
+2. for **every** qualifying short on each side, enumerates every hedge
+   candidate that is width-valid *for that specific short's own strike*
+   (`_side_combos`) — not only the delta-nearest short's own hedge;
+3. cross-joins the two independent sides (put combos x call combos —
+   independent because one side's width/credit never depends on the
+   other's chosen combination) and, for every complete combination, applies
+   every whole-basket hard filter unchanged from the single-path version
+   (equal/positive lot size, combined spread, positive credit, positive
+   wing width, credit/width ratio, entry delta-per-lot tolerance —
+   `_assemble_candidate`);
+4. ranks every surviving combination by the deterministic order confirmed
+   by independent review of the first draft's proposed order: **total
+   delta-target distance, then lowest absolute projected portfolio delta
+   per lot, then combined bid/ask spread, then a stable strike/security-id
+   tie-break** (`_ranking_key`) — never combined spread ahead of projected
+   delta, which the first draft had backwards.
+
+`best_hedge`/`rank_role_candidates` are unchanged and still exported: the
+hedge-repair path (`strategy.py::_hedge_repair_needed`) still replaces
+exactly one leg against an already-open basket, which has no sibling short
+to jointly search against — a different, still-correct use of the single-
+best-candidate shape.
+
+**Tests:** `tests/unit/test_weekly_delta_neutral_candidate_search.py` — a
+fixture chain where the delta-nearest short put's own width band has no
+delta-valid hedge, but a short put one step farther from the target delta
+(still within its own tolerance) has a fully valid one.
+`test_nearest_leg_selection_would_block_entry_that_the_complete_search_finds`
+reconstructs the old algorithm inline (`rank_role_candidates(...)[0]` then
+`best_hedge`) and proves it returns no hedge at all — the old shortcut
+would have blocked entry outright — while `select_iron_condor`'s real
+search finds the valid basket through the farther-from-target short. A
+second test proves the fixture's own width bounds are set up as intended
+(the "bad" hedge is delta-invalid, not width-invalid or unlisted), so the
+first test is proven by the actual defect being fixed, not an accident of
+the fixture.
+
+**Verification:** `test_weekly_delta_neutral_candidate_search.py` (2
+passed) plus the full existing `test_weekly_delta_neutral_selection.py`,
+`test_weekly_delta_neutral_entry.py`, `test_weekly_delta_neutral_restart.py`,
+`test_weekly_delta_neutral_lot_size.py`, `test_dashboard_positional_real_data.py`,
+`test_no_weekly_delta_neutral_branches.py` re-run unchanged and passing —
+the rewritten search produces the identical accepted candidate on every
+existing fixture (none of them exercise the divergent case the new test
+adds). `ruff check .` clean. `mypy common strategies runtimes dashboards
+scripts --strict` — clean, 229 source files.

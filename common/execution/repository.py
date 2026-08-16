@@ -2094,6 +2094,65 @@ class ExecutionRepository:
             .fetchall()
         )
 
+    def record_cycle_margin_snapshot(
+        self,
+        *,
+        runtime_id: str,
+        strategy_id: str,
+        execution_mode: ExecutionMode,
+        cycle_id: str,
+        decision_type: str,
+        estimated_margin: float,
+        source: str,
+        estimated_at: str,
+        allocated_capital: float,
+        utilization_percent: float,
+        correlation_id: str | None,
+    ) -> None:
+        """Append-only (migration 0011). Written at the same pre-effect
+        checkpoint as the cycle/leg rows themselves — see
+        ``PositionalMultiLegEngine._enter_cycle``'s critical persistence
+        block, which raises ``MultiLegDurabilityError`` (blocking entry, no
+        order placed) if this write fails, exactly as it already does for
+        ``strategy_cycles``/``strategy_cycle_legs``."""
+        with self._db.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO strategy_cycle_margin_snapshots
+                    (runtime_id, strategy_id, execution_mode, cycle_id, decision_type,
+                     estimated_margin, source, estimated_at, allocated_capital,
+                     utilization_percent, correlation_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    runtime_id,
+                    strategy_id,
+                    execution_mode.value,
+                    cycle_id,
+                    decision_type,
+                    estimated_margin,
+                    source,
+                    estimated_at,
+                    allocated_capital,
+                    utilization_percent,
+                    correlation_id,
+                    _now(),
+                ),
+            )
+
+    def load_cycle_margin_snapshots(
+        self, *, cycle_id: str, limit: int = 200
+    ) -> list[sqlite3.Row]:
+        return list(
+            self._db.connect()
+            .execute(
+                "SELECT * FROM strategy_cycle_margin_snapshots WHERE cycle_id = ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (cycle_id, limit),
+            )
+            .fetchall()
+        )
+
 
 def _row_to_position(row: sqlite3.Row) -> Position:
     return Position(

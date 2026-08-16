@@ -38,6 +38,8 @@ GENERIC_TARGETS: tuple[Path, ...] = (
     REPO_ROOT / "common" / "market_data" / "chain_view.py",
     REPO_ROOT / "common" / "market_data" / "option_chain.py",
     REPO_ROOT / "common" / "market_data" / "dhan_option_chain.py",
+    REPO_ROOT / "common" / "market_data" / "dhan_margin.py",
+    REPO_ROOT / "common" / "margin",
     REPO_ROOT / "dashboards" / "data" / "positional.py",
     REPO_ROOT / "dashboards" / "positional_options.py",
 )

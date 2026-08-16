@@ -34,6 +34,7 @@ from common.config.models import ExecutionMode
 from common.engine.feed import MarketDataFeed
 from common.execution import ExecutionRepository, check_mode_transition_safety
 from common.logging import get_logger
+from common.margin import MarginEstimator
 from common.market_data.option_chain import ChainFetcher
 from common.market_data.scrip_master import ScripMaster
 from common.notifications import Notifier
@@ -105,6 +106,7 @@ def run_supervisor(
     feed: MarketDataFeed,
     chain_fetcher: ChainFetcher,
     scrip_master: ScripMaster,
+    margin_estimator: MarginEstimator,
     notifier: Notifier | None = None,
     trading_date: str | None = None,
 ) -> SupervisorOutcome:
@@ -188,6 +190,7 @@ def run_supervisor(
                 feed=feed,
                 chain_fetcher=chain_fetcher,
                 scrip_master=scrip_master,
+                margin_estimator=margin_estimator,
                 runtime_root=paths.runtime_root,
                 notifier=notifier,
             )

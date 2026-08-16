@@ -27,10 +27,15 @@ from common.config.models import ExecutionMode
 from common.engine.config import SessionConfig
 from common.engine.feed import SimulatedFeed
 from common.execution import ExecutionRepository
+from common.margin import LegMarginRequest, MarginEstimator
 from common.models import Tick
 from common.persistence import Database, MigrationRunner
 from runtimes.positional_options.config_adapter import WorkerConfig
 from runtimes.positional_options.worker import build_engine
+
+
+def _fake_margin_fetcher(_leg: LegMarginRequest) -> float:
+    return 20_000.0
 
 IST = ZoneInfo("Asia/Kolkata")
 NIFTY_SECURITY_ID = "13"
@@ -175,7 +180,9 @@ def _build_fixture_database(db_path: Path) -> None:
         scrip_master = ScripMaster("NIFTY", exchange="NSE").load_from_text(_scrip_master_csv())
         built = build_engine(
             config, repository=repository, session_id=session.id, feed=feed,
-            chain_fetcher=_chain_fetcher, scrip_master=scrip_master, clock=lambda: entry_ts,
+            chain_fetcher=_chain_fetcher, scrip_master=scrip_master,
+            margin_estimator=MarginEstimator(margin_fetcher=_fake_margin_fetcher),
+            clock=lambda: entry_ts,
         )
         built.engine.run()
     finally:

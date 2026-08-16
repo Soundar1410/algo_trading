@@ -22,6 +22,7 @@ from common.engine.config import SessionConfig
 from common.engine.feed import SimulatedFeed
 from common.engine.positional.positional_models import CycleState, LegRole
 from common.execution import ExecutionRepository
+from common.margin import LegMarginRequest, MarginEstimator
 from common.market_data.scrip_master import ScripMaster
 from common.models import Tick
 from common.persistence import Database, MigrationRunner
@@ -83,6 +84,15 @@ def _scrip_master_csv() -> str:
 
 def _build_scrip_master() -> ScripMaster:
     return ScripMaster("NIFTY", exchange="NSE").load_from_text(_scrip_master_csv())
+
+
+#: A fixed, well-under-cap per-leg margin (4 legs x 20,000 = 80,000, 16% of
+#: the default 500,000 allocated capital) — this suite is about hedge-first
+#: entry sequencing, not the margin gate itself (see
+#: tests/unit/test_margin_estimator.py for that), so a real Dhan call is
+#: neither needed nor desired here.
+def _fake_margin_fetcher(_leg: LegMarginRequest) -> float:
+    return 20_000.0
 
 
 def _leg(delta: float, bid: float, ask: float) -> dict[str, Any]:
@@ -212,6 +222,7 @@ def test_weekly_delta_neutral_hedge_first_entry(tmp_path) -> None:  # type: igno
             feed=feed,
             chain_fetcher=_chain_fetcher,
             scrip_master=scrip_master,
+            margin_estimator=MarginEstimator(margin_fetcher=_fake_margin_fetcher),
             # A fixed clock matching the ticks' own exchange_time: chain
             # snapshots and Greek decisions are evaluated for freshness
             # against context.now (the tick-driven "now"), so the injected

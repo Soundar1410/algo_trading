@@ -297,6 +297,7 @@ def test_shipped_migrations_start_at_the_walking_skeleton():
         "0008",
         "0009",
         "0010",
+        "0011",
     ]
     assert shipped[0].name == "walking_skeleton"
     assert shipped[1].name == "feed_and_auth_health"
@@ -312,6 +313,9 @@ def test_shipped_migrations_start_at_the_walking_skeleton():
     assert shipped[8].name == "multi_leg_baskets"
     # strategy-weekly-delta-neutral: durable cross-day cycle support (D69).
     assert shipped[9].name == "positional_cycles"
+    # strategy-weekly-delta-neutral gap-closing session: real margin-gate
+    # decision snapshots (spec section 3.7).
+    assert shipped[10].name == "strategy_cycle_margin_snapshots"
 
 
 def test_shipped_migrations_apply_to_a_fresh_database(tmp_path: Path):
@@ -339,6 +343,7 @@ def test_shipped_migrations_apply_to_a_fresh_database(tmp_path: Path):
         "0008",
         "0009",
         "0010",
+        "0011",
     ]
     assert database.integrity_check() == []
     assert database.foreign_key_check() == []
@@ -406,6 +411,7 @@ def test_later_migrations_upgrade_a_database_created_by_0001_alone(tmp_path: Pat
         "0008",
         "0009",
         "0010",
+        "0011",
     ]
     with database.connect() as conn:
         survivors = conn.execute("SELECT COUNT(*) FROM runtime_sessions").fetchone()[0]
@@ -869,7 +875,11 @@ def test_migration_0010_upgrades_a_database_created_by_0009_with_real_rows(tmp_p
     up_to_0009 = tmp_path / "up_to_0009"
     up_to_0009.mkdir()
     for migration in discover_migrations(VERSIONS_DIR):
-        if migration.version == "0010":
+        # Zero-padded version strings sort lexicographically the same as
+        # numerically — excludes 0010 *and* every later migration (0011+),
+        # not just 0010 by name, so this test's own "seed through 0009
+        # only" intent survives a future migration being added.
+        if migration.version >= "0010":
             continue
         (up_to_0009 / migration.path.name).write_text(
             migration.path.read_text(encoding="utf-8"), encoding="utf-8"
@@ -891,7 +901,7 @@ def test_migration_0010_upgrades_a_database_created_by_0009_with_real_rows(tmp_p
     )
 
     applied = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
-    assert [m.version for m in applied] == ["0010"]
+    assert [m.version for m in applied] == ["0010", "0011"]
 
     assert database.integrity_check() == []
     assert database.foreign_key_check() == []
@@ -913,7 +923,7 @@ def test_migration_0010_upgrades_a_database_created_by_0009_with_real_rows(tmp_p
             "cycle_decision_snapshots",
         } <= tables
 
-    # A second startup must not attempt to reapply 0010.
+    # A second startup must not attempt to reapply 0010 or 0011.
     second_run = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
     assert second_run == []
 

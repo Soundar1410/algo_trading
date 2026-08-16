@@ -21,11 +21,16 @@ from common.engine.config import SessionConfig
 from common.engine.feed import SimulatedFeed
 from common.engine.positional.positional_models import CycleState
 from common.execution import ExecutionRepository
+from common.margin import LegMarginRequest, MarginEstimator
 from common.market_data.scrip_master import ScripMaster
 from common.models import Tick
 from common.persistence import Database, MigrationRunner
 from runtimes.positional_options.config_adapter import WorkerConfig
 from runtimes.positional_options.worker import build_engine
+
+
+def _fake_margin_fetcher(_leg: LegMarginRequest) -> float:
+    return 20_000.0
 
 IST = ZoneInfo("Asia/Kolkata")
 NIFTY_SECURITY_ID = "13"
@@ -178,7 +183,9 @@ def test_restart_adopts_the_same_cycle_with_no_re_entry_and_no_duplicate_rows(
     built1 = build_engine(
         _build_worker_config(ENTRY_DATE), repository=repository, session_id=session1.id,
         feed=SimulatedFeed(ticks_day1), chain_fetcher=_chain_fetcher,
-        scrip_master=_build_scrip_master(), clock=lambda: entry_ts,
+        scrip_master=_build_scrip_master(),
+        margin_estimator=MarginEstimator(margin_fetcher=_fake_margin_fetcher),
+        clock=lambda: entry_ts,
     )
     built1.engine.run()
     repository.close_session(session1.id, reason="clean_shutdown")
@@ -207,7 +214,9 @@ def test_restart_adopts_the_same_cycle_with_no_re_entry_and_no_duplicate_rows(
     built2 = build_engine(
         _build_worker_config(RESTART_DATE), repository=repository2, session_id=session2.id,
         feed=SimulatedFeed(ticks_day2), chain_fetcher=_chain_fetcher,
-        scrip_master=_build_scrip_master(), clock=lambda: restart_ts,
+        scrip_master=_build_scrip_master(),
+        margin_estimator=MarginEstimator(margin_fetcher=_fake_margin_fetcher),
+        clock=lambda: restart_ts,
     )
     built2.engine.run()
     repository2.close_session(session2.id, reason="clean_shutdown")

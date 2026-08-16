@@ -31,11 +31,19 @@ from common.engine.positional.positional_strategy import (
     register_positional_strategy,
 )
 from common.engine.selection import DhanOptionChainResolver
+from common.margin import (
+    OVERNIGHT_PRODUCT_TYPE,
+    LegMarginRequest,
+    MarginEstimate,
+    MarginUnavailable,
+)
+from common.margin.estimator import DEFAULT_MAX_MARGIN_AGE_SECONDS
 from common.market_data.scrip_master import ScripMaster
 from common.models import ExitReason, OrderSide
 from common.utils.timeutils import local_date_in, local_time_in
 
 from .config import WeeklyDeltaNeutralParameters, _parse_hhmm
+from .models import IronCondorCandidate
 from .risk import (
     compute_pnl,
     is_capital_stop,
@@ -217,6 +225,21 @@ class WeeklyDeltaNeutralStrategy(BasePositionalMultiLegStrategy):
         if candidate is None:
             return None
 
+        # Spec section 3.7: estimated margin utilization <= 50% of
+        # allocated capital, checked before the first order. Missing,
+        # stale, invalid or failed estimation blocks entry and records an
+        # incident (independent-review correction: never a fabricated
+        # value, never a silent offline-model substitution in production —
+        # see common.margin's own module docstring).
+        margin_estimate = self._entry_margin_estimate(candidate, context)
+        if margin_estimate is None:
+            return None
+        if (
+            margin_estimate.utilization_percent
+            > self._params.exits.maximum_margin_utilization_percent
+        ):
+            return None  # over the cap: an ordinary blocked entry, not an incident
+
         legs = tuple(
             CycleLegIntent(role=leg.role, side=_ROLE_SIGN[leg.role], contract=leg.contract)
             for leg in candidate.legs()
@@ -228,10 +251,55 @@ class WeeklyDeltaNeutralStrategy(BasePositionalMultiLegStrategy):
             reason=(
                 f"entry candidate: credit={candidate.initial_net_credit:.2f} "
                 f"width={candidate.wing_width:.0f} ratio={candidate.credit_to_width_ratio:.3f} "
-                f"net_delta_per_lot={candidate.net_delta_per_lot:.2f}"
+                f"net_delta_per_lot={candidate.net_delta_per_lot:.2f} "
+                f"margin_utilization={margin_estimate.utilization_percent:.1f}%"
             ),
             original_wing_width=candidate.wing_width,
+            margin_estimate=margin_estimate,
         )
+
+    def _entry_margin_estimate(
+        self, candidate: IronCondorCandidate, context: PositionalContext
+    ) -> MarginEstimate | None:
+        quantity = self._params.lots * candidate.lot_size
+        requests = []
+        for leg in candidate.legs():
+            side = _ROLE_SIGN[leg.role]
+            assert leg.quote.bid is not None and leg.quote.ask is not None
+            reference_price = leg.quote.ask if side is OrderSide.BUY else leg.quote.bid
+            requests.append(
+                LegMarginRequest(
+                    security_id=leg.contract.security_id,
+                    exchange_segment=context.option_segment,
+                    side=side,
+                    quantity=quantity,
+                    product_type=OVERNIGHT_PRODUCT_TYPE,
+                    reference_price=reference_price,
+                )
+            )
+        try:
+            estimate = context.margin_estimator.estimate_basket(
+                requests,
+                spot=context.spot or 0.0,
+                allocated_capital=self._params.allocated_capital,
+                now=context.now,
+            )
+        except MarginUnavailable as exc:
+            context.record_pre_entry_incident(f"margin estimation blocked entry: {exc}")
+            return None
+        # Defence in depth beyond the estimator's own internal freshness
+        # check (which self-stamps estimated_at at computation time, so it
+        # alone can never observe drift): re-validate against the engine's
+        # own tick-driven "now" in case a real HTTP round trip took a
+        # while — spec section 3.7's "missing, stale ... blocks entry"
+        # applies here too, not only to the estimator's own internal check.
+        if not estimate.is_fresh(now=context.now, max_age_seconds=DEFAULT_MAX_MARGIN_AGE_SECONDS):
+            context.record_pre_entry_incident(
+                f"margin estimate is stale relative to the evaluation clock "
+                f"(age={estimate.age_seconds(now=context.now):.1f}s)"
+            )
+            return None
+        return estimate
 
     @staticmethod
     def _expiry_close_at(resolved_expiry: str) -> datetime:
@@ -272,10 +340,18 @@ class WeeklyDeltaNeutralStrategy(BasePositionalMultiLegStrategy):
             return self._exit_all(context, "soft loss stop", ExitReason.STOP_LOSS)
         if is_profit_target(cycle, pnl, exits):
             return self._exit_all(context, "profit target", ExitReason.TARGET_PROFIT)
-        # Margin-limit breach: not modelled without a live margin feed —
-        # deliberately never fabricated; the check is a documented no-op
-        # (is_margin_breach always receives estimated_margin=None from this
-        # strategy today) rather than a fabricated pass.
+        # Margin-limit breach (spec section 6.2 step 10): the *entry* gate
+        # (spec 3.7) now computes a real basket margin estimate before the
+        # first order — see _entry_margin_estimate. This ongoing,
+        # per-evaluation check stays a deliberate, documented no-op:
+        # polling the real Dhan margin-calculator endpoint on every
+        # evaluation tick (every few seconds, for the life of an open
+        # cycle) is real load this task's scope does not ask for and this
+        # branch does not add; estimated_margin=None here is honest, never
+        # a fabricated pass, exactly as before. Missing/failed margin
+        # estimation must never block exits either way (spec section 4.2's
+        # fail-open-for-exits rule applies equally here) — this call is
+        # itself only ever an *additional* exit trigger, never a block.
         margin_breached = is_margin_breach(
             estimated_margin=None, allocated_capital=self._params.allocated_capital, config=exits
         )

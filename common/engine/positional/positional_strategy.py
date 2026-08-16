@@ -20,6 +20,7 @@ from datetime import datetime
 from typing import Any
 
 from common.greeks import GreekSnapshot, GreeksService
+from common.margin import MarginEstimator
 from common.market_data.chain_view import ChainView
 
 from .positional_models import Cycle, CycleSignal
@@ -91,6 +92,25 @@ class PositionalContext:
     greeks_service: GreeksService
     underlying_security_id: str
     underlying_segment: str
+    #: The exchange segment every option leg lives in (e.g. ``"NSE_FNO"``)
+    #: — distinct from ``underlying_segment``. See
+    #: ``PositionalMultiLegEngine``'s own docstring for why a strategy must
+    #: never guess at this from the underlying's own segment.
+    option_segment: str
+    #: The one door a strategy's margin-utilization gate goes through (spec
+    #: section 3.7) — real Dhan margin-calculator result in production,
+    #: raising ``MarginUnavailable`` on any failure (see
+    #: ``common.margin``'s own module docstring); never a fabricated
+    #: number. Always present — a strategy that needs a margin gate calls
+    #: it every entry evaluation, exactly like ``greeks_service``.
+    margin_estimator: MarginEstimator
+    #: Records an operational incident with no cycle yet to attach it to
+    #: (e.g. a margin-estimation failure blocking entry) — routes through
+    #: the engine's own ``record_incident`` callback under a synthetic
+    #: "pre-entry" label, so a strategy needs no persistence access of its
+    #: own to raise one (spec section 12: "notify ... persistence failure,
+    #: unknown exposure").
+    record_pre_entry_incident: Callable[[str], None]
 
 
 class BasePositionalMultiLegStrategy(ABC):
