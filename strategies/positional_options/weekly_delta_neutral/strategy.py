@@ -462,10 +462,17 @@ class WeeklyDeltaNeutralStrategy(BasePositionalMultiLegStrategy):
             return None
         expiry_date = date.fromisoformat(cycle.resolved_expiry_date[:10])
         local_day = local_date_in(context.now, self._timezone, argument="now")
-        if local_day == expiry_date:
+        is_expiry_day = local_day == expiry_date
+        # Spec section 8: no normal adjustment from 14:30 on the actual
+        # expiry day (resolved_expiry_date, never an assumed Tuesday/
+        # weekday). Bounds everything below this point to [start, 14:30) —
+        # the inward-roll prohibition (from 12:00) only ever has an effect
+        # inside that same window; the unconditional 14:30+ cutoff is
+        # unchanged.
+        if is_expiry_day:
             cutoff = _parse_hhmm(schedule.expiry_adjustment_cutoff)
             if local_clock >= cutoff:
-                return None  # spec section 8: no normal adjustment from 14:30 on expiry day
+                return None
 
         net_delta = self._net_delta_per_lot(cycle, context)
         if net_delta is None:
@@ -511,6 +518,32 @@ class WeeklyDeltaNeutralStrategy(BasePositionalMultiLegStrategy):
         old_signed_delta = self._leg_signed_delta(old_leg, context)
         if old_signed_delta is None:
             return None  # the leg being rolled has no usable Greek this evaluation
+
+        # Spec section 8 (Phase 3A correction): from 12:00 IST on the
+        # actual expiry day, "tighten monitoring and do not make aggressive
+        # inward rolls." An inward roll is a replacement short whose strike
+        # is closer to current spot than the short it replaces — for this
+        # strategy's own adjustment mechanism (put rolled *upward* on
+        # negative delta, call rolled *downward* on positive delta) that is
+        # the ordinary, expected direction, so this window does not merely
+        # narrow the candidate search — it can leave a confirmed trigger
+        # with no permitted replacement at all. Fail conservative in that
+        # case: exit the whole cycle rather than silently leave a confirmed
+        # elevated-delta position unaddressed this close to expiry (never
+        # classified as a known limitation — see docs/
+        # IMPLEMENTATION_STATUS_AND_RUNBOOK.md section 11.10 Phase 3A).
+        # Unknown spot is treated the same as "cannot prove it is not
+        # inward" — fail conservative, never assume a direction it cannot
+        # verify. Hedge repair and any other exposure-*reducing* action are
+        # untouched by this: they are decided before _maybe_adjust is ever
+        # reached (see _evaluate_active's own ordering).
+        inward_rolls_prohibited = False
+        if is_expiry_day:
+            tighten_at = _parse_hhmm(schedule.expiry_tighten_at)
+            inward_rolls_prohibited = local_clock >= tighten_at
+        old_strike = old_leg.contract.strike
+        spot = context.spot
+
         replacement = None
         for candidate in candidates:
             if candidate.contract.security_id == old_leg.contract.security_id:
@@ -530,10 +563,24 @@ class WeeklyDeltaNeutralStrategy(BasePositionalMultiLegStrategy):
             projected_delta = net_delta - old_signed_delta + new_signed_delta
             if abs(projected_delta) >= abs(net_delta):
                 continue  # must reduce projected absolute delta (spec 7.2)
+            if inward_rolls_prohibited:
+                is_inward = spot is None or abs(candidate.contract.strike - spot) < abs(
+                    old_strike - spot
+                )
+                if is_inward:
+                    continue  # spec section 8: no aggressive inward rolls from 12:00
             replacement = candidate
             break
         if replacement is None:
             self._trigger_confirmations = 0
+            if inward_rolls_prohibited:
+                return self._exit_all(
+                    context,
+                    "expiry-day risk exit: confirmed delta trigger has no valid "
+                    "non-inward short replacement at/after 12:00 on the actual "
+                    "expiry day",
+                    ExitReason.EXPIRY,
+                )
             return None  # no safe candidate -> skip, never loosen filters
 
         self._trigger_confirmations = 0

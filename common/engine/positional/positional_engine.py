@@ -439,11 +439,225 @@ class PositionalMultiLegEngine:
                 )
                 return
 
+        if self._cycle is not None and self._cycle.state not in TERMINAL_CYCLE_STATES:
+            self._resume_pending_adjustment(ts)
+            if self._cycle.state is CycleState.CRITICAL_UNRESOLVED:
+                return  # the resume attempt itself found unmanageable state
+
         context = self._build_context(ts)
         signal = self.strategy.evaluate(cycle=self._cycle, context=context)
         if signal is None or signal.action is CycleAction.NONE:
             return
         self._apply_signal(signal, ts)
+
+    def _resume_pending_adjustment(self, ts: datetime) -> None:
+        """Spec section 7.3/9.5: restart must resume a uniquely safe
+        pending adjustment action, never silently strand one.
+
+        Called on **every** evaluation (Phase 3A correction — a genuine
+        gap this closes, not a documented limitation): a replacement or
+        hedge-repair leg left ``PENDING_ORDER`` by a prior *session* — or
+        by this evaluation's own predecessor, if its attempt found no
+        fresh quote yet — was previously never retried at all, because
+        nothing but ``_roll_short``/``_repair_hedge`` themselves ever
+        called ``_open_leg_now`` for it, and both are one-shot, called
+        only at the instant the strategy first signals the roll/repair.
+        A cycle whose replacement leg missed its first-attempt quote (or
+        whose process simply restarted before the fill was confirmed)
+        was therefore stuck for that role forever, with
+        ``WeeklyDeltaNeutralStrategy._maybe_adjust`` finding the same
+        non-``OPEN`` leg via ``Cycle.current_leg`` and silently returning
+        ``None`` on every subsequent evaluation — no retry, no incident.
+        This method is the missing retry driver, mirroring
+        ``_drive_entry``'s own cross-evaluation retry of a pending entry
+        leg. A no-op on the overwhelming majority of evaluations, where
+        nothing is pending.
+        """
+        cycle = self._cycle
+        assert cycle is not None
+        pending_role = cycle.pending_adjustment_role
+        pending_state = cycle.pending_adjustment_state
+        if pending_role is None or pending_state is None:
+            return
+
+        if pending_state == AdjustmentLifecycle.AWAITING_NEXT_CANDLE.value:
+            # The old short is confirmed closed, but no replacement was
+            # ever attempted before the process stopped — this state is
+            # never the *final* one persisted by a normal, uninterrupted
+            # _roll_short call (it is always immediately superseded, in
+            # the same call, by REPLACEMENT_PENDING or REPLACEMENT_FAILED),
+            # so finding it here can only mean a crash landed in that exact
+            # gap. Auto-resuming would mean re-running the strategy's own
+            # candidate search after an unknown gap in market conditions —
+            # a risk-*increasing* decision this generic engine code must
+            # never make unilaterally. Fail closed with a named incident
+            # instead (spec section 9.5's own "block and raise a critical
+            # incident for ... otherwise unmanageable exposure" — a hedge
+            # with no matching short is exactly that). Checked *before* any
+            # leg lookup below: by construction, this state means the old
+            # short is already terminal (CLOSED) and no replacement leg
+            # exists yet, so ``current_leg`` would return ``None`` here
+            # every single time — that is the expected, unremarkable shape
+            # of this state, never itself an anomaly to report.
+            self._fail_closed_pending_adjustment(
+                cycle,
+                pending_role,
+                f"pending adjustment for {pending_role.value} is AWAITING_NEXT_CANDLE "
+                "(old short confirmed closed, no replacement was ever attempted) at "
+                "process start — cannot safely auto-resume candidate selection",
+            )
+            return
+
+        if pending_state in (
+            AdjustmentLifecycle.EXIT_SUBMISSION_PENDING.value,
+            AdjustmentLifecycle.EXIT_UNKNOWN.value,
+        ):
+            # The adjustment claim (counters, pending role/state) is
+            # already durable either way — the only open question is what
+            # actually happened to the old short's close. Restart recovery
+            # (positional_multi_leg_engine_worker._reconcile_leg) has
+            # *already* resolved that ambiguity from authoritative
+            # order/position state before this method ever runs — a
+            # genuinely irreconcilable mismatch raises
+            # UnmanageableCycleState during recovery itself and this code
+            # never executes at all — so ``leg.state`` here is trustworthy,
+            # never guessed at fresh. Uses ``latest_leg``, not
+            # ``current_leg``: the leg may already be the terminal CLOSED
+            # state (reconciliation proved the close succeeded), which
+            # ``current_leg`` would hide.
+            leg = cycle.latest_leg(pending_role)
+            if leg is None:
+                self._fail_closed_pending_adjustment(
+                    cycle,
+                    pending_role,
+                    f"pending_adjustment_state={pending_state} for role {pending_role.value} "
+                    "but no matching leg exists on restart — cannot safely resume",
+                )
+                return
+            if leg.state is LegState.OPEN:
+                # The close was never actually applied (EXIT_SUBMISSION_
+                # PENDING: never even attempted; EXIT_UNKNOWN: attempted
+                # but reconciliation proved the position is still open) —
+                # safe to attempt exactly the same close _roll_short itself
+                # would attempt next, exactly once.
+                closed = self._close_leg_safely(
+                    leg, ts, ExitReason.ADJUSTMENT, reason_text="resumed pending adjustment"
+                )
+                cycle.pending_adjustment_state = (
+                    AdjustmentLifecycle.AWAITING_NEXT_CANDLE.value
+                    if closed
+                    else AdjustmentLifecycle.EXIT_UNKNOWN.value
+                )
+                self._persist_cycle()
+                self._log_event(
+                    "adjustment_resumed",
+                    f"resumed close for {leg.leg_id} ({cycle.pending_adjustment_state})",
+                    ts,
+                )
+                return
+            if leg.state is LegState.CLOSED:
+                # Reconciliation proved the close genuinely succeeded, but
+                # no replacement was ever attempted — identical in every
+                # respect to a crash landing in the AWAITING_NEXT_CANDLE
+                # gap; fail closed the same way rather than silently
+                # leaving a naked hedge with no offsetting short.
+                self._fail_closed_pending_adjustment(
+                    cycle,
+                    pending_role,
+                    f"pending adjustment for {pending_role.value} was {pending_state} but "
+                    f"restart reconciliation confirmed {leg.leg_id} is CLOSED and no "
+                    "replacement was ever attempted — cannot safely auto-resume candidate "
+                    "selection",
+                )
+                return
+            # Any other leg.state here (e.g. still CLOSE_SUBMISSION_UNKNOWN
+            # — which recovery itself should already have resolved or
+            # refused to start over) is left for an operator/controlled
+            # reconciliation, never guessed at.
+            return
+
+        if pending_state != AdjustmentLifecycle.REPLACEMENT_PENDING.value:
+            # A terminal outcome (REPLACEMENT_FILLED/_FAILED/_EXPIRED)
+            # leaves nothing to resume.
+            return
+
+        # REPLACEMENT_PENDING: the "leg" in question is the replacement
+        # itself, never yet terminal by construction of a healthy
+        # ``_roll_short`` run (a FAILED outcome is always paired, in the
+        # same call, with clearing pending_adjustment_role — so finding
+        # REPLACEMENT_PENDING with the replacement already FAILED can only
+        # mean a crash landed in that exact gap; ``current_leg`` correctly
+        # returns ``None`` for it, handled by the fail-closed branch below,
+        # identical in spirit to the AWAITING_NEXT_CANDLE case above).
+        leg = cycle.current_leg(pending_role)
+        if leg is None:
+            self._fail_closed_pending_adjustment(
+                cycle,
+                pending_role,
+                f"pending_adjustment_state={pending_state} for role {pending_role.value} "
+                "but no matching leg exists on restart — cannot safely resume",
+            )
+            return
+
+        if leg.state is LegState.OPEN:
+            # Already filled — by an earlier evaluation's own call to this
+            # same method, or by a crash that landed after the fill but
+            # before the terminal pending_adjustment_state was persisted
+            # (restart reconciliation's own PENDING_ORDER->OPEN promotion,
+            # positional_multi_leg_engine_worker._reconcile_leg, already
+            # proved this from authoritative order/position state before
+            # this method ever runs). Finalize the bookkeeping only.
+            cycle.pending_adjustment_state = AdjustmentLifecycle.REPLACEMENT_FILLED.value
+            cycle.pending_adjustment_role = None
+            self._persist_cycle()
+            self._log_event(
+                "adjustment_resumed", f"{leg.leg_id} already filled on restart", ts
+            )
+            return
+
+        if leg.state is not LegState.PENDING_ORDER:
+            # FAILED / CLOSE_SUBMISSION_UNKNOWN / anything else this method
+            # cannot safely act on — left for an operator or controlled
+            # reconciliation, exactly like any other unmanageable leg
+            # state; never guessed at or retried blindly.
+            return
+
+        if leg.contract is not None:
+            self.feed.subscribe(leg.contract.security_id)
+        if not self._open_leg_now(leg, ts):
+            return  # still no fresh quote; retried again next evaluation
+
+        # _open_leg_now mutates leg.state in place; re-read it through a
+        # fresh LegState(...) construction rather than the narrowed
+        # `leg.state` expression above, which mypy would otherwise still
+        # treat as the pre-call PENDING_ORDER literal.
+        resumed_state = LegState(leg.state)
+        outcome = (
+            AdjustmentLifecycle.REPLACEMENT_FILLED
+            if resumed_state is LegState.OPEN
+            else AdjustmentLifecycle.REPLACEMENT_FAILED
+        )
+        cycle.pending_adjustment_state = outcome.value
+        cycle.pending_adjustment_role = None
+        self._persist_cycle()
+        self._log_event(
+            "adjustment_resumed", f"resumed pending replacement {leg.leg_id} ({outcome.value})", ts
+        )
+
+    def _fail_closed_pending_adjustment(
+        self, cycle: Cycle, pending_role: LegRole, message: str
+    ) -> None:
+        """Shared fail-closed path for every ``_resume_pending_adjustment``
+        case that cannot be safely auto-resumed: record a named incident,
+        block further entries, and leave the cycle ``CRITICAL_UNRESOLVED``
+        for an operator/controlled reconciliation — never guessed at."""
+        self._record_incident(cycle.cycle_id, message)
+        self.block_entries(
+            f"cycle {cycle.cycle_id}: pending adjustment for {pending_role.value} "
+            "needs operator/controlled reconciliation"
+        )
+        cycle.state = CycleState.CRITICAL_UNRESOLVED
+        self._persist_cycle()
 
     def _build_context(self, ts: datetime) -> PositionalContext:
         chain = None

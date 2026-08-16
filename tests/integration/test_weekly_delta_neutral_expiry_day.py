@@ -5,19 +5,20 @@ temp SQLite database. See
 ``tests/integration/_weekly_delta_neutral_fixtures.py`` for the shared
 fixture helpers.
 
-**Known gap, disclosed rather than silently fixed (out of this task's
-"add tests" scope):** spec section 8's "from 12:00 IST: tighten monitoring
-and do not make aggressive inward rolls" has no strategy-side consumer.
-``common.engine.positional.lifecycle.PositionalLifecyclePolicy.
-aggressive_inward_rolls_permitted``/``expiry_day_phase``'s ``TIGHTEN`` value
-exist and are correctly computed, but
-``WeeklyDeltaNeutralStrategy`` never reads either — only the 14:30 no-
-adjustment cutoff (already covered,
-``test_weekly_delta_neutral_adjustment.py::
-test_no_normal_adjustment_after_the_expiry_day_cutoff``) is actually wired.
-Defining "aggressive/inward" precisely enough to implement and test is a
-real design decision, not a test gap — recorded here and in
-``docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md`` rather than guessed at.
+**The 12:00 "no aggressive inward rolls" rule (spec section 8) is
+implemented** (Phase 3A correction — see ``docs/
+IMPLEMENTATION_STATUS_AND_RUNBOOK.md`` section 11.10) in
+``WeeklyDeltaNeutralStrategy._maybe_adjust``: from 12:00 IST on the actual
+expiry day, a replacement short whose strike is closer to spot than the
+short it replaces is prohibited; a confirmed trigger with no valid
+non-inward candidate exits the whole cycle rather than silently doing
+nothing. Its own boundary tests (both roll directions, immediately before
+and at 12:00, an outward-still-permitted case, and a non-expiry-day
+control) live in ``test_weekly_delta_neutral_adjustment.py`` alongside the
+rest of the adjustment acceptance matrix, not here — this module stays
+scoped to the expiry-day-timing rows (12:00/14:30 already covered by the
+adjustment cutoff test; 15:05/15:15; the actual persisted, including
+Monday-shifted, expiry; exit ordering; incomplete flattening).
 
 No live order API is constructed or called anywhere in this module.
 """

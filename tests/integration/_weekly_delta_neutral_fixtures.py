@@ -70,6 +70,14 @@ ROLL_DOWN_SHORT_CALL_STRIKE = 24400.0
 #: A hedge-repair replacement for the put hedge — same target band as a
 #: fresh entry hedge, a different strike than HEDGE_PUT_STRIKE.
 REPAIR_HEDGE_PUT_STRIKE = 23200.0
+#: An *outward* short-put replacement (spec section 8, Phase 3A correction)
+#: — a lower strike than SHORT_PUT_STRIKE, i.e. *farther* from spot 24000
+#: than the short it would replace, so it is never prohibited by the
+#: 12:00-on-expiry-day inward-roll rule. Deliberately out of its own target
+#: band (-0.20 +/- 0.03) in the shared baseline payload — a test that wants
+#: it as a real candidate mutates its delta into range itself, so adding it
+#: here can never silently change an existing test's own candidate ranking.
+OUTWARD_SHORT_PUT_STRIKE = 23400.0
 
 SECURITY_IDS: dict[tuple[float, str], str] = {
     (HEDGE_PUT_STRIKE, "PE"): "90001",
@@ -80,6 +88,7 @@ SECURITY_IDS: dict[tuple[float, str], str] = {
     (ROLL_DOWN_SHORT_CALL_STRIKE, "CE"): "90006",
     (ROLL_UP_SHORT_PUT_STRIKE_2, "PE"): "90007",
     (REPAIR_HEDGE_PUT_STRIKE, "PE"): "90008",
+    (OUTWARD_SHORT_PUT_STRIKE, "PE"): "90009",
 }
 
 LOT_SIZE = "75"
@@ -144,6 +153,7 @@ def initial_chain_payload() -> dict[str, Any]:
                 f"{ROLL_UP_SHORT_PUT_STRIKE_2:.6f}": {"pe": _leg_payload(-0.35, 96.0, 98.0)},
                 f"{ROLL_DOWN_SHORT_CALL_STRIKE:.6f}": {"ce": _leg_payload(0.22, 93.0, 95.0)},
                 f"{REPAIR_HEDGE_PUT_STRIKE:.6f}": {"pe": _leg_payload(-0.35, 19.0, 21.0)},
+                f"{OUTWARD_SHORT_PUT_STRIKE:.6f}": {"pe": _leg_payload(-0.35, 60.0, 62.0)},
             },
         },
     }

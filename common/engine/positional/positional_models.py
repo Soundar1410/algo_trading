@@ -273,6 +273,18 @@ class Cycle:
                 return leg
         return None
 
+    def latest_leg(self, role: LegRole) -> LegInstance | None:
+        """The highest-``sequence`` leg for ``role``, terminal or not —
+        unlike :meth:`current_leg` (which deliberately excludes
+        ``TERMINAL_LEG_STATES``), this is for restart-resume logic that
+        must inspect a role's most recent leg *because* it may already be
+        terminal (e.g. proving a pending adjustment's old short really did
+        close before deciding how to resume it)."""
+        candidates = [leg for leg in self.legs.values() if leg.role is role]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda leg: leg.sequence)
+
     def short_legs(self) -> list[LegInstance]:
         return [leg for leg in self.open_legs() if leg.role in SHORT_ROLES]
 

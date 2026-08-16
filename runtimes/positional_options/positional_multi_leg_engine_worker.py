@@ -17,9 +17,11 @@ from common.engine.positional.positional_models import (
 )
 from common.engine.positional.positional_state import CycleRowInconsistent
 from common.engine.positional.positional_state import load_cycle as _load_cycle
+from common.engine.positional.positional_state import persist_cycle_leg as _persist_cycle_leg
 from common.engine.positional.positional_strategy import BasePositionalMultiLegStrategy
 from common.execution import ExecutionRepository
 from common.logging import get_logger
+from common.models import OrderSide
 
 from .config_adapter import WorkerConfig
 
@@ -96,7 +98,44 @@ def _reconcile_cycle(
     mismatches: list[str] = []
 
     for leg in cycle.legs.values():
+        original_state = leg.state
         result = _reconcile_leg(repository, leg, open_positions)
+        if leg.state is not original_state:
+            # Reconciliation corrected an in-memory-only projection gap
+            # (spec section 9.4: "repaired by reconciliation" must mean
+            # durably repaired, not merely correct for the lifetime of
+            # this one process — a second restart before this leg is ever
+            # touched again must not have to re-derive the same
+            # correction from authoritative order/position history every
+            # time, and any other reader of ``strategy_cycle_legs``
+            # — a dashboard, an audit query — must see the true state
+            # too). Persisted with the same best-effort semantics
+            # ``PositionalMultiLegEngine._persist_leg`` itself uses
+            # elsewhere: a failure here is recorded, never raised — the
+            # in-memory correction this session runs on is authoritative
+            # either way.
+            try:
+                _persist_cycle_leg(
+                    repository,
+                    leg,
+                    runtime_id=config.runtime_id,
+                    strategy_id=config.strategy_id,
+                    execution_mode=ExecutionMode.PAPER,
+                    cycle_id=leg.basket_id,
+                )
+            except Exception as exc:
+                log.exception(
+                    "%s: could not durably persist restart reconciliation's own "
+                    "correction for leg %s",
+                    config.strategy_id,
+                    leg.leg_id,
+                )
+                _record_recovery_failure(
+                    config,
+                    repository,
+                    f"leg {leg.leg_id} reconciled to {leg.state.value} in memory but the "
+                    f"durable correction failed: {exc}",
+                )
         if result is not None:
             mismatches.append(result)
             continue
@@ -143,6 +182,39 @@ def _reconcile_leg(
                 f"resolves to {entry_outcome}, not a confirmed fill"
             )
         if position is None:
+            # The projection still says OPEN, but no authoritative open
+            # position exists. Before failing closed, check whether a
+            # confirmed *exit* fill explains it — a real close that
+            # succeeded (the broker-authoritative order/fill/position
+            # writes all committed) but whose own leg-state persistence
+            # never landed, e.g. a crash between _close_leg's authoritative
+            # positions.close() call and its own best-effort _persist_leg
+            # (spec section 9.4: "post-effect projection failures must
+            # generate incidents and be repaired by reconciliation, not
+            # pretend the trade did not occur"). Reconstructed from the
+            # authoritative order_intents/orders fill row alone —
+            # exit_time/exit_reason are left unknown (None) rather than
+            # fabricated; realized_gross_pnl is computed from the leg's
+            # own (already-correct, untouched) entry_price and this
+            # reconstructed exit price, the same formula
+            # LegInstance.unrealised_pnl already uses for the open case.
+            exit_row = exit_rows[0] if exit_rows else None
+            exit_outcome = _resolve_intent_outcome(exit_row)
+            reconstructed_price = (
+                exit_row["order_average_fill_price"] if exit_row is not None else None
+            )
+            if exit_outcome == "FILLED" and reconstructed_price is not None:
+                exit_price = float(reconstructed_price)
+                leg.state = LegState.CLOSED
+                leg.exit_price = exit_price
+                leg.exit_correlation_id = exit_row["correlation_id"] if exit_row else None
+                if leg.entry_price is not None:
+                    leg.realized_gross_pnl = (
+                        (leg.entry_price - exit_price)
+                        if leg.side is OrderSide.SELL
+                        else (exit_price - leg.entry_price)
+                    ) * leg.quantity
+                return None
             return f"leg {leg.leg_id!r} is OPEN but no matching OPEN position exists"
         return None
 

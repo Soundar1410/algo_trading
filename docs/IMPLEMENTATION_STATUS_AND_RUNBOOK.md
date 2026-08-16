@@ -7876,18 +7876,15 @@ tests — not documented scope boundaries, genuine bugs:**
    `PositionalContext.total_charges` field the strategy now passes to
    `compute_pnl` directly.
 
-**One real, unimplemented behaviour found and *disclosed*, not fixed —
-genuinely out of an "add tests" scope, recorded rather than guessed at:**
-spec section 8's "from 12:00 IST: tighten monitoring and do not make
-aggressive inward rolls" has no strategy-side consumer at all.
-`PositionalLifecyclePolicy.aggressive_inward_rolls_permitted`/
-`expiry_day_phase`'s `TIGHTEN` value are correctly computed generic engine
-infrastructure — genuinely unused by `WeeklyDeltaNeutralStrategy`, which
-only ever consults the (separately, correctly implemented) 14:30
-no-adjustment cutoff. Defining "aggressive/inward" precisely enough to
-implement and test it is a real design decision this session did not make
-unilaterally — see `test_weekly_delta_neutral_expiry_day.py`'s own module
-docstring.
+**One gap found and, in this phase, only *disclosed* rather than fixed —
+closed in Phase 3A below, never carried forward as an accepted known
+limitation:** spec section 8's "from 12:00 IST: tighten monitoring and do
+not make aggressive inward rolls" had no strategy-side consumer at all in
+this phase. See section 11.10 Phase 3A for the implementation, its exact
+"inward" definition, and its own dedicated tests
+(`test_weekly_delta_neutral_adjustment.py`, not
+`test_weekly_delta_neutral_expiry_day.py` — that module's docstring was
+updated accordingly in Phase 3A).
 
 **Acceptance rows covered:** three consecutive confirmations and the
 correct roll direction for both signs of net delta; one/two confirmations
@@ -7913,19 +7910,15 @@ sessions, since that counter resets per session, is documented and fixed
 in `closing_sequence_numbers`'s own docstring); incomplete flattening
 staying `CRITICAL_UNRESOLVED` and never `COMPLETED`.
 
-**Scope note on restart coverage:** "restart at every adjustment boundary"
-is proven at two real boundaries (a restart immediately after a completed
-roll, with full counter/state verification, and a restart onto the actual
-expiry day past its adjustment cutoff) via `test_weekly_delta_neutral_
-adjustment.py` and the Phase 1/2 restart tests already in place — not
-literally every conceivable crash instant (e.g. a process death after the
-old short's close is confirmed but before the replacement's own order
-even reaches `PENDING_ORDER`, mid-Python-call, which no tick-driven test
-harness can express without invasive engine surgery). `_roll_short`'s own
-`MultiLegDurabilityError` handling around each persistence step (already
-covered generically by the Phase 2/legacy `MultiLegEngine` adjustment
-tests this code path is structurally shared with) is the fail-closed net
-for that gap.
+**Scope note on restart coverage (superseded by Phase 3A below):** this
+phase proved restart correctness at two real boundaries only (a restart
+immediately after a completed roll, and a restart onto the actual expiry
+day past its adjustment cutoff), and explicitly said a mid-`_roll_short`
+process death was out of reach of a tick-driven test harness "without
+invasive engine surgery." Phase 3A did exactly that surgery — a
+`BaseException`-based simulated-crash injection technique — and covers
+nine durable failure-injection/restart boundaries across the whole claim/
+submit/reconcile state machine; see section 11.10 Phase 3A.
 
 **Verification:** targeted suite (all four new files) — 28 passed. Full
 regression (weekly_delta_neutral/positional/margin `-k` filter) — all
@@ -7934,3 +7927,157 @@ scripts --strict` — clean, 229 source files.
 `python -m scripts.assert_no_live_config_committed` — OK. Full `pytest` —
 see the final consolidated run for the exact count. No order-capable Dhan
 endpoint referenced anywhere in this phase's new code.
+
+### Phase 3A — Closing two mandatory acceptance gaps before Phase 4 (16 August 2026)
+
+Phase 3 was conditionally accepted with two mandatory gaps to close before
+the option-chain diagnostic (Phase 4): the spec section 8 12:00 inward-roll
+rule (previously disclosed, never implemented) and restart-boundary testing
+across the full adjustment claim/submit/reconcile state machine (previously
+proven at two boundaries only). Neither is carried forward as a known
+limitation — both are closed below.
+
+#### Item 1 — 12:00 IST "no aggressive inward rolls" (spec section 8)
+
+`WeeklyDeltaNeutralStrategy._maybe_adjust` now defines an **inward roll**
+exactly as specified: a replacement short whose strike is closer to current
+spot than the short being closed (`abs(candidate.strike - spot) <
+abs(old_strike - spot)`; an unknown spot is treated as "cannot prove it is
+not inward" — fail conservative, never assumed). From `expiry_tighten_at`
+(`12:00`, already a validated `ExitsConfig`/`ScheduleConfig` field with no
+prior consumer) on the actual `resolved_expiry_date` — never an assumed
+Tuesday/weekday — every inward candidate is skipped in the replacement
+search; exposure-*reducing* actions (hedge repair, every exit) are
+untouched, since they are decided earlier in `_evaluate_active`'s own
+priority order, before `_maybe_adjust` is ever reached. If a confirmed
+delta trigger has no non-inward replacement left, the strategy returns a
+full `EXIT_ALL` (`ExitReason.EXPIRY`, reason text containing "expiry-day
+risk exit") instead of silently doing nothing — never opening new short
+risk this close to expiry with no verified-safe replacement. From
+`expiry_adjustment_cutoff` (`14:30`) onward, the existing unconditional
+no-adjustment cutoff is unchanged (this window only ever narrows candidates
+inside `[12:00, 14:30)`).
+
+**Tests** (`test_weekly_delta_neutral_adjustment.py`, 5 new): an inward
+short-put roll prohibited exactly at 12:00 exits the cycle; the symmetric
+inward short-call case; the same inward candidate still rolls normally one
+minute before 12:00, even on the actual expiry day; a non-expiry-day
+control proves the rule never engages off the actual expiry date; an
+outward (delta-reducing, farther-from-spot) replacement still rolls
+normally at exactly 12:00, proving exposure-reducing actions are never
+blocked. `test_weekly_delta_neutral_expiry_day.py`'s own module docstring
+was corrected — it no longer claims this rule is unimplemented; its four
+existing tests stay scoped to the timing rows they always covered
+(Monday-shift expiry, 15:05/15:15, exit ordering, incomplete flattening).
+
+#### Item 2 — Nine restart boundaries across the adjustment state machine
+
+**Two real production defects found and fixed while building these tests
+— not documented scope boundaries:**
+
+1. **No pending replacement/hedge-repair leg was ever retried.**
+   `_roll_short`/`_repair_hedge` call `_open_leg_now` exactly once, at
+   signal time; if that evaluation found no fresh two-sided quote yet (or
+   the process simply restarted before the fill confirmed),
+   `WeeklyDeltaNeutralStrategy._maybe_adjust` kept finding the same
+   non-`OPEN` leg via `Cycle.current_leg` and silently returned `None`
+   forever — no retry, no incident, the leg stuck `PENDING_ORDER`
+   indefinitely. Fixed with a new `PositionalMultiLegEngine.
+   _resume_pending_adjustment`, called on every evaluation (mirroring
+   `_drive_entry`'s own cross-evaluation retry of a pending entry leg),
+   which retries a `REPLACEMENT_PENDING` leg still `PENDING_ORDER`, and
+   — the harder case — safely resumes an `EXIT_SUBMISSION_PENDING`/
+   `EXIT_UNKNOWN` claim whose old short's close was never actually applied
+   (proven from the leg's own, already-reconciled state, never guessed at
+   fresh: restart reconciliation itself raises `UnmanageableCycleState`
+   for any ambiguity it cannot resolve, so by the time this method runs
+   the leg's state is always trustworthy) by re-attempting exactly the
+   close `_roll_short` itself would attempt next. A state this method
+   cannot safely act on (`AWAITING_NEXT_CANDLE` — the old short confirmed
+   closed with no replacement candidate ever persisted to resume from, or
+   a genuinely irreconcilable leg state) fails closed: a named incident,
+   `block_entries`, `CycleState.CRITICAL_UNRESOLVED` — never a guess at
+   which candidate to re-select, since that would mean re-running
+   candidate search after an unknown gap in market conditions, a
+   risk-*increasing* decision this generic engine code must never make
+   unilaterally. A new `Cycle.latest_leg(role)` (unlike `current_leg`,
+   does not exclude terminal states) lets this method distinguish "close
+   never attempted" from "close confirmed, no replacement attempted"
+   purely from the leg's own reconciled state.
+2. **Restart reconciliation's own corrections were never persisted back.**
+   `_reconcile_leg`'s existing authoritative-fill fallback (already fixed
+   earlier in this phase — see Fix B below) mutates a stale-projected leg
+   in memory, but `_adopt_recovered_cycle` never wrote the correction back
+   to `strategy_cycle_legs` — so the DB stayed wrong forever unless the
+   engine happened to touch that leg again, and any reader outside the
+   live process (a dashboard, an audit query) would see stale data
+   indefinitely, even though the running engine's own behaviour was
+   already correct. Fixed: `positional_multi_leg_engine_worker.
+   _reconcile_cycle` now durably persists (best-effort, non-critical,
+   mirroring `PositionalMultiLegEngine._persist_leg`'s own semantics) any
+   leg whose state `_reconcile_leg` actually changed, using the same
+   `positional_state.persist_cycle_leg` the engine itself uses — before
+   ever returning the recovered cycle.
+
+**Fix B** (found while tracing the boundaries, fixed as part of this
+phase): `_reconcile_leg`'s `LegState.OPEN` branch previously failed closed
+(`UnmanageableCycleState`) the moment a projected-open leg's authoritative
+position was missing, even when a confirmed exit fill fully explained it
+(a crash between the real broker-side close and that one leg's own
+best-effort projection persist). It now reconstructs the leg as `CLOSED`
+— `exit_price`/`exit_correlation_id`/`realized_gross_pnl` all computed from
+the authoritative `order_intents`/`orders` fill row, `exit_time`/
+`exit_reason` left honestly `None` (never fabricated) — before falling
+back to failing closed.
+
+**The nine boundaries, each proven via `_run_session`'s `before_run`
+seam injecting a persistence/gateway failure into the real engine (never
+by fabricating a `strategy_cycles`/`strategy_cycle_legs` row — every
+scenario is produced by driving production repository APIs through a real
+entry, a real three-confirmation trigger, and a real restart):**
+
+| # | Boundary | Mechanism proven |
+|---|---|---|
+| 1 | Before the claim persists | Failure caught inline by `_roll_short`'s own try/except; counters/pending fields revert in memory; a restart afterwards rolls completely normally |
+| 2 | Claim durable, close never attempted | `_persist_cycle_cb` raises *after* a real write (the write's own confirmation lost) — a genuine `MultiLegDurabilityError`-driven in-memory revert with a durable "ghost claim"; restart resumes the close, then fails closed (no candidate survives) |
+| 3 | Close submission unknown | `positions.close` raises (paper-broker failure) — leg `CLOSE_SUBMISSION_UNKNOWN`; restart reconciliation resolves it (no fill ever occurred) to `OPEN`, resume closes it for real, then fails closed |
+| 4 | Old-short close confirmed, leg projection missing | Leg's own best-effort persist fails after a real close+replacement fully succeeded; restart reconciliation (Fix B) reconstructs the stale row from the authoritative fill — fully healed, no incident |
+| 5 | `AWAITING_NEXT_CANDLE` persisted before replacement evaluation | `_SimulatedCrash` (a `BaseException`, not `Exception` — bypasses every internal `except Exception` resilience layer) immediately after that state's own durable write; restart fails closed with a named incident, no naked exposure |
+| 6 | Replacement claimed, never submitted | `_SimulatedCrash` immediately after the replacement leg's own `PENDING_ORDER` row becomes durable; restart resumes by submitting exactly that one leg — never re-claims |
+| 7 | Replacement's own open outcome durable, cycle bookkeeping stale | `positions.open` raises (this engine's opening path has no ambiguous "unknown" — it resolves definitively to `FAILED`); the *cycle-level* clearing of the claim is separately lost; restart never mistakes the stale `REPLACEMENT_PENDING` label for something resumable — fails closed |
+| 8 | Replacement filled, leg projection missing | Leg's own best-effort persist fails after a real fill; restart's *existing* `PENDING_ORDER -> OPEN` reconciliation fallback resolves it silently — no incident needed |
+| 9 | Completed replacement, ordinary restart (control) | No failure injected; `_resume_pending_adjustment` is a pure no-op (`pending_adjustment_role` already `None`) — nothing re-touched, no incident, counters unchanged |
+
+Every boundary proves, from real repository/order/fill/position state (not
+assumption): a consumed adjustment claim is never repeated; the old short
+is never duplicate-closed; a replacement is never opened while the old
+close is unknown; no naked or overlapping short exposure is ever created;
+authoritative fills are reconstructed when projection persistence failed;
+daily/cycle counts and cooldown survive every boundary unchanged; the
+engine either resumes a uniquely safe pending action or fails closed with a
+named critical incident.
+
+**Tests:** `tests/integration/test_weekly_delta_neutral_adjustment.py` grew
+from 11 (Phase 3) to 16 (+5, Item 1) to 25 (+9, Item 2) — 25 tests, all new
+work in this phase.
+
+**Verification:** `test_weekly_delta_neutral_adjustment.py` (25),
+`test_weekly_delta_neutral_expiry_day.py` (4), `test_weekly_delta_neutral_
+pnl_and_exits.py` (8), `test_weekly_delta_neutral_entry.py`,
+`test_weekly_delta_neutral_restart.py`, `test_weekly_delta_neutral_lot_
+size.py`, `test_weekly_delta_neutral_risk_boundaries.py`,
+`test_weekly_delta_neutral_selection.py`, `test_weekly_delta_neutral_
+candidate_search.py`, `test_weekly_delta_neutral_config.py`,
+`test_no_weekly_delta_neutral_branches.py`, `test_scripts_runtime_
+registry.py`, `test_cycle_position_bindings_are_atomic.py`,
+`test_dashboard_positional_real_data.py`, `test_migrations.py` — all
+passed (120 tests across the full weekly_delta_neutral/positional family).
+`test_straddle_920_reconciliation.py` and `test_straddle_920_durability.py`
+(the existing straddle_920 durability/reconciliation suites named by the
+review) — all passed, unaffected. Full `pytest` — see the run this phase's
+report cites. `ruff check .` clean. `mypy common strategies runtimes
+--strict` — clean, 190 source files (also individually clean on every file
+this phase touched). `python -m scripts.assert_no_live_config_committed` —
+OK. No order-capable Dhan endpoint referenced anywhere in this phase's new
+code; every injected failure is a Python-level callback/method patch, never
+a real network call.
