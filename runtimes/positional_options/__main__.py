@@ -1,14 +1,18 @@
 """Entrypoint for the ``positional_options`` runtime.
 
-    .venv/bin/python -m runtimes.positional_options [--config-root config]
+    .venv/bin/python -m runtimes.positional_options [--config-root config] [--strategy-id ID]
 
 Mirrors ``runtimes.intraday_options.__main__``'s startup order exactly —
-legacy-system guard, backup/migrate/retain, auth bootstrap, real feed — with
-one structural difference: no child process is spawned. This module
-discovers the one enabled strategy, builds the real Dhan feed adapter, chain
-fetcher and scrip master for its underlying, then hands everything to
-:func:`runtimes.positional_options.supervisor.run_supervisor`, which runs
-that strategy's engine on this same process.
+legacy-system guard, backup/migrate/retain, auth bootstrap, real feed —
+and, since Phase 5 (runtime generalization), its child-process fan-out too:
+this module builds the **one shared** Dhan feed adapter, discovers every
+enabled strategy under this runtime, and hands the whole set to
+:func:`runtimes.positional_options.supervisor.build_positional_supervisor`,
+which spawns one child process per strategy under one shared
+:class:`~common.feed.hub.SharedFeedHub` — never one Dhan WebSocket per
+strategy. A single enabled strategy (the only case this runtime has ever
+actually run) is simply the N=1 case of that same machinery, not a
+different code path.
 
 Every committed strategy under this runtime ships ``mode: paper``, and
 ``config/runtimes/positional_options.yaml`` ships ``enabled: false`` — see
@@ -24,88 +28,38 @@ from pathlib import Path
 from common.authentication import AuthBootstrap, AuthCredentials, AuthError
 from common.config import (
     ConfigError,
-    ProjectPaths,
-    ResolvedConfig,
-    RuntimeConfig,
+    discover_enabled_strategies,
     load_paths,
     load_runtime_config,
     load_settings,
 )
+from common.config.models import RuntimeConfig
+from common.config.paths import ProjectPaths
 from common.config.secrets import read_secret
 from common.logging import get_logger, setup_logging
-from common.margin import MarginEstimator
-from common.market_data.dhan_margin import build_dhan_margin_fetcher
-from common.market_data.dhan_option_chain import build_dhan_chain_fetcher
-from common.market_data.scrip_master import ScripMaster, ScripMasterCache, resolve_index_meta
 from common.notifications import build_notifier
 from common.persistence import Database, MigrationRunner
 from common.process import legacy_system_status
 from common.retention import backup_database, run_retention, verify_backup_restorable
-from common.utils.timeutils import local_date_in, now_ist
 
-from .supervisor import (
-    EXIT_ALREADY_RUNNING,
-    EXIT_FAILED,
-    EXIT_MODE_TRANSITION_UNSAFE,
-    EXIT_OK,
-    SupervisorOutcome,
-    run_supervisor,
-    select_one_enabled_strategy,
-)
+from .supervisor import EXIT_OK, build_positional_supervisor
 
 _log = get_logger(__name__)
 
+EXIT_FAILED = 1
 EXIT_RUNTIME_DISABLED = 10
 EXIT_NO_CREDENTIALS = 11
 #: Phase 8's "old-system exclusion" gate — see
 #: runtimes.intraday_options.__main__.EXIT_LEGACY_SYSTEM_ACTIVE for the
 #: fail-closed reasoning this mirrors exactly.
 EXIT_LEGACY_SYSTEM_ACTIVE = 12
-EXIT_TOO_MANY_STRATEGIES = 13
+EXIT_STRATEGY_NOT_FOUND = 13
 
 
 def _database_path(paths: ProjectPaths, runtime_cfg: RuntimeConfig, runtime_id: str) -> Path:
     if runtime_cfg.database:
         return paths.project_root / runtime_cfg.database
     return paths.database_path(runtime_id)
-
-
-def _resolve_underlying_meta(cfg: ResolvedConfig):  # type: ignore[no-untyped-def]
-    parameters = cfg.strategy.parameters
-    underlying = str(parameters["underlying"])
-    meta = resolve_index_meta(
-        underlying,
-        index_security_id=str(parameters.get("index_security_id") or "") or None,
-        index_segment=str(parameters.get("index_segment") or "") or None,
-        fno_segment=str(parameters.get("fno_segment") or "") or None,
-    )
-    return underlying, meta
-
-
-def _build_scrip_master(cfg: ResolvedConfig, *, default_cache_dir: Path) -> ScripMaster:
-    underlying, meta = _resolve_underlying_meta(cfg)
-    cache_dir_raw = cfg.strategy.parameters.get("scrip_master_cache_dir")
-    cache_dir = Path(cache_dir_raw) if cache_dir_raw else default_cache_dir
-    return ScripMaster(underlying, exchange=meta.exchange).load(cache=ScripMasterCache(cache_dir))
-
-
-def _build_feed(cfg: ResolvedConfig, adapter):  # type: ignore[no-untyped-def]
-    from common.engine.adapter_feed import AdapterFeed
-    from common.engine.feed import SubscriptionMode
-    from common.market_data.scrip_master import segment_code
-
-    _underlying, meta = _resolve_underlying_meta(cfg)
-    underlying_id = str(meta.security_id)
-    underlying_segment = segment_code(meta.segment)
-    option_segment = segment_code(meta.fno_segment)
-
-    def _segment_for(security_id: str) -> int | None:
-        return underlying_segment if security_id == underlying_id else option_segment
-
-    def _mode_for(security_id: str) -> int | None:
-        return None if security_id == underlying_id else int(SubscriptionMode.FULL)
-
-    return AdapterFeed(adapter, segment_for=_segment_for, mode_for=_mode_for)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -115,6 +69,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--runtime-id", default="positional_options", help="Which runtime group to start."
+    )
+    parser.add_argument(
+        "--strategy-id",
+        default=None,
+        help=(
+            "Start only this one strategy — still through this same supervisor "
+            "(scripts/start_strategy.py's only mechanism; a bare worker is never "
+            "spawned outside one). Omit to start every enabled strategy."
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -154,23 +117,22 @@ def main(argv: list[str] | None = None) -> int:
             )
         return EXIT_LEGACY_SYSTEM_ACTIVE
 
-    # Which strategy (if any) is admitted has to be known before the feed or
-    # scrip master can be built for its real underlying — checked before
-    # authentication too, so a misconfigured/absent strategy costs no Dhan
-    # auth request.
-    try:
-        cfg = select_one_enabled_strategy(args.config_root, args.runtime_id, settings=settings)
-    except ConfigError as exc:
-        print(str(exc))
-        return EXIT_TOO_MANY_STRATEGIES
-    if cfg is None:
-        print(f"No enabled strategy under runtimes/{args.runtime_id}.yaml; nothing to start.")
-        return EXIT_OK
+    if args.strategy_id is not None:
+        # Checked before authenticating: a typo'd strategy id should not
+        # cost a Dhan auth request against the ~1-per-2-minute limit.
+        enabled = discover_enabled_strategies(args.config_root, args.runtime_id, settings=settings)
+        enabled_ids = {cfg.strategy.strategy_id for cfg in enabled}
+        if args.strategy_id not in enabled_ids:
+            print(
+                f"{args.strategy_id!r} is not an enabled strategy under "
+                f"runtimes/{args.runtime_id}.yaml (enabled: {sorted(enabled_ids) or ['none']})."
+            )
+            return EXIT_STRATEGY_NOT_FOUND
 
-    # Backup, migrate, retain — once, here, strictly before authentication or
-    # any worker exists — identical discipline to the intraday entrypoint.
-    # supervisor.run_supervisor() re-opens this same database and re-runs
-    # migration (a no-op replay) because it is also called directly by tests.
+    # Backup, migrate, retain — once, here, strictly before authentication
+    # or any worker exists. build_positional_supervisor() re-opens this
+    # same database and re-runs migration (a no-op replay) because it is
+    # also called directly by tests without going through main().
     database_path = _database_path(paths, runtime_cfg, args.runtime_id)
     database = Database(database_path)
     backup_path = backup_database(
@@ -201,6 +163,9 @@ def main(argv: list[str] | None = None) -> int:
         print("DHAN_CLIENT_ID is not set. Fill it in .env (see .env.example).")
         return EXIT_NO_CREDENTIALS
 
+    # Authenticated exactly once, here, in the parent — every spawned child
+    # reads this same cached token from disk (worker._cached_dhan_token),
+    # never re-authenticating over the network itself.
     bootstrap = AuthBootstrap(
         AuthCredentials(
             client_id=client_id,
@@ -216,6 +181,7 @@ def main(argv: list[str] | None = None) -> int:
     except AuthError as exc:
         print(f"Cannot authenticate ({type(exc).__name__}): {exc}")
         return EXIT_FAILED
+    redactor.add_secrets([token])
     _log.info("authenticated source=%s", outcome.source)
 
     # Imported here, not at module level, so this module can be read and
@@ -223,46 +189,33 @@ def main(argv: list[str] | None = None) -> int:
     # runtimes.intraday_options.__main__ uses for the same reason.
     from common.market_data.dhan import DhanMarketFeedAdapter
 
+    # One shared adapter for the whole group — never one per strategy. Each
+    # spawned child builds its own chain fetcher/margin fetcher/scrip
+    # master independently (worker.run_positional_worker_process's own
+    # docstring); only this one feed connection is shared.
     adapter = DhanMarketFeedAdapter(client_id=client_id, access_token=token)
-    chain_fetcher = build_dhan_chain_fetcher(client_id=client_id, access_token=token)
-    scrip_master = _build_scrip_master(cfg, default_cache_dir=paths.cache_root)
-    feed = _build_feed(cfg, adapter)
-    # Production posture (independent review correction): the real Dhan
-    # margin-calculator source only, no fallback_model. A missing/stale/
-    # invalid/failed margin estimate must block entry, never silently fall
-    # through to the offline approximation — see common.margin's own module
-    # docstring and MarginEstimator's own docstring for why fallback_model
-    # is never set here.
-    margin_estimator = MarginEstimator(
-        margin_fetcher=build_dhan_margin_fetcher(client_id=client_id, access_token=token)
-    )
 
-    supervisor_outcome = run_supervisor(
-        cfg=cfg,
-        runtime_id=args.runtime_id,
-        config_root=args.config_root,
-        paths=paths,
-        feed=feed,
-        chain_fetcher=chain_fetcher,
-        scrip_master=scrip_master,
-        margin_estimator=margin_estimator,
-        notifier=build_notifier(settings),
-        trading_date=local_date_in(now_ist()).isoformat(),
-    )
-    return _exit_code_for(supervisor_outcome)
-
-
-def _exit_code_for(outcome: SupervisorOutcome) -> int:
-    if outcome.exit_code == EXIT_OK:
-        return EXIT_OK
-    if outcome.exit_code == EXIT_MODE_TRANSITION_UNSAFE:
-        print(f"Refusing to start {outcome.strategy_id}: {outcome.error}")
+    try:
+        supervisor = build_positional_supervisor(
+            runtime_id=args.runtime_id,
+            config_root=args.config_root,
+            paths=paths,
+            adapter=adapter,
+            settings=settings,
+            strategy_ids=frozenset({args.strategy_id}) if args.strategy_id else None,
+            notifier=build_notifier(settings),
+        )
+    except ConfigError as exc:
+        print(str(exc))
         return EXIT_FAILED
-    if outcome.exit_code == EXIT_ALREADY_RUNNING:
-        print(outcome.error)
-        return EXIT_FAILED
-    print(outcome.error or "positional_options runtime failed")
-    return EXIT_FAILED
+
+    result = supervisor.run()
+    _log.info(
+        "supervisor run finished workers_started=%d ticks_received=%d",
+        result.workers_started,
+        result.ticks_received,
+    )
+    return EXIT_OK
 
 
 if __name__ == "__main__":

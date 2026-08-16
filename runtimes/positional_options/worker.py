@@ -1,18 +1,21 @@
 """The ``positional_options`` runtime worker — builds and runs one
-:class:`~common.engine.positional.positional_engine.PositionalMultiLegEngine`
-in-process.
+:class:`~common.engine.positional.positional_engine.PositionalMultiLegEngine`.
 
-**Single-process, deliberately, for this first positional runtime.**
-``runtimes/intraday_options`` spawns one child process per strategy because
-it must isolate *several concurrent* strategies from each other. CLAUDE.md
-and the spec both restrict this runtime to exactly one approved strategy
-(``weekly_delta_neutral``) — the multi-process fan-out that isolation exists
-for has no strategy to isolate from yet. This module still gets everything
-that isolation would have bought incidentally right (its own process lock,
-its own database, its own log file when launched via ``__main__``), and
-nothing about the on-disk config/database contract here would need to
-change if a second positional strategy is ever approved and this becomes a
-real supervisor/child-process split — see ``supervisor.py``'s own docstring.
+**One child process per strategy, one shared feed hub for the group**
+(Phase 5, runtime generalization). :func:`build_engine`/:func:`run_worker`
+are the single-worker body — completely unaware of whether they are being
+called in-process (every existing test; the original single-strategy
+posture this runtime shipped with) or inside a spawned child under
+:class:`~runtimes.positional_options.supervisor.PositionalOptionsSupervisor`
+(:func:`run_positional_worker_process`, this module's own multiprocessing
+entry point, added in Phase 5). Neither function's signature changed for
+this — a worker is, and always was, "run one engine to completion"; N
+workers under a shared hub is simply N calls to the same thing, each in its
+own process, exactly mirroring ``runtimes.intraday_options.worker.
+run_worker_process``'s own relationship to ``run_worker``/``build_engine``
+there. See ``supervisor.py``'s own module docstring for the group-level
+shape (shared adapter, one ``SharedFeedHub``, one control queue per
+worker).
 
 Mirrors the intraday worker's own recovery/shutdown discipline throughout:
 migration + integrity check before any trading, restart reconciliation
@@ -22,17 +25,27 @@ return.
 
 from __future__ import annotations
 
+import enum
+import os
+import sys
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
+from importlib import import_module
 from pathlib import Path
+from typing import Any
 
+from common.authentication.bootstrap import TOKEN_CACHE_FILENAME
+from common.authentication.token_cache import TokenCache
 from common.broker import PaperBroker
 from common.broker.quotes import QuoteBook
+from common.config import load_settings
 from common.config.models import ExecutionMode
-from common.engine.feed import MarketDataFeed
+from common.config.secrets import read_secret
+from common.engine.feed import MarketDataFeed, SubscriptionMode
 from common.engine.gateway import LifecycleGateway
+from common.engine.hub_feed import HubTickFeed
 from common.engine.positional.lifecycle import PositionalLifecyclePolicy
 from common.engine.positional.positional_engine import PositionalMultiLegEngine
 from common.engine.positional.positional_models import Cycle
@@ -45,11 +58,22 @@ from common.engine.session import MarketSession
 from common.execution import ExecutionRepository, OrderLifecycle
 from common.greeks import GreeksService, ModelAssumptions
 from common.health import HealthState, HeartbeatWriter
-from common.logging import get_logger
+from common.logging import get_logger, setup_logging
 from common.margin import MarginEstimate, MarginEstimator
+from common.market_data.dhan_margin import build_dhan_margin_fetcher
+from common.market_data.dhan_option_chain import build_dhan_chain_fetcher
 from common.market_data.option_chain import ChainFetcher, OptionChainService
-from common.market_data.scrip_master import ScripMaster
-from common.notifications import NotificationEvent, Notifier, NullNotifier, SafeNotifier
+from common.market_data.scrip_master import ScripMaster, ScripMasterCache, resolve_index_meta
+from common.market_data.scrip_master import segment_code as _segment_code
+from common.notifications import (
+    NotificationEvent,
+    Notifier,
+    NullNotifier,
+    SafeNotifier,
+    build_notifier,
+)
+from common.persistence import Database, MigrationRunner
+from common.process import DuplicateProcessError, worker_lock
 from common.process.signals import shutdown_signals
 from common.process.square_off_requests import (
     clear_square_off_request,
@@ -67,7 +91,91 @@ from .positional_multi_leg_engine_worker import load_positional_strategy, recove
 #: heartbeat, neither of which needs tick-speed polling.
 _POLL_INTERVAL_SECONDS = 5.0
 
+#: Exit code used when another process already owns this strategy's worker
+#: lock — distinct from 1 so the supervisor (or a test) can tell "refused as
+#: duplicate" from "crashed". Mirrors ``runtimes.intraday_options.worker.
+#: EXIT_DUPLICATE`` exactly.
+EXIT_DUPLICATE = 3
+
 log = get_logger(__name__)
+
+
+class _NotifierSentinel(enum.Enum):
+    """Sentinel for ``notifier=`` on :func:`run_positional_worker_process`:
+    build the production notifier here, in the spawned child, from a
+    freshly-loaded :class:`~common.config.Settings`, rather than passing an
+    already-built one across the ``spawn`` boundary. An ``Enum``, not a
+    plain sentinel object, for the identical pickling reason ``runtimes.
+    intraday_options.worker._NotifierSentinel``'s own docstring gives in
+    full: a plain ``object()`` does not survive an unpickle with its
+    identity intact, and an un-recognised value falling through to being
+    used *as* a notifier fails the moment anything calls ``.send()`` on it.
+    """
+
+    FROM_SETTINGS = enum.auto()
+
+
+NOTIFIER_FROM_SETTINGS = _NotifierSentinel.FROM_SETTINGS
+
+
+class _NoDhanCredentials(RuntimeError):
+    """No cached Dhan token was available to build the real chain/margin
+    fetchers. Never raised when a factory override is set — see
+    :class:`~runtimes.positional_options.config_adapter.WorkerConfig`'s own
+    ``chain_fetcher_factory``/``margin_fetcher_factory`` docstring."""
+
+
+def _resolve_factory(ref: str) -> Callable[[], Any]:
+    """Import ``"module.submodule:function_name"`` and return the function
+    itself — never a live object pickled across the process boundary, only
+    this string. Mirrors ``positional_multi_leg_engine_worker.
+    load_positional_strategy``'s own dotted-path resolution exactly, for
+    the identical picklability reason."""
+    module_name, separator, attr_name = ref.partition(":")
+    if not separator or not module_name or not attr_name:
+        raise ValueError(f"factory ref must be 'module:function', got {ref!r}")
+    module = import_module(module_name)
+    try:
+        factory = getattr(module, attr_name)
+    except AttributeError as exc:
+        raise ValueError(f"{module_name!r} has no attribute {attr_name!r}") from exc
+    if not callable(factory):
+        raise ValueError(f"{ref!r} does not resolve to a callable")
+    return factory  # type: ignore[no-any-return]
+
+
+def _cached_dhan_token(settings: Any, cache_dir: Path, client_id: str) -> str | None:
+    """The token the parent already minted before any worker spawned (Phase
+    5: authentication runs once, in the parent, before any worker exists —
+    see ``supervisor.py``'s own module docstring). An environment override
+    is checked first, mirroring ``runtimes.intraday_options.engine_worker.
+    _resolve_access_token`` exactly; otherwise the on-disk cache the
+    parent's own ``AuthBootstrap.get_token()`` call just wrote. Never a
+    fresh network authentication call from a worker process."""
+    env_token = read_secret(settings.dhan_access_token)
+    if env_token:
+        return env_token
+    cached = TokenCache(cache_dir / TOKEN_CACHE_FILENAME).load(expected_client_id=client_id)
+    return cached.access_token if cached is not None else None
+
+
+def _build_scrip_master_for(config: WorkerConfig, *, default_cache_dir: Path) -> ScripMaster:
+    """The real, Dhan-instrument-master-backed resolver — built fresh in
+    this process (never pickled across the spawn boundary), from exactly
+    the same ``parameters`` a direct ``__main__.py`` composition already
+    reads via ``resolve_index_meta``."""
+    meta = resolve_index_meta(
+        config.underlying_instrument,
+        index_security_id=str(config.parameters.get("index_security_id") or "") or None,
+        index_segment=str(config.parameters.get("index_segment") or "") or None,
+        fno_segment=str(config.parameters.get("fno_segment") or "") or None,
+    )
+    cache_dir = (
+        Path(config.scrip_master_cache_dir) if config.scrip_master_cache_dir else default_cache_dir
+    )
+    return ScripMaster(config.underlying_instrument, exchange=meta.exchange).load(
+        cache=ScripMasterCache(cache_dir)
+    )
 
 
 @dataclass
@@ -485,3 +593,223 @@ def _has_open_cycle(repository: ExecutionRepository, config: WorkerConfig) -> bo
     except CycleRowInconsistent:
         return True
     return cycle is not None
+
+
+# ============================================================ Phase 5: spawn
+def run_positional_worker_process(
+    config: WorkerConfig,
+    tick_queue: Any,
+    control_queue: Any,
+    notifier: Notifier | _NotifierSentinel | None = None,
+) -> None:
+    """The real ``multiprocessing.Process(target=...)`` entry point for one
+    strategy under :class:`~runtimes.positional_options.supervisor.
+    PositionalOptionsSupervisor`'s shared feed hub.
+
+    Mirrors ``runtimes.intraday_options.worker.run_worker_process``'s own
+    shape and reasoning exactly: ``multiprocessing`` discards a spawned
+    target's return value, so only a ``sys.exit()``-translating wrapper
+    like this one makes the supervisor's own ``worker_exit_codes`` reflect
+    what actually happened. Every direct caller keeps using
+    :func:`run_worker`, unchanged — this function exists only to be the
+    thing ``multiprocessing.Process`` calls.
+
+    Builds every network-facing dependency itself, in this process, from
+    its own environment and the token the parent already cached — never a
+    live client/credential pickled across the spawn boundary (see
+    :func:`_cached_dhan_token`) — mirroring ``engine_worker.run_engine``'s
+    own per-child construction pattern. ``config.chain_fetcher_factory``/
+    ``scrip_master_factory``/``margin_fetcher_factory``, when set, are used
+    instead — see their own docstring on
+    :class:`~runtimes.positional_options.config_adapter.WorkerConfig`.
+    """
+    assert config.database_path is not None, "the supervisor must set database_path"
+    assert config.lock_dir is not None, "the supervisor must set lock_dir"
+    assert config.pid_dir is not None, "the supervisor must set pid_dir"
+    assert config.log_dir is not None, "the supervisor must set log_dir"
+    assert config.runtime_root is not None, "the supervisor must set runtime_root"
+
+    settings = load_settings()
+    # settings= registers this worker's own secrets with its own redaction
+    # filter — spawn starts a fresh interpreter, so the parent's own
+    # registration never carries over. Mirrors run_worker_process's own
+    # setup_logging call in runtimes.intraday_options.worker exactly.
+    setup_logging(
+        level=settings.algo_log_level,
+        log_dir=config.log_dir,
+        log_file_name=f"{config.strategy_id}.log",
+        settings=settings,
+    )
+
+    resolved_notifier: Notifier | None = (
+        build_notifier(settings) if notifier is NOTIFIER_FROM_SETTINGS else notifier
+    )
+
+    if tick_queue is None:
+        # Refused, not degraded to some other path — every positional
+        # worker under this supervisor is tick-driven; one spawned with no
+        # tick queue at all is a wiring defect, not a valid configuration.
+        log.error(
+            "refusing to start strategy_id=%s: no tick queue was given; the supervisor "
+            "must register every worker with a tick channel",
+            config.strategy_id,
+        )
+        sys.exit(1)
+
+    lock = worker_lock(
+        runtime_id=config.runtime_id,
+        strategy_id=config.strategy_id,
+        lock_dir=config.lock_dir,
+        pid_dir=config.pid_dir,
+    )
+    try:
+        lock.acquire()
+    except DuplicateProcessError as exc:
+        # Refusal, not a crash. The rest of the group keeps running
+        # untouched — see PositionalOptionsSupervisor._report_duplicate_
+        # worker, which is what makes this visible to an operator.
+        log.error("%s", exc)
+        sys.exit(EXIT_DUPLICATE)
+
+    try:
+        outcome = _run_positional_worker_locked(
+            config, tick_queue, control_queue, resolved_notifier, settings
+        )
+    finally:
+        lock.release()
+    sys.exit(outcome.exit_code)
+
+
+def _run_positional_worker_locked(
+    config: WorkerConfig,
+    tick_queue: Any,
+    control_queue: Any,
+    notifier: Notifier | None,
+    settings: Any,
+) -> WorkerOutcome:
+    assert config.database_path is not None
+    assert config.runtime_root is not None
+    database = Database(config.database_path)
+    MigrationRunner(database).run_pending()
+
+    problems = database.integrity_check()
+    if problems:
+        # A corrupt database must stop this worker, not be traded through.
+        outcome = WorkerOutcome(exit_code=1, error=f"integrity check failed: {problems}")
+        log.error("refusing to start strategy_id=%s: %s", config.strategy_id, outcome.error)
+        database.close()
+        return outcome
+
+    repository = ExecutionRepository(database)
+    cache_dir = config.cache_dir or Path(".")
+
+    def _credentials() -> tuple[str, str]:
+        client_id = read_secret(settings.dhan_client_id)
+        if not client_id:
+            raise _NoDhanCredentials("DHAN_CLIENT_ID is not set")
+        token = _cached_dhan_token(settings, cache_dir, client_id)
+        if not token:
+            raise _NoDhanCredentials(
+                "no cached Dhan access token — the parent must authenticate "
+                "(AuthBootstrap.get_token()) before any worker is spawned"
+            )
+        return client_id, token
+
+    try:
+        if config.chain_fetcher_factory is not None:
+            chain_fetcher: ChainFetcher = _resolve_factory(config.chain_fetcher_factory)()
+        else:
+            client_id, token = _credentials()
+            chain_fetcher = build_dhan_chain_fetcher(client_id=client_id, access_token=token)
+
+        if config.margin_fetcher_factory is not None:
+            margin_fetcher = _resolve_factory(config.margin_fetcher_factory)()
+        else:
+            client_id, token = _credentials()
+            margin_fetcher = build_dhan_margin_fetcher(client_id=client_id, access_token=token)
+        margin_estimator = MarginEstimator(margin_fetcher=margin_fetcher)
+
+        if config.scrip_master_factory is not None:
+            scrip_master = _resolve_factory(config.scrip_master_factory)()
+        else:
+            scrip_master = _build_scrip_master_for(config, default_cache_dir=cache_dir)
+    except _NoDhanCredentials as exc:
+        error_message = str(exc)
+        outcome = WorkerOutcome(exit_code=1, error=error_message)
+        log.error("refusing to start strategy_id=%s: %s", config.strategy_id, error_message)
+        repository.record_error(
+            runtime_id=config.runtime_id,
+            strategy_id=config.strategy_id,
+            execution_mode=ExecutionMode.PAPER,
+            severity="CRITICAL",
+            component="positional_multi_leg_engine",
+            message=error_message,
+        )
+        database.close()
+        return outcome
+
+    option_segment_code = _segment_code(config.option_segment)
+
+    def _request_subscription(security_id: str) -> None:
+        """Forward one runtime subscription upstream to the hub, never
+        blocking. Mirrors ``engine_worker._subscription_sender``'s own
+        segment/mode split exactly: the underlying keeps the hub's
+        defaults; every other id this engine ever subscribes to is an
+        option contract, so it goes out on the real ``NSE_FNO``-equivalent
+        segment in Full (21) mode — the only mode carrying a bid/ask book,
+        which the paper fill model needs."""
+        if control_queue is None:
+            log.warning(
+                "no control queue wired for strategy_id=%s; a runtime subscription for "
+                "%s will never reach the hub",
+                config.strategy_id,
+                security_id,
+            )
+            return
+        is_underlying = security_id == config.underlying_security_id
+        segment = None if is_underlying else option_segment_code
+        mode = None if is_underlying else int(SubscriptionMode.FULL)
+        try:
+            control_queue.put_nowait((security_id, segment, mode))
+        except Exception:
+            log.exception(
+                "could not forward a subscription request for %s from %s; ticks for it "
+                "will not arrive",
+                security_id,
+                config.strategy_id,
+            )
+
+    feed = HubTickFeed(
+        tick_queue,
+        request_subscription=_request_subscription,
+        # A live production session never idle-times-out: a quiet option
+        # market between adjustment checks is ordinary, not a finished
+        # tape. Square-off is never driven by ending this feed early —
+        # see run_worker's own docstring ("stop is not square-off") — only
+        # the supervisor's shutdown sentinel and this worker's own SIGTERM
+        # handler (feed.stop(), already wired inside run_worker, unchanged)
+        # ever end it.
+        idle_timeout_seconds=None,
+    )
+
+    session = repository.open_session(
+        runtime_id=config.runtime_id,
+        strategy_id=config.strategy_id,
+        execution_mode=ExecutionMode.PAPER,
+        process_role="worker",
+        pid=os.getpid(),
+    )
+
+    outcome = run_worker(
+        config,
+        repository=repository,
+        session_id=session.id,
+        feed=feed,
+        chain_fetcher=chain_fetcher,
+        scrip_master=scrip_master,
+        margin_estimator=margin_estimator,
+        runtime_root=config.runtime_root,
+        notifier=notifier,
+    )
+    database.close()
+    return outcome

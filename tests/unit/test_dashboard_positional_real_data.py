@@ -121,10 +121,10 @@ def _leg_tick(security_id: str, bid: float, ask: float, ts: datetime) -> Tick:
     )
 
 
-def _build_worker_config() -> WorkerConfig:
+def _build_worker_config(strategy_id: str = "weekly_delta_neutral") -> WorkerConfig:
     return WorkerConfig(
         runtime_id="positional_options",
-        strategy_id="weekly_delta_neutral",
+        strategy_id=strategy_id,
         strategy_ref=(
             "strategies.positional_options.weekly_delta_neutral.strategy:"
             "WeeklyDeltaNeutralStrategy"
@@ -156,17 +156,19 @@ def _build_worker_config() -> WorkerConfig:
     )
 
 
-def _build_fixture_database(db_path: Path) -> None:
+def _build_fixture_database(
+    db_path: Path, *, strategy_id: str = "weekly_delta_neutral", pid: int = 1234
+) -> None:
     from common.market_data.scrip_master import ScripMaster
 
     database = Database(db_path)
     MigrationRunner(database).run_pending()
     repository = ExecutionRepository(database)
     try:
-        config = _build_worker_config()
+        config = _build_worker_config(strategy_id)
         session = repository.open_session(
             runtime_id=config.runtime_id, strategy_id=config.strategy_id,
-            execution_mode=ExecutionMode.PAPER, process_role="worker", pid=1234,
+            execution_mode=ExecutionMode.PAPER, process_role="worker", pid=pid,
         )
         entry_ts = _ts(9, 26, 0)
         ticks = [
@@ -230,3 +232,65 @@ def test_positional_options_page_history_and_performance_are_empty_for_an_open_c
 
     assert any("No completed cycle history" in text for text in st.infos)
     assert any("No completed cycle to compute performance" in text for text in st.infos)
+
+
+def test_positional_dashboard_data_filters_two_strategies_independently(tmp_path: Path) -> None:
+    """Phase 5 (runtime generalization): dashboards/data/positional.py's own
+    module docstring already claims "not specific to weekly_delta_neutral
+    ... any future positional strategy reuses every function here
+    unchanged" — proven here, not merely asserted, with two real cycles
+    (from two independently-run engines, real entries, same database) under
+    two different strategy_ids: each strategy's own rows must be visible
+    only under its own id, never the other's."""
+    import sqlite3
+
+    from dashboards.data.positional import load_cycles, load_legs_for_cycle, load_open_cycle
+
+    db_path = tmp_path / "positional_options.db"
+    _build_fixture_database(db_path, strategy_id="weekly_delta_neutral", pid=1234)
+    _build_fixture_database(db_path, strategy_id="dashboard_fixture_two", pid=5678)
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        cycles_a = load_cycles(conn, strategy_id="weekly_delta_neutral", execution_mode="paper")
+        cycles_b = load_cycles(conn, strategy_id="dashboard_fixture_two", execution_mode="paper")
+        assert len(cycles_a) == 1 and len(cycles_b) == 1
+        assert cycles_a[0].cycle_id != cycles_b[0].cycle_id
+        assert cycles_a[0].cycle_id.startswith("weekly_delta_neutral:")
+        assert cycles_b[0].cycle_id.startswith("dashboard_fixture_two:")
+
+        open_a = load_open_cycle(conn, strategy_id="weekly_delta_neutral", execution_mode="paper")
+        open_b = load_open_cycle(
+            conn, strategy_id="dashboard_fixture_two", execution_mode="paper"
+        )
+        assert open_a is not None and open_b is not None
+        assert open_a.cycle_id == cycles_a[0].cycle_id
+        assert open_b.cycle_id == cycles_b[0].cycle_id
+
+        # A strategy_id with no rows at all gets nothing fabricated — never
+        # falls back to "the one cycle that happens to exist".
+        assert load_cycles(conn, strategy_id="not_a_real_strategy", execution_mode="paper") == ()
+        assert (
+            load_open_cycle(conn, strategy_id="not_a_real_strategy", execution_mode="paper")
+            is None
+        )
+
+        legs_a = load_legs_for_cycle(conn, cycle_id=cycles_a[0].cycle_id)
+        legs_b = load_legs_for_cycle(conn, cycle_id=cycles_b[0].cycle_id)
+        assert len(legs_a) == 4 and len(legs_b) == 4
+        assert {leg.leg_id for leg in legs_a}.isdisjoint({leg.leg_id for leg in legs_b})
+    finally:
+        conn.close()
+
+    # And through the real page, not just the data layer: selecting one
+    # strategy in the dropdown renders cleanly and never falls back to the
+    # "not configured" message a cross-strategy leak or an empty result
+    # would otherwise produce.
+    st = FakeStreamlit()
+    st.selectbox_returns = {"po_strategy": "dashboard_fixture_two"}
+    positional_page.render(st, config_root=None, database_path=db_path)
+    assert not any(positional_page.NOT_CONFIGURED in w for w in st.warnings)
+    leg_tables = [rows for rows in st.dataframes if rows and "Role" in rows[0]]
+    assert len(leg_tables) == 1
+    assert any(label == "State" for label, _value in st.metrics)

@@ -85,8 +85,10 @@ def test_start_strategy_still_uses_the_strategy_id_flag_for_intraday(
 def test_start_strategy_refuses_a_strategy_not_enabled_under_positional(
     tmp_path, monkeypatch
 ) -> None:
-    """positional_options has no --strategy-id flag to filter with, so this
-    is verified up front, against real discovery, before anything starts."""
+    """positional_options's own main() (Phase 5: a real --strategy-id filter,
+    same as intraday_options) verifies the requested id is actually enabled
+    before starting anything, and start_strategy.py simply propagates
+    whatever exit code that real main() returns."""
     _write_positional_config_root(tmp_path)
 
     exit_code = start_strategy.main(
@@ -96,7 +98,7 @@ def test_start_strategy_refuses_a_strategy_not_enabled_under_positional(
             "--config-root", str(tmp_path / "config"),
         ]
     )
-    assert exit_code == start_strategy.EXIT_STRATEGY_NOT_FOUND
+    assert exit_code != 0
 
 
 def test_start_strategy_delegates_a_correctly_named_positional_strategy(
@@ -120,9 +122,14 @@ def test_start_strategy_delegates_a_correctly_named_positional_strategy(
         ]
     )
     assert exit_code == 0
-    # No --strategy-id: positional_options's own main() has no such flag.
+    # Phase 5: positional_options now supports the same real --strategy-id
+    # filter intraday_options always has.
     assert calls == [
-        ["--runtime-id", "positional_options", "--config-root", str(tmp_path / "config")]
+        [
+            "--runtime-id", "positional_options",
+            "--strategy-id", "weekly_delta_neutral",
+            "--config-root", str(tmp_path / "config"),
+        ]
     ]
 
 

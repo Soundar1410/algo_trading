@@ -16,6 +16,15 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 MARGIN_PACKAGE = REPO_ROOT / "common" / "margin"
 DHAN_MARGIN_MODULE = REPO_ROOT / "common" / "market_data" / "dhan_margin.py"
 MAIN_MODULE = REPO_ROOT / "runtimes" / "positional_options" / "__main__.py"
+#: Phase 5 (runtime generalization) moved the real, per-strategy
+#: ``MarginEstimator``/``build_dhan_margin_fetcher`` construction out of
+#: ``__main__.py`` (which now only builds the one shared feed adapter) and
+#: into each spawned child's own composition
+#: (``run_positional_worker_process`` -> ``_run_positional_worker_locked``)
+#: — "each child process independently builds its own ... margin fetcher",
+#: never a live object pickled across the spawn boundary. This is now the
+#: real production composition root for this specific construction.
+WORKER_MODULE = REPO_ROOT / "runtimes" / "positional_options" / "worker.py"
 
 MARGIN_FILES = [*sorted(MARGIN_PACKAGE.glob("*.py")), DHAN_MARGIN_MODULE]
 
@@ -102,21 +111,27 @@ def test_dhan_margin_module_constructs_no_broker_or_order_client() -> None:
 
 def test_production_composition_root_never_wires_the_offline_fallback_model() -> None:
     """Independent-review correction: ``ConservativeMarginModel``/
-    ``fallback_model`` must never appear in the production entrypoint — the
-    real Dhan margin-calculator source, or a blocked entry, are the only two
-    outcomes production may ever reach."""
-    source = MAIN_MODULE.read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    # Only real code — not the comment explaining *why* fallback_model must
-    # never appear here, which would otherwise trip this exact check.
-    imported_names: set[str] = set()
-    keyword_args: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom):
-            imported_names.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.Call):
-            keyword_args.update(kw.arg for kw in node.keywords if kw.arg is not None)
-    assert "ConservativeMarginModel" not in imported_names
-    assert "fallback_model" not in keyword_args
-    assert "MarginEstimator(" in source
-    assert "build_dhan_margin_fetcher" in source
+    ``fallback_model`` must never appear in either production composition
+    root (the shared-adapter entrypoint, or the per-child worker
+    construction Phase 5 moved the real ``MarginEstimator`` build into) —
+    the real Dhan margin-calculator source, or a blocked entry, are the
+    only two outcomes production may ever reach."""
+    for module in (MAIN_MODULE, WORKER_MODULE):
+        source = module.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        # Only real code — not the comment explaining *why* fallback_model
+        # must never appear here, which would otherwise trip this exact
+        # check.
+        imported_names: set[str] = set()
+        keyword_args: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                imported_names.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.Call):
+                keyword_args.update(kw.arg for kw in node.keywords if kw.arg is not None)
+        assert "ConservativeMarginModel" not in imported_names, module
+        assert "fallback_model" not in keyword_args, module
+
+    worker_source = WORKER_MODULE.read_text(encoding="utf-8")
+    assert "MarginEstimator(" in worker_source
+    assert "build_dhan_margin_fetcher" in worker_source

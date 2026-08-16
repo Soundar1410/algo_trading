@@ -31,6 +31,7 @@ GENERIC_TARGETS: tuple[Path, ...] = (
     REPO_ROOT / "runtimes" / "positional_options" / "supervisor.py",
     REPO_ROOT / "runtimes" / "positional_options" / "worker.py",
     REPO_ROOT / "runtimes" / "positional_options" / "__main__.py",
+    REPO_ROOT / "runtimes" / "positional_options" / "config_adapter.py",
     REPO_ROOT / "runtimes" / "positional_options" / "positional_multi_leg_engine_worker.py",
     REPO_ROOT / "common" / "execution" / "repository.py",
     REPO_ROOT / "common" / "execution" / "lifecycle.py",

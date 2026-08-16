@@ -9,6 +9,7 @@ what actually trades.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from common.config import ConfigError, EngineKind, ResolvedConfig
@@ -53,10 +54,56 @@ class WorkerConfig:
     paper_execution: dict[str, Any] | None = None
     cost_rates: dict[str, Any] | None = None
     scrip_master_cache_dir: str = ""
+    #: Phase 5 (runtime generalization): every field below this line is
+    #: ``None`` unless :class:`~runtimes.positional_options.supervisor.
+    #: PositionalOptionsSupervisor` fills it in before spawning a child
+    #: process for this worker — mirrors ``runtimes.intraday_options.
+    #: config_adapter.WorkerConfig`` carrying its own
+    #: ``database_path``/``lock_dir``/``pid_dir``/``log_dir`` for exactly
+    #: the same reason: a spawned child owns no inherited object, only
+    #: picklable plain values, and must open its own database connection,
+    #: acquire its own lock and write its own log file. A direct
+    #: :func:`~runtimes.positional_options.worker.run_worker`/
+    #: :func:`~runtimes.positional_options.worker.build_engine` caller
+    #: (every existing test) never sets these and is unaffected.
+    database_path: Path | None = None
+    lock_dir: Path | None = None
+    pid_dir: Path | None = None
+    log_dir: Path | None = None
+    runtime_root: Path | None = None
+    #: Where the scrip-master CSV and the parent's already-minted Dhan
+    #: token cache both live — the same directory (``ProjectPaths.
+    #: cache_root``) production always uses for both today; kept as one
+    #: field, not two, since they are never configured separately.
+    cache_dir: Path | None = None
+    #: ``"module.submodule:function_name"`` overrides for a spawned
+    #: child's own network-facing construction — resolved and called
+    #: inside the child (mirrors ``strategy_ref``'s own dotted-path
+    #: convention and ``load_positional_strategy``'s resolution), never a
+    #: live object pickled across the process boundary. ``None`` (every
+    #: production strategy) builds the real Dhan chain fetcher, scrip
+    #: master and margin fetcher, exactly as before Phase 5. Set only by a
+    #: test's own fixture strategy config, so a real strategy config can
+    #: never accidentally construct anything but the real Dhan sources.
+    chain_fetcher_factory: str | None = None
+    scrip_master_factory: str | None = None
+    margin_fetcher_factory: str | None = None
 
 
 def build_worker_config(
-    cfg: ResolvedConfig, *, trading_date: str, timezone: str = "Asia/Kolkata"
+    cfg: ResolvedConfig,
+    *,
+    trading_date: str,
+    timezone: str = "Asia/Kolkata",
+    database_path: Path | None = None,
+    lock_dir: Path | None = None,
+    pid_dir: Path | None = None,
+    log_dir: Path | None = None,
+    runtime_root: Path | None = None,
+    cache_dir: Path | None = None,
+    chain_fetcher_factory: str | None = None,
+    scrip_master_factory: str | None = None,
+    margin_fetcher_factory: str | None = None,
 ) -> WorkerConfig:
     if cfg.strategy.engine is not EngineKind.POSITIONAL_MULTI_LEG_ENGINE:
         raise ConfigError(
@@ -132,6 +179,15 @@ def build_worker_config(
         max_adjustments_per_cycle=int(adjustment.get("maximum_per_cycle", 3)),
         min_minutes_between_adjustments=int(adjustment.get("minimum_minutes_between", 90)),
         parameters=parameters,
+        database_path=database_path,
+        lock_dir=lock_dir,
+        pid_dir=pid_dir,
+        log_dir=log_dir,
+        runtime_root=runtime_root,
+        cache_dir=cache_dir,
+        chain_fetcher_factory=chain_fetcher_factory,
+        scrip_master_factory=scrip_master_factory,
+        margin_fetcher_factory=margin_fetcher_factory,
         paper_execution=parameters.get("paper_execution"),
         cost_rates=parameters.get("cost_rates"),
         scrip_master_cache_dir=str(parameters.get("scrip_master_cache_dir", "")),

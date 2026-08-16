@@ -8286,3 +8286,198 @@ clean, 230 source files. `python -m scripts.assert_no_live_config_committed`
 — OK. No order-capable Dhan endpoint referenced; no network call made in
 this phase (every test uses the existing fixture/stub chain-fetcher
 pattern).
+
+### Phase 5 — Positional runtime generalization: N strategies, one shared feed (16 August 2026)
+
+Generalized `runtimes/positional_options` from "exactly one strategy per
+process" to "one shared Dhan feed hub, one isolated child worker process
+per enabled strategy" — mirroring `runtimes/intraday_options`'s own
+`IntradayOptionsSupervisor`/`SharedFeedHub`/`WorkerChannel`/`HubTickFeed`
+machinery exactly, reusing every one of those classes unchanged (no new
+hub/feed mechanism). N=1 — the only case this runtime has ever actually
+run — is simply this same machinery with one registered channel; there is
+no separate single-worker code path left.
+
+**`runtimes/positional_options/supervisor.py` — rewritten.**
+`select_one_enabled_strategy`/`run_supervisor` (the old ">1 enabled ->
+refuse" single-process composition root) are removed — nothing outside
+this package ever called them directly except `__main__.py`, which now
+uses the new shape. New `PositionalOptionsSupervisor`: owns one
+`SharedFeedHub` over one shared `MarketFeedAdapter`; `add_worker` always
+registers a tick channel (every positional worker is tick-driven, never
+candle-driven, so — unlike the intraday supervisor — there is no
+fixture/non-engine path to make this conditional on) with the worker's own
+underlying subscribed under its real exchange segment; `run()` spawns one
+`multiprocessing.get_context("spawn")` child per worker
+(`worker.run_positional_worker_process`), drives the feed on its own
+thread, drains each worker's control queue into `hub.request_subscription`
+(copied from `IntradayOptionsSupervisor._drain_control_queues`, already
+fully strategy-agnostic), joins every worker without stopping on one
+failure, and reports a duplicate-lock refusal the same way the intraday
+supervisor already does (`_report_duplicate_worker`). New
+`build_positional_supervisor` free function: discovers enabled strategies
+(optionally filtered by `strategy_ids`), re-runs the same defense-in-depth
+`check_mode_transition_safety` gate the old single-worker code ran (live is
+structurally unreachable for this runtime either way), and registers one
+worker per admitted strategy — a strategy that fails the gate is skipped,
+not a reason to refuse the whole group.
+
+Deliberately narrower than the intraday supervisor: no `ReconnectingFeed`
+wrap and no stuck-subscription/stale-instrument alarms — this phase's own
+scope is worker isolation/routing/dedup, not feed-reconnect robustness.
+Both reuse the identical `SharedFeedHub`/`WorkerChannel` machinery either
+way; reconnect-robustness parity is recorded here as explicit future work,
+never silently dropped.
+
+**`runtimes/positional_options/worker.py` — `build_engine`/`run_worker`
+unchanged; one new spawn entry point.** New
+`run_positional_worker_process` (the `multiprocessing.Process(target=...)`
+body, mirroring `intraday_options.worker.run_worker_process`'s own
+`sys.exit()`-translating-wrapper shape exactly): opens its own database
+connection, re-runs migration (a no-op replay) and an integrity check,
+acquires its own `worker_lock` (`EXIT_DUPLICATE` on conflict, matching
+intraday's own exit code), and — the one genuinely new construction
+concern — builds its own chain fetcher, margin fetcher and scrip master
+*in this process*, from the parent's already-cached Dhan token
+(`TokenCache`, an environment override checked first) — never a live
+network client pickled across the `spawn` boundary. `HubTickFeed` is wired
+with only `request_subscription` (never `on_square_off`/`should_stop`):
+`PositionalMultiLegEngine.run()`'s own docstring already establishes that a
+shutdown is never a forced square-off here (unlike the intraday engine) —
+only an operator's square-off-request file, polled by `run_worker`'s
+existing thread, ever calls `request_square_off`, completely unchanged by
+this phase. `_request_subscription` splits segment/mode exactly like
+`engine_worker._subscription_sender`: the underlying keeps the hub's
+default; every other id the engine ever subscribes to is an option
+contract, sent with the real `NSE_FNO`-equivalent segment code in Full
+(21) mode — the only mode carrying a bid/ask book.
+
+**Test-only construction overrides, never used by a real strategy.**
+`WorkerConfig` gained `chain_fetcher_factory`/`scrip_master_factory`/
+`margin_fetcher_factory` — `"module:function"` dotted-path refs (mirrors
+`strategy_ref`'s own convention), resolved and *called* inside the child
+in place of the real Dhan construction. `None` (every production strategy;
+`__main__.py` never sets these) builds the real sources exactly as before.
+Exists so a real multi-process integration test can prove the group's own
+routing/isolation without ever reaching the network.
+
+**`runtimes/positional_options/__main__.py` — rewritten.** Builds the one
+shared `DhanMarketFeedAdapter` once (never one per strategy), gained the
+same real `--strategy-id` filter `intraday_options.__main__` already has
+(`scripts/start_strategy.py`'s own mechanism), and hands the whole
+discovered set to `build_positional_supervisor`. Backup/migrate/retain and
+authentication (`AuthBootstrap.get_token()`) still run exactly once, here,
+strictly before the supervisor (or any worker) exists — unchanged in
+position, now serving every worker in the group rather than one.
+
+**`scripts/start_strategy.py` simplified to be fully runtime-generic** —
+the `positional_options`-specific branch ("no `--strategy-id` flag, verify
+before delegating") is gone; every runtime now supports the identical real
+filter, so this script just passes it through unconditionally.
+`tests/unit/test_scripts_runtime_registry.py`'s two positional-specific
+tests updated to match (one now asserts on `positional_options.__main__`'s
+own real refusal exit code instead of `start_strategy.py`'s inline check;
+the other asserts `--strategy-id` is now passed through, matching
+intraday's own shape).
+
+**Dashboards already ready — proven, not merely assumed.**
+`dashboards/data/positional.py`'s own module docstring already claimed
+"not specific to weekly_delta_neutral ... any future positional strategy
+reuses every function here unchanged"; a new test
+(`test_dashboard_positional_real_data.py::
+test_positional_dashboard_data_filters_two_strategies_independently`)
+builds two real cycles under two different `strategy_id`s in one database
+(via two independent real `build_engine` runs) and proves `load_cycles`/
+`load_open_cycle`/`load_legs_for_cycle` — and the real Streamlit page
+itself — never cross-contaminate, and a strategy_id with no rows gets
+nothing fabricated.
+
+**A real production defect found while writing these tests, not a
+documented scope boundary:** `test_no_margin_order_calls.py::
+test_production_composition_root_never_wires_the_offline_fallback_model`
+asserted the real `MarginEstimator`/`build_dhan_margin_fetcher`
+construction lived in `__main__.py` — true before this phase, false after
+(that construction now happens per-child, in `worker.py`, for the reason
+above). Fixed by checking `worker.py` for the positive assertions
+(construction genuinely happens somewhere real) and both composition roots
+for the negative ones (`ConservativeMarginModel`/`fallback_model` still
+appear in neither) — a required test update tracking a real, deliberate
+move of where production construction happens, not a weakening.
+
+**New fixture strategy:** `strategies/positional_options/
+_fixture_second_strategy/` — never enabled by any committed
+`config/strategies/*.yaml`, never approved for real trading. Deliberately
+never completes an entry: doing so needs a genuinely fresh quote for a
+newly-subscribed contract already sitting in the engine's own `QuoteBook`
+at the instant `_drive_entry` runs, which a *newly* subscribed contract
+driven through the real multi-process hub cannot provide within one
+evaluation (the subscription itself must round-trip child -> control queue
+-> supervisor -> hub -> adapter first) — and nothing resumes a first
+`_drive_entry` attempt that found no fresh quote yet. **This is a real,
+pre-existing engine gap this phase found and is disclosing, not silently
+routing around**: `PositionalMultiLegEngine` has no cross-evaluation retry
+for a partial *entry* the way Phase 3A's `_resume_pending_adjustment`
+built for a partial *adjustment* — every existing entry test avoids it by
+pre-delivering every leg's fresh quote before the triggering tick, which a
+genuinely new dynamic subscription cannot do. Fixing it is out of this
+phase's own scope (runtime generalization, not engine entry-retry
+correctness) and is recorded here as an explicit follow-up, never folded
+into "known limitations" silently. The fixture strategy instead proves
+exactly what the new integration suite needs of it — a second worker
+starts, holds its own lock, subscribes to its own (shared, deduplicated)
+underlying, and genuinely evaluates real ticks — via one durable,
+strategy-specific `errors` marker it writes through
+`context.record_pre_entry_incident` (the only repository-reaching hook a
+strategy has before ever entering), never by completing a cycle.
+
+**New `tests/integration/test_positional_runtime_multi_strategy.py`**
+(3 tests, real `multiprocessing` spawns, no live network):
+- `test_two_workers_share_one_feed_and_are_independently_isolated` — two
+  workers sharing NIFTY as their underlying; the adapter is subscribed to
+  it exactly once despite both wanting it (dedup); one worker's own lock is
+  held by the test process before the group starts (a real duplicate-lock
+  refusal, `EXIT_DUPLICATE`) and never stops its sibling, which runs to a
+  clean exit with its own real ticks (proven via its own durable `errors`
+  marker), its own session/heartbeat rows, while the refused worker opens
+  no session at all and is reported via `supervisor.duplicate_worker`.
+- `test_single_worker_n_equals_1_case_is_unchanged` — the exact same
+  machinery with one registered channel behaves like the surviving half of
+  the two-worker case above.
+- `test_dynamic_subscription_routes_to_the_correct_worker_in_full_mode` —
+  the supervisor's own control-queue -> `hub.request_subscription` -> hub
+  apply path, driven directly (not through a real spawned child's engine,
+  for the entry-retry reason above): a subscription from one worker's
+  control queue is applied under the correct segment/Full(21) mode and
+  routed to *that* worker's channel only, never its sibling's.
+
+**Verification:** the new multi-strategy suite (3), the new dashboard
+multi-strategy test, every existing weekly_delta_neutral/positional suite,
+and the explicitly-named regression battery — `test_dynamic_subscription_
+wake.py`, `test_engine_over_hub.py`, `test_feed_cross_thread_shutdown.py`,
+`test_feed_hub.py`, `test_feed_reconnect.py`, `test_hub_tick_feed.py`,
+`test_tick_drop_blocks_entries.py` (intraday shared-feed), `test_ema_cross_
+9_21_buy_strategy.py`/`test_ema_cross_9_21_buy_engine.py` (EMA),
+`test_straddle_920_acceptance_gaps.py`/`_correlation.py`/`_durability.py`/
+`_engine.py`/`_reconciliation.py`/`_restart.py`/`test_no_straddle_920_
+branches.py`/`test_straddle_920_risk_separation.py` (straddle_920),
+`test_process_locks.py` (process-lock), `test_heartbeat.py` (heartbeat),
+`test_account_shared_database.py`/`test_account_wide_coordination_across_
+runtime_groups.py` (account-wide coordination), `tests/end_to_end/
+test_supervisor.py`/`test_supervisor_signal.py` (real multi-process
+end-to-end) — all passed, unaffected. Full `pytest` — all passed.
+`ruff check .` clean. `mypy common strategies runtimes dashboards scripts
+--strict` — clean, 232 source files. `python -m scripts.
+assert_no_live_config_committed` — OK. No order-capable Dhan endpoint
+referenced or called anywhere in this phase; the shared feed adapter in
+every test is a fully in-process fake.
+
+**Remaining gap, explicitly recorded, not silently dropped:** the
+pre-existing engine entry-retry gap the fixture strategy's own docstring
+describes above — a partial four-leg entry has no cross-evaluation resume
+the way an interrupted adjustment now does (Phase 3A). Out of this phase's
+scope; a candidate for a future gap-closing session, not a "known
+limitation" folded into general trading-logic caveats. Reconnect-
+robustness parity with the intraday supervisor (`ReconnectingFeed`,
+stuck-subscription/stale-instrument alarms) is the other explicit,
+disclosed scope narrowing this phase made — see `supervisor.py`'s own
+module docstring.
