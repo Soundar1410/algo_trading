@@ -8188,3 +8188,101 @@ Endpoints called: `/app/generateAccessToken`, `/v2/profile` (via
 order-capable endpoint referenced or called anywhere in this phase.
 `weekly_delta_neutral` stays disabled; the market-hours freshness gap above
 is the recorded blocker.
+
+### Phase 4A — has_complete_greeks correction; timestamp terminology honesty (16 August 2026)
+
+Phase 4's own structural validation was accepted, but it surfaced (and
+under-reacted to) a real defect: a real Dhan response can report an option
+as structurally "present" — every Greek key exists — with delta, gamma,
+theta and vega **all literally zero**, on a strike with no real book at all
+(the deep-OTM sample in `tests/fixtures/dhan_option_chain_sample.json`,
+verified live in Phase 4). `ChainQuote.has_complete_greeks` previously only
+checked "no field is `None`", so it accepted this garbage as a valid,
+usable chain-sourced Greek set — and
+`GreeksService._from_chain` trusted it over a real Black-Scholes-Merton
+fallback computation. This is the real production defect Phase 4A closes.
+
+**`ChainQuote.has_complete_greeks` rewritten** (`common/market_data/
+chain_view.py`) to require, in order: delta/gamma/theta/vega/
+`implied_volatility` all present; all finite (`math.isfinite` — rejects
+`NaN`/`+-inf`, which a real JSON response can carry since `httpx`'s default
+decoding accepts the `NaN`/`Infinity` extension tokens); `implied_
+volatility > 0`; delta/gamma/theta/vega not *all four* exactly zero at
+once (the specific garbage fingerprint — a genuinely tiny nonzero Greek is
+never rejected by this check alone); delta within the conventional bound
+for the leg's own `option_type` (CE: `0 <= delta <= 1`; PE:
+`-1 <= delta <= 0`) — `ChainQuote` gained a required `option_type` field
+so this bound can be checked without the caller supplying it separately;
+gamma and vega non-negative, theta non-positive (the sign conventions this
+codebase's own fallback model, `common.greeks.model` wrapping `vollib`,
+and every real sample this session observed both agree on).
+`GreeksService._from_chain`'s own now-redundant `quote.implied_volatility
+is None` check was removed (already covered).
+
+**Effect on entry/adjustment/exit (all pre-existing architecture, not
+new):** `GreeksService.resolve` already tries the fallback model whenever
+`has_complete_greeks` is `False` — so a chain leg with garbage Greeks but a
+still-usable IV now silently, correctly falls through to a real model
+computation instead of trusting zeros. If the model input (IV) is also
+unusable, `resolve` raises `GreeksUnavailable`, which — as it already did
+before this correction — blocks entry/normal-adjustment risk for that leg
+only, and never affects an exit: no exit-priority check in this codebase
+(`is_emergency_stop`/`is_hard_stop`/`is_capital_stop`/the expiry-day phase
+exits/`is_soft_stop`/`is_profit_target`/the margin-breach check) reads
+`PositionalContext.chain`/`leg_greeks` at all — they are computed entirely
+from `pnl`/`cycle` state, checked before the `greeks_available` gate in
+`_evaluate_active` is ever reached. This phase added tests proving it
+end-to-end rather than relying on that structural argument alone.
+
+**Timestamp terminology corrected for honesty**, per the same Phase 4
+verification (a real Dhan response carries no exchange/source timestamp,
+confirmed, not assumed): `ChainSnapshot.snapshot_at` (`common/market_data/
+option_chain.py`), `ChainView.snapshot_at` (`common/market_data/
+chain_view.py`) and `GreekSnapshot.source_timestamp` (`common/greeks/
+models.py`) docstrings all corrected to stop describing this value as "the
+exchange/broker's own timestamp" — it is always the HTTP receive time
+under a different name in practice today. `received_at` is documented as
+the one honest, unconditional timestamp, and every docstring now states
+explicitly that a recent `received_at` proves the HTTP round trip was
+recent, never that the underlying market data is genuinely live/moving —
+that stronger claim is exactly what Phase 4's separately-reported,
+never-inferred market-hours section is for. No functional change: freshness
+math (`GreekSnapshot.is_fresh`/`age_seconds`) already used `received_at`
+alone, never `source_timestamp`/`snapshot_at`. **The explicit market-hours
+validation blocker recorded in Phase 4 above is retained unchanged** — it
+is not re-verified or downgraded by this correction; re-run
+`scripts.verify_dhan_option_chain` during a live NSE session before
+`weekly_delta_neutral` is ever enabled, exactly as Phase 4 already said.
+
+**Tests added** (spec 4.2): `tests/unit/test_option_chain_view.py` grew
+from 11 to 33 — dedicated `has_complete_greeks` boundary coverage: all-zero
+rejected (even with a plausible IV); zero/negative IV rejected; `NaN`/
+`+-inf` rejected on every one of delta/gamma/theta/vega and on IV; valid
+CE and valid PE sets accepted; delta at the exact `0`/`1`/`-1` boundary
+accepted; genuinely small but nonzero Greeks accepted (never rejected for
+smallness alone); CE/PE delta outside its conventional bound rejected;
+negative gamma/vega and positive theta rejected; the existing real-shaped
+fixture test's far-OTM assertions corrected to the new (correct) `False`.
+`tests/unit/test_greeks_service.py` (+1, 7 total):
+`test_model_source_is_used_when_chain_greeks_are_all_zero` — proves the
+real production consumer (`GreeksService._from_chain`) now falls back to
+the model instead of trusting the garbage chain values, and that the model
+still prices from the chain's own real IV. `tests/integration/
+test_weekly_delta_neutral_pnl_and_exits.py` (+1, 9 total):
+`test_unusable_greeks_never_block_a_hard_stop_exit` — a real end-to-end
+proof, through the production engine/repository/chain-fetcher stack (not a
+raising stub, unlike the pre-existing "chain unreachable" test alongside
+it), that every leg's Greeks *and* IV being genuinely unusable never
+blocks a hard-stop exit.
+
+**Verification:** `test_option_chain_view.py` (33), `test_greeks_service.py`
+(7), `test_greeks_model.py`, `test_weekly_delta_neutral_pnl_and_exits.py`
+(9), and the rest of the weekly_delta_neutral/positional family (adjustment,
+entry, restart, expiry-day, lot-size, risk-boundaries, selection,
+candidate-search, config, no-branches, scripts-are-read-only,
+dhan-adapter) — all passed. Full `pytest` — all passed. `ruff check .`
+clean. `mypy common strategies runtimes dashboards scripts --strict` —
+clean, 230 source files. `python -m scripts.assert_no_live_config_committed`
+— OK. No order-capable Dhan endpoint referenced; no network call made in
+this phase (every test uses the existing fixture/stub chain-fetcher
+pattern).

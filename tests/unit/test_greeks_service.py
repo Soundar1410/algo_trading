@@ -55,6 +55,29 @@ _INCOMPLETE_CHAIN_PAYLOAD = {
     }
 }
 
+#: Phase 4A correction fixture: every Greek field *present*, every one
+#: literally zero, on a strike with a real (nonzero) IV and a real book —
+#: the exact "structurally complete, economically garbage" shape a real
+#: Dhan response can carry (verified 2026-08-16, Phase 4). Before the
+#: correction, GreeksService._from_chain accepted this as a usable
+#: BROKER_CHAIN snapshot; it must now fall through to the model instead.
+_ALL_ZERO_GREEKS_CHAIN_PAYLOAD = {
+    "data": {
+        "last_price": 24000.0,
+        "oc": {
+            "24000.000000": {
+                "ce": {
+                    "greeks": {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0},
+                    "implied_volatility": 14.0,
+                    "top_bid_price": 100.0,
+                    "top_ask_price": 101.0,
+                },
+                "pe": {},
+            }
+        },
+    }
+}
+
 
 def _service(payload, *, clock=lambda: NOW, max_age_seconds=5.0) -> GreeksService:
     chain_service = OptionChainService(
@@ -110,6 +133,34 @@ def test_model_source_is_used_when_chain_greeks_are_incomplete():
     assert snapshot.source is GreekSource.MODEL
     assert snapshot.model_inputs is not None
     assert snapshot.model_inputs.implied_volatility == pytest.approx(0.14)
+
+
+def test_model_source_is_used_when_chain_greeks_are_all_zero():
+    """Phase 4A correction: a chain leg with every Greek *present* but
+    literally all zero (a real, verified Dhan response shape — see
+    common.market_data.chain_view.ChainQuote.has_complete_greeks's own
+    docstring) must not be accepted as a usable BROKER_CHAIN snapshot —
+    ChainQuote.has_complete_greeks now rejects it, so this falls through
+    to the fallback model exactly like the "fields missing entirely" case
+    above, not like a genuine (if unusual) all-zero market condition."""
+    service = _service(_ALL_ZERO_GREEKS_CHAIN_PAYLOAD)
+    chain = _fetch_chain(service)
+    snapshot = service.resolve(
+        chain=chain,
+        security_id="X",
+        option_type=OptionType.CE,
+        strike=24000.0,
+        spot=24000.0,
+        expiry_at=NOW + timedelta(days=2),
+    )
+    assert snapshot.source is GreekSource.MODEL
+    assert snapshot.model_inputs is not None
+    # The model still prices from the chain's own real (nonzero) IV, per
+    # _implied_volatility_for_model's own documented precedence.
+    assert snapshot.model_inputs.implied_volatility == pytest.approx(0.14)
+    # A real Black-Scholes-Merton computation for an ATM call, unlike the
+    # rejected all-zero chain values, has a genuinely nonzero delta.
+    assert snapshot.delta != 0.0
 
 
 def test_model_source_is_used_when_chain_greeks_are_stale():

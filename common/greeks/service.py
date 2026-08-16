@@ -143,7 +143,11 @@ class GreeksService:
         if row is None:
             return None
         quote = row.side(option_type)
-        if not quote.has_complete_greeks or quote.implied_volatility is None:
+        # has_complete_greeks (Phase 4A correction) already requires a
+        # present, finite, positive implied_volatility on top of every
+        # Greek-sanity check it performs — no separate IV check needed
+        # here.
+        if not quote.has_complete_greeks:
             return None
         snapshot = GreekSnapshot(
             security_id=security_id,
@@ -153,7 +157,7 @@ class GreeksService:
             gamma=quote.gamma,  # type: ignore[arg-type]
             theta=quote.theta,  # type: ignore[arg-type]
             vega=quote.vega,  # type: ignore[arg-type]
-            implied_volatility=quote.implied_volatility,
+            implied_volatility=quote.implied_volatility,  # type: ignore[arg-type]
             source=GreekSource.BROKER_CHAIN,
             source_timestamp=chain.snapshot_at,
             received_at=chain.received_at,

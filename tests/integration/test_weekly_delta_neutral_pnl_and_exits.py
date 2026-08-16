@@ -24,6 +24,8 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from _weekly_delta_neutral_fixtures import (
+    HEDGE_CALL_STRIKE,
+    HEDGE_PUT_STRIKE,
     ROLL_UP_SHORT_PUT_STRIKE,
     SHORT_CALL_STRIKE,
     SHORT_PUT_STRIKE,
@@ -389,6 +391,77 @@ def test_missing_chain_never_blocks_a_hard_stop_exit(tmp_path: Any) -> None:
         assert cycle is not None
         assert cycle["state"] == CycleState.COMPLETED.value, (
             "a hard-stop exit needs only leg last_price (real ticks), never the chain"
+        )
+        database = db2
+    finally:
+        database.close()
+
+
+def _make_greeks_unusable(payload: dict[str, Any], strike: float, option_type: str) -> None:
+    """Mutate one leg to the real, verified-against-a-live-response shape
+    ``ChainQuote.has_complete_greeks`` now rejects (Phase 4A correction):
+    every Greek present but all-zero, *and* ``implied_volatility`` zeroed
+    too so the fallback model has no usable IV to price from either
+    (``GreeksService._implied_volatility_for_model`` requires a positive
+    chain-reported IV) — the chain still parses fine (unlike
+    ``test_missing_chain_never_blocks_a_hard_stop_exit`` above, which makes
+    the fetch itself fail), but this leg's Greeks are genuinely,
+    completely unusable from either source. Used only to prove an exit is
+    never blocked by that; never to prove entry/adjustment behaviour
+    (that belongs to the chain_view/greeks_service unit suites)."""
+    side_key = option_type.lower()
+    leg = payload["data"]["oc"][f"{strike:.6f}"][side_key]
+    leg["greeks"] = {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
+    leg["implied_volatility"] = 0.0
+
+
+def test_unusable_greeks_never_block_a_hard_stop_exit(tmp_path: Any) -> None:
+    """Phase 4A correction: a chain that parses fine but reports every
+    leg's Greeks/IV as genuinely unusable (the real, verified all-zero
+    Dhan quirk that ``has_complete_greeks`` now rejects, with the fallback
+    model's own IV input also unusable) must never block a hard-stop exit
+    — proven with the real chain fetcher/parser/GreeksService in the loop
+    this time, not a raising stub, so this is specifically about Phase
+    4A's own new rejection, not about the chain being unreachable (that is
+    ``test_missing_chain_never_blocks_a_hard_stop_exit`` above)."""
+    database, _repository, b0, entry_price = _enter(tmp_path, "unusable_greeks.db")
+    try:
+        payload = initial_chain_payload()
+        for strike, option_type in (
+            (HEDGE_PUT_STRIKE, "PE"),
+            (HEDGE_CALL_STRIKE, "CE"),
+            (SHORT_PUT_STRIKE, "PE"),
+            (SHORT_CALL_STRIKE, "CE"),
+        ):
+            _make_greeks_unusable(payload, strike, option_type)
+
+        hard_threshold = 1.50 * b0
+        ts1 = _ts(9, 31)
+        steps = [
+            _short_put_price_tick_for_loss(entry_price, hard_threshold, ts1),
+            underlying_tick(ts1),
+        ]
+        database.close()
+
+        db2, repo2 = open_repository(tmp_path, "unusable_greeks.db")
+        session2 = repo2.open_session(
+            runtime_id="positional_options", strategy_id="weekly_delta_neutral",
+            execution_mode=ExecutionMode.PAPER, process_role="worker", pid=2,
+        )
+        config = build_worker_config(ENTRY_DATE, cost_rates=ZERO_COST_RATES)
+        feed = ScriptedFeed(steps=steps, initial_now=ts1)
+        built = build_engine(
+            config, repository=repo2, session_id=session2.id, feed=feed,
+            chain_fetcher=chain_fetcher_for(payload), scrip_master=_SCRIP_MASTER,
+            margin_estimator=MarginEstimator(margin_fetcher=fake_margin_fetcher),
+            clock=feed.clock,
+        )
+        built.engine.run()
+        cycle = repo2.load_cycle(cycle_id=CYCLE_ID)
+        assert cycle is not None
+        assert cycle["state"] == CycleState.COMPLETED.value, (
+            "a hard-stop exit needs only leg last_price (real ticks/fills), never a "
+            "usable Greek/IV set from either the chain or the fallback model"
         )
         database = db2
     finally:

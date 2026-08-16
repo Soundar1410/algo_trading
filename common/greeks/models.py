@@ -72,9 +72,27 @@ class GreekSnapshot:
     vega: float
     implied_volatility: float
     source: GreekSource
-    #: The exchange/broker's own timestamp for a chain-sourced snapshot, or
-    #: the evaluation timestamp for a model-sourced one — never fabricated.
+    #: For a MODEL-sourced snapshot: the evaluation timestamp it was priced
+    #: at — a genuine, meaningful instant. For a BROKER_CHAIN-sourced one:
+    #: whatever ``ChainView.snapshot_at`` carried, which — Phase 4A
+    #: correction, 16 August 2026 gap-closing session, verified against a
+    #: real live response, not assumed — is *never* an actual exchange/
+    #: broker-supplied timestamp in practice; Dhan's real response carries
+    #: none, so this is always just the HTTP receive time under a
+    #: different name. Never treat this field as proof of genuine
+    #: exchange/market-data freshness for a chain-sourced snapshot — use
+    #: ``received_at`` (below) for all freshness math, which
+    #: ``is_fresh``/``age_seconds`` already do exclusively; this field is
+    #: retained only as non-authoritative provenance metadata.
     source_timestamp: datetime
+    #: When this snapshot was actually received/computed — the one
+    #: unconditionally honest timestamp here. All freshness math uses this
+    #: alone. A recent ``received_at`` proves the computation/HTTP round
+    #: trip was recent; it does not, by itself, prove the underlying
+    #: quotes reflect genuinely live, moving market data during market
+    #: hours — that stronger claim can only be checked while the market is
+    #: actually open (see ``scripts/verify_dhan_option_chain.py``'s own
+    #: separately-reported, never-inferred market-hours section).
     received_at: datetime
     #: Present only for a MODEL-sourced snapshot — the exact inputs it was
     #: computed from. ``None`` for BROKER_CHAIN (Dhan's own Greeks are not

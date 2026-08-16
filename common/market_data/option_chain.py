@@ -72,9 +72,22 @@ class ChainSnapshot:
 
     key: ChainKey
     payload: dict[str, Any]
-    #: Exchange/broker timestamp if the response carried one, else receive time.
+    #: Exchange/broker timestamp *if the response carried one, else receive
+    #: time* — but Phase 4A correction (16 August 2026 gap-closing
+    #: session) confirmed against a real, live Dhan response that it never
+    #: does, so this always equals ``received_at`` in practice today. Kept
+    #: only as non-authoritative provenance metadata (via
+    #: ``GreekSnapshot.source_timestamp``, which never uses it for
+    #: freshness math either) — never call it "the exchange timestamp" as
+    #: though that were independently confirmed.
     snapshot_at: datetime
-    #: When we received it.
+    #: When we received it — the one honest, unconditional timestamp here.
+    #: All freshness/staleness arithmetic below uses this alone. A recent
+    #: value proves the HTTP round trip was recent; it does not by itself
+    #: prove the underlying quotes are genuinely live/moving market data —
+    #: only an observation made while the market is actually open can (see
+    #: ``scripts/verify_dhan_option_chain.py``'s own separately-reported,
+    #: never-inferred market-hours section).
     received_at: datetime
     #: Monotonic reading at receipt, used for all age arithmetic.
     received_monotonic: float
