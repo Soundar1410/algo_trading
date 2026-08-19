@@ -220,6 +220,13 @@ def build_worker_config(
     #: GreeksService age from parameters.selection.quote_max_age_seconds
     #: too), so both stay consistent by construction here as well.
     quote_max_age_seconds: float = 3600.0,
+    #: Generous by the same design reasoning as quote_max_age_seconds above
+    #: — real time (not simulated tick time) only matters for a dedicated
+    #: entry-stage-timeout test, which passes its own short override; every
+    #: other test in this family completes entry within a single tick batch
+    #: (zero elapsed simulated time), so a short default here would add risk
+    #: for no coverage benefit.
+    entry_leg_timeout_seconds: float = 3600.0,
     max_adjustments_per_day: int = 1,
     max_adjustments_per_cycle: int = 3,
     min_minutes_between_adjustments: int = 90,
@@ -266,6 +273,7 @@ def build_worker_config(
         dividend_yield=0.0,
         quote_max_age_seconds=quote_max_age_seconds,
         evaluation_interval_seconds=evaluation_interval_seconds,
+        entry_leg_timeout_seconds=entry_leg_timeout_seconds,
         max_adjustments_per_day=max_adjustments_per_day,
         max_adjustments_per_cycle=max_adjustments_per_cycle,
         min_minutes_between_adjustments=min_minutes_between_adjustments,

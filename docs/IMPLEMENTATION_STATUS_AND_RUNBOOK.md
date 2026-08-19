@@ -8471,13 +8471,162 @@ assert_no_live_config_committed` — OK. No order-capable Dhan endpoint
 referenced or called anywhere in this phase; the shared feed adapter in
 every test is a fully in-process fake.
 
-**Remaining gap, explicitly recorded, not silently dropped:** the
-pre-existing engine entry-retry gap the fixture strategy's own docstring
-describes above — a partial four-leg entry has no cross-evaluation resume
-the way an interrupted adjustment now does (Phase 3A). Out of this phase's
-scope; a candidate for a future gap-closing session, not a "known
-limitation" folded into general trading-logic caveats. Reconnect-
+**Gap closed, not merely recorded — see Phase 5A below.** The pre-existing
+engine entry-retry gap the fixture strategy's own docstring describes above
+(a partial four-leg entry had no cross-evaluation resume the way an
+interrupted adjustment already did, Phase 3A) was out of this phase's own
+scope and was disclosed rather than silently dropped. Phase 5A (19 August
+2026) closed it: `PositionalMultiLegEngine` now resumes a staged entry on
+every evaluation, bounded by a durable per-stage timeout. Reconnect-
 robustness parity with the intraday supervisor (`ReconnectingFeed`,
-stuck-subscription/stale-instrument alarms) is the other explicit,
-disclosed scope narrowing this phase made — see `supervisor.py`'s own
-module docstring.
+stuck-subscription/stale-instrument alarms) remains the other explicit,
+disclosed scope narrowing this phase made — still open, see
+`supervisor.py`'s own module docstring.
+
+### Phase 5A — Bounded cross-evaluation staged-entry resume (19 August 2026)
+
+Closes the Phase 5 partial-entry follow-up above. Conditionally accepted on
+first review; a second review found the initial resume-on-every-evaluation
+fix unsafe without a bound (a quote that never arrives would retry
+forever), plus two test-coverage gaps and a Phase-3-style false-positive
+risk. All three corrections are folded in below — nothing here shipped
+without them.
+
+**`common/engine/positional/positional_engine.py` — cross-evaluation
+resume.** New `PositionalMultiLegEngine._resume_pending_entry`, called
+unconditionally every evaluation from `_evaluate` (mirrors
+`_resume_pending_adjustment`'s own "no-op on the overwhelming majority of
+evaluations" call shape exactly) — a no-op unless the cycle is currently
+`ENTERING`, in which case it re-enters `_drive_entry`. Before this,
+`_drive_entry` was only ever invoked once, synchronously, from
+`_enter_cycle`; a role whose first attempt found no fresh quote yet was
+never retried by anything. No `weekly_delta_neutral` branch — generic
+engine code, reusing `next_entry_role`/`entry_is_complete`/
+`entry_has_blocking_leg` verbatim.
+
+**Bounded, not resume-forever.** New `Cycle.entry_stage_role`/
+`entry_stage_deadline_at` (`positional_models.py`) — the durable clock for
+whichever staged-entry step is currently in flight (entry is strictly
+sequential, so one role/deadline pair suffices). New method
+`_advance_entry_stage` (replacing the old direct `_open_leg_now` call
+inside `_drive_entry`'s loop): on a role's first attempt, arms and
+durably persists the deadline (`ts + entry_leg_timeout_seconds`, new
+engine constructor parameter, default `DEFAULT_ENTRY_LEG_TIMEOUT_SECONDS =
+180.0`) *before* requesting that role's dynamic subscription; on every
+later attempt (this evaluation's own resume, or a resumed cycle after a
+restart), checks the deadline *before* ever consulting the quote book — a
+quote arriving after the deadline is never even looked at, so it can never
+reopen or continue the entry. `_enter_cycle` no longer bulk-subscribes all
+four contracts up front (verified harmless for every existing
+`SimulatedFeed`/`ScriptedFeed` test: `QuoteBook` recording is a tick
+observer, independent of `feed.subscribe` having been called) — subscribing
+becomes genuinely per-stage.
+
+On expiry, new `_expire_entry_stage` reconciles against authoritative
+order/position state before deciding anything (spec 5.3: "a timeout ...
+is not a failed order — reconcile before retrying"): `NEVER_PLACED`/
+`TERMINAL_NO_FILL` fails the stage closed (`LegState.FAILED`, unsubscribed)
+and lets the existing `_unwind_partial_entry` run; a genuinely `FILLED`
+order (a race between the timeout and a late confirmation) is adopted, not
+discarded; an `UNKNOWN` outcome — this engine cannot safely tell whether an
+order was ever submitted — sets `CycleState.CRITICAL_UNRESOLVED` and blocks
+new entries, exactly like `_fail_closed_pending_adjustment`'s own posture,
+and is never auto-retried. New `_entry_submission_outcome`/
+`_open_position_for` duplicate (never import — a runtime composition-root
+module must never be a dependency of `common/engine`) the same tiny
+classification `positional_multi_leg_engine_worker._resolve_intent_outcome`
+already uses.
+
+**A real, pre-existing ordering bug found and fixed alongside this:**
+`_unwind_partial_entry` closed `open_legs()` in dict-insertion order, which
+for a partial entry is hedge-first — backwards (a short can genuinely be
+open here — e.g. both hedges plus the short put filled, the short call's
+own stage timed out — so closing a hedge before that short would briefly
+leave it naked). Fixed to the same shorts-then-hedges-then-generic ordering
+`_exit_all` already used correctly; also now unsubscribes every abandoned
+pending leg's contract.
+
+**Persistence — new side table, never `ALTER TABLE strategy_cycles`.**
+This codebase has an explicit, twice-stated rule (migrations `0010`/`0011`
+own header comments) against widening `strategy_cycles` with `ALTER TABLE`
+— SQLite has no `ADD COLUMN IF NOT EXISTS`, so it is not safely replayable
+after a partial apply. New migration `0012_positional_entry_stage_
+deadline.sql` follows `0011`'s own established pattern: a dedicated,
+additive `strategy_cycle_entry_stage` table (one upserted row per
+`cycle_id`, mirroring `strategy_cycles` itself), never a schema change to
+an existing table. `ExecutionRepository.upsert_cycle_entry_stage`/
+`load_cycle_entry_stage`; `positional_state.persist_cycle`/`load_cycle`
+extended to read/write it — piggybacking on every existing `_persist_cycle`
+call site, no new call sites needed there. `entry_leg_timeout_seconds`
+threaded through `WorkerConfig` → `config_adapter.build_worker_config`
+(`parameters.entry_leg_timeout_seconds`, same pattern as
+`evaluation_interval_seconds`) → `worker.build_engine`.
+
+**Test-coverage corrections from the second review round:**
+- **0/4 and 4/4 restart boundaries added**, alongside 1/4, 2/4, 3/4 (all
+  five now in `tests/integration/test_weekly_delta_neutral_restart.py`,
+  using the same `_SimulatedCrash`/persistence-wrapper injection style
+  already proven in `test_weekly_delta_neutral_adjustment.py`'s nine
+  restart-boundary suite). 0/4: cycle and every leg intent durably
+  persisted, but the first stage's deadline never armed. 4/4: every leg
+  genuinely `OPEN` and durable, but the cycle's own `ACTIVE` projection
+  never landed — restart must reconstruct/finalize it from the already-open
+  legs alone, without placing a single new order (proven via
+  `cycle_order_history` row counts before/after). A dedicated
+  naked-short-never-exposed assertion (`_assert_no_naked_short`) runs at
+  every restart boundary, and an entry-side "unknown submission reconciled
+  before retry" test mirrors the adjustment suite's own boundary-8 test.
+- **`order_intents.sequence_number` is never used to prove ordering across
+  a restart** — it is a per-*session* counter, and comparing it across two
+  different sessions is the exact false-positive risk already found and
+  fixed in Phase 3. Every new restart/multi-process test proves hedge-
+  before-short ordering from each leg's own durable, timezone-aware
+  `entry_time` instead.
+- **New `tests/integration/test_weekly_delta_neutral_entry_stage_timeout.py`**
+  (5 tests): no quote ever arriving (clean unwind to `FAILED`), a quote
+  arriving just before the deadline (fills, entry keeps progressing), a
+  quote arriving just after it (never reopens the stage, despite being
+  "fresh"), and restart immediately before/after the persisted deadline
+  (the *original* deadline governs, never one recomputed from the
+  restart's own clock).
+
+**New `tests/integration/test_positional_runtime_weekly_staged_entry.py`
+— the real production-path proof Phase 5's own fixture strategy could not
+provide.** The real `weekly_delta_neutral` strategy, over the real
+`SharedFeedHub`/`PositionalOptionsSupervisor`/real spawned
+`multiprocessing` workers/a real control queue, alongside a second,
+independent `_fixture_second_strategy` worker (never disrupted). New
+`_StagedAdapter` gates each stage on two genuine, observable events —
+`alpha_channel.wants(security_id)` (the dynamic subscription actually
+round-tripped; a tick for a security nobody wants yet is silently dropped
+by `SharedFeedHub._fan_out_tick`/`_fan_out`) polled via the real `on_idle`
+callback `SharedFeedHub.start()` already wires to `hub._apply_pending_
+subscriptions`, then the durable `strategy_cycle_legs` row itself reaching
+`OPEN` — never a fixed sleep. Proves: the initial evaluation's dynamic
+subscription round-trips; each leg's own fresh quote fills *only* that leg
+on its own later hub iteration (every later-in-order role verified still
+not `OPEN` at that same checkpoint); the complete cycle reaches `ACTIVE`;
+exact hedge-then-short order; an unrelated tick and a repeated already-open
+leg's own tick produce no new leg row and no duplicate `order_intents` row;
+two new module-level picklable factory functions in
+`_positional_multi_strategy_fixtures.py` (`build_weekly_chain_fetcher`/
+`build_weekly_margin_fetcher`) reuse `_weekly_delta_neutral_fixtures.py`'s
+existing chain payload rather than duplicating it. Neither this file nor
+the restart/timeout additions touch or weaken the existing
+`_fixture_second_strategy`-based failure-isolation tests.
+
+**Verification:** the new Phase 5A tests (6 restart-boundary + 5
+entry-stage-timeout + 1 real-multi-process production-path); every
+existing weekly_delta_neutral entry/restart/adjustment/expiry-day/pnl/
+lot-size test; `test_positional_runtime_multi_strategy.py` (unweakened);
+`test_engine_over_hub.py`; the full `straddle_920` durability/
+reconciliation/engine/acceptance-gaps battery; `tests/unit/
+test_migrations.py` (updated for the new `0012` migration — four hardcoded
+shipped-migration-list assertions extended, never loosened). Full `pytest`
+— all passed. `ruff check .` — clean. `mypy` (project's configured
+`common`/`strategies`/`runtimes`/`dashboards`/`scripts` packages, strict)
+— clean, 233 source files. `python scripts/assert_no_live_config_
+committed.py` — OK. No order-capable/live Dhan endpoint referenced or
+called anywhere in this phase; every feed adapter in every new/changed test
+is a fully in-process/in-repository fake. All live gates remain disabled —
+this phase touches no gate-controlling config.

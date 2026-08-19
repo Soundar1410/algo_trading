@@ -78,6 +78,20 @@ def persist_cycle(repository: ExecutionRepository, cycle: Cycle, *, runtime_id: 
         square_off_state=cycle.square_off_state,
         opened_trading_date=cycle.opened_trading_date,
     )
+    repository.upsert_cycle_entry_stage(
+        runtime_id=runtime_id,
+        strategy_id=cycle.strategy_id,
+        execution_mode=cycle.execution_mode,
+        cycle_id=cycle.cycle_id,
+        entry_stage_role=(
+            cycle.entry_stage_role.value if cycle.entry_stage_role is not None else None
+        ),
+        entry_stage_deadline_at=(
+            cycle.entry_stage_deadline_at.isoformat()
+            if cycle.entry_stage_deadline_at is not None
+            else None
+        ),
+    )
 
 
 def persist_cycle_leg(
@@ -154,6 +168,23 @@ def load_cycle(
             "is not a recognised LegRole"
         ) from exc
 
+    entry_stage_role: LegRole | None = None
+    entry_stage_deadline_at: datetime | None = None
+    entry_stage_row = repository.load_cycle_entry_stage(cycle_id=cycle_row["cycle_id"])
+    if entry_stage_row is not None:
+        raw_entry_stage_role = entry_stage_row["entry_stage_role"]
+        if raw_entry_stage_role:
+            try:
+                entry_stage_role = LegRole(raw_entry_stage_role)
+            except ValueError as exc:
+                raise CycleRowInconsistent(
+                    "strategy_cycle_entry_stage.entry_stage_role="
+                    f"{raw_entry_stage_role!r} is not a recognised LegRole"
+                ) from exc
+        raw_entry_stage_deadline_at = entry_stage_row["entry_stage_deadline_at"]
+        if raw_entry_stage_deadline_at:
+            entry_stage_deadline_at = datetime.fromisoformat(raw_entry_stage_deadline_at)
+
     cycle = Cycle(
         cycle_id=cycle_row["cycle_id"],
         strategy_id=strategy_id,
@@ -177,6 +208,8 @@ def load_cycle(
         ),
         pending_adjustment_role=pending_role,
         pending_adjustment_state=cycle_row["pending_adjustment_state"],
+        entry_stage_role=entry_stage_role,
+        entry_stage_deadline_at=entry_stage_deadline_at,
         square_off_state=cycle_row["square_off_state"],
     )
 

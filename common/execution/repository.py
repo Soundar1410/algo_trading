@@ -1787,6 +1787,56 @@ class ExecutionRepository:
             .fetchall()
         )
 
+    def upsert_cycle_entry_stage(
+        self,
+        *,
+        runtime_id: str,
+        strategy_id: str,
+        execution_mode: ExecutionMode,
+        cycle_id: str,
+        entry_stage_role: str | None,
+        entry_stage_deadline_at: str | None,
+    ) -> None:
+        """Durable clock for one cycle's in-flight staged-entry step
+        (migration 0012) — a dedicated side table, never an ``ALTER TABLE``
+        on ``strategy_cycles`` (see that migration's own header). One row per
+        ``cycle_id``, upserted in place exactly like :meth:`upsert_cycle`
+        itself."""
+        with self._db.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO strategy_cycle_entry_stage
+                    (runtime_id, strategy_id, execution_mode, cycle_id,
+                     entry_stage_role, entry_stage_deadline_at, version, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+                ON CONFLICT (cycle_id) DO UPDATE SET
+                    entry_stage_role = excluded.entry_stage_role,
+                    entry_stage_deadline_at = excluded.entry_stage_deadline_at,
+                    version = strategy_cycle_entry_stage.version + 1,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    runtime_id,
+                    strategy_id,
+                    execution_mode.value,
+                    cycle_id,
+                    entry_stage_role,
+                    entry_stage_deadline_at,
+                    _now(),
+                    _now(),
+                ),
+            )
+
+    def load_cycle_entry_stage(self, *, cycle_id: str) -> sqlite3.Row | None:
+        row: sqlite3.Row | None = (
+            self._db.connect()
+            .execute(
+                "SELECT * FROM strategy_cycle_entry_stage WHERE cycle_id = ?", (cycle_id,)
+            )
+            .fetchone()
+        )
+        return row
+
     def upsert_cycle_leg(
         self,
         *,

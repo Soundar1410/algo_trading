@@ -14,6 +14,7 @@ from typing import Any
 
 from common.config import ConfigError, EngineKind, ResolvedConfig
 from common.engine.config import SessionConfig
+from common.engine.positional.positional_engine import DEFAULT_ENTRY_LEG_TIMEOUT_SECONDS
 from common.market_data.scrip_master import resolve_index_meta, segment_code
 
 _REQUIRED_PARAMETERS = ("underlying", "index_security_id", "index_segment", "fno_segment")
@@ -51,6 +52,12 @@ class WorkerConfig:
     max_adjustments_per_cycle: int
     min_minutes_between_adjustments: int
     parameters: dict[str, Any] = field(default_factory=dict)
+    #: Phase 5A: how long a single staged-entry step (one leg role) may wait
+    #: for its dynamically subscribed contract's first fresh quote before it
+    #: is durably failed and the partial entry unwound (spec section 5.3's
+    #: "bounded workflow"). Defaults to the engine's own default so an
+    #: unset/legacy config behaves exactly as before this field existed.
+    entry_leg_timeout_seconds: float = DEFAULT_ENTRY_LEG_TIMEOUT_SECONDS
     paper_execution: dict[str, Any] | None = None
     cost_rates: dict[str, Any] | None = None
     scrip_master_cache_dir: str = ""
@@ -175,6 +182,9 @@ def build_worker_config(
             (parameters.get("selection", {}) or {}).get("quote_max_age_seconds", 5.0)
         ),
         evaluation_interval_seconds=float(parameters.get("evaluation_interval_seconds", 5.0)),
+        entry_leg_timeout_seconds=float(
+            parameters.get("entry_leg_timeout_seconds", DEFAULT_ENTRY_LEG_TIMEOUT_SECONDS)
+        ),
         max_adjustments_per_day=int(adjustment.get("maximum_per_day", 1)),
         max_adjustments_per_cycle=int(adjustment.get("maximum_per_cycle", 3)),
         min_minutes_between_adjustments=int(adjustment.get("minimum_minutes_between", 90)),

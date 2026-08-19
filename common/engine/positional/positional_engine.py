@@ -51,7 +51,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from common.broker.quotes import QuoteBook
 from common.config.models import ExecutionMode
@@ -59,7 +59,7 @@ from common.execution import ExecutionRepository
 from common.greeks import GreekSnapshot, GreeksService
 from common.logging import get_logger
 from common.margin import MarginEstimate, MarginEstimator
-from common.models import ExitReason, Tick
+from common.models import ExitReason, Position, Tick
 from common.notifications import NotificationEvent, Notifier, NullNotifier, SafeNotifier
 from common.utils.timeutils import now_ist
 
@@ -94,6 +94,23 @@ from .positional_strategy import BasePositionalMultiLegStrategy, PositionalConte
 
 log = get_logger(__name__)
 
+#: Phase 5A: how long a single staged-entry step (one leg role) may wait for
+#: its dynamically subscribed contract's first fresh Full-mode quote before
+#: the step is durably failed and the partial entry unwound (spec section
+#: 5.3's "bounded workflow"). Generous for a real dynamic-subscription/quote
+#: round trip, still bounded — see ``_advance_entry_stage``.
+DEFAULT_ENTRY_LEG_TIMEOUT_SECONDS = 180.0
+
+#: ``_entry_submission_outcome``'s return vocabulary — mirrors
+#: ``runtimes.positional_options.positional_multi_leg_engine_worker.
+#: _resolve_intent_outcome`` exactly, duplicated rather than imported (this
+#: module is common/engine; that one is a runtime composition root and must
+#: never be imported from here).
+_NEVER_PLACED = "NEVER_PLACED"
+_SUBMISSION_UNKNOWN = "UNKNOWN"
+_TERMINAL_NO_FILL = "TERMINAL_NO_FILL"
+_FILLED = "FILLED"
+
 
 class PositionalMultiLegEngine:
     def __init__(
@@ -122,6 +139,7 @@ class PositionalMultiLegEngine:
         min_minutes_between_adjustments: int = 90,
         evaluation_interval_seconds: float = 5.0,
         max_quote_age_seconds: float = 5.0,
+        entry_leg_timeout_seconds: float = DEFAULT_ENTRY_LEG_TIMEOUT_SECONDS,
         notifier: Notifier | None = None,
         notify_deferred: bool = True,
         persist_notification_failure: Callable[[NotificationEvent, str], None] | None = None,
@@ -169,6 +187,7 @@ class PositionalMultiLegEngine:
         self._min_minutes_between_adjustments = min_minutes_between_adjustments
         self._evaluation_interval = evaluation_interval_seconds
         self._max_quote_age_seconds = max_quote_age_seconds
+        self._entry_leg_timeout_seconds = entry_leg_timeout_seconds
 
         self.report: ReportWriter = report or NullReportWriter()
         self.notifier = (
@@ -439,6 +458,10 @@ class PositionalMultiLegEngine:
                 )
                 return
 
+        self._resume_pending_entry(ts)
+        if self._cycle is not None and self._cycle.state is CycleState.CRITICAL_UNRESOLVED:
+            return  # an entry stage timed out with an unknown submission
+
         if self._cycle is not None and self._cycle.state not in TERMINAL_CYCLE_STATES:
             self._resume_pending_adjustment(ts)
             if self._cycle.state is CycleState.CRITICAL_UNRESOLVED:
@@ -449,6 +472,52 @@ class PositionalMultiLegEngine:
         if signal is None or signal.action is CycleAction.NONE:
             return
         self._apply_signal(signal, ts)
+
+    def _resume_pending_entry(self, ts: datetime) -> None:
+        """Phase 5A: cross-evaluation resume for a sequential four-leg entry
+        still in progress (spec sections 5.2/5.3) — the entry-side
+        counterpart of :meth:`_resume_pending_adjustment`.
+
+        Before this method existed, ``_drive_entry`` was only ever invoked
+        once, synchronously, from ``_enter_cycle`` — the instant a strategy
+        first returned ``ENTER_CYCLE``. If the very first leg's dynamically
+        subscribed contract had no fresh, complete quote yet,
+        ``_open_leg_now`` correctly returned ``False`` and that one call
+        correctly stopped, leaving the leg ``PENDING_ORDER`` for "the next
+        evaluation" to retry — but nothing on any later evaluation ever
+        called ``_drive_entry`` again. Every positional strategy's own
+        ``evaluate`` deliberately returns ``None`` for a cycle already
+        ``ENTERING``, on the documented assumption that "the engine is
+        already driving this synchronously" (see
+        ``WeeklyDeltaNeutralStrategy.evaluate``'s own comment) — an
+        assumption this method now makes true. A cycle whose first hedge (or
+        any later stage) missed its first fresh quote was previously stuck
+        ``ENTERING`` forever, with no retry and no incident: the disclosed
+        Phase 5 partial-entry defect this closes.
+
+        Simply a re-entrant call into the same ``_drive_entry`` that
+        ``_enter_cycle`` itself uses first — ``next_entry_role``/
+        ``_advance_entry_stage`` are already idempotent and safe to call
+        again on a still-in-flight stage. Restart-safe for the same reason
+        ``_resume_pending_adjustment`` is: restart reconciliation
+        (``positional_multi_leg_engine_worker._reconcile_leg``) already
+        promotes any entry-stage ``PENDING_ORDER`` leg whose order in fact
+        filled to ``OPEN`` (or leaves it ``PENDING_ORDER`` for a genuine
+        retry) from authoritative order/position state before this method
+        ever runs on a recovered cycle, and ``_adopt_recovered_cycle``
+        already re-subscribes every pending leg's contract. Bounded, not
+        resume-forever: ``_advance_entry_stage``'s own persisted
+        ``entry_stage_deadline_at`` fails the stage closed once a fresh
+        quote never arrives in time — see that method's own docstring.
+
+        Safe to call every evaluation unconditionally — a no-op whenever no
+        cycle is open or the cycle is not currently ``ENTERING`` (mirrors
+        ``_resume_pending_adjustment``'s own "no-op on the overwhelming
+        majority of evaluations" posture).
+        """
+        if self._cycle is None or self._cycle.state is not CycleState.ENTERING:
+            return
+        self._drive_entry(ts)
 
     def _resume_pending_adjustment(self, ts: datetime) -> None:
         """Spec section 7.3/9.5: restart must resume a uniquely safe
@@ -798,9 +867,10 @@ class PositionalMultiLegEngine:
             self._cycle = None
             return
 
-        for leg in cycle.legs.values():
-            if leg.contract is not None:
-                self.feed.subscribe(leg.contract.security_id)
+        # Unlike the pre-effect persist above, every leg's own dynamic
+        # subscription is requested per-stage, not all at once here — see
+        # _advance_entry_stage, which arms and persists that stage's own
+        # bounded deadline immediately before requesting it.
         self._log_event("cycle_entry_attempted", f"expiry={resolved_expiry}", ts)
         self._drive_entry(ts)
 
@@ -813,8 +883,10 @@ class PositionalMultiLegEngine:
                 break
             leg = self._cycle.original_leg(role)
             assert leg is not None
-            if not self._open_leg_now(leg, ts):
-                return  # no fresh quote yet — resume on the next evaluation
+            if not self._advance_entry_stage(leg, role, ts):
+                return  # no fresh quote yet, deadline not reached — resume later
+            if self._cycle.state is CycleState.CRITICAL_UNRESOLVED:
+                return  # this stage timed out with an unknown submission
 
         if entry_is_complete(self._cycle):
             self._finalize_entry(ts)
@@ -881,6 +953,161 @@ class PositionalMultiLegEngine:
         )
         return True
 
+    def _advance_entry_stage(self, leg: LegInstance, role: LegRole, ts: datetime) -> bool:
+        """Phase 5A: the bounded staged-entry step this ``role`` is
+        currently in (spec section 5.3's "bounded workflow").
+
+        ``True`` once this role is resolved for now — filled, definitively
+        FAILED, or its stage timed out (``_expire_entry_stage`` decides
+        which) — so the caller may move on to derive the next role fresh.
+        ``False`` only means "still waiting, no fresh quote yet, deadline
+        not reached" — retried again on a later evaluation, exactly like
+        ``_open_leg_now`` on its own already promised.
+
+        The first attempt at a role arms and durably persists this stage's
+        deadline *before* the dynamic subscription for its contract is ever
+        requested — a crash between those two would otherwise leave a
+        subscription in flight for a stage the engine no longer remembers
+        timing. Every later attempt at the *same* role (this evaluation's
+        resume, or a resumed cycle after a restart) checks the deadline
+        *before* ever consulting the quote book: a quote that arrives after
+        the deadline must never reopen or continue the entry, so once
+        expired it is never even looked at.
+        """
+        assert self._cycle is not None
+        if self._cycle.entry_stage_role is not role:
+            self._cycle.entry_stage_role = role
+            self._cycle.entry_stage_deadline_at = ts + timedelta(
+                seconds=self._entry_leg_timeout_seconds
+            )
+            try:
+                self._persist_cycle(critical=True)
+            except MultiLegDurabilityError:
+                log.error(
+                    "%s: could not durably arm the entry stage for %s; refusing to "
+                    "subscribe or attempt it this evaluation",
+                    self.label,
+                    role.value,
+                )
+                self._cycle.entry_stage_role = None
+                self._cycle.entry_stage_deadline_at = None
+                return False
+            if leg.contract is not None:
+                self.feed.subscribe(leg.contract.security_id)
+            # entry_leg_timeout_seconds > 0, so a freshly-armed deadline is
+            # always still in the future relative to ts — proceed straight
+            # to the fill attempt below without re-checking it.
+        else:
+            if leg.contract is not None:
+                self.feed.subscribe(leg.contract.security_id)
+            deadline = self._cycle.entry_stage_deadline_at
+            if deadline is not None and ts >= deadline:
+                self._expire_entry_stage(leg, role, ts)
+                return True
+
+        if self._open_leg_now(leg, ts):
+            self._clear_entry_stage(ts)
+            return True
+        return False
+
+    def _clear_entry_stage(self, ts: datetime) -> None:
+        assert self._cycle is not None
+        self._cycle.entry_stage_role = None
+        self._cycle.entry_stage_deadline_at = None
+        self._persist_cycle()
+
+    def _expire_entry_stage(self, leg: LegInstance, role: LegRole, ts: datetime) -> None:
+        """A staged-entry step's deadline has passed with no confirmed
+        fill. Spec section 5.3: "a timeout or unknown response is not a
+        failed order — reconcile before retrying." Reconciles against
+        authoritative order/position state *before* deciding anything, so a
+        genuine (if late) fill is adopted rather than discarded, and a
+        genuinely ambiguous submission blocks rather than guesses."""
+        assert self._cycle is not None
+        outcome = self._entry_submission_outcome(leg)
+        if outcome == _FILLED:
+            position = self._open_position_for(leg.contract.security_id) if leg.contract else None
+            if position is not None:
+                leg.state = LegState.OPEN
+                leg.entry_price = position.average_price
+                leg.quantity = position.quantity
+                leg.entry_time = ts
+                leg.last_price = position.average_price
+                leg.entry_correlation_id = position.entry_correlation_id
+                self._persist_leg(leg)
+                self._clear_entry_stage(ts)
+                self._log_event(
+                    "entry_stage_reconciled_filled",
+                    f"{leg.leg_id} ({role.value}) had actually filled by its stage "
+                    "deadline; adopted rather than failed",
+                    ts,
+                )
+                return
+            # A FILLED order row but no matching authoritative open position
+            # — never guessed at; treated the same as a genuinely unknown
+            # submission below.
+            outcome = _SUBMISSION_UNKNOWN
+
+        if outcome in (_NEVER_PLACED, _TERMINAL_NO_FILL):
+            leg.state = LegState.FAILED
+            self._persist_leg(leg)
+            if leg.contract is not None:
+                self.feed.unsubscribe(leg.contract.security_id)
+            self._clear_entry_stage(ts)
+            self._log_event(
+                "entry_stage_timed_out",
+                f"{leg.leg_id} ({role.value}) timed out waiting for a fresh quote "
+                f"(submission_outcome={outcome}); no exposure was ever opened for it",
+                ts,
+            )
+            return
+
+        # UNKNOWN: this engine cannot safely tell whether an order was ever
+        # submitted for this leg, let alone whether it filled — fail closed
+        # exactly like _fail_closed_pending_adjustment's own posture.
+        # entry_stage_role/entry_stage_deadline_at are deliberately left as
+        # they are (a forensic record of exactly what timed out) — never
+        # cleared, never auto-retried.
+        self._record_incident(
+            self._cycle.cycle_id,
+            f"entry stage for {role.value} ({leg.leg_id}) timed out with an unknown "
+            "order-submission outcome — cannot safely resume or unwind automatically",
+        )
+        self.block_entries(
+            f"cycle {self._cycle.cycle_id}: entry stage {role.value} needs "
+            "operator/controlled reconciliation"
+        )
+        self._cycle.state = CycleState.CRITICAL_UNRESOLVED
+        self._persist_cycle()
+
+    def _entry_submission_outcome(self, leg: LegInstance) -> str:
+        """``NEVER_PLACED`` | ``UNKNOWN`` | ``TERMINAL_NO_FILL`` | ``FILLED``
+        for ``leg``'s own entry-side order — mirrors
+        ``positional_multi_leg_engine_worker._resolve_intent_outcome``
+        exactly (duplicated, never imported — see this module's own
+        docstring for why a runtime composition-root module is never a
+        dependency of common/engine)."""
+        assert self._cycle is not None
+        history = self._repository.cycle_order_history(cycle_id=self._cycle.cycle_id)
+        rows = [r for r in history if r["leg_id"] == leg.leg_id and r["side"] == leg.side.value]
+        if not rows:
+            return _NEVER_PLACED
+        status = rows[-1]["order_status"]
+        if status is None:
+            return _SUBMISSION_UNKNOWN
+        if status == "FILLED":
+            return _FILLED
+        if status in ("REJECTED", "CANCELLED", "EXPIRED"):
+            return _TERMINAL_NO_FILL
+        return _SUBMISSION_UNKNOWN
+
+    def _open_position_for(self, security_id: str) -> Position | None:
+        assert self._cycle is not None
+        for position in self._repository.open_positions_for_cycle(cycle_id=self._cycle.cycle_id):
+            if position.security_id == security_id:
+                return position
+        return None
+
     def _finalize_entry(self, ts: datetime) -> None:
         assert self._cycle is not None
         hedge_put = self._cycle.original_leg(LegRole.HEDGE_PUT)
@@ -941,13 +1168,30 @@ class PositionalMultiLegEngine:
         self._cycle.day_blocked_reason = "partial entry — unwinding"
         self._persist_cycle()
 
-        for leg in list(self._cycle.open_legs()):
-            self._close_leg_safely(
-                leg, ts, ExitReason.STRATEGY_EXIT, reason_text="partial-entry unwind"
-            )
+        # Shorts before hedges, exactly like _exit_all (spec section 6.2/8):
+        # a partial entry can genuinely have a short open here (e.g. both
+        # hedges + the short put filled, the short call's own stage timed
+        # out) — closing a hedge first would briefly leave that short naked.
+        for leg in list(self._cycle.legs.values()):
+            if leg.role in SHORT_ROLES and leg.state is LegState.OPEN:
+                self._close_leg_safely(
+                    leg, ts, ExitReason.STRATEGY_EXIT, reason_text="partial-entry unwind"
+                )
+        for leg in list(self._cycle.legs.values()):
+            if leg.role in HEDGE_ROLES and leg.state is LegState.OPEN:
+                self._close_leg_safely(
+                    leg, ts, ExitReason.STRATEGY_EXIT, reason_text="partial-entry unwind"
+                )
+        for leg in list(self._cycle.legs.values()):
+            if leg.role is LegRole.GENERIC and leg.state is LegState.OPEN:
+                self._close_leg_safely(
+                    leg, ts, ExitReason.STRATEGY_EXIT, reason_text="partial-entry unwind"
+                )
         for leg in list(self._cycle.pending_legs()):
             leg.state = LegState.EXPIRED
             self._persist_leg(leg)
+            if leg.contract is not None:
+                self.feed.unsubscribe(leg.contract.security_id)
 
         if self._cycle.unresolved_legs():
             self._cycle.state = CycleState.CRITICAL_UNRESOLVED

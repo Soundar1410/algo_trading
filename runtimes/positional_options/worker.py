@@ -365,6 +365,7 @@ def build_engine(
         min_minutes_between_adjustments=config.min_minutes_between_adjustments,
         evaluation_interval_seconds=config.evaluation_interval_seconds,
         max_quote_age_seconds=config.quote_max_age_seconds,
+        entry_leg_timeout_seconds=config.entry_leg_timeout_seconds,
         notifier=notifier or NullNotifier(),
         reporter=(
             HeartbeatEngineReporter(

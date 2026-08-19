@@ -298,6 +298,7 @@ def test_shipped_migrations_start_at_the_walking_skeleton():
         "0009",
         "0010",
         "0011",
+        "0012",
     ]
     assert shipped[0].name == "walking_skeleton"
     assert shipped[1].name == "feed_and_auth_health"
@@ -316,6 +317,8 @@ def test_shipped_migrations_start_at_the_walking_skeleton():
     # strategy-weekly-delta-neutral gap-closing session: real margin-gate
     # decision snapshots (spec section 3.7).
     assert shipped[10].name == "strategy_cycle_margin_snapshots"
+    # Phase 5A: bounded staged-entry timeout (spec section 5.3).
+    assert shipped[11].name == "positional_entry_stage_deadline"
 
 
 def test_shipped_migrations_apply_to_a_fresh_database(tmp_path: Path):
@@ -344,6 +347,7 @@ def test_shipped_migrations_apply_to_a_fresh_database(tmp_path: Path):
         "0009",
         "0010",
         "0011",
+        "0012",
     ]
     assert database.integrity_check() == []
     assert database.foreign_key_check() == []
@@ -412,6 +416,7 @@ def test_later_migrations_upgrade_a_database_created_by_0001_alone(tmp_path: Pat
         "0009",
         "0010",
         "0011",
+        "0012",
     ]
     with database.connect() as conn:
         survivors = conn.execute("SELECT COUNT(*) FROM runtime_sessions").fetchone()[0]
@@ -901,7 +906,7 @@ def test_migration_0010_upgrades_a_database_created_by_0009_with_real_rows(tmp_p
     )
 
     applied = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
-    assert [m.version for m in applied] == ["0010", "0011"]
+    assert [m.version for m in applied] == ["0010", "0011", "0012"]
 
     assert database.integrity_check() == []
     assert database.foreign_key_check() == []

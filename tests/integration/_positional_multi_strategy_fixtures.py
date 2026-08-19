@@ -77,6 +77,30 @@ def build_fixture_margin_fetcher() -> Callable[[Any], float]:
     return _fixture_margin_fetcher
 
 
+def build_weekly_chain_fetcher() -> Callable[[int, str, str], dict[str, object]]:
+    """A ``WorkerConfig.chain_fetcher_factory`` target for the real
+    ``weekly_delta_neutral`` strategy (Phase 5A production-path proof) — a
+    thin, zero-arg, picklable-by-reference wrapper reusing
+    ``_weekly_delta_neutral_fixtures.py``'s own ``initial_chain_payload``/
+    ``chain_fetcher_for`` rather than duplicating the strike/Greeks payload
+    those already define. Imported *inside* the function, not at module
+    level: this file must stay resolvable in a freshly spawned child before
+    any of this repository's own path wiring runs (see the module
+    docstring's own reasoning for why every factory here is a bare
+    module-level function)."""
+    from _weekly_delta_neutral_fixtures import chain_fetcher_for, initial_chain_payload
+
+    return chain_fetcher_for(initial_chain_payload())
+
+
+def build_weekly_margin_fetcher() -> Callable[[Any], float]:
+    """The margin-side counterpart of :func:`build_weekly_chain_fetcher` —
+    see that function's own docstring."""
+    from _weekly_delta_neutral_fixtures import fake_margin_fetcher
+
+    return fake_margin_fetcher
+
+
 def fixture_scrip_master() -> ScripMaster:
     """A minimal, in-memory NIFTY master — one strike, both option types, one
     expiry safely in the future. ``DhanOptionChainResolver.__init__`` calls

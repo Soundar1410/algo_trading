@@ -240,6 +240,20 @@ class Cycle:
     last_adjustment_at: datetime | None = None
     pending_adjustment_role: LegRole | None = None
     pending_adjustment_state: str | None = None
+    #: Phase 5A: the durable clock for a bounded staged-entry step (spec
+    #: section 5.2/5.3). At most one stage is ever in flight — entry is
+    #: strictly sequential (:data:`ENTRY_ROLE_ORDER`) — so one role/deadline
+    #: pair suffices, the same way ``pending_adjustment_role``/
+    #: ``pending_adjustment_state`` suffice for the one in-flight adjustment.
+    #: ``entry_stage_role`` names which role's stage is currently timed;
+    #: ``entry_stage_deadline_at`` is the absolute instant it expires — armed
+    #: and persisted *before* that role's dynamic subscription is ever
+    #: requested (``PositionalMultiLegEngine._advance_entry_stage``), and
+    #: preserved verbatim across a restart, never recomputed from the
+    #: restart's own clock. Both ``None`` whenever no stage is in flight
+    #: (entry not yet started, already complete, or already failed/unwound).
+    entry_stage_role: LegRole | None = None
+    entry_stage_deadline_at: datetime | None = None
     square_off_state: str = "PENDING"
     created_at: datetime | None = None
 
