@@ -7605,12 +7605,9 @@ refactor:
 
 ### 11.8 Known limitations (this branch)
 
-- **Chain payload shape unverified against a live response.**
-  `common/market_data/chain_view.py`'s own docstring already says so;
-  carried forward, not newly introduced — the same category of gap
-  `verify_vix_security_id.py` exists to close for a different field, and
-  the same bounded, read-only, no-order-capability pattern should close
-  this one before the first live paper session.
+- ~~**Chain payload shape unverified against a live response.**~~ **Closed
+  in Phase 4 (structural, 16 August 2026) and Phase 6 (market-hours
+  freshness, 19 August 2026)** — see those sections below.
 - **No genuine broker-side `LIMIT` order.** `OrderLifecycle.handle_signal`
   always builds `OrderType.MARKET` — a structural fact of shared code
   every strategy routes through, not something this branch could change
@@ -7983,9 +7980,15 @@ existing tests stay scoped to the timing rows they always covered
    non-`OPEN` leg via `Cycle.current_leg` and silently returned `None`
    forever — no retry, no incident, the leg stuck `PENDING_ORDER`
    indefinitely. Fixed with a new `PositionalMultiLegEngine.
-   _resume_pending_adjustment`, called on every evaluation (mirroring
-   `_drive_entry`'s own cross-evaluation retry of a pending entry leg),
-   which retries a `REPLACEMENT_PENDING` leg still `PENDING_ORDER`, and
+   _resume_pending_adjustment`, called on every evaluation. **Correction
+   (Phase 5A, 19 August 2026): the original wording here claimed this
+   mirrored "`_drive_entry`'s own cross-evaluation retry of a pending entry
+   leg" — that claim was false when written. `_drive_entry` had no such
+   retry at all; a pending *entry* leg that missed its first fresh quote
+   was stuck exactly the same way, undiscovered until Phase 5's own
+   multi-process integration work surfaced it and Phase 5A closed it with
+   `_resume_pending_entry`, built the other way round from this method.**
+   This method retries a `REPLACEMENT_PENDING` leg still `PENDING_ORDER`, and
    — the harder case — safely resumes an `EXIT_SUBMISSION_PENDING`/
    `EXIT_UNKNOWN` claim whose old short's close was never actually applied
    (proven from the leg's own, already-reconciled state, never guessed at
@@ -8164,6 +8167,15 @@ folded into the general "known limitations" list: re-run
 `scripts.verify_dhan_option_chain` during a live NSE session (09:15-15:30
 IST, a trading day) before `weekly_delta_neutral` is ever enabled, and
 record that result here.
+
+**Closed in Phase 6 (19 August 2026) — see that section below for the full
+result:** re-run during a real live NSE session (Wednesday 12:12 IST),
+structural validation and market-hours freshness both PASS. This was the
+only remaining named paper-enablement blocker; it is closed, though
+`weekly_delta_neutral` stays disabled pending the other, separately-named,
+non-technical approvals (30-day paper evaluation, second real paper
+strategy, EMA-specific minimum-quantity approval, static-IP/provider setup,
+live auth revalidation, explicit gate-flip approval) unchanged by this.
 
 **New permanent regression fixture:** `tests/fixtures/
 dhan_option_chain_sample.json` — sanitized and representative, **not** a
@@ -8630,3 +8642,90 @@ committed.py` — OK. No order-capable/live Dhan endpoint referenced or
 called anywhere in this phase; every feed adapter in every new/changed test
 is a fully in-process/in-repository fake. All live gates remain disabled —
 this phase touches no gate-controlling config.
+
+### Phase 6 — Final consolidated verification, audit and completion report (19 August 2026)
+
+Documentation- and verification-only phase — no production code changed
+(only this file). Closes the last named paper-enablement blocker and
+audits the whole branch before the strategy is described as
+implementation-complete.
+
+**1. Market-hours option-chain freshness — CLOSED.** Re-ran
+`scripts.verify_dhan_option_chain --underlying NIFTY` during a real live
+NSE session (Wednesday 2026-08-19, 12:12 IST, market open). Both sections
+PASS: structural validation (18 expiries, 244 strikes parsed with zero
+`ChainPayloadError`, no field-mapping mismatch on the sampled round trip,
+no bid/ask-crossed book, no negative IV, `has_complete_greeks` true for a
+real near-the-money sample — non-zero, finite Greeks) and market-hours
+freshness (response age 0.04s, `stale=False`). This was Phase 4's own
+named blocker (structural PASS, freshness explicitly SKIPPED-not-claimed
+on a Sunday); it is now genuinely observed, not inferred. Strictly
+read-only — no broker/order client constructed, no order-capable endpoint
+referenced (unchanged from Phase 4's own proof of that). Corrected two
+now-stale documentation passages found while closing this out: 11.8's
+"chain payload shape unverified" bullet (now struck through, closed) and a
+factually wrong claim in 11.10 Phase 3 that `_drive_entry` already had
+cross-evaluation entry retry when that section was written (it did not —
+Phase 5A both found and closed that gap; the claim is corrected in place,
+not silently left).
+
+**2. Full code/architecture audit against both foundation branches
+(`phase-10-controlled-live`, `strategy-straddle-920` — both are ancestors
+of this branch per `git merge-base`) — no defect found.** Verified
+directly (grep + targeted reads, not assumed): zero imports/`sys.path`
+references to the legacy `Trading_Automation` package anywhere in
+`common`/`strategies`/`runtimes`/`dashboards`/`scripts` (every match is
+either `common/process/legacy_guard.py`'s own *exclusion* detector or a
+docstring describing logic that was ported, never a dependency); no
+hardcoded `lot_size` literal in the positional strategy/engine code, and
+`config_adapter.build_worker_config` still refuses a strategy config that
+sets `parameters.lot_size` at all; `select_iron_condor` still collects all
+four legs' own `contract.lot_size` into a set and rejects unless exactly
+one, positive value is agreed; `_resolve_actual_expiry` still resolves
+from `ScripMaster.nearest_expiry` (authoritative reference data), never
+weekday arithmetic; `original_net_credit` is written exactly once, in
+`_finalize_entry`, never touched by any adjustment/exit path; the string
+`weekly_delta_neutral` appears in `common/engine/positional/*.py` only in
+comments/docstrings, never a code branch (`test_no_weekly_delta_neutral_
+branches.py` still passes); no file under `common/engine/engine.py` or
+`common/engine/multi_leg_engine.py` (the intraday engine) was touched by
+this branch at any point; `dashboards/data/positional.py` still only ever
+calls `conn.execute(SELECT ...)` against a `connect_readonly` connection.
+Every other checklist item (cycle_id survives restarts, positions retain
+their opening date, staged entry is hedge-first/bounded/restart-safe,
+shorts close before hedges in both `_exit_all` and the Phase-5A-fixed
+`_unwind_partial_entry`, incomplete flattening stays `CRITICAL_UNRESOLVED`,
+margin gating fails closed, stale quotes/Greeks/margin block only
+risk-*increasing* actions while every exit check runs unconditionally
+before that gate, N isolated workers over one shared feed) is the
+unmodified subject of Phases 3-5A above and re-confirmed here by the full
+regression run below, not re-derived from scratch.
+
+**3/4. Acceptance and regression gates, full verification — see this
+session's own final report for the complete, itemised pass/fail table
+(every named suite the task specified, plus full `pytest`/`ruff`/`mypy`/
+`assert_no_live_config_committed`/`validate_environment`).** Headline:
+2504 collected, 2486 passed, 18 skipped (all pre-existing,
+environment-gated: live-smoke-test credential/opt-in guards and two
+documented dashboard/legacy-plist design skips), 0 failed, 0 errors. Every
+explicitly named battery (weekly_delta_neutral + positional family, EMA
+Rev 3.1 + warmup/exit-registry, straddle_920, Phase 10 live-safety/
+preflight/rate-limiter, broker/paper-execution, feed-hub/dynamic-
+subscription, dashboard AppTest/read-only, migrations 0001-0012, process-
+lock/heartbeat/square-off/account-wide-coordination) passed in full, run
+both individually and as part of the one full suite. Nothing was skipped,
+loosened or deleted to reach this. `ruff check .` clean; `mypy --strict`
+clean; `python scripts/assert_no_live_config_committed.py` OK;
+`python -m scripts.validate_environment --runtime-id positional_options`
+— all checks passed, read-only, runtime never started.
+
+**5. Paper-enablement status.** The market-hours freshness blocker is
+closed. `weekly_delta_neutral` and the `positional_options` runtime remain
+`enabled: false` — unchanged, and correctly so: the outstanding,
+non-technical approvals CLAUDE.md and 11.9 already name (a 30-day paper
+evaluation, the separately-specified second real paper strategy,
+EMA-specific minimum-quantity approval, static-IP/provider setup, live
+auth revalidation, and explicit operator approval to flip any gate) are
+unaffected by this phase and remain outstanding. No config, gate, or
+auto-start file was touched. No order-capable Dhan endpoint was called
+anywhere in this phase.
