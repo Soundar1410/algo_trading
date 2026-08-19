@@ -21,10 +21,14 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from _weekly_delta_neutral_fixtures import OffsetClock
+
 from common.engine.config import SessionConfig
+from common.feed.reconnect import ReconnectingFeed
 from common.models import Tick
 from common.persistence import Database, MigrationRunner
 from common.process import worker_lock
+from common.utils.timeutils import now_ist
 from runtimes.positional_options.config_adapter import WorkerConfig
 from runtimes.positional_options.supervisor import (
     EXIT_OK,
@@ -84,6 +88,55 @@ class _FakeAdapter:
         self._running = False
 
 
+class _FlakyAdapter:
+    """A scripted batch, a disconnect, then a second batch — the real
+    socket shape ``test_feed_reconnect.py``'s own ``_ScriptedAdapter``
+    already established, reused here (Phase 6A) to prove the supervisor's
+    real ``ReconnectingFeed`` wrap survives a genuine reconnect under two
+    real spawned workers without either one being disrupted."""
+
+    def __init__(self, *batches: Any) -> None:
+        self._batches = list(batches)
+        self._running = False
+        self.resubscribe_calls = 0
+
+    def subscribe(
+        self, security_ids: Any, *, segment: int | None = None, mode: int | None = None
+    ) -> None:
+        pass
+
+    def resubscribe_all(self) -> None:
+        self.resubscribe_calls += 1
+
+    def request_stop(self) -> None:
+        self._running = False
+
+    def stop(self) -> None:
+        self._running = False
+
+    def start(self, on_tick: Any, *, on_idle: Any = None) -> None:
+        self._running = True
+        try:
+            while self._batches:
+                item = self._batches.pop(0)
+                if isinstance(item, Exception):
+                    raise item
+                for tick in item:
+                    if not self._running:
+                        break
+                    on_tick(tick)
+                # Deliver, then die — the realistic shape of a dropped
+                # socket (same "peek ahead" shape as test_feed_reconnect.
+                # py's own _ScriptedAdapter): only actually return (a clean
+                # end) if nothing scripted next is an exception; otherwise
+                # keep looping so the next iteration raises it.
+                if self._batches and isinstance(self._batches[0], Exception):
+                    continue
+                return
+        finally:
+            self._running = False
+
+
 def _worker_config(
     tmp_path: Path, *, strategy_id: str, database_path: Path
 ) -> WorkerConfig:
@@ -124,7 +177,7 @@ def _worker_config(
 
 
 def _build_supervisor(
-    tmp_path: Path, *, database_path: Path, adapter: _FakeAdapter
+    tmp_path: Path, *, database_path: Path, adapter: _FakeAdapter, clock: Any = None
 ) -> PositionalOptionsSupervisor:
     runtime_root = tmp_path / "runtime"
     config = PositionalSupervisorConfig(
@@ -136,7 +189,9 @@ def _build_supervisor(
         runtime_root=runtime_root,
         cache_dir=tmp_path / "cache",
     )
-    return PositionalOptionsSupervisor(config, adapter)
+    if clock is None:
+        return PositionalOptionsSupervisor(config, adapter)
+    return PositionalOptionsSupervisor(config, adapter, clock=clock)
 
 
 def _incident_messages(database_path: Path, *, strategy_id: str) -> list[str]:
@@ -195,7 +250,16 @@ def test_two_workers_share_one_feed_and_are_independently_isolated(tmp_path: Any
     ticks = [_tick(NIFTY_SECURITY_ID, 24000.0 + i, ts + timedelta(seconds=i)) for i in range(3)]
     adapter = _FakeAdapter(ticks)
 
-    supervisor = _build_supervisor(tmp_path, database_path=database_path, adapter=adapter)
+    # Phase 6A: context.spot_is_fresh is now time-bounded against the
+    # engine's own clock (previously it meant only "a spot tick has ever
+    # arrived") — the spawned worker's clock must track this test's own
+    # simulated tick timeline, not the real wall clock, or the fixture
+    # strategy's fresh-spot marker (asserted below) never fires. Picklable,
+    # so it survives the real multiprocessing.Process spawn boundary.
+    clock = OffsetClock(offset=ts - now_ist())
+    supervisor = _build_supervisor(
+        tmp_path, database_path=database_path, adapter=adapter, clock=clock
+    )
     alpha = _worker_config(tmp_path, strategy_id="_fixture_alpha", database_path=database_path)
     beta = _worker_config(tmp_path, strategy_id="_fixture_beta", database_path=database_path)
     supervisor.add_worker(alpha)
@@ -284,7 +348,13 @@ def test_single_worker_n_equals_1_case_is_unchanged(tmp_path: Any) -> None:
     ticks = [_tick(NIFTY_SECURITY_ID, 24000.0, ts)]
     adapter = _FakeAdapter(ticks)
 
-    supervisor = _build_supervisor(tmp_path, database_path=database_path, adapter=adapter)
+    # See the two-worker test's own comment: the fixture strategy's
+    # fresh-spot marker needs the worker's clock on the same timeline as
+    # this test's own simulated tick.
+    clock = OffsetClock(offset=ts - now_ist())
+    supervisor = _build_supervisor(
+        tmp_path, database_path=database_path, adapter=adapter, clock=clock
+    )
     solo = _worker_config(tmp_path, strategy_id="_fixture_solo", database_path=database_path)
     supervisor.add_worker(solo)
 
@@ -351,4 +421,61 @@ def test_dynamic_subscription_routes_to_the_correct_worker_in_full_mode(tmp_path
     assert len(subscribe_calls) == 1
     assert subscribe_calls[0][1] == option_segment_code
     assert subscribe_calls[0][2] == full_mode
+
+
+# ============================================ Phase 6A: reconnect + isolation
+def test_the_supervisor_wraps_its_adapter_in_a_reconnecting_feed(tmp_path: Any) -> None:
+    """Direct wiring proof — mirrors ``test_supervisor_health_wiring.py``/
+    ``test_candle_gap_policy_wiring.py``'s own established pattern for this
+    exact kind of assertion on the intraday supervisor."""
+    database_path = tmp_path / "positional_options.db"
+    MigrationRunner(Database(database_path)).run_pending()
+    adapter = _FakeAdapter([])
+    supervisor = _build_supervisor(tmp_path, database_path=database_path, adapter=adapter)
+
+    assert isinstance(supervisor._feed, ReconnectingFeed)
+    assert supervisor.hub._adapter is supervisor._feed
+
+
+def test_two_workers_share_one_feed_and_stay_isolated_through_a_reconnect(tmp_path: Any) -> None:
+    """A real scripted disconnect/reconnect cycle (the real default
+    ``ReconnectPolicy`` backoff — no override, mirroring
+    ``IntradayOptionsSupervisor``'s own precedent of not exposing one) under
+    two real spawned worker processes sharing one hub. Both workers'
+    sessions/incident markers survive it independently — the reconnect wrap
+    never leaks across worker boundaries, and neither worker is disrupted or
+    duplicated by it."""
+    database_path = tmp_path / "positional_options.db"
+    MigrationRunner(Database(database_path)).run_pending()
+
+    t0 = datetime(2026, 8, 19, 9, 26, tzinfo=UTC)
+    first_batch = [_tick(NIFTY_SECURITY_ID, 24000.0, t0)]
+    second_batch = [_tick(NIFTY_SECURITY_ID, 24001.0, t0 + timedelta(seconds=5))]
+    adapter = _FlakyAdapter(first_batch, ConnectionResetError("scripted drop"), second_batch)
+
+    clock = OffsetClock(offset=t0 - now_ist())
+    supervisor = _build_supervisor(
+        tmp_path, database_path=database_path, adapter=adapter, clock=clock
+    )
+    alpha = _worker_config(tmp_path, strategy_id="_fixture_alpha", database_path=database_path)
+    beta = _worker_config(tmp_path, strategy_id="_fixture_beta", database_path=database_path)
+    supervisor.add_worker(alpha)
+    supervisor.add_worker(beta)
+
+    result = supervisor.run()
+
+    assert result.workers_started == 2
+    assert result.worker_exit_codes["_fixture_alpha"] == EXIT_OK
+    assert result.worker_exit_codes["_fixture_beta"] == EXIT_OK
+    assert adapter.resubscribe_calls >= 1, "the scripted drop must have actually reconnected"
+
+    # Each worker's own fresh-spot marker fired (from the first batch, before
+    # the drop) and its own session ended cleanly — independently keyed by
+    # its own strategy_id, proving the reconnect never wedged or
+    # cross-contaminated either sibling.
+    for strategy_id in ("_fixture_alpha", "_fixture_beta"):
+        incidents = _incident_messages(database_path, strategy_id=strategy_id)
+        assert len(incidents) == 1
+        sessions = _session_rows(database_path, strategy_id=strategy_id)
+        assert len(sessions) == 1 and sessions[0]["ended_at"] is not None
 

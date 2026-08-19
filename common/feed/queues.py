@@ -65,6 +65,46 @@ class TickDropNotice:
     dropped: int
 
 
+@dataclass(frozen=True)
+class FeedGapNotice:
+    """Sent down *every* worker's tick channel when the shared feed's own
+    connection state changes in a way that must gate a risk-increasing
+    engine decision (Phase 6A).
+
+    Unlike :class:`TickDropNotice` (per-channel, raised only for the one
+    worker whose own queue overflowed), this is broadcast to every
+    registered channel unconditionally — a feed-level disconnect or
+    reconnect affects every worker sharing that one feed equally (see
+    :meth:`~common.feed.hub.SharedFeedHub.broadcast_feed_gap`).
+
+    ``kind`` is ``"disconnected"`` — raised the instant
+    :class:`~common.feed.reconnect.ReconnectingFeed` marks itself
+    disconnected, so a worker's own engine can latch a recoverable
+    market-data-degraded gate *before* any further risk-increasing
+    decision — or ``"resubscribed"`` — raised once a reconnect's own
+    resubscription round trip completes. ``"resubscribed"`` is
+    confirmation the round trip happened, never proof of fresh data by
+    itself: the consumer must still observe a genuinely fresh post-event
+    tick for everything it currently needs before treating itself as
+    recovered (spec-equivalent to the supervisor's own "fresh ticks before
+    degraded clears" rule, applied per-worker rather than only at the
+    feed's own aggregate health).
+
+    Crosses a pickle boundary like ``TickDropNotice`` — consumers must
+    match on type, not identity. Same bounded/drop-oldest delivery
+    guarantee as ``TickDropNotice``: "at least one gets through", not "none
+    is lost" — a low-frequency, high-importance event, not a new guarantee
+    invented here.
+    """
+
+    kind: str
+    #: Wall-clock instant this notice was raised — timezone-aware, the
+    #: instant a consumer compares its own later tick timestamps against
+    #: (never inferred fresh from a naive or missing timestamp; see
+    #: :func:`~common.utils.timeutils.is_fresh`).
+    at: datetime
+
+
 #: Send a drop notice on the first drop, then every this-many drops.
 #:
 #: Publishing one per dropped tick was the first implementation and is **measured**

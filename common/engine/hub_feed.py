@@ -60,7 +60,7 @@ import queue as queue_module
 from collections.abc import Callable
 from typing import Any
 
-from common.feed.queues import TickDropNotice
+from common.feed.queues import FeedGapNotice, TickDropNotice
 from common.logging import get_logger
 from common.models import Tick
 
@@ -89,6 +89,7 @@ class HubTickFeed(MarketDataFeed):
         request_subscription: Callable[[str], None] | None = None,
         on_square_off: Callable[[str], None] | None = None,
         on_tick_dropped: Callable[[TickDropNotice], None] | None = None,
+        on_feed_gap: Callable[[FeedGapNotice], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
         on_poll: Callable[[], None] | None = None,
         poll_seconds: float = DEFAULT_POLL_SECONDS,
@@ -99,6 +100,10 @@ class HubTickFeed(MarketDataFeed):
         self._request_subscription = request_subscription
         self._on_square_off = on_square_off
         self._on_tick_dropped = on_tick_dropped
+        #: Phase 6A: the shared feed's own connection-state notices
+        #: (disconnected/resubscribed), broadcast to every worker regardless
+        #: of instrument — see ``FeedGapNotice``'s own docstring.
+        self._on_feed_gap = on_feed_gap
         #: Asked on every poll wake, so a shutdown is honoured even while the stream
         #: is silent. The worker wires this to ``engine.square_off_requested``; see
         #: the module docstring for why the check belongs here.
@@ -191,6 +196,16 @@ class HubTickFeed(MarketDataFeed):
                     )
                     if self._on_tick_dropped is not None:
                         self._on_tick_dropped(item)
+                    continue
+
+                if isinstance(item, FeedGapNotice):
+                    # Not a tick, not a sentinel, not a drop — a feed-level
+                    # connection-state change every worker sharing the feed
+                    # receives (see FeedGapNotice's own docstring for why
+                    # this is broadcast rather than routed like a tick).
+                    log.warning("feed gap notice: kind=%s at=%s", item.kind, item.at)
+                    if self._on_feed_gap is not None:
+                        self._on_feed_gap(item)
                     continue
 
                 tick: Tick = item

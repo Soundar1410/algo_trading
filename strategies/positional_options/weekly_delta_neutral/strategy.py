@@ -362,9 +362,12 @@ class WeeklyDeltaNeutralStrategy(BasePositionalMultiLegStrategy):
         if margin_breached:
             return self._exit_all(context, "margin-limit breach", ExitReason.STOP_LOSS)
 
-        if not greeks_available:
-            # Spec section 4.2: missing/invalid Greeks block new/adjustment
-            # risk but never an exit — every exit branch above already ran.
+        if not greeks_available or not context.spot_is_fresh:
+            # Spec section 4.2: missing/invalid Greeks — or, Phase 6A, a
+            # stale underlying — block new/adjustment risk but never an
+            # exit: every exit branch above already ran. spot_is_fresh is
+            # the same generic, now time-bounded field _evaluate_entry
+            # already reads for the identical reason at entry.
             return None
 
         hedge_repair = self._hedge_repair_needed(cycle, context)

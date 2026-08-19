@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 from common.config.models import ExecutionMode
 from common.engine.config import SessionConfig
 from common.engine.feed import SimulatedFeed
-from common.engine.positional.positional_models import CycleState, LegRole
+from common.engine.positional.positional_models import CycleState, LegRole, cycle_id_for
 from common.execution import ExecutionRepository
 from common.margin import LegMarginRequest, MarginEstimator
 from common.market_data.scrip_master import ScripMaster
@@ -232,7 +232,13 @@ def test_weekly_delta_neutral_hedge_first_entry(tmp_path) -> None:  # type: igno
         built.engine.run()
 
         # -------------------------------------------------------- durable cycle
-        cycle_id = f"weekly_delta_neutral:{EXPIRY_DATE}"
+        cycle_id = cycle_id_for(
+            runtime_id="positional_options",
+            strategy_id="weekly_delta_neutral",
+            execution_mode=ExecutionMode.PAPER,
+            underlying="NIFTY",
+            resolved_expiry_date=EXPIRY_DATE,
+        )
         cycle_row = repository.load_cycle(cycle_id=cycle_id)
         assert cycle_row is not None
         assert cycle_row["state"] == CycleState.ACTIVE.value

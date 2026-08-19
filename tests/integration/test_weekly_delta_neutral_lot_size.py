@@ -30,6 +30,7 @@ from zoneinfo import ZoneInfo
 from common.config.models import ExecutionMode
 from common.engine.config import SessionConfig
 from common.engine.feed import SimulatedFeed
+from common.engine.positional.positional_models import cycle_id_for
 from common.execution import ExecutionRepository
 from common.margin import LegMarginRequest, MarginEstimator
 from common.market_data.scrip_master import ScripMaster
@@ -230,7 +231,13 @@ def test_entry_resolves_the_current_real_lot_size_from_contract_metadata(
         )
         built.engine.run()
 
-        cycle_id = f"weekly_delta_neutral:{EXPIRY_DATE}"
+        cycle_id = cycle_id_for(
+            runtime_id="positional_options",
+            strategy_id="weekly_delta_neutral",
+            execution_mode=ExecutionMode.PAPER,
+            underlying="NIFTY",
+            resolved_expiry_date=EXPIRY_DATE,
+        )
         legs = repository.load_cycle_legs(cycle_id=cycle_id)
         assert len(legs) == 4
         assert all(leg["state"] == "OPEN" for leg in legs)

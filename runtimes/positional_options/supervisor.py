@@ -31,16 +31,28 @@ Migrations/retention/authentication all run exactly once, in
 ``__main__.main()``, strictly before this supervisor (or any worker)
 exists — see that module's own docstring for the full startup order.
 
-**Deliberately leaner than ``IntradayOptionsSupervisor``.** This phase's
-own scope is worker isolation/routing/dedup, not feed-reconnect robustness
-— so, unlike the intraday supervisor, this one does not wrap the adapter in
-:class:`~common.feed.reconnect.ReconnectingFeed` and does not run the
-stuck-subscription/stale-instrument alarms. Both reuse the identical
-``SharedFeedHub``/``WorkerChannel`` machinery either way and neither
-omission changes anything this phase's own acceptance criteria requires;
-revisiting reconnect-robustness parity is future work, not silently
-dropped scope — see the gap-closing session's own runbook entry for this
-phase.
+**Phase 6A: reconnect/stale-feed parity with ``IntradayOptionsSupervisor``,
+reused rather than reimplemented.** The one shared adapter is wrapped in
+:class:`~common.feed.reconnect.ReconnectingFeed` exactly as the intraday
+supervisor already does (bounded backoff/jitter, automatic
+segment-and-mode-aware resubscription via the real adapter's own
+``resubscribe_all``, per-instrument staleness tracking); the
+stuck-subscription/stale-instrument alarms and feed-health-event
+persistence are ported near-verbatim from
+``IntradayOptionsSupervisor``'s own methods of the same name. New here
+(the intraday runtime has no equivalent, because its own engine's
+per-candle/per-quote freshness gates were judged sufficient at the time):
+every ``"disconnected"``/``"resubscribed"`` feed-health event is also
+broadcast, in band on the existing tick channel, to *every* worker via
+:meth:`~common.feed.hub.SharedFeedHub.broadcast_feed_gap` — each worker's
+own engine latches a recoverable market-data-degraded gate on disconnect
+and clears it only once it has observed fresh data, since the reconnect,
+for everything it currently needs (see
+``PositionalMultiLegEngine.on_feed_gap_notice``). ``ReconnectingFeed``/
+``mark_feed_gap``/supervisor health alone protect candle-aggregation
+integrity and operator visibility; they do not by themselves stop a
+worker's own engine from acting on stale data, which is what the
+propagated gate is for.
 """
 
 from __future__ import annotations
@@ -51,7 +63,8 @@ import queue as queue_module
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -64,8 +77,9 @@ from common.config import (
 )
 from common.config.models import ExecutionMode, RuntimeConfig
 from common.execution import ExecutionRepository, check_mode_transition_safety
-from common.feed import DEFAULT_TICK_MAX_DEPTH, SharedFeedHub
+from common.feed import DEFAULT_TICK_MAX_DEPTH, FeedGapNotice, SharedFeedHub
 from common.feed.hub import WorkerChannel, build_channel
+from common.feed.reconnect import FeedHealthEvent, ReconnectingFeed
 from common.health import DEFAULT_INTERVAL_SECONDS, HealthState, HeartbeatWriter
 from common.logging import get_logger
 from common.market_data.adapter import MarketFeedAdapter
@@ -98,6 +112,18 @@ HEARTBEAT_POLL_SECONDS = 1.0
 #: ``process_role`` for the group-level session — distinguishes it from the
 #: ``worker`` sessions each spawned child opens for itself.
 SUPERVISOR_ROLE = "supervisor"
+
+#: Mirrors ``IntradayOptionsSupervisor``'s own threshold (limitation 15):
+#: a runtime subscription request older than this, still unapplied, means
+#: the feed is connected but delivering nothing to this group.
+STUCK_SUBSCRIPTION_SECONDS = 30.0
+
+#: Feed-health event kinds worth a notification, not just a `feed_events`
+#: row — mirrors ``IntradayOptionsSupervisor``'s own
+#: ``_CHAT_WORTHY_FEED_EVENTS`` exactly (the other event kinds already have
+#: their own, more specific alarms: ``_check_stuck_subscription``/
+#: ``_raise_silent_feed_alarm``).
+_CHAT_WORTHY_FEED_EVENTS = frozenset({"disconnected", "recovered", "reconnect_exhausted"})
 
 
 def _parse_subscription_request(request: object) -> tuple[str, int | None, int | None] | None:
@@ -168,6 +194,11 @@ class PositionalSupervisorResult:
     #: — see ``IntradayOptionsSupervisor``'s own field of the same name for
     #: the full reasoning this mirrors.
     clean_feed_shutdown: bool = True
+    #: True once a runtime subscription has been waiting
+    #: ``STUCK_SUBSCRIPTION_SECONDS`` unapplied — mirrors
+    #: ``IntradayOptionsSupervisor``'s own field of the same name; see
+    #: ``_check_stuck_subscription``.
+    stopped_by_stuck_subscription: bool = False
 
 
 class PositionalOptionsSupervisor:
@@ -178,9 +209,25 @@ class PositionalOptionsSupervisor:
         config: PositionalSupervisorConfig,
         adapter: MarketFeedAdapter,
         notifier: Notifier | None = None,
+        clock: Callable[[], datetime] = now_ist,
     ) -> None:
         self._config = config
-        self._hub = SharedFeedHub(adapter, interval_seconds=config.candle_interval_seconds)
+        #: Threaded to every spawned worker's own ``run_worker`` clock.
+        #: Defaults to the real wall clock — production never overrides
+        #: this. Exists so a test spawning a real worker process against a
+        #: scripted, non-real-time tick stream can supply a picklable clock
+        #: whose "now" tracks that same simulated timeline (Phase 6A: a
+        #: worker's own ``on_poll`` evaluates independent of the last tick
+        #: it saw) — see ``tests.integration._weekly_delta_neutral_fixtures.
+        #: OffsetClock``.
+        self._clock = clock
+        # The adapter is wrapped rather than used bare — see the module
+        # docstring for why this now matches IntradayOptionsSupervisor.
+        # Safe for the recorded/fake adapter every test uses:
+        # ReconnectingFeed._run treats a clean return as "the tape is
+        # finished", never as a failure to retry.
+        self._feed = ReconnectingFeed(adapter, on_feed_gap=lambda: self._hub.mark_feed_gap())
+        self._hub = SharedFeedHub(self._feed, interval_seconds=config.candle_interval_seconds)
         self._workers: list[tuple[WorkerConfig, WorkerChannel]] = []
         self._processes: dict[str, mp.process.BaseProcess] = {}
         #: Upstream control queues, one per worker — the child puts a
@@ -189,6 +236,18 @@ class PositionalOptionsSupervisor:
         #: them into the hub. See :meth:`_drain_control_queues`.
         self._control_queues: dict[str, Any] = {}
         self._notifier = SafeNotifier(notifier or NullNotifier())
+        #: Latched once the stuck-subscription alarm has fired, so a
+        #: condition that persists produces one notification, not one per
+        #: poll. Mirrors ``IntradayOptionsSupervisor`` exactly.
+        self._stuck_subscription_alarmed = False
+        #: Security ids already reported stale — one ``feed_events`` row per
+        #: stale spell, not one per poll. Mirrors ``IntradayOptionsSupervisor``.
+        self._stale_instruments_alarmed: set[str] = set()
+        #: The feed's own health events land here, not in a repository call
+        #: directly — the feed runs on its own thread, and this
+        #: repository's sqlite3 connection belongs to the thread that calls
+        #: :meth:`run`. See :meth:`_drain_feed_health_events`.
+        self._feed_health_events: queue_module.Queue[FeedHealthEvent] = queue_module.Queue()
 
     @property
     def hub(self) -> SharedFeedHub:
@@ -287,6 +346,14 @@ class PositionalOptionsSupervisor:
             )
         )
 
+        # Late-bound: the feed was constructed in __init__, before this
+        # repository existed — mirrors IntradayOptionsSupervisor's own
+        # comment and reasoning verbatim. The sink only enqueues for the DB
+        # write below and broadcasts to every worker (both safe on the feed
+        # thread) — it must never touch this thread's own sqlite3 connection
+        # directly.
+        self._feed.set_health_event_sink(self._on_feed_health_event)
+
         try:
             context = mp.get_context("spawn")
             for worker_config, channel in self._workers:
@@ -297,6 +364,7 @@ class PositionalOptionsSupervisor:
                         channel.tick_queue.raw if channel.tick_queue is not None else None,
                         self._control_queues.get(worker_config.strategy_id),
                         NOTIFIER_FROM_SETTINGS,
+                        self._clock,
                     ),
                     name=f"{self._config.runtime_id}:{worker_config.strategy_id}",
                     daemon=False,
@@ -310,7 +378,9 @@ class PositionalOptionsSupervisor:
                     process.pid,
                 )
 
-            self._run_feed(result, heartbeat=heartbeat, shutdown_grace=shutdown_grace)
+            self._run_feed(
+                result, heartbeat=heartbeat, repository=repository, shutdown_grace=shutdown_grace
+            )
             result.ticks_received = self._hub.tick_count
 
             # Sentinel per worker, on every channel it has — tells a
@@ -428,13 +498,14 @@ class PositionalOptionsSupervisor:
         result: PositionalSupervisorResult,
         *,
         heartbeat: HeartbeatWriter,
+        repository: ExecutionRepository,
         shutdown_grace: float,
     ) -> None:
         """Drive the feed on its own thread until it finishes or is signalled.
 
-        Mirrors ``IntradayOptionsSupervisor._run_feed``'s own shape, minus
-        the stuck-subscription/stale-instrument alarms — see the module
-        docstring for why those are out of this phase's own scope."""
+        Mirrors ``IntradayOptionsSupervisor._run_feed``'s own shape,
+        including the stuck-subscription/stale-instrument alarms (Phase 6A
+        parity — see the module docstring)."""
         signalled = threading.Event()
         wake = threading.Event()
         failure: list[BaseException] = []
@@ -460,10 +531,24 @@ class PositionalOptionsSupervisor:
             heartbeat.beat(HealthState.running_for(ExecutionMode.PAPER), force=True)
             while not wake.wait(timeout=HEARTBEAT_POLL_SECONDS):
                 self._drain_control_queues()
+                self._drain_feed_health_events(repository)
+                if self._check_stuck_subscription(heartbeat, repository):
+                    # Connected but delivering nothing long enough that no
+                    # worker's own runtime subscription can ever be applied
+                    # — end the run rather than sit RUNNING_PAPER forever
+                    # with every engine unable to act. Mirrors
+                    # IntradayOptionsSupervisor exactly.
+                    result.stopped_by_stuck_subscription = True
+                    log.info("stuck subscription threshold crossed; asking the feed to finish")
+                    self._hub.request_stop()
+                    break
+                self._check_stale_instruments(repository)
                 self._beat_running(heartbeat)
-            # Once more after the wake: a request that arrived in the same
-            # instant the feed finished is still worth applying.
+            # Once more after the wake: a request — or a health event —
+            # that arrived in the same instant the feed finished is still
+            # worth applying.
             self._drain_control_queues()
+            self._drain_feed_health_events(repository)
             if signalled.is_set():
                 result.stopped_by_signal = True
                 log.info("shutdown requested; asking the feed to finish")
@@ -472,12 +557,7 @@ class PositionalOptionsSupervisor:
 
         if feed_thread.is_alive():
             result.clean_feed_shutdown = False
-            log.error(
-                "feed did not finish within %.1fs of being asked to stop; the connection "
-                "is left to process exit — it is NOT closed from this thread, which would "
-                "hang",
-                shutdown_grace,
-            )
+            self._raise_silent_feed_alarm(heartbeat, repository, shutdown_grace)
         else:
             self._hub.stop()
 
@@ -516,6 +596,148 @@ class PositionalOptionsSupervisor:
             last_tick_at=self._hub.last_tick_at,
             queue_depth=max((s.depth for s in stats), default=0),
             dropped_events=sum(s.dropped for s in stats),
+        )
+
+    # -------------------------------------------------------- feed health
+    def _on_feed_health_event(self, event: FeedHealthEvent) -> None:
+        """Runs on the feed thread (``ReconnectingFeed``'s own callback) —
+        never touches the repository directly (see :meth:`run`'s own
+        comment). Two things, both safe here: enqueue for the durable
+        ``feed_events`` write :meth:`_drain_feed_health_events` performs on
+        the thread that owns the sqlite connection, and — Phase 6A, the one
+        real addition beyond ``IntradayOptionsSupervisor`` parity — broadcast
+        a :class:`~common.feed.queues.FeedGapNotice` to every worker so each
+        one's own engine can latch/track its recoverable degraded gate. The
+        broadcast is safe here specifically because it is a tick-channel
+        publish, exactly like a real tick, and this *is* the thread that
+        publishes real ticks.
+        """
+        self._feed_health_events.put(event)
+        if event.event in ("disconnected", "resubscribed"):
+            self._hub.broadcast_feed_gap(FeedGapNotice(kind=event.event, at=datetime.now(UTC)))
+
+    def _drain_feed_health_events(self, repository: ExecutionRepository) -> None:
+        """Write every queued ``feed_events`` row on this (the repository's)
+        thread. Mirrors ``IntradayOptionsSupervisor._drain_feed_health_
+        events`` exactly: a write that raises is logged and dropped, never
+        allowed to break the poll loop — a ``feed_events`` row is
+        diagnostic, not something the run depends on."""
+        while True:
+            try:
+                event = self._feed_health_events.get_nowait()
+            except queue_module.Empty:
+                break
+            try:
+                repository.record_feed_event(runtime_id=self._config.runtime_id, **asdict(event))
+            except Exception:
+                log.exception("failed to persist a feed_events row (event=%s)", event.event)
+            if event.event in _CHAT_WORTHY_FEED_EVENTS:
+                self._notifier.send(
+                    NotificationEvent(
+                        event_type=f"feed_{event.event}",
+                        message=event.reason or event.event,
+                        runtime_id=self._config.runtime_id,
+                        execution_mode=ExecutionMode.PAPER,
+                    )
+                )
+
+    def _check_stuck_subscription(
+        self, heartbeat: HeartbeatWriter, repository: ExecutionRepository
+    ) -> bool:
+        """Alarm when a runtime subscription has not been applied. Mirrors
+        ``IntradayOptionsSupervisor._check_stuck_subscription`` exactly —
+        see that method's own docstring for the full reasoning (the hub
+        applies a pending subscription only on a real tick, so a feed
+        delivering nothing never applies one, and an engine waiting on a
+        contract it just chose will not fill against a cached price).
+        Raised once per run; returns ``True`` exactly once, on the poll that
+        first crosses the threshold."""
+        age = self._hub.pending_subscription_age_seconds()
+        if age < STUCK_SUBSCRIPTION_SECONDS:
+            return False
+        if self._stuck_subscription_alarmed:
+            return False
+        self._stuck_subscription_alarmed = True
+
+        message = (
+            f"a runtime subscription has been waiting {age:.1f}s to be applied "
+            f"(threshold {STUCK_SUBSCRIPTION_SECONDS:.0f}s). The feed is delivering "
+            "nothing for this group. Any engine waiting on a contract it just chose "
+            "will not enter — it wants a fresh tick and will not use a cached price. "
+            "Ending the run rather than continuing to present it as healthy; check "
+            "the feed connection."
+        )
+        log.error("%s", message)
+        heartbeat.beat(HealthState.DEGRADED, force=True)
+        repository.record_error(
+            runtime_id=self._config.runtime_id,
+            strategy_id=None,
+            execution_mode=ExecutionMode.PAPER,
+            severity="CRITICAL",
+            component="feed",
+            message=message,
+        )
+        repository.record_feed_event(
+            runtime_id=self._config.runtime_id, event="degraded", reason=message
+        )
+        self._notifier.send(
+            NotificationEvent(
+                event_type="subscription_not_applied",
+                message=message,
+                runtime_id=self._config.runtime_id,
+                execution_mode=ExecutionMode.PAPER,
+            )
+        )
+        return True
+
+    def _check_stale_instruments(self, repository: ExecutionRepository) -> None:
+        """Write a ``feed_events`` row for each newly-stale instrument.
+        Mirrors ``IntradayOptionsSupervisor._check_stale_instruments``
+        exactly — diagnostic only (a quiet far-OTM strike is not itself a
+        broken feed), latched per instrument until a fresh tick clears it."""
+        stale = set(self._feed.health.stale_instruments())
+        newly_stale = stale - self._stale_instruments_alarmed
+        for security_id in sorted(newly_stale):
+            repository.record_feed_event(
+                runtime_id=self._config.runtime_id,
+                event="stale_instrument",
+                security_id=security_id,
+            )
+        self._stale_instruments_alarmed = stale
+
+    def _raise_silent_feed_alarm(
+        self, heartbeat: HeartbeatWriter, repository: ExecutionRepository, shutdown_grace: float
+    ) -> None:
+        """Make an unclosable feed impossible to miss. Mirrors
+        ``IntradayOptionsSupervisor._raise_silent_feed_alarm`` exactly —
+        three channels (heartbeat, ``errors`` row, notification), because a
+        log line is not an alarm."""
+        message = (
+            f"feed did not finish within {shutdown_grace:.1f}s of being asked to stop; "
+            "the socket is connected but delivering nothing. The rest of the shutdown "
+            "completed and the connection is left to process exit — it is NOT closed "
+            "from this thread, which would hang. Check that the process actually exited."
+        )
+        log.error("%s", message)
+        heartbeat.beat(HealthState.DEGRADED, force=True)
+        repository.record_error(
+            runtime_id=self._config.runtime_id,
+            strategy_id=None,
+            execution_mode=ExecutionMode.PAPER,
+            severity="CRITICAL",
+            component="feed",
+            message=message,
+        )
+        repository.record_feed_event(
+            runtime_id=self._config.runtime_id, event="degraded", reason=message
+        )
+        self._notifier.send(
+            NotificationEvent(
+                event_type="feed_shutdown_unclean",
+                message=message,
+                runtime_id=self._config.runtime_id,
+                execution_mode=ExecutionMode.PAPER,
+            )
         )
 
     @contextmanager

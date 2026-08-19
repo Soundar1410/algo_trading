@@ -36,6 +36,7 @@ from common.engine.config import SessionConfig
 from common.engine.positional.positional_models import ENTRY_ROLE_ORDER
 from common.models import Tick
 from common.persistence import Database, MigrationRunner
+from common.utils.timeutils import now_ist
 from runtimes.positional_options.config_adapter import WorkerConfig
 from runtimes.positional_options.supervisor import (
     PositionalOptionsSupervisor,
@@ -225,14 +226,14 @@ class _StagedAdapter:
 
 def _alpha_worker_config(tmp_path: Path, *, database_path: Path) -> WorkerConfig:
     runtime_root = tmp_path / "runtime"
-    base = weekly_fixtures.build_worker_config(
-        "2026-08-19",
-        # Generous: real process-spawn/round-trip latency must never
-        # spuriously fire the new bounded entry-stage timeout here — the
-        # timeout's own behaviour has dedicated coverage in
-        # test_weekly_delta_neutral_entry_stage_timeout.py.
-        entry_leg_timeout_seconds=3600.0,
-    )
+    # Defaults (3600s each — see build_worker_config) are fine here: the
+    # spawned worker's own clock is now the test's OffsetClock (see the
+    # test function itself), tracking the same simulated timeline as every
+    # scripted tick, so there is no real-wall-clock gap for these timeouts
+    # to have to outlast. The timeouts' own boundary behaviour has
+    # dedicated, clock-controlled coverage in
+    # test_weekly_delta_neutral_entry_stage_timeout.py.
+    base = weekly_fixtures.build_worker_config("2026-08-19")
     return replace(
         base,
         database_path=database_path,
@@ -292,7 +293,7 @@ def _beta_worker_config(tmp_path: Path, *, database_path: Path) -> WorkerConfig:
 
 
 def _build_supervisor(
-    tmp_path: Path, *, database_path: Path, adapter: Any
+    tmp_path: Path, *, database_path: Path, adapter: Any, clock: Any = None
 ) -> PositionalOptionsSupervisor:
     runtime_root = tmp_path / "runtime"
     config = PositionalSupervisorConfig(
@@ -304,7 +305,9 @@ def _build_supervisor(
         runtime_root=runtime_root,
         cache_dir=tmp_path / "cache",
     )
-    return PositionalOptionsSupervisor(config, adapter)
+    if clock is None:
+        return PositionalOptionsSupervisor(config, adapter)
+    return PositionalOptionsSupervisor(config, adapter, clock=clock)
 
 
 def _incident_messages(database_path: Path, *, strategy_id: str) -> list[str]:
@@ -327,7 +330,21 @@ def test_real_weekly_strategy_completes_a_staged_entry_over_the_shared_hub(
     MigrationRunner(Database(database_path)).run_pending()
 
     adapter = _StagedAdapter(database_path=database_path)
-    supervisor = _build_supervisor(tmp_path, database_path=database_path, adapter=adapter)
+    # Phase 6A: HubTickFeed's own on_poll now drives engine.poll() on a
+    # timer, independent of whichever tick last arrived — see
+    # positional_engine._maybe_evaluate. A worker's clock therefore has to
+    # track the *same* timeline this test's scripted ticks use (ENTRY_TS),
+    # never the real wall clock a poll would otherwise default to: a poll
+    # evaluating "now" as the real current instant, while the last tick it
+    # saw carries this test's simulated 09:26 IST timestamp, would make
+    # _maybe_evaluate's own elapsed-time gate go negative and silently drop
+    # every tick-driven evaluation forever. OffsetClock is picklable, so it
+    # survives the real multiprocessing.Process spawn boundary — a bare
+    # lambda would not.
+    clock = weekly_fixtures.OffsetClock(offset=ENTRY_TS - now_ist())
+    supervisor = _build_supervisor(
+        tmp_path, database_path=database_path, adapter=adapter, clock=clock
+    )
     alpha = _alpha_worker_config(tmp_path, database_path=database_path)
     beta = _beta_worker_config(tmp_path, database_path=database_path)
     alpha_channel = supervisor.add_worker(alpha)

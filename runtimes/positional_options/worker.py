@@ -56,6 +56,7 @@ from common.engine.reporting_bindings import HeartbeatEngineReporter
 from common.engine.selection import DhanOptionChainResolver
 from common.engine.session import MarketSession
 from common.execution import ExecutionRepository, OrderLifecycle
+from common.feed.queues import FeedGapNotice, TickDropNotice
 from common.greeks import GreeksService, ModelAssumptions
 from common.health import HealthState, HeartbeatWriter
 from common.logging import get_logger, setup_logging
@@ -417,6 +418,7 @@ def run_worker(
     runtime_root: Path,
     notifier: Notifier | None = None,
     clock: Callable[[], datetime] = now_ist,
+    engine_holder: list[PositionalMultiLegEngine] | None = None,
 ) -> WorkerOutcome:
     """Build one engine and drive it to completion — the composition root's
     only call into this module beyond ``build_engine`` itself.
@@ -432,6 +434,15 @@ def run_worker(
     square-off request file, noticed by the poll thread below — a distinct,
     deliberate act (``scripts/square_off.py``), never an accident of process
     lifecycle.
+
+    ``engine_holder`` (Phase 6A): an optional one-element list the caller
+    already constructed *before* this function ran, so it could wire
+    ``feed``'s own ``on_poll``/``on_tick_dropped``/``on_feed_gap``
+    callbacks — which only exist at ``HubTickFeed`` construction time,
+    strictly before the real engine exists — against a forward reference
+    (mirrors ``build_engine``'s own internal ``engine_holder`` trick for its
+    heartbeat reporter, just threaded one level further out here). Appended
+    to the instant the real engine exists, before it ever runs.
     """
     safe_notifier = (
         notifier if isinstance(notifier, SafeNotifier) else SafeNotifier(notifier or NullNotifier())
@@ -478,6 +489,8 @@ def run_worker(
         return outcome
 
     engine = built.engine
+    if engine_holder is not None:
+        engine_holder.append(engine)
     safe_notifier.send(
         NotificationEvent(
             event_type="worker_started",
@@ -602,6 +615,7 @@ def run_positional_worker_process(
     tick_queue: Any,
     control_queue: Any,
     notifier: Notifier | _NotifierSentinel | None = None,
+    clock: Callable[[], datetime] = now_ist,
 ) -> None:
     """The real ``multiprocessing.Process(target=...)`` entry point for one
     strategy under :class:`~runtimes.positional_options.supervisor.
@@ -623,6 +637,16 @@ def run_positional_worker_process(
     ``scrip_master_factory``/``margin_fetcher_factory``, when set, are used
     instead — see their own docstring on
     :class:`~runtimes.positional_options.config_adapter.WorkerConfig`.
+
+    ``clock`` defaults to the real wall clock — a production spawn never
+    passes anything else. It exists so a test driving a real spawned
+    worker against a *scripted*, non-real-time tick stream (Phase 6A wires
+    ``HubTickFeed``'s ``on_poll`` to ``engine.poll()``, which evaluates
+    against this clock independent of the last tick's own timestamp) can
+    supply a picklable, spawn-safe clock instead — see
+    ``tests.integration._weekly_delta_neutral_fixtures.OffsetClock``.
+    Threaded straight through to :func:`run_worker`'s own ``clock``
+    parameter, unchanged.
     """
     assert config.database_path is not None, "the supervisor must set database_path"
     assert config.lock_dir is not None, "the supervisor must set lock_dir"
@@ -674,7 +698,7 @@ def run_positional_worker_process(
 
     try:
         outcome = _run_positional_worker_locked(
-            config, tick_queue, control_queue, resolved_notifier, settings
+            config, tick_queue, control_queue, resolved_notifier, settings, clock
         )
     finally:
         lock.release()
@@ -687,6 +711,7 @@ def _run_positional_worker_locked(
     control_queue: Any,
     notifier: Notifier | None,
     settings: Any,
+    clock: Callable[[], datetime] = now_ist,
 ) -> WorkerOutcome:
     assert config.database_path is not None
     assert config.runtime_root is not None
@@ -780,9 +805,43 @@ def _run_positional_worker_locked(
                 config.strategy_id,
             )
 
+    # Phase 6A: HubTickFeed's own on_poll/on_tick_dropped/on_feed_gap
+    # callbacks only exist at construction time, strictly before
+    # run_worker (and the build_engine call inside it) ever returns the
+    # real engine — so this holder is the forward reference every callback
+    # below closes over, populated by run_worker itself the instant the
+    # real engine exists (mirrors build_engine's own internal
+    # engine_holder trick for its heartbeat reporter).
+    engine_holder: list[PositionalMultiLegEngine] = []
+
+    def _on_poll() -> None:
+        # The only place this worker polls on a timer: without it, a feed
+        # gone quiet (staleness, a stuck subscription) would never
+        # re-trigger the engine's own hard-expiry-deadline check, which is
+        # otherwise only ever reached from an underlying tick.
+        if engine_holder:
+            engine_holder[0].poll()
+
+    def _on_tick_dropped(notice: TickDropNotice) -> None:
+        # Mirrors multi_leg_engine_worker.py's own _on_tick_dropped shape:
+        # a lost tick means this worker's own candle/quote picture may be
+        # quietly wrong, so new risk is refused for the rest of the day.
+        if engine_holder:
+            engine_holder[0].block_entries(
+                f"tick queue overflow (dropped={notice.dropped}); refusing new risk "
+                "for the rest of the day"
+            )
+
+    def _on_feed_gap(notice: FeedGapNotice) -> None:
+        if engine_holder:
+            engine_holder[0].on_feed_gap_notice(notice)
+
     feed = HubTickFeed(
         tick_queue,
         request_subscription=_request_subscription,
+        on_poll=_on_poll,
+        on_tick_dropped=_on_tick_dropped,
+        on_feed_gap=_on_feed_gap,
         # A live production session never idle-times-out: a quiet option
         # market between adjustment checks is ordinary, not a finished
         # tape. Square-off is never driven by ending this feed early —
@@ -811,6 +870,8 @@ def _run_positional_worker_locked(
         margin_estimator=margin_estimator,
         runtime_root=config.runtime_root,
         notifier=notifier,
+        engine_holder=engine_holder,
+        clock=clock,
     )
     database.close()
     return outcome

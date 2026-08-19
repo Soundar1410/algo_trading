@@ -132,3 +132,27 @@ def parse_hhmm(value: str) -> time:
         except ValueError:
             continue
     raise ValueError(f"Invalid time string {value!r}; expected 'HH:MM' or 'HH:MM:SS'.")
+
+
+def is_fresh(
+    observed_at: datetime | None, *, now: datetime, max_age_seconds: float
+) -> bool:
+    """Shared, fail-closed freshness arithmetic (Phase 6A).
+
+    ``True`` only when both timestamps are timezone-aware and
+    ``0 <= (now - observed_at).total_seconds() <= max_age_seconds``. Every
+    one of the following is treated as "not fresh", never as "trust it":
+    ``observed_at`` is ``None``; either timestamp is naive (comparing a
+    naive and an aware datetime raises in Python, and two naive ones could
+    silently compare across different, unstated timezones — neither is a
+    safe basis for a risk decision); ``observed_at`` is in the future
+    relative to ``now`` (a negative age must never pass merely because it is
+    negative — a clock-skew or mis-stamped tick is exactly the case this
+    guards against, not an edge case to special-case away).
+    """
+    if observed_at is None:
+        return False
+    if observed_at.tzinfo is None or now.tzinfo is None:
+        return False
+    age_seconds = (now - observed_at).total_seconds()
+    return 0 <= age_seconds <= max_age_seconds

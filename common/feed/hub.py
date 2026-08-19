@@ -91,6 +91,7 @@ from common.models import Candle, Tick
 from .queues import (
     DEFAULT_TICK_MAX_DEPTH,
     BoundedWorkerQueue,
+    FeedGapNotice,
     QueueStats,
     TickDropNotice,
     drop_notice_cadence,
@@ -511,6 +512,25 @@ class SharedFeedHub:
             return
         self._last_drop_notice[channel.strategy_id] = dropped
         channel.tick_queue.publish(TickDropNotice(dropped=dropped))
+
+    def broadcast_feed_gap(self, notice: FeedGapNotice) -> None:
+        """Publish a feed-level connection-state change to *every* worker's
+        tick channel, unconditionally (Phase 6A).
+
+        Unlike :meth:`_fan_out_tick`/:meth:`_notify_drop` (routed to the one
+        channel that wants the instrument, or whose own queue overflowed), a
+        disconnect or reconnect of the one shared feed affects every worker
+        equally — every registered tick channel gets this notice, whether or
+        not it currently "wants" any particular instrument. Callable from any
+        thread that already owns a tick-publishing moment (the supervisor's
+        own feed-health-event callback runs on the feed thread, the same one
+        that publishes ticks), matching :meth:`request_subscription`'s own
+        any-thread-safe posture for the write side of this hub.
+        """
+        for channel in self._channels:
+            if channel.tick_queue is None:
+                continue
+            channel.tick_queue.publish(notice)
 
     def _fan_out(self, candle: Candle) -> None:
         self.candle_count += 1

@@ -8171,11 +8171,20 @@ record that result here.
 **Closed in Phase 6 (19 August 2026) — see that section below for the full
 result:** re-run during a real live NSE session (Wednesday 12:12 IST),
 structural validation and market-hours freshness both PASS. This was the
-only remaining named paper-enablement blocker; it is closed, though
-`weekly_delta_neutral` stays disabled pending the other, separately-named,
-non-technical approvals (30-day paper evaluation, second real paper
+only remaining named paper-enablement blocker; it is closed. **Corrected in
+Phase 6A (19 August 2026 — see that section below):** the passage this
+originally replaced listed "30-day paper evaluation, second real paper
 strategy, EMA-specific minimum-quantity approval, static-IP/provider setup,
-live auth revalidation, explicit gate-flip approval) unchanged by this.
+live auth revalidation" as one undifferentiated set of reasons
+`weekly_delta_neutral` stays disabled — conflating *live*-enablement
+requirements with *paper*-enablement ones. Only Phase 6A's own two
+mandatory paper-safety gaps (durable cycle identity, feed reconnect/
+staleness protection — now both closed) stood between this branch and
+being technically eligible for a *separately approved* paper start; the
+second-strategy/static-IP/live-auth/minimum-quantity/live-approval items
+are *live*-enablement requirements that were never paper blockers. Both
+`enabled: false` remain unchanged by this correction — see Phase 6A for the
+full, corrected readiness statement.
 
 **New permanent regression fixture:** `tests/fixtures/
 dhan_option_chain_sample.json` — sanitized and representative, **not** a
@@ -8721,11 +8730,271 @@ clean; `python scripts/assert_no_live_config_committed.py` OK;
 
 **5. Paper-enablement status.** The market-hours freshness blocker is
 closed. `weekly_delta_neutral` and the `positional_options` runtime remain
-`enabled: false` — unchanged, and correctly so: the outstanding,
-non-technical approvals CLAUDE.md and 11.9 already name (a 30-day paper
-evaluation, the separately-specified second real paper strategy,
-EMA-specific minimum-quantity approval, static-IP/provider setup, live
-auth revalidation, and explicit operator approval to flip any gate) are
-unaffected by this phase and remain outstanding. No config, gate, or
+`enabled: false` — unchanged. No config, gate, or auto-start file was
+touched. No order-capable Dhan endpoint was called anywhere in this phase.
+**Corrected in Phase 6A (19 August 2026 — see that section below): this
+paragraph conflated live-enablement requirements with paper-enablement
+ones.** At this point in the branch's history two mandatory paper-safety
+gaps remained (the durable cycle identity contract and positional feed
+reconnect/staleness protection — Phase 6A's own subject, both closed
+there); the second real paper strategy, EMA-specific minimum-quantity
+approval, static-IP/provider setup, live auth revalidation, and explicit
+gate-flip approval are *live*-enablement requirements, never paper
+blockers, and an operator-defined paper-evaluation period (commonly
+30 days, but the actual duration is the operator's own choice) runs
+*after* paper mode is enabled, not before — completing it never
+auto-enables live trading, which stays a separate, explicit approval with
+every live gate satisfied regardless of how long paper ran.
+
+### Phase 6A — durable cycle identity and positional feed reconnect/staleness protection (19 August 2026)
+
+Phase 6's own verification was accepted, but review found two real,
+mandatory paper-safety gaps still open. Both are closed here. No strategy
+beyond `weekly_delta_neutral` was touched; no live gate was flipped; no
+order-capable Dhan endpoint was called; the runtime was never started.
+
+**1. Durable cycle identity — was wrong, now correct.** The persisted
+`cycle_id` had been `f"{strategy_id}:{resolved_expiry}"` since Phase 3 —
+missing `runtime_id`, `execution_mode`, and `underlying`. Every durable
+binding (`strategy_cycles`, `strategy_cycle_legs`,
+`strategy_cycle_margin_snapshots`, `strategy_cycle_entry_stage`,
+`order_intents.basket_id`, `positions.cycle_id`, adjustment/event rows)
+looks that string up directly, never additionally filtered by
+runtime/mode in SQL — so a second runtime group, a live run sharing the
+same strategy_id/expiry as a paper one, or a second underlying could
+silently collide under one identity. This never happened operationally
+(the strategy has never run outside a test), but the identity contract
+itself was wrong and had to be fixed before any paper start.
+
+Fixed with one central, generic builder —
+`common.engine.positional.positional_models.cycle_id_for(*, runtime_id,
+strategy_id, execution_mode, underlying, resolved_expiry_date)` —
+percent-encoding each component (`urllib.parse.quote(str(part), safe="")`)
+and joining with `:`, so an embedded colon in any component is always
+escaped and can never be split ambiguously against a differently-divided
+set of components. `PositionalMultiLegEngine._enter_cycle` — the sole
+construction site (confirmed by a repo-wide grep; no strategy code builds
+a `cycle_id` itself) — calls it instead of the old inline f-string; every
+leg/position/intent/adjustment/event/margin/entry-stage binding already
+derives from `Cycle.cycle_id` alone, so nothing else needed to change.
+`repository.load_open_cycle` finds an in-flight cycle by
+`(runtime_id, strategy_id, execution_mode)` columns, never by parsing or
+recomputing the id string, so an already-open cycle keeps working under
+whatever format it already has for its own life — no migration or
+backfill was written or is needed (no released migration is ever edited
+in place; nothing was silently orphaned). A dedicated restart test
+(`test_restart_adopts_a_pre_phase_6a_cycle_id_without_ever_regenerating_it`)
+proves this directly: a hand-built, old-format cycle row (built through
+repository calls only, never through the engine) is adopted safely on
+restart and every subsequent leg/order binding keeps resolving through
+that same old-format id.
+
+New `tests/unit/test_positional_cycle_id.py` (9 tests): deterministic;
+paper and live never collide; different runtime_id/underlying/strategy_id/
+resolved_expiry_date never collide; an embedded colon is percent-encoded,
+not stripped, so it can never collide with a differently-divided split.
+Extended `test_weekly_delta_neutral_restart.py` with explicit equality
+assertions (the persisted id equals `cycle_id_for(...)` computed
+independently) plus the old-format-adoption test above. Every existing
+test that hardcoded the old `f"{strategy_id}:{expiry}"` shape
+(`test_weekly_delta_neutral_entry.py`, `_restart.py`, `_lot_size.py`,
+`test_dashboard_positional_real_data.py`, and the shared
+`_weekly_delta_neutral_fixtures.cycle_id_for()` helper every acceptance
+suite in the family uses) now calls the real production builder instead
+of reconstructing the format independently.
+
+**2. Positional feed reconnect and stale-feed protection — did not exist,
+now does.** `PositionalOptionsSupervisor` used its adapter bare — no
+reconnect, no backoff, no resubscription, no staleness detection, unlike
+`IntradayOptionsSupervisor`. A multi-day strategy is the worst candidate
+to run without that posture: a silently dead socket would leave every
+worker's own hard-expiry-deadline check believing nothing had happened,
+and `PositionalContext.spot_is_fresh` — despite its name — meant only "a
+spot tick has ever arrived", never time-bounded, so it could not detect a
+stale underlying at all.
+
+**Transport layer (reused, not reimplemented).** The supervisor now wraps
+its adapter exactly the way the intraday supervisor already does:
+`self._feed = ReconnectingFeed(adapter, on_feed_gap=lambda:
+self._hub.mark_feed_gap())`; `self._hub = SharedFeedHub(self._feed, ...)`.
+`_run_feed` gained the same stuck-subscription/stale-instrument/silent-feed
+alarm methods `IntradayOptionsSupervisor` already has, ported near-verbatim
+(only `runtime_id`/`execution_mode` differ, already parameters).
+`DhanMarketFeedAdapter` already remembers segment and mode **per security
+id** and exposes `resubscribe_all()`, which `ReconnectingFeed._reconnect()`
+already calls automatically — so the initial underlying subscription and
+every dynamic option subscription (its own segment, Full mode) are
+restored for free; no positional-specific resubscription logic was
+written anywhere. The worker's own `HubTickFeed` gained `on_poll`
+(so the engine's time-based checks — the hard-expiry deadline, the
+90-minute adjustment cooldown — keep firing even on a silent stream) and
+`on_tick_dropped` (a tick-queue overflow now blocks entries for the rest
+of the day, matching the intraday worker's own posture) — both already
+generic, neither previously wired for positional.
+
+**The engine's own recoverable market-data-degraded gate — the part
+reused machinery alone cannot provide.** Reconnect/backoff/resubscribe
+protects candle aggregation and operator visibility; it says nothing about
+whether *this worker's own risk decisions* are currently safe. New
+`common.feed.queues.FeedGapNotice(kind, at)` — `"disconnected"` or
+`"resubscribed"` — broadcast unconditionally to every worker's tick
+channel via `SharedFeedHub.broadcast_feed_gap` (mirrors `TickDropNotice`'s
+own in-band, "at least one gets through" precedent, not a new IPC path),
+raised by the supervisor's feed-health-event sink on the feed thread (the
+same thread already publishing ticks). `HubTickFeed` dispatches it to a
+new `on_feed_gap` callback, wired in the worker to
+`engine.on_feed_gap_notice(notice)`.
+
+`PositionalMultiLegEngine` gained `_market_data_degraded` (`False` until a
+real disconnect latches it — never inferred at construction),
+`_resubscribed_at`, and `_fresh_since_resubscribe`.
+`on_feed_gap_notice("disconnected")` latches the gate immediately, before
+any further evaluation can act. `on_feed_gap_notice("resubscribed")`
+records that this outage's own round trip completed — it does **not**
+clear the gate by itself; a fresh, worker-selected security id could still
+be silently missing its own subscription, which is the whole reason this
+gate never simply trusts the supervisor's own "recovered" health state or
+a single fresh underlying tick. Every tick (`on_tick`) is checked against
+the gate: once its own `exchange_time` is at or after `_resubscribed_at`
+(both required timezone-aware — a naive or unresolvable pair never counts,
+fails closed), its `security_id` is recorded, and the gate clears only
+once `_required_security_ids()` — the underlying plus every currently
+open **and** pending leg's own contract — is a subset of what has ticked
+fresh since the resubscribe. Option-quote freshness is checked
+independently of `spot_is_fresh`/`greeks_available`, never inferred from
+either alone.
+
+The gate is enforced at exactly one dispatch point, `_apply_signal`:
+`ENTER_CYCLE`, `ROLL_SHORT`, and `REPAIR_HEDGE`
+(`_RISK_INCREASING_ACTIONS`) are suppressed while degraded; `EXIT_ALL`/
+`EXIT_LEG` are never gated, reached the same way they always were, so an
+exit, restart reconciliation, or the hard-expiry-deadline net all still
+fire regardless of the gate. `_advance_entry_stage`'s own bounded deadline
+check still runs unconditionally while degraded — a flapping feed must
+never extend the bounded-workflow guarantee indefinitely — and a role is
+still armed/subscribed while degraded (pure data plumbing, the earlier the
+subscription is in flight the sooner recovery can complete); only the
+actual fill attempt (`_open_leg_now`, which can place an order) is skipped,
+exactly like "no fresh quote yet" — retried again once the gate clears,
+never abandoned, never duplicated.
+
+**Freshness arithmetic — one shared, fail-closed helper.** New
+`common.utils.timeutils.is_fresh(observed_at, *, now, max_age_seconds)`:
+`False` for `None`, a naive `observed_at`, or a naive `now`; otherwise
+requires `0 <= (now - observed_at).total_seconds() <= max_age_seconds` — a
+future-dated `observed_at` (negative age) is never fresh. Used by the
+gate's own post-resubscribe tick comparison and by the engine's
+`spot_is_fresh` computation, which previously meant only "a spot tick has
+ever arrived": `_build_context` now computes it as
+`is_fresh(self._spot_fresh_at, now=ts, max_age_seconds=
+self._max_quote_age_seconds)`, reusing the engine's existing
+`max_quote_age_seconds` knob. `WeeklyDeltaNeutralStrategy._evaluate_active`
+already blocked hedge-repair/adjustment (never an exit) when Greeks were
+unusable; the same line now also requires `context.spot_is_fresh` — the
+minimal extension of an already-existing staleness rule, not new strategy
+logic.
+
+**New tests.** `tests/integration/test_positional_feed_reconnect.py` (18
+tests): `is_fresh`'s own boundary coverage (`None`, naive, future-dated/
+negative-age, boundary-equality); a disconnect before any entry suppresses
+`ENTER_CYCLE` with zero orders placed, and recovers correctly once the
+underlying alone (the only thing required pre-cycle) re-ticks;
+disconnect landing squarely inside a staged entry (between the HEDGE_PUT
+and HEDGE_CALL stages) blocks only the fill attempt — the stage stays
+armed, no order is placed, and the gate is proven to stay latched through
+five separate partial-recovery steps until the very last required
+instrument (underlying plus all four legs' own contracts) has ticked
+fresh, at which point entry resumes and completes with exactly one order
+per leg; each of `_RISK_INCREASING_ACTIONS` is suppressed directly and
+`EXIT_ALL` is proven never gated, both as a direct white-box call into
+`_apply_signal`; an operator square-off still closes every leg while the
+gate is latched; two-to-three repeated disconnect/recovery cycles across a
+full entry produce no duplicate orders and leave the gate clear, not
+permanently latched; two independent engines with different required sets
+(one with an open four-leg cycle, one that never entered) clear their own
+gates independently; a real `ReconnectingFeed` reconnect restores both the
+underlying and a dynamically subscribed option under their original
+segment/mode. Extended `test_positional_runtime_multi_strategy.py` with a
+real spawned-multiprocess reconnect test (two workers, one scripted
+disconnect/reconnect using the real default `ReconnectPolicy` backoff — no
+override, matching `IntradayOptionsSupervisor`'s own precedent of not
+exposing one) proving neither worker's own session/incident marker is
+disrupted or duplicated by it, plus a direct wiring assertion
+(`isinstance(supervisor._feed, ReconnectingFeed)`,
+`supervisor.hub._adapter is supervisor._feed`) mirroring
+`test_supervisor_health_wiring.py`'s own established pattern.
+
+A real bug surfaced and was fixed while building this: wiring `on_poll` to
+`engine.poll()` for the first time exposed that a positional worker's
+engine had never had its clock overridable when spawned as a real child
+process — `run_positional_worker_process`/`_run_positional_worker_locked`
+accepted no `clock` parameter at all, so a poll-driven evaluation always
+used the real wall clock even in a test scripting simulated tick
+timestamps. Two compounding symptoms followed purely from that gap: the
+engine's own monotonic evaluation-interval gate (`_maybe_evaluate`) saw a
+later real-clock poll timestamp before an earlier simulated tick
+timestamp and silently dropped every tick-driven evaluation from then on,
+and the ones that did run (poll-driven) evaluated the strategy's
+time-of-day logic against the real hour of whenever the test happened to
+run rather than the scripted trading window — together, `test_positional_
+runtime_weekly_staged_entry.py` hung indefinitely instead of completing in
+seconds. Fixed generically, not by special-casing the test: `clock` is now
+threaded from `PositionalOptionsSupervisor.__init__` through
+`run_positional_worker_process`/`_run_positional_worker_locked` to
+`run_worker`, defaulting to the real wall clock everywhere (zero
+production behaviour change) and overridable by a caller. The two affected
+tests supply a small, picklable `OffsetClock` (`tests/integration/
+_weekly_delta_neutral_fixtures.py`) — spawn-safe, unlike a bare
+closure/lambda — that tracks the real clock shifted onto the test's own
+simulated timeline.
+
+**Explicit unchanged re-run — intraday reconnect/stale-feed regressions:**
+`test_feed_reconnect.py`, `test_stuck_subscription_alarm.py`,
+`test_tick_drop_blocks_entries.py`, `test_feed_hub.py`,
+`test_dynamic_subscription_wake.py`, `test_feed_cross_thread_shutdown.py`,
+`test_candle_gap_policy_wiring.py`, `test_supervisor_health_wiring.py` —
+all pass unchanged; this phase changed nothing about the intraday
+runtime's own reconnect posture.
+
+**3. Corrected paper/live readiness language.** See the corrections made
+in place to 11.10 and to Phase 6's own paragraphs 2 and 5 above: an
+operator-defined paper-evaluation period (commonly discussed as 30 days,
+but the actual duration — 15, 30, 60, 90 days, or another value — is the
+operator's own choice, never fixed by this codebase) runs *after* paper
+mode is enabled, not before, and completing it never automatically
+enables live trading, which stays a separate, explicit approval
+requiring every live gate satisfied regardless of how long paper ran; the
+second real paper strategy, EMA-specific minimum-quantity approval,
+static-IP/provider setup, and live auth revalidation are *live*-enablement
+requirements, not paper-mode blockers.
+
+**Verification.** New and targeted suites above; the full weekly/
+positional family (`test_weekly_delta_neutral_adjustment/_entry/
+_entry_stage_timeout/_expiry_day/_lot_size/_pnl_and_exits/_restart.py`,
+`test_positional_runtime_multi_strategy.py`,
+`test_positional_runtime_weekly_staged_entry.py`,
+`test_positional_feed_reconnect.py`, and the positional/dashboard unit
+suites) — 125 passed. The intraday reconnect/stale-feed regression list
+above — 134 passed, unchanged. Full `pytest` — 2532 collected, 2508
+passed, 24 skipped (all pre-existing, environment-gated), 0 failed, 0
+errors. `ruff check .`
+clean. `mypy common strategies runtimes dashboards scripts` — Success: no
+issues found in 232 source files. `python -m
+scripts.assert_no_live_config_committed` — OK. `python -m
+scripts.validate_environment --runtime-id positional_options` — all
+checks passed.
+
+**Status.** Both mandatory paper-safety gaps are closed. `weekly_delta_
+neutral` and the `positional_options` runtime remain `enabled: false`.
+`weekly_delta_neutral` is now technically eligible for a *separately
+approved* paper start — this phase does not itself start it, and every
+other outstanding, non-technical approval (30-day-or-operator-chosen
+paper evaluation running after that start, the second real paper
+strategy, EMA-specific minimum-quantity approval, static-IP/provider
+setup, live auth revalidation, and explicit operator approval to flip any
+live gate) remains outstanding and unaffected by this phase. Genuine
+broker-side `LIMIT` execution remains an explicit **live**-enablement
+limitation (paper fills through `PaperBroker`'s bid/ask-crossing model
+instead — see 11.8), never described as complete. No config, gate, or
 auto-start file was touched. No order-capable Dhan endpoint was called
 anywhere in this phase.

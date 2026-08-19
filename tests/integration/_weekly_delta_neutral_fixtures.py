@@ -32,7 +32,7 @@ import csv
 import io
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -306,7 +306,20 @@ def open_repository(
 
 
 def cycle_id_for(expiry: str = EXPIRY_DATE) -> str:
-    return f"weekly_delta_neutral:{expiry}"
+    """The real production identity (Phase 6A) — delegates to the one
+    generic builder rather than reconstructing the format inline, so every
+    caller of this helper stays correct automatically if that format ever
+    changes again."""
+    from common.config.models import ExecutionMode
+    from common.engine.positional.positional_models import cycle_id_for as _build_cycle_id
+
+    return _build_cycle_id(
+        runtime_id="positional_options",
+        strategy_id="weekly_delta_neutral",
+        execution_mode=ExecutionMode.PAPER,
+        underlying="NIFTY",
+        resolved_expiry_date=expiry,
+    )
 
 
 @dataclass
@@ -381,3 +394,30 @@ def closing_sequence_numbers(
             if row["leg_id"] == leg["leg_id"] and row["side"] == closing_side:
                 result[leg["leg_id"]] = row["sequence_number"]
     return result
+
+
+@dataclass(frozen=True)
+class OffsetClock:
+    """A picklable clock for a *real spawned* worker-process test.
+
+    ``PositionalOptionsSupervisor``/``run_worker`` accept an injectable
+    ``clock`` for exactly this reason (Phase 6A: ``HubTickFeed``'s
+    ``on_poll`` now drives ``engine.poll()`` on a timer, independent of
+    whichever tick last arrived) — but a real ``multiprocessing.Process``
+    worker needs that clock *pickled across the spawn boundary*, so a
+    closure/lambda over a local variable will not do; it has to be a real,
+    module-level class.
+
+    Tracks the same moving instant as the real wall clock, just shifted by
+    a fixed ``offset`` so "now" lands inside a test's own simulated trading
+    window instead of wherever the real wall-clock date/time happens to be
+    when the suite runs — the same reason ``build_engine``'s own ``clock``
+    parameter exists for a single-process test, just made spawn-safe.
+    """
+
+    offset: timedelta
+
+    def __call__(self) -> datetime:
+        from common.utils.timeutils import now_ist
+
+        return now_ist() + self.offset

@@ -26,6 +26,7 @@ import dashboards.positional_options as positional_page
 from common.config.models import ExecutionMode
 from common.engine.config import SessionConfig
 from common.engine.feed import SimulatedFeed
+from common.engine.positional.positional_models import cycle_id_for
 from common.execution import ExecutionRepository
 from common.margin import LegMarginRequest, MarginEstimator
 from common.models import Tick
@@ -257,8 +258,22 @@ def test_positional_dashboard_data_filters_two_strategies_independently(tmp_path
         cycles_b = load_cycles(conn, strategy_id="dashboard_fixture_two", execution_mode="paper")
         assert len(cycles_a) == 1 and len(cycles_b) == 1
         assert cycles_a[0].cycle_id != cycles_b[0].cycle_id
-        assert cycles_a[0].cycle_id.startswith("weekly_delta_neutral:")
-        assert cycles_b[0].cycle_id.startswith("dashboard_fixture_two:")
+        # The exact real identity (Phase 6A) — never just a format-prefix
+        # guess — proving restart/lookup would reconstruct precisely this.
+        assert cycles_a[0].cycle_id == cycle_id_for(
+            runtime_id="positional_options",
+            strategy_id="weekly_delta_neutral",
+            execution_mode=ExecutionMode.PAPER,
+            underlying="NIFTY",
+            resolved_expiry_date=EXPIRY_DATE,
+        )
+        assert cycles_b[0].cycle_id == cycle_id_for(
+            runtime_id="positional_options",
+            strategy_id="dashboard_fixture_two",
+            execution_mode=ExecutionMode.PAPER,
+            underlying="NIFTY",
+            resolved_expiry_date=EXPIRY_DATE,
+        )
 
         open_a = load_open_cycle(conn, strategy_id="weekly_delta_neutral", execution_mode="paper")
         open_b = load_open_cycle(

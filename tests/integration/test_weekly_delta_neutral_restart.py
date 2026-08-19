@@ -20,7 +20,12 @@ from zoneinfo import ZoneInfo
 from common.config.models import ExecutionMode
 from common.engine.config import SessionConfig
 from common.engine.feed import SimulatedFeed
-from common.engine.positional.positional_models import CycleState, LegRole, LegState
+from common.engine.positional.positional_models import (
+    CycleState,
+    LegRole,
+    LegState,
+    cycle_id_for,
+)
 from common.execution import ExecutionRepository
 from common.margin import LegMarginRequest, MarginEstimator
 from common.market_data.scrip_master import ScripMaster
@@ -159,11 +164,21 @@ def _build_worker_config(trading_date: str) -> WorkerConfig:
     )
 
 
+def _cycle_id_for(expiry: str = EXPIRY_DATE) -> str:
+    return cycle_id_for(
+        runtime_id="positional_options",
+        strategy_id="weekly_delta_neutral",
+        execution_mode=ExecutionMode.PAPER,
+        underlying="NIFTY",
+        resolved_expiry_date=expiry,
+    )
+
+
 def test_restart_adopts_the_same_cycle_with_no_re_entry_and_no_duplicate_rows(
     tmp_path,
 ) -> None:
     db_path = tmp_path / "positional_options_restart.db"
-    cycle_id = f"weekly_delta_neutral:{EXPIRY_DATE}"
+    cycle_id = _cycle_id_for()
 
     # -------------------------------------------------------------- day 1
     database = Database(db_path)
@@ -195,6 +210,16 @@ def test_restart_adopts_the_same_cycle_with_no_re_entry_and_no_duplicate_rows(
     cycle_after_day1 = repository.load_cycle(cycle_id=cycle_id)
     assert cycle_after_day1 is not None
     assert cycle_after_day1["state"] == CycleState.ACTIVE.value
+    # Phase 6A: the real, persisted identity is exactly what the one central
+    # builder computes independently from the same five inputs — never a
+    # format the engine happened to produce, verified against the builder.
+    assert cycle_after_day1["cycle_id"] == cycle_id_for(
+        runtime_id="positional_options",
+        strategy_id="weekly_delta_neutral",
+        execution_mode=ExecutionMode.PAPER,
+        underlying="NIFTY",
+        resolved_expiry_date=EXPIRY_DATE,
+    )
     legs_after_day1 = repository.load_cycle_legs(cycle_id=cycle_id)
     assert all(leg["state"] == "OPEN" for leg in legs_after_day1)
     positions_after_day1 = {
@@ -229,6 +254,15 @@ def test_restart_adopts_the_same_cycle_with_no_re_entry_and_no_duplicate_rows(
     cycle_after_restart = repository2.load_cycle(cycle_id=cycle_id)
     assert cycle_after_restart is not None
     assert cycle_after_restart["cycle_id"] == cycle_after_day1["cycle_id"]
+    # Restart reconstructs exactly the same identity — not merely "some
+    # cycle row", the same string the builder itself would compute.
+    assert cycle_after_restart["cycle_id"] == cycle_id_for(
+        runtime_id="positional_options",
+        strategy_id="weekly_delta_neutral",
+        execution_mode=ExecutionMode.PAPER,
+        underlying="NIFTY",
+        resolved_expiry_date=EXPIRY_DATE,
+    )
     assert cycle_after_restart["state"] == CycleState.ACTIVE.value
     # opened_trading_date is the cycle's own opening date — never rewritten
     # by the restart (spec review correction 4).
@@ -279,7 +313,7 @@ def test_restart_adopts_the_same_cycle_with_no_re_entry_and_no_duplicate_rows(
 # exchange_time regardless of which session performed the fill.
 # ======================================================================
 
-CYCLE_ID = f"weekly_delta_neutral:{EXPIRY_DATE}"
+CYCLE_ID = _cycle_id_for()
 _HEDGE_PUT_LEG_ID = f"{CYCLE_ID}:HEDGE_PUT:1"
 _HEDGE_CALL_LEG_ID = f"{CYCLE_ID}:HEDGE_CALL:1"
 _SHORT_PUT_LEG_ID = f"{CYCLE_ID}:SHORT_PUT:1"
@@ -707,5 +741,77 @@ def test_restart_reconciles_an_unknown_entry_submission_before_retrying(tmp_path
             if r["leg_id"] == _HEDGE_PUT_LEG_ID and r["side"] == legs2["HEDGE_PUT"]["side"]
         ]
         assert len(hedge_put_entry_rows2) == 1, "never a second, duplicate submission"
+    finally:
+        database2.close()
+
+
+# ------------------------------------------- pre-Phase-6A identity, never orphaned
+def test_restart_adopts_a_pre_phase_6a_cycle_id_without_ever_regenerating_it(
+    tmp_path: Any,
+) -> None:
+    """A cycle row from *before* this fix — the bare ``f"{strategy_id}:
+    {expiry}"`` format, hand-built directly through repository calls, never
+    through the engine (simulating a row this fix must never touch) — is
+    adopted safely on restart, and every subsequent leg/order binding keeps
+    resolving through that *same* old-format id: never regenerated to the
+    new richer format, never silently orphaned."""
+    db_name = "old_format_cycle.db"
+    old_cycle_id = f"weekly_delta_neutral:{EXPIRY_DATE}"  # deliberately not cycle_id_for()
+
+    database = Database(tmp_path / db_name)
+    MigrationRunner(database).run_pending()
+    repository = ExecutionRepository(database)
+    repository.upsert_cycle(
+        runtime_id="positional_options", strategy_id="weekly_delta_neutral",
+        execution_mode=ExecutionMode.PAPER, cycle_id=old_cycle_id,
+        underlying="NIFTY", resolved_expiry_date=EXPIRY_DATE, state="ENTERING",
+        entries_consumed=True, day_blocked_reason=None,
+        original_net_credit=None, original_max_loss=None, original_wing_width=None,
+        adjustments_today=0, adjustments_today_date=ENTRY_DATE, adjustments_this_cycle=0,
+        last_adjustment_at=None, pending_adjustment_role=None, pending_adjustment_state=None,
+        square_off_state="PENDING", opened_trading_date=ENTRY_DATE,
+    )
+    for role, (strike, option_type) in (
+        ("HEDGE_PUT", (HEDGE_PUT_STRIKE, "PE")),
+        ("HEDGE_CALL", (HEDGE_CALL_STRIKE, "CE")),
+        ("SHORT_PUT", (SHORT_PUT_STRIKE, "PE")),
+        ("SHORT_CALL", (SHORT_CALL_STRIKE, "CE")),
+    ):
+        repository.upsert_cycle_leg(
+            runtime_id="positional_options", strategy_id="weekly_delta_neutral",
+            execution_mode=ExecutionMode.PAPER, cycle_id=old_cycle_id,
+            leg_id=f"{old_cycle_id}:{role}:1", leg_role=role, option_type=option_type,
+            leg_sequence=1, is_replacement=False, replaces_leg_id=None,
+            security_id=_SECURITY_IDS[(strike, option_type)],
+            symbol=f"NIFTY {strike:.0f} {option_type}", strike=strike, expiry=EXPIRY_DATE,
+            lot_size=75, side=("BUY" if role.startswith("HEDGE") else "SELL"), quantity=None,
+            entry_price=None, entry_time=None, entry_correlation_id=None,
+            exit_price=None, exit_time=None, exit_reason=None, exit_correlation_id=None,
+            realized_gross_pnl=None, state="PENDING_ORDER",
+        )
+    database.close()
+
+    restart_ts = _restart_ts(10, 0, 0)
+    database2, repository2 = _run_entry_session(
+        tmp_path, db_name=db_name, trading_date=RESTART_DATE, ticks=_entry_ticks(restart_ts),
+        clock_ts=restart_ts, session_pid=3333,
+    )
+    try:
+        cycle2 = repository2.load_cycle(cycle_id=old_cycle_id)
+        assert cycle2 is not None
+        assert cycle2["cycle_id"] == old_cycle_id, "never regenerated to the new format"
+        assert cycle2["state"] == CycleState.ACTIVE.value
+
+        legs2 = repository2.load_cycle_legs(cycle_id=old_cycle_id)
+        assert len(legs2) == 4
+        assert all(leg["state"] == "OPEN" for leg in legs2)
+        for leg in legs2:
+            assert leg["leg_id"].startswith(f"{old_cycle_id}:"), "still keyed by the old id"
+
+        # Every order this cycle placed resolves through the old id too —
+        # nothing was left behind under a recomputed one.
+        history = repository2.cycle_order_history(cycle_id=old_cycle_id)
+        entry_rows = [r for r in history if r["side"] in ("BUY", "SELL")]
+        assert len(entry_rows) == 4
     finally:
         database2.close()

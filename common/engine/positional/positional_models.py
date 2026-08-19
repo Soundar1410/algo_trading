@@ -27,7 +27,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 
 from common.margin import MarginEstimate
 from common.models import ExitReason, OrderSide
@@ -43,6 +44,12 @@ from ..multi_leg_models import (
     MultiLegDurabilityError,
     UnmanageableBasketState,
 )
+
+if TYPE_CHECKING:
+    # Avoids the same import-cycle risk Cycle.execution_mode's own ``Any``
+    # annotation already documents — only ever used for the type hint below;
+    # cycle_id_for reads nothing but ``.value`` off the object it is given.
+    from common.config.models import ExecutionMode
 
 __all__ = [
     "ENTRY_ROLE_ORDER",
@@ -61,6 +68,7 @@ __all__ = [
     "MultiLegDurabilityError",
     "UnmanageableBasketState",
     "UnmanageableCycleState",
+    "cycle_id_for",
     "entry_has_blocking_leg",
     "entry_is_complete",
     "hedge_for",
@@ -132,6 +140,53 @@ def hedge_for(short_role: LegRole) -> LegRole:
 
 def short_for(hedge_role: LegRole) -> LegRole:
     return _SHORT_FOR_HEDGE[hedge_role]
+
+
+def cycle_id_for(
+    *,
+    runtime_id: str,
+    strategy_id: str,
+    execution_mode: ExecutionMode,
+    underlying: str,
+    resolved_expiry_date: str,
+) -> str:
+    """The one, generic, durable cycle identity every binding uses.
+
+    Phase 6A correction: the original identity (``f"{strategy_id}:
+    {resolved_expiry}"``) was missing ``runtime_id``, ``execution_mode`` and
+    ``underlying`` — and ``order_intents.basket_id``/``cycle_position_
+    bindings.cycle_id``/``cycle_order_history`` etc. are all looked up by
+    that raw string alone, never additionally filtered by runtime or mode in
+    SQL. A second runtime group, a paper-vs-live run, or a second underlying
+    reusing the same ``strategy_id`` and resolved expiry would silently mix
+    exposure under one identity. This is the single, central builder — never
+    reimplemented inline, in engine or strategy code alike (grep the tree:
+    ``_enter_cycle`` in ``positional_engine.py`` is the sole construction
+    site).
+
+    Deterministic and immutable: the same five inputs always produce the
+    same string, for the life of the cycle. Safely encoded: each component
+    is percent-encoded with the separator itself excluded from "safe"
+    (``quote(part, safe="")``), so a component that happens to contain a
+    colon can never be split ambiguously against a differently-divided set
+    of components — two distinct five-tuples can never collide on the joined
+    string.
+
+    Restarting a cycle already open under an *older* identity format never
+    regenerates it: ``recover_cycle``/``load_open_cycle`` find the in-flight
+    row by ``(runtime_id, strategy_id, execution_mode)`` columns, never by
+    parsing or recomputing the cycle_id string, so an already-persisted
+    cycle keeps working under whatever id it already has — this builder only
+    ever applies to a *new* cycle's own first persist.
+    """
+    parts = (
+        runtime_id,
+        strategy_id,
+        execution_mode.value,
+        underlying,
+        resolved_expiry_date,
+    )
+    return ":".join(quote(str(part), safe="") for part in parts)
 
 
 class CycleAction(StrEnum):

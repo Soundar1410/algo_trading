@@ -56,12 +56,13 @@ from datetime import datetime, timedelta
 from common.broker.quotes import QuoteBook
 from common.config.models import ExecutionMode
 from common.execution import ExecutionRepository
+from common.feed.queues import FeedGapNotice
 from common.greeks import GreekSnapshot, GreeksService
 from common.logging import get_logger
 from common.margin import MarginEstimate, MarginEstimator
 from common.models import ExitReason, Position, Tick
 from common.notifications import NotificationEvent, Notifier, NullNotifier, SafeNotifier
-from common.utils.timeutils import now_ist
+from common.utils.timeutils import is_fresh, now_ist
 
 from ..feed import MarketDataFeed
 from ..gateway import LifecycleGateway
@@ -85,6 +86,7 @@ from .positional_models import (
     LegState,
     MultiLegDurabilityError,
     UnmanageableCycleState,
+    cycle_id_for,
     entry_has_blocking_leg,
     entry_is_complete,
     next_entry_role,
@@ -110,6 +112,13 @@ _NEVER_PLACED = "NEVER_PLACED"
 _SUBMISSION_UNKNOWN = "UNKNOWN"
 _TERMINAL_NO_FILL = "TERMINAL_NO_FILL"
 _FILLED = "FILLED"
+
+#: Phase 6A: the signal kinds the market-data-degraded gate suppresses.
+#: Every other action (EXIT_ALL/EXIT_LEG) always dispatches regardless —
+#: exits/reconciliation must never be blocked by stale data.
+_RISK_INCREASING_ACTIONS = frozenset(
+    {CycleAction.ENTER_CYCLE, CycleAction.ROLL_SHORT, CycleAction.REPAIR_HEDGE}
+)
 
 
 class PositionalMultiLegEngine:
@@ -213,6 +222,22 @@ class PositionalMultiLegEngine:
         self._spot_fresh_at: datetime | None = None
         self._pending_by_security: dict[str, str] = {}
         self._last_evaluated_at: datetime | None = None
+
+        #: Phase 6A: the recoverable market-data-degraded gate. Latched the
+        #: instant a "disconnected" FeedGapNotice arrives; cleared only once
+        #: every currently-required security id has shown a genuinely fresh
+        #: tick since the outage's own resubscribe was confirmed — never on
+        #: the reconnect/resubscribe/supervisor-recovered events alone. See
+        #: on_feed_gap_notice/_record_tick_for_gate.
+        self._market_data_degraded = False
+        #: Wall-clock instant the current outage's own resubscription round
+        #: trip was confirmed complete — ``None`` until a "resubscribed"
+        #: notice arrives for it. A tick only counts towards clearing the
+        #: gate once its own exchange_time is at/after this instant.
+        self._resubscribed_at: datetime | None = None
+        #: Security ids observed with a fresh tick since ``_resubscribed_at``
+        #: was last set. Reset on every "disconnected"/"resubscribed" notice.
+        self._fresh_since_resubscribe: set[str] = set()
 
         self._square_off_requested = square_off_event or threading.Event()
         self._stopped = threading.Event()
@@ -376,10 +401,82 @@ class PositionalMultiLegEngine:
 
     # ------------------------------------------------------- tick routing
     def on_tick(self, tick: Tick) -> None:
+        self._record_tick_for_gate(tick)
         if tick.security_id == self.underlying_id:
             self._on_underlying_tick(tick)
             return
         self._on_leg_tick(tick)
+
+    # --------------------------------------------------- market-data gate
+    def on_feed_gap_notice(self, notice: FeedGapNotice) -> None:
+        """Phase 6A: the shared feed's own connection-state change, wired
+        from ``HubTickFeed``'s ``on_feed_gap`` callback (broadcast to every
+        worker sharing the feed — see ``FeedGapNotice``'s own docstring).
+
+        ``"disconnected"`` latches the gate immediately, before any further
+        evaluation can act — this runs on the same thread/callback path a
+        tick would use, so it is processed in order, ahead of whatever tick
+        comes next. ``"resubscribed"`` only records that this outage's own
+        resubscription round trip completed; it is never by itself
+        sufficient to clear the gate (a fresh, worker-selected security_id
+        could still be silently missing its own subscription — the whole
+        reason this gate does not simply trust the supervisor's own
+        "recovered" health state).
+        """
+        if notice.kind == "disconnected":
+            was_degraded = self._market_data_degraded
+            self._market_data_degraded = True
+            self._resubscribed_at = None
+            self._fresh_since_resubscribe = set()
+            if not was_degraded:
+                log.warning(
+                    "%s: market data degraded (feed disconnected) — new entries, staged-"
+                    "entry continuation, hedge repair and adjustment are suppressed until "
+                    "recovery",
+                    self.label,
+                )
+                self._notify(
+                    "market_data_degraded", f"{self.label}: feed disconnected at {notice.at}"
+                )
+            return
+        if notice.kind == "resubscribed":
+            self._resubscribed_at = notice.at
+            self._fresh_since_resubscribe = set()
+
+    def _record_tick_for_gate(self, tick: Tick) -> None:
+        """A no-op unless the gate is latched *and* this outage's own
+        resubscribe has already been confirmed — true for the overwhelming
+        majority of ticks. Clears the gate once every currently-required
+        security id has its own tick at or after that resubscribe instant —
+        never inferred from one instrument alone."""
+        if not self._market_data_degraded or self._resubscribed_at is None:
+            return
+        if tick.exchange_time.tzinfo is None or self._resubscribed_at.tzinfo is None:
+            return  # fail closed: never trust a naive timestamp comparison
+        if tick.exchange_time < self._resubscribed_at:
+            return
+        self._fresh_since_resubscribe.add(tick.security_id)
+        if self._required_security_ids() <= self._fresh_since_resubscribe:
+            self._market_data_degraded = False
+            self._resubscribed_at = None
+            self._fresh_since_resubscribe = set()
+            log.info(
+                "%s: market data recovered — every currently-required instrument has a "
+                "fresh post-reconnect tick",
+                self.label,
+            )
+            self._notify("market_data_recovered", f"{self.label}: market data recovered")
+
+    def _required_security_ids(self) -> set[str]:
+        """Everything the gate must see a fresh post-reconnect tick for
+        before clearing: the underlying, plus every open and every pending
+        (staged-entry/replacement/hedge-repair) leg's own contract."""
+        required = {self.underlying_id}
+        if self._cycle is not None:
+            for leg in (*self._cycle.open_legs(), *self._cycle.pending_legs()):
+                if leg.contract is not None:
+                    required.add(leg.contract.security_id)
+        return required
 
     def _on_underlying_tick(self, tick: Tick) -> None:
         self._spot = tick.last_price
@@ -771,7 +868,13 @@ class PositionalMultiLegEngine:
             now=ts,
             trading_date=self._lifecycle_policy.trading_date(ts),
             spot=self._spot,
-            spot_is_fresh=self._spot_fresh_at is not None,
+            # Phase 6A: time-bounded, not merely "has ever arrived" — the
+            # real defect that made this field unable to detect a stale
+            # underlying at all. Fails closed on a naive or future-dated
+            # tick timestamp too (common.utils.timeutils.is_fresh).
+            spot_is_fresh=is_fresh(
+                self._spot_fresh_at, now=ts, max_age_seconds=self._max_quote_age_seconds
+            ),
             chain=chain,
             leg_greeks=leg_greeks,
             can_enter=self.session.can_enter(ts),
@@ -787,6 +890,13 @@ class PositionalMultiLegEngine:
         )
 
     def _apply_signal(self, signal: CycleSignal, ts: datetime) -> None:
+        if signal.action in _RISK_INCREASING_ACTIONS and self._market_data_degraded:
+            log.info(
+                "%s: risk-increasing signal %s suppressed — market data degraded",
+                self.label,
+                signal.action.value,
+            )
+            return
         if signal.action is CycleAction.ENTER_CYCLE:
             self._enter_cycle(signal, ts)
         elif signal.action is CycleAction.ROLL_SHORT:
@@ -824,7 +934,13 @@ class PositionalMultiLegEngine:
 
         resolved_expiry = signal.legs[0].contract.expiry
         trading_date = self._lifecycle_policy.trading_date(ts)
-        cycle_id = f"{self._strategy_id}:{resolved_expiry}"
+        cycle_id = cycle_id_for(
+            runtime_id=self._runtime_id,
+            strategy_id=self._strategy_id,
+            execution_mode=self._mode,
+            underlying=self.underlying_instrument,
+            resolved_expiry_date=resolved_expiry,
+        )
         cycle = Cycle(
             cycle_id=cycle_id,
             strategy_id=self._strategy_id,
@@ -973,6 +1089,15 @@ class PositionalMultiLegEngine:
         *before* ever consulting the quote book: a quote that arrives after
         the deadline must never reopen or continue the entry, so once
         expired it is never even looked at.
+
+        Phase 6A: arming/subscribing happens regardless of the market-data-
+        degraded gate (pure data plumbing — the earlier the subscription is
+        in flight, the sooner recovery can complete), and the deadline check
+        above still runs unconditionally while degraded (a flapping feed
+        must never extend the bounded-workflow guarantee indefinitely) —
+        but the actual fill attempt (``_open_leg_now``, which can place a
+        new order) is skipped while degraded, exactly like "no fresh quote
+        yet": retried again once the gate clears.
         """
         assert self._cycle is not None
         if self._cycle.entry_stage_role is not role:
@@ -1005,6 +1130,8 @@ class PositionalMultiLegEngine:
                 self._expire_entry_stage(leg, role, ts)
                 return True
 
+        if self._market_data_degraded:
+            return False
         if self._open_leg_now(leg, ts):
             self._clear_entry_stage(ts)
             return True
