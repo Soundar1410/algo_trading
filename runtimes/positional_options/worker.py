@@ -86,12 +86,6 @@ from common.utils.timeutils import now_ist
 from .config_adapter import WorkerConfig
 from .positional_multi_leg_engine_worker import load_positional_strategy, recover_cycle
 
-#: How often the square-off-request poll thread wakes — independent of, and
-#: much coarser than, the engine's own ``evaluation_interval_seconds``: this
-#: thread only ever notices an operator's file write and rate-limits the
-#: heartbeat, neither of which needs tick-speed polling.
-_POLL_INTERVAL_SECONDS = 5.0
-
 #: Exit code used when another process already owns this strategy's worker
 #: lock — distinct from 1 so the supervisor (or a test) can tell "refused as
 #: duplicate" from "crashed". Mirrors ``runtimes.intraday_options.worker.
@@ -431,9 +425,8 @@ def run_worker(
     restart, operator ``Ctrl-C``) leaves any open cycle exactly as it is, to
     be reconciled and adopted by ``recover_cycle`` on the next restart. The
     *only* thing that ever calls ``request_square_off`` here is an operator's
-    square-off request file, noticed by the poll thread below — a distinct,
-    deliberate act (``scripts/square_off.py``), never an accident of process
-    lifecycle.
+    square-off request file — a distinct, deliberate act
+    (``scripts/square_off.py``), never an accident of process lifecycle.
 
     ``engine_holder`` (Phase 6A): an optional one-element list the caller
     already constructed *before* this function ran, so it could wire
@@ -443,6 +436,27 @@ def run_worker(
     (mirrors ``build_engine``'s own internal ``engine_holder`` trick for its
     heartbeat reporter, just threaded one level further out here). Appended
     to the instant the real engine exists, before it ever runs.
+
+    **Phase 6A correction: no separate polling thread lives here anymore.**
+    Before this phase, this function ran its own background thread —
+    woken every few seconds to write a liveness heartbeat and notice an
+    operator's square-off request file. Both jobs were silently broken:
+    the thread reused this function's own ``repository``/``database``
+    sqlite3 connection from a *different* thread than the one that opened
+    it, which sqlite3 refuses outright (D31) — so the very first wake
+    raised, uncaught, and killed the thread for the rest of the run.
+    Operator square-off polling and periodic heartbeats had therefore
+    never actually worked past the first few seconds of any real session.
+    Fixed by using the *existing* generic, correctly-threaded mechanism
+    instead of a second one: ``_run_positional_worker_locked``'s own
+    ``on_poll`` callback (running on this same thread, via
+    ``HubTickFeed`` — see that module's own docstring on why that thread
+    is the one thread D31 allows to touch this connection) now checks the
+    square-off request file directly, and the engine's own ``_evaluate``
+    calls its reporter's ``beat()`` on every evaluation, tick- or
+    poll-driven. Both are therefore only as available as the caller's own
+    ``feed.on_poll`` wiring — true today (the only real caller) and
+    consistent with how ``on_tick_dropped``/``on_feed_gap`` already work.
     """
     safe_notifier = (
         notifier if isinstance(notifier, SafeNotifier) else SafeNotifier(notifier or NullNotifier())
@@ -501,24 +515,7 @@ def run_worker(
         )
     )
 
-    stop_polling = threading.Event()
     signalled = threading.Event()
-
-    def _poll_square_off() -> None:
-        while not stop_polling.wait(_POLL_INTERVAL_SECONDS):
-            heartbeat.beat(HealthState.running_for(ExecutionMode.PAPER))
-            request = read_square_off_request(square_off_request_file)
-            if request is not None and not engine.square_off_requested:
-                log.warning(
-                    "operator square-off request for strategy_id=%s: %s",
-                    config.strategy_id,
-                    request.reason,
-                )
-                engine.request_square_off(request.reason)
-
-    poll_thread = threading.Thread(
-        target=_poll_square_off, name=f"{config.strategy_id}:square_off_poll", daemon=True
-    )
 
     def _on_shutdown_signal() -> None:
         signalled.set()
@@ -526,12 +523,7 @@ def run_worker(
 
     try:
         with shutdown_signals(_on_shutdown_signal):
-            poll_thread.start()
-            try:
-                engine.run()
-            finally:
-                stop_polling.set()
-                poll_thread.join(timeout=_POLL_INTERVAL_SECONDS * 2)
+            engine.run()
         outcome.clean_shutdown = True
     except (KeyboardInterrupt, SystemExit):
         raise
@@ -814,13 +806,35 @@ def _run_positional_worker_locked(
     # engine_holder trick for its heartbeat reporter).
     engine_holder: list[PositionalMultiLegEngine] = []
 
+    # An operator's square-off request file — read here, on this thread,
+    # every on_poll wake (see _on_poll below), never from a separate
+    # thread: run_worker used to run its own polling thread for exactly
+    # this, and it silently never worked past its first wake (see
+    # run_worker's own updated docstring for the full D31 explanation).
+    assert config.runtime_root is not None
+    square_off_request_file = square_off_request_path(
+        config.runtime_root, config.runtime_id, config.strategy_id
+    )
+
     def _on_poll() -> None:
         # The only place this worker polls on a timer: without it, a feed
         # gone quiet (staleness, a stuck subscription) would never
         # re-trigger the engine's own hard-expiry-deadline check, which is
-        # otherwise only ever reached from an underlying tick.
-        if engine_holder:
-            engine_holder[0].poll()
+        # otherwise only ever reached from an underlying tick. Checked
+        # before poll() so a request landing on this exact wake is acted
+        # on by this same evaluation, not the next one — mirrors the wall-
+        # clock net's own ordering (hub_feed.py's module docstring).
+        if not engine_holder:
+            return
+        request = read_square_off_request(square_off_request_file)
+        if request is not None and not engine_holder[0].square_off_requested:
+            log.warning(
+                "operator square-off request for strategy_id=%s: %s",
+                config.strategy_id,
+                request.reason,
+            )
+            engine_holder[0].request_square_off(request.reason)
+        engine_holder[0].poll()
 
     def _on_tick_dropped(notice: TickDropNotice) -> None:
         # Mirrors multi_leg_engine_worker.py's own _on_tick_dropped shape:

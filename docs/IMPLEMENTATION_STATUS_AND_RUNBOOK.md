@@ -8968,21 +8968,85 @@ second real paper strategy, EMA-specific minimum-quantity approval,
 static-IP/provider setup, and live auth revalidation are *live*-enablement
 requirements, not paper-mode blockers.
 
+**4. A third, previously-undiscovered defect found and fixed: operator
+square-off and periodic heartbeats had never actually worked for this
+runtime.** Surfaced by this phase's own hang debugging, not part of
+either gap above, but real and worth closing here rather than leaving for
+a later phase to rediscover independently. `run_worker` ran a separate
+background thread (`_poll_square_off`, woken every 5 seconds) to write a
+liveness heartbeat and notice an operator's square-off request file
+(`scripts/square_off.py`). That thread reused this worker's own
+`repository`/`database` sqlite3 connection — opened on the process's main
+thread — from a *different* thread, which sqlite3 refuses outright
+(`sqlite3.ProgrammingError: SQLite objects created in a thread can only
+be used in that same thread`, the exact D31 rule this codebase already
+names elsewhere). The exception was uncaught, so it silently killed the
+thread on its very first wake, five seconds into every real run — meaning
+an operator's square-off request file had never actually been noticed by
+a running positional worker, and a heartbeat had been written exactly
+once (at start) for the entire life of any real session, never again
+until the worker stopped. Every existing test completed in well under
+five seconds, so this had never been observed.
+
+Fixed by using the one thread D31 already allows to touch this
+connection, rather than adding a second, correctly-synchronised one:
+`_run_positional_worker_locked`'s own `on_poll` callback (`HubTickFeed`'s
+own timer, already wired this phase for the market-data-degraded gate)
+now reads the square-off request file and calls
+`engine.request_square_off(...)` directly, before calling `engine.poll()`
+so a request landing on this exact wake is acted on by this same
+evaluation. The periodic heartbeat moved even closer to correct: rather
+than a poll-only callback, `PositionalMultiLegEngine._evaluate` — reached
+on every tick *and* every poll — now calls its own reporter's `beat(...)`
+directly (`HeartbeatEngineReporter`, already constructed and wired
+correctly by `build_engine`, but never actually invoked outside of
+`start()`/`stopped()` before this). No new thread, no new synchronisation
+primitive — both fixes are call sites moved onto machinery that was
+already on the right thread. `run_worker`'s separate polling thread is
+removed entirely; its docstring is corrected in place.
+
+New `tests/integration/test_positional_runtime_multi_strategy.py::
+test_operator_square_off_is_noticed_and_heartbeats_are_written_periodically`
+proves both directly through a real spawned child process (not a
+unit-level stand-in): a square-off request file written before the
+supervisor runs is cleared and produces an `audit_events` row once the
+worker's own post-run check confirms it took effect, and at least two
+`runtime_heartbeats` rows exist for the one session — impossible before
+this fix, which wrote exactly one.
+
 **Verification.** New and targeted suites above; the full weekly/
 positional family (`test_weekly_delta_neutral_adjustment/_entry/
 _entry_stage_timeout/_expiry_day/_lot_size/_pnl_and_exits/_restart.py`,
 `test_positional_runtime_multi_strategy.py`,
 `test_positional_runtime_weekly_staged_entry.py`,
 `test_positional_feed_reconnect.py`, and the positional/dashboard unit
-suites) — 125 passed. The intraday reconnect/stale-feed regression list
-above — 134 passed, unchanged. Full `pytest` — 2532 collected, 2508
+suites) — 126 passed. The intraday reconnect/stale-feed regression list
+above — 134 passed, unchanged. Full `pytest` — 2533 collected, 2509
 passed, 24 skipped (all pre-existing, environment-gated), 0 failed, 0
-errors. `ruff check .`
+errors, in 150.5s. `ruff check .`
 clean. `mypy common strategies runtimes dashboards scripts` — Success: no
 issues found in 232 source files. `python -m
 scripts.assert_no_live_config_committed` — OK. `python -m
 scripts.validate_environment --runtime-id positional_options` — all
 checks passed.
+
+**A transient, unrelated flake observed and ruled out while verifying.**
+One full-suite attempt stalled for ~39 minutes inside
+`tests/unit/test_stuck_subscription_alarm.py::
+test_a_stuck_feed_ends_the_run_instead_of_idling_forever` — entirely
+`runtimes.intraday_options` code, untouched anywhere in this phase. That
+test monkeypatches two real-time intervals down to 20ms/100ms specifically
+to keep its own runtime short; under the scheduling contention of running
+deep inside a 2500+-test suite, the underlying stuck-subscription
+detection it drives did not fire within that tightened window. Confirmed
+unrelated to this phase's own changes before re-running: three isolated
+runs of that single test each passed in under a second, and the very next
+full-suite attempt (above) passed clean, both `ruff`/`mypy`-verified
+changes unchanged in between. Not a hang in the sense the rest of this
+phase's own work was about — this is a pre-existing test's tight,
+real-time-dependent bound, occasionally too tight under heavy concurrent
+load; recorded here for honesty, not treated as a defect of this phase's
+own changes, and not otherwise investigated further (out of scope).
 
 **Status.** Both mandatory paper-safety gaps are closed. `weekly_delta_
 neutral` and the `positional_options` runtime remain `enabled: false`.

@@ -518,6 +518,18 @@ class PositionalMultiLegEngine:
 
     # ----------------------------------------------------------- evaluation
     def _evaluate(self, ts: datetime) -> None:
+        # Phase 6A: this is now reached on a timer even with no tick
+        # (HubTickFeed's own on_poll -> poll() -> here), which is what
+        # makes this the right, single place for a periodic liveness
+        # beat — never a separate thread. A second thread calling
+        # heartbeat.beat() would use the same sqlite3 connection this
+        # engine's own repository/database were opened with from a
+        # *different* thread, which sqlite3 refuses outright (D31); this
+        # reporter was always the correctly-threaded one, just never
+        # called outside of start()/stopped() before. HeartbeatEngineReporter
+        # (the only non-null implementation in production) already rate-
+        # limits its own writes and never raises.
+        self._reporter.beat(self.positions.positions, self.positions.trades)
         cycle_is_active = self._cycle is not None and self._cycle.state not in TERMINAL_CYCLE_STATES
         if self._square_off_requested.is_set() and cycle_is_active:
             self._exit_all(

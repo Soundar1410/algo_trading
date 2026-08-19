@@ -28,6 +28,7 @@ from common.feed.reconnect import ReconnectingFeed
 from common.models import Tick
 from common.persistence import Database, MigrationRunner
 from common.process import worker_lock
+from common.process.square_off_requests import square_off_request_path, write_square_off_request
 from common.utils.timeutils import now_ist
 from runtimes.positional_options.config_adapter import WorkerConfig
 from runtimes.positional_options.supervisor import (
@@ -135,6 +136,45 @@ class _FlakyAdapter:
                 return
         finally:
             self._running = False
+
+
+class _SlowAdapter:
+    """Delivers its ticks, then stays "connected" (blocking ``start()``)
+    for a short, fixed real-time window before returning cleanly — long
+    enough for the real spawned child's own ``on_poll`` (fired every
+    ``HubTickFeed``'s default ~0.5s, unrelated to any tick) to wake
+    several times, so a test can prove something that only happens across
+    *repeated* wakes: an operator's square-off request file being noticed,
+    or more than one heartbeat row being written."""
+
+    def __init__(self, ticks: list[Tick], *, hold_seconds: float = 2.5) -> None:
+        self._ticks = ticks
+        self._hold_seconds = hold_seconds
+        self._running = False
+
+    def subscribe(
+        self, security_ids: Any, *, segment: int | None = None, mode: int | None = None
+    ) -> None:
+        pass
+
+    def request_stop(self) -> None:
+        self._running = False
+
+    def stop(self) -> None:
+        self._running = False
+
+    def start(self, on_tick: Any, *, on_idle: Any = None) -> None:
+        self._running = True
+        for tick in self._ticks:
+            if not self._running:
+                break
+            on_tick(tick)
+        deadline = time.monotonic() + self._hold_seconds
+        while self._running and time.monotonic() < deadline:
+            if on_idle is not None:
+                on_idle()
+            time.sleep(0.05)
+        self._running = False
 
 
 def _worker_config(
@@ -478,4 +518,65 @@ def test_two_workers_share_one_feed_and_stay_isolated_through_a_reconnect(tmp_pa
         assert len(incidents) == 1
         sessions = _session_rows(database_path, strategy_id=strategy_id)
         assert len(sessions) == 1 and sessions[0]["ended_at"] is not None
+
+
+# =========================== Phase 6A gap-closing: operator square-off + heartbeat
+def test_operator_square_off_is_noticed_and_heartbeats_are_written_periodically(
+    tmp_path: Any,
+) -> None:
+    """Before this fix, a real spawned positional worker's own square-off-
+    request-file polling and periodic liveness heartbeat both ran on a
+    separate background thread that reused the worker's own sqlite3
+    connection from a different thread than the one that opened it —
+    which sqlite3 refuses outright, so the thread crashed, uncaught, on
+    its very first wake (5s in). Operator square-off had therefore never
+    actually worked for this runtime, and a heartbeat was written exactly
+    once (at start) for the life of any real run. Both are now driven off
+    the correctly-threaded ``on_poll`` callback instead — this proves both
+    directly, through a real spawned child process, not a unit-level
+    stand-in."""
+    database_path = tmp_path / "positional_options.db"
+    MigrationRunner(Database(database_path)).run_pending()
+
+    t0 = datetime(2026, 8, 19, 9, 26, tzinfo=UTC)
+    adapter = _SlowAdapter([_tick(NIFTY_SECURITY_ID, 24000.0, t0)], hold_seconds=2.5)
+
+    clock = OffsetClock(offset=t0 - now_ist())
+    supervisor = _build_supervisor(
+        tmp_path, database_path=database_path, adapter=adapter, clock=clock
+    )
+    solo = _worker_config(tmp_path, strategy_id="_fixture_solo", database_path=database_path)
+    supervisor.add_worker(solo)
+
+    assert solo.runtime_root is not None
+    request_file = square_off_request_path(solo.runtime_root, "positional_options", "_fixture_solo")
+    write_square_off_request(request_file, requested_by="test-operator", reason="phase 6a proof")
+
+    result = supervisor.run()
+
+    assert result.worker_exit_codes["_fixture_solo"] == EXIT_OK
+
+    # Noticed and honoured: FixtureSecondStrategy never opens a cycle, so
+    # "square off" completes immediately once request_square_off is ever
+    # called at all — the request file is cleared and an audit row is
+    # written only on that path (worker.py's own post-run check).
+    assert not request_file.exists(), "the request file should have been cleared"
+    db = Database(database_path)
+    try:
+        conn = db.connect()
+        audit_rows = conn.execute(
+            "SELECT * FROM audit_events WHERE strategy_id = ? AND action = 'square_off_completed'",
+            ("_fixture_solo",),
+        ).fetchall()
+        assert len(audit_rows) == 1
+        heartbeat_rows = conn.execute(
+            "SELECT * FROM runtime_heartbeats WHERE strategy_id = ? ORDER BY id",
+            ("_fixture_solo",),
+        ).fetchall()
+    finally:
+        db.close()
+    # More than the single start-of-run beat — proof the periodic beat
+    # inside _evaluate actually ran repeatedly across the ~2.5s the feed
+    # stayed connected, not just once.
+    assert len(heartbeat_rows) >= 2
 
