@@ -119,15 +119,47 @@ def test_the_interpreter_is_this_projects_own_venv(filename, document):
 
 
 @pytest.mark.parametrize("filename,document", list(_committed_plists().items()))
-@pytest.mark.skipif(
-    not (COMMITTED_PROJECT_ROOT / "pyproject.toml").is_file(),
-    reason="operator-Mac mount validation requires /Volumes/Trading/algo_trading",
-)
-def test_working_directory_is_the_project_root(filename, document):
+def test_no_launchd_prerequisite_path_needs_the_mounted_volume(filename, document):
+    """The correction that makes delayed-mount recovery real.
+
+    launchd chdirs to ``WorkingDirectory`` and opens ``StandardOutPath`` /
+    ``StandardErrorPath`` *before* it executes ``ProgramArguments[0]``. While
+    any of the three pointed under ``/Volumes/Trading``, job setup could fail
+    on an unmounted volume and the carefully-written wait loop would never run
+    at all — so the wrapper did not actually prove what it claimed to.
+    """
+    for key in ("WorkingDirectory", "StandardOutPath", "StandardErrorPath"):
+        value = document[key]
+        assert not value.startswith("/Volumes/"), (
+            f"{filename}: {key} = {value} — launchd must prepare this before the "
+            "wait loop can run, so it cannot live on the mounted volume"
+        )
+        assert Path(value).is_absolute()
+        assert "~" not in value and "$" not in value, (
+            f"{filename}: {key} carries an unexpanded path; launchd expands neither"
+        )
+
+
+@pytest.mark.parametrize("filename,document", list(_committed_plists().items()))
+def test_the_working_directory_exists_on_the_boot_volume(filename, document):
     working_directory = Path(document["WorkingDirectory"])
-    assert (working_directory / "pyproject.toml").is_file(), (
-        f"{filename}: WorkingDirectory {working_directory} does not look like the project root"
-    )
+    assert working_directory.is_dir(), f"{filename}: {working_directory} must already exist"
+
+
+@pytest.mark.parametrize("filename,document", list(_committed_plists().items()))
+def test_the_wrapper_enters_the_project_root_before_exec(filename, document):
+    """WorkingDirectory is no longer the project root, so the shell must cd —
+    otherwise `.env` (loaded relative to CWD) and every relative path move."""
+    script = document["ProgramArguments"][2]
+    assert f"cd '{COMMITTED_PROJECT_ROOT}'" in script
+    assert script.index("cd '") < script.index("exec "), "the cd must precede the exec"
+
+
+@pytest.mark.parametrize("filename,document", list(_committed_plists().items()))
+def test_project_root_still_points_at_the_mounted_volume(filename, document):
+    """PROJECT_ROOT is an environment variable, not something launchd opens,
+    so it may — and must — still name the real project."""
+    assert document["EnvironmentVariables"]["PROJECT_ROOT"] == str(COMMITTED_PROJECT_ROOT)
 
 
 def test_stdout_and_stderr_paths_are_distinct_across_every_label():
@@ -140,9 +172,13 @@ def test_stdout_and_stderr_paths_are_distinct_across_every_label():
     assert len(stream_paths) == len(set(stream_paths)), "two labels share a stdout/stderr path"
 
 
-def test_stdout_and_stderr_paths_live_under_the_project_log_root():
+def test_stdout_and_stderr_paths_live_under_the_dedicated_boot_log_root():
+    """A dedicated boot-volume directory, not the project's own logs/ — see
+    test_no_launchd_prerequisite_path_needs_the_mounted_volume for why."""
+    from orchestration.launchd.generate_plists import boot_log_root
+
+    log_root = boot_log_root()
     for document in _committed_plists().values():
-        log_root = Path(document["WorkingDirectory"]) / "logs"
         assert Path(document["StandardOutPath"]).is_relative_to(log_root)
         assert Path(document["StandardErrorPath"]).is_relative_to(log_root)
 
@@ -195,8 +231,14 @@ def test_keep_alive_false_matches_what_the_code_says_about_restarts():
 
 
 def test_every_plist_sets_project_root_in_its_environment():
+    """PROJECT_ROOT names the real project — it used to be asserted equal to
+    WorkingDirectory, which stopped being right when WorkingDirectory moved to
+    the boot volume. What must still hold is that the environment variable and
+    the directory the wrapper actually enters are the same place."""
     for document in _committed_plists().values():
-        assert document["EnvironmentVariables"]["PROJECT_ROOT"] == document["WorkingDirectory"]
+        project_root = document["EnvironmentVariables"]["PROJECT_ROOT"]
+        assert project_root == str(COMMITTED_PROJECT_ROOT)
+        assert f"cd '{project_root}'" in document["ProgramArguments"][2]
 
 
 # ------------------------------------------------- the delayed-volume mechanism
@@ -220,20 +262,29 @@ def test_the_wait_executable_lives_on_the_boot_volume_and_exists():
         assert Path(binary).exists(), f"{binary} must be present before any volume mounts"
 
 
-def test_the_wait_loop_is_bounded_by_the_committed_schedule_not_a_fixed_five_minutes():
-    """A drive mounting at 09:06 must still trade: there is no second calendar
-    trigger that day. The budget is the configured 09:00 -> 15:15 span."""
-    from orchestration.launchd.generate_plists import mount_wait_seconds
+def test_the_trading_wrapper_uses_an_absolute_wall_clock_deadline():
+    """Not an elapsed budget, and this is the whole point.
 
-    budget = mount_wait_seconds()
-    assert budget > 5 * 60, "a five-minute cap would lose the whole day"
-    assert budget == 6 * 3600 + 15 * 60
+    RunAtLoad fires whenever the Mac is switched on. Under a
+    ``deadline - startup`` elapsed budget a 07:00 login with the volume
+    unavailable would expire at 13:15 — and while that shell is still waiting,
+    launchd will not start a second copy for the 09:00 StartCalendarInterval
+    event. The day would be lost by the very mechanism meant to save it.
+    """
+    from orchestration.launchd.generate_plists import session_deadline_hhmm
 
     script = _committed_plists()["com.soundarraj.algotrading.autostart.plist"][
         "ProgramArguments"
     ][2]
-    assert str(budget) in script
+    deadline = session_deadline_hhmm()
+    assert deadline == "1515"
+    assert f"-ge 1{deadline}" in script, "the boundary must be a wall-clock comparison"
+    assert "/bin/date +%H%M" in script
+    assert "session deadline" in script
     assert "is /Volumes/Trading mounted?" in script, "the log message must be actionable"
+    # An elapsed counter must not survive anywhere in the trading wrapper.
+    assert "n=$((n+1))" not in script
+    assert "n=0" not in script
 
 
 def test_the_wait_loop_is_valid_shell():

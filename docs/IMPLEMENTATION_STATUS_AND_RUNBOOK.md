@@ -5905,40 +5905,90 @@ rather than a failed bind.
 
 #### The delayed Trading-volume mount
 
-The repository, the `.venv` and the logs all live on `/Volumes/Trading`, which
-at login routinely mounts *after* `launchd` fires. A plist whose
-`ProgramArguments[0]` is the venv interpreter simply fails at that moment, and
-with `KeepAlive=false` nothing tries again.
+The repository, the `.venv` and the project's own logs all live on
+`/Volumes/Trading`, which at login routinely mounts *after* `launchd` fires.
 
-So the program is `/bin/sh` — on the boot volume, always executable — running
-a generated wait loop that `exec`s the real interpreter once it appears:
+**Two things have to be true for delayed-mount recovery to actually work, and
+the first one is easy to miss.** `launchd` chdirs to `WorkingDirectory` and
+opens `StandardOutPath` / `StandardErrorPath` *before* it executes
+`ProgramArguments[0]`. While those three pointed under `/Volumes/Trading`, job
+setup could fail on an unmounted volume and the carefully-written wait loop
+would never run at all — the wrapper looked like it handled a late mount and
+did not. So every path launchd itself must prepare now lives on the boot
+volume:
+
+| Key | Value |
+| --- | --- |
+| `WorkingDirectory` | `/Users/Soundarraj` |
+| `StandardOutPath` | `/Users/Soundarraj/Library/Logs/algo_trading/launchd/<name>.out.log` |
+| `StandardErrorPath` | `/Users/Soundarraj/Library/Logs/algo_trading/launchd/<name>.err.log` |
+| `EnvironmentVariables.PROJECT_ROOT` | `/Volumes/Trading/algo_trading` (an env var — launchd never opens it) |
+
+Both paths are resolved absolutely at generation time; a committed plist never
+contains `~` or an unexpanded `$VAR`, neither of which launchd expands. The
+installer creates the log directory with `/bin/mkdir -p` **before**
+bootstrapping, because a missing directory there fails the job in exactly the
+way this change exists to prevent.
+
+Since `WorkingDirectory` is no longer the project root, **the wrapper `cd`s
+into the real project root itself**, once it exists and before `exec`, so
+`.env` resolution and every relative path inside the application behave
+exactly as before.
+
+The program is `/bin/sh` — on the boot volume, always executable — and the
+only other executables used before the volume appears are `/bin/date` and
+`/bin/sleep`:
 
 ```sh
-n=0
 while [ ! -x '/Volumes/Trading/algo_trading/.venv/bin/python' ]; do
-  n=$((n+1))
-  if [ "$n" -gt 1500 ]; then
-    echo "autostart: ... never appeared before the session deadline (22500s); \
+  if [ "1$(/bin/date +%H%M)" -ge 11515 ]; then
+    echo "autostart: ... did not appear before the 15:15 session deadline; \
 is /Volumes/Trading mounted?" >&2
     exit 75
   fi
-  sleep 15
+  /bin/sleep 15
 done
+cd '/Volumes/Trading/algo_trading' || { echo "autostart: cannot enter ..." >&2; exit 75; }
 exec '/usr/bin/caffeinate' -i -s '.../python' -m orchestration.auto_start
 ```
 
-**There is deliberately no five-minute cap.** A drive that mounts at 09:06
-must still trade — there is no second calendar trigger that day. The wrapper
-cannot read repository configuration before the volume exists, so the
-generator derives its budget from the committed schedule itself
-(`session_deadline_time - startup_time`, currently 22500s = 06:15), and Python
-re-reads the *actual* configured deadline and re-validates the window the
-moment the project is importable. The shell bound is a floor for the
-boot-volume phase; it is never the authority on when trading may start.
+**The boundary is an absolute wall-clock time, not an elapsed budget.** This
+is the second thing that has to be right. `RunAtLoad` fires whenever the Mac
+is switched on, so under an elapsed `session_deadline - startup_time` budget a
+07:00 login with the volume unavailable would expire at **13:15** — and while
+that shell is still waiting, `launchd` will not start a second copy for the
+09:00 `StartCalendarInterval` event. The day would be silently lost by the
+very mechanism written to save it. Comparing `date +%H%M` against the
+configured deadline removes the invocation time from the arithmetic entirely.
 
-The loop contains only absolute paths generated from the project root. No
+The `1` prefix in `[ "1$(date +%H%M)" -ge 11515 ]` looks odd and is
+deliberate: it turns `0700` into `10700`, so `test` never sees a leading zero
+it might read as octal, while the ordering of the original times is preserved
+exactly.
+
+Behaviour, all of it covered by tests that execute the real generated script
+against a stub clock and a stub volume:
+
+| Situation | Result |
+| --- | --- |
+| Volume present at 08:30 | `exec`s Python immediately. The **Python** early gate then exits 0 and defers to the 09:00 trigger — the shell has no opinion about 09:00, and does not contain the string. |
+| Login 07:00, volume absent | Keeps polling. Does **not** expire at 13:15. |
+| Volume appears 09:06 / 12:00 / 14:30 | The already-running wrapper starts the controller. |
+| Clock at or past 15:15 | Exits 75 without waiting at all. Nothing starts. |
+| Project root missing after mount | Exits 75 with `cannot enter <root>`. |
+
+The loop carries only absolute paths generated from the project root. No
 secret is interpolated, and the generator refuses outright to build a command
 containing a quote character.
+
+**The dashboard has its own, deliberately different policy.** It has no
+calendar trigger and no trading session, and is meant to work at weekends and
+on holidays — a wrapper that gave up at 15:15 would refuse to start a Saturday
+dashboard at all, and one that consulted the trading clock would be applying a
+trading rule to something that does not trade. Its wrapper therefore never
+reads the clock: it polls for up to `DASHBOARD_WAIT_SECONDS` (12 hours) from
+invocation and then exits 75 telling the operator to log in again. An elapsed
+budget is the right shape precisely because there is no trigger to lose.
 
 #### Configuration
 
@@ -5985,12 +6035,21 @@ An operator who understands the consequence may set
 
 #### Log locations
 
+launchd's own streams are on the **boot volume**, deliberately — they have to
+be readable when the mount is exactly what failed:
+
 ```
-logs/launchd/autostart.out.log      launchd stdout  (pre-logger failures)
-logs/launchd/autostart.err.log      launchd stderr  (volume-mount messages)
-logs/launchd/dashboard.out.log      dashboard stdout
-logs/launchd/dashboard.err.log      dashboard stderr
-logs/auto_start.log                 the controller's own redacted log
+/Users/Soundarraj/Library/Logs/algo_trading/launchd/autostart.out.log
+/Users/Soundarraj/Library/Logs/algo_trading/launchd/autostart.err.log   <- mount messages
+/Users/Soundarraj/Library/Logs/algo_trading/launchd/dashboard.out.log
+/Users/Soundarraj/Library/Logs/algo_trading/launchd/dashboard.err.log
+```
+
+The application's own redacted log stays with the project, written after the
+volume is up:
+
+```
+/Volumes/Trading/algo_trading/logs/auto_start.log
 ```
 
 #### Installation — a separate operator step, not part of this work
@@ -6035,7 +6094,8 @@ launchctl list | grep com.soundarraj.algotrading
 .venv/bin/python -m orchestration.auto_start --dry-run
 
 .venv/bin/python -m scripts.install_launch_agents logs
-tail -f logs/launchd/autostart.err.log logs/auto_start.log
+tail -f ~/Library/Logs/algo_trading/launchd/autostart.err.log \
+        /Volumes/Trading/algo_trading/logs/auto_start.log
 ```
 
 #### Rollback / uninstall

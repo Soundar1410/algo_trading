@@ -42,7 +42,7 @@ from common.config import load_auto_start_config
 from common.config.paths import resolve_project_root
 from common.process import legacy_system_status
 from orchestration.auto_start.gate import system_timezone_matches, system_timezone_name
-from orchestration.launchd.generate_plists import PLIST_SPECS
+from orchestration.launchd.generate_plists import PLIST_SPECS, boot_log_root
 
 EXIT_OK = 0
 EXIT_REFUSED = 2
@@ -146,7 +146,15 @@ def cmd_install(args: argparse.Namespace) -> int:
         return EXIT_REFUSED
 
     source = _source_dir()
-    commands: list[list[str]] = [["/bin/mkdir", "-p", str(LAUNCH_AGENTS_DIR)]]
+    # The launchd log directory must exist, on the boot volume, *before*
+    # bootstrapping: launchd opens StandardOutPath/StandardErrorPath while
+    # setting the job up, and a missing directory there fails the job before
+    # its wait loop ever runs — the exact class of failure the boot-volume
+    # paths exist to remove.
+    commands: list[list[str]] = [
+        ["/bin/mkdir", "-p", str(LAUNCH_AGENTS_DIR)],
+        ["/bin/mkdir", "-p", str(boot_log_root())],
+    ]
     for spec in PLIST_SPECS:
         target = LAUNCH_AGENTS_DIR / spec.filename
         commands.append(["/bin/cp", str(source / spec.filename), str(target)])

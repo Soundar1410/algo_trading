@@ -87,6 +87,48 @@ def test_uninstall_executes_nothing_without_the_execute_flag(
     assert [c for c in _never_run_a_command if "launchctl" in " ".join(c)] == []
 
 
+def test_the_installer_creates_the_boot_volume_launchd_log_directory(
+    capsys: pytest.CaptureFixture,
+):
+    """launchd opens StandardOutPath/StandardErrorPath while setting the job
+    up. A missing directory there fails the job before its wait loop runs —
+    the exact failure the boot-volume paths exist to remove."""
+    from orchestration.launchd.generate_plists import boot_log_root
+
+    ila.cmd_install(_args())
+    output = capsys.readouterr().out
+
+    log_root = boot_log_root()
+    assert f"/bin/mkdir -p {log_root}" in output
+    assert not str(log_root).startswith("/Volumes/")
+    # It must be created before anything is bootstrapped.
+    assert output.index(f"mkdir -p {log_root}") < output.index("launchctl bootstrap")
+
+
+def test_the_installer_creates_the_log_directory_for_real_when_executed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """The mkdir is a real command in the list, not just printed prose."""
+    from orchestration.launchd.generate_plists import boot_log_root
+
+    executed: list[list[str]] = []
+
+    class _Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def _record(command, **kwargs):
+        executed.append(list(command))
+        return _Result()
+
+    monkeypatch.setattr(ila.subprocess, "run", _record)
+    ila.cmd_install(_args(execute=True))
+
+    mkdirs = [c for c in executed if c[:2] == ["/bin/mkdir", "-p"]]
+    assert [str(boot_log_root())] in [c[2:] for c in mkdirs]
+
+
 def test_the_printed_commands_cover_every_committed_agent(capsys: pytest.CaptureFixture):
     ila.cmd_install(_args())
     output = capsys.readouterr().out

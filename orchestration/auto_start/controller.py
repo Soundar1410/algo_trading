@@ -307,7 +307,10 @@ class AutoStartController:
                 "No runtime was started. Execution posture: PAPER ONLY."
             ),
             runtime_id=NOTIFY_RUNTIME_ID,
-            required_action="Check logs/launchd/autostart.err.log and the auto-start log.",
+            required_action=(
+                "Check ~/Library/Logs/algo_trading/launchd/autostart.err.log "
+                "and logs/auto_start.log."
+            ),
         )
         result = self._claim.send_once(
             day=day, kind=KIND_GIVE_UP, deliver=lambda: self._deliver(event)

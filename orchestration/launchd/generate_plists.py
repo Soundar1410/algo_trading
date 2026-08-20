@@ -84,10 +84,12 @@ class PlistSpec:
     #: protection lasts as long as the trading does. The dashboard has no
     #: runtime-hours requirement of its own.
     prevent_sleep: bool = False
-    #: Run under a ``/bin/sh`` loop that waits for the project's ``.venv`` to
-    #: appear before ``exec``-ing it. Required for anything on the mounted
-    #: volume, which is everything.
-    wait_for_project: bool = True
+    #: How the ``/bin/sh`` wrapper bounds its wait for the project volume.
+    #: ``"session_deadline"`` stops at today's configured wall-clock deadline;
+    #: ``"elapsed"`` stops after a fixed duration from invocation. See
+    #: :func:`_wait_for_project_command` for why the trading controller cannot
+    #: use an elapsed budget.
+    wait_policy: str = "session_deadline"
 
     @property
     def label(self) -> str:
@@ -135,72 +137,149 @@ PLIST_SPECS: tuple[PlistSpec, ...] = (
         run_at_load=True,
         keep_alive=False,
         weekday_hour_minute=None,
+        # Deliberately NOT the trading controller's 09:00-15:15 boundary. The
+        # dashboard is read-only, has no calendar trigger and no session, and
+        # is meant to work at weekends and on holidays — a wrapper that gave up
+        # at 15:15 would refuse to start a Saturday dashboard at all, and one
+        # that gave up at *any* wall-clock time would be applying a trading
+        # rule to something that does not trade. An elapsed budget is the right
+        # shape here precisely because there is no trigger to lose: the only
+        # thing waiting longer costs is an idle shell, and the only thing
+        # giving up costs is a re-login.
+        wait_policy="elapsed",
     ),
 )
 
 
 #: Absolute, on the boot volume, present before any external volume mounts.
-#: Both are what make the wait loop possible at all.
+#: These are what make the wait loop possible at all.
 SHELL_BIN = "/bin/sh"
 CAFFEINATE_BIN = "/usr/bin/caffeinate"
+DATE_BIN = "/bin/date"
+SLEEP_BIN = "/bin/sleep"
+
+#: How long the dashboard's wrapper waits for the volume, in seconds. Twelve
+#: hours: it has no calendar trigger, so giving up early means "no dashboard
+#: until the next login" for no benefit. See the spec's own comment.
+DASHBOARD_WAIT_SECONDS = 12 * 3600
 
 
-def mount_wait_seconds(config_root: Path | None = None) -> int:
-    """How long the boot-volume loop waits for the project to appear.
+def boot_log_root() -> Path:
+    """Where launchd writes stdout/stderr — on the **boot volume**.
 
-    Derived from the committed auto-start schedule rather than picked: the
-    budget is ``session_deadline_time - startup_time``, so a volume that mounts
-    at 09:06 — or at 13:00 — still gets a start, and one that never mounts
-    stops at the same boundary the Python-side deadline would have stopped at.
+    This is not a stylistic choice. ``launchd`` opens ``StandardOutPath`` and
+    ``StandardErrorPath``, and chdirs to ``WorkingDirectory``, *before* it
+    executes ``ProgramArguments[0]``. Pointing any of them at
+    ``/Volumes/Trading`` means launchd can fail to prepare the job while the
+    volume is still unmounted — so the carefully-written wait loop never runs,
+    and the delayed-mount recovery this whole design rests on does not
+    actually exist. Every prerequisite launchd needs must therefore be
+    somewhere that is always present.
 
-    A fixed five-minute cap was the obvious thing to write and would have been
-    wrong: ``StartCalendarInterval`` fires once a day, so a mount at 09:06 with
-    a 09:00+5min budget means no trading at all that day, with nothing left to
-    retry it.
+    Resolved absolutely at generation time: a committed plist must never
+    contain ``~`` or an unexpanded environment variable, neither of which
+    launchd expands.
+    """
+    return Path.home() / "Library" / "Logs" / "algo_trading" / "launchd"
 
-    This is a *floor for the boot-volume phase only*. The moment the project is
-    importable, :mod:`orchestration.auto_start` re-reads the real configured
-    deadline and re-validates the window; the shell never gets to be the
-    authority on when trading may start.
+
+def boot_working_directory() -> Path:
+    """A ``WorkingDirectory`` that exists before any volume mounts.
+
+    The project root cannot be used for the reason above. The wrapper ``cd``s
+    to the real project root itself, once it exists, so ``.env`` resolution
+    and every relative path inside the application behave exactly as before.
+    """
+    return Path.home()
+
+
+def session_deadline_hhmm(config_root: Path | None = None) -> str:
+    """Today's configured session deadline as a zero-padded ``HHMM`` string.
+
+    The wrapper compares against this as an **absolute wall-clock boundary**,
+    never as a duration from its own invocation. The difference is not
+    academic: ``RunAtLoad`` fires whenever the Mac is switched on, so a 07:00
+    login with the volume unavailable would, under an elapsed
+    ``deadline - startup`` budget, expire at 13:15 — and while that shell is
+    still waiting, ``launchd`` will not start a second copy for the 09:00
+    ``StartCalendarInterval`` event. The day would be silently lost, by the
+    very mechanism written to save it.
     """
     if config_root is None:
         config_root = Path(__file__).resolve().parents[2] / "config"
-    root = config_root
     try:
         from common.config import load_auto_start_config
 
-        cfg = load_auto_start_config(root)
-        start = parse_hhmm(cfg.startup_time)
-        deadline = parse_hhmm(cfg.session_deadline_time)
-    except Exception:
-        return 6 * 3600
-    span = (
-        deadline.hour * 3600 + deadline.minute * 60
-    ) - (start.hour * 3600 + start.minute * 60)
-    return max(span, MOUNT_POLL_SECONDS)
+        deadline = parse_hhmm(load_auto_start_config(config_root).session_deadline_time)
+    except Exception:  # generation must not require a loadable config
+        deadline = parse_hhmm("15:15")
+    return f"{deadline.hour:02d}{deadline.minute:02d}"
 
 
-def _wait_for_project_command(argv: list[str], *, python_bin: Path, budget_seconds: int) -> str:
-    """A ``/bin/sh`` script that waits for ``python_bin``, then ``exec``s ``argv``.
+def _wait_for_project_command(
+    argv: list[str],
+    *,
+    python_bin: Path,
+    project_root: Path,
+    short_name: str,
+    wait_policy: str,
+    deadline_hhmm: str,
+    elapsed_seconds: int,
+) -> str:
+    """A ``/bin/sh`` script that waits for the project, ``cd``s in, then ``exec``s.
 
-    Every token is an absolute path this generator produced; nothing is
-    interpolated from the environment and no secret appears anywhere — the
-    LaunchAgent passes credentials by not passing them, leaving ``.env`` to be
-    read by Python from the working directory.
+    Only boot-volume executables are used before the volume appears:
+    ``/bin/sh`` itself, ``/bin/date`` and ``/bin/sleep``. Every path is an
+    absolute one this generator produced; nothing is interpolated from the
+    environment and no secret appears anywhere — the LaunchAgent passes
+    credentials by not passing them, leaving ``.env`` to be read by Python from
+    the project root it ``cd``s to below.
+
+    **The ``session_deadline`` policy compares an absolute wall-clock time**,
+    not elapsed seconds. ``[ "1$(date +%H%M)" -ge 1<deadline> ]`` looks odd and
+    is deliberate: the ``1`` prefix turns ``0700`` into ``10700``, so ``test``
+    never sees a leading zero it might read as octal, while the ordering of the
+    original times is preserved exactly.
+
+    The ``elapsed`` policy is for jobs with no calendar trigger and no session
+    — see the dashboard spec's comment for why an absolute trading boundary
+    would be wrong there.
     """
-    attempts = max(budget_seconds // MOUNT_POLL_SECONDS, 1)
     quoted = " ".join(_shell_quote(token) for token in argv)
     target = _shell_quote(str(python_bin))
+    root = _shell_quote(str(project_root))
+
+    if wait_policy == "session_deadline":
+        guard = (
+            f'if [ "1$({DATE_BIN} +%H%M)" -ge 1{deadline_hhmm} ]; then '
+            f'echo "{short_name}: {python_bin} did not appear before the '
+            f'{deadline_hhmm[:2]}:{deadline_hhmm[2:]} session deadline; '
+            f'is /Volumes/Trading mounted?" >&2; exit 75; fi; '
+        )
+        preamble = ""
+    elif wait_policy == "elapsed":
+        attempts = max(elapsed_seconds // MOUNT_POLL_SECONDS, 1)
+        guard = (
+            f"n=$((n+1)); "
+            f'if [ "$n" -gt {attempts} ]; then '
+            f'echo "{short_name}: {python_bin} did not appear within '
+            f'{elapsed_seconds}s; is /Volumes/Trading mounted? '
+            f'Log in again to retry." >&2; exit 75; fi; '
+        )
+        preamble = "n=0; "
+    else:  # pragma: no cover - guarded by the spec table and its test
+        raise ValueError(f"unknown wait_policy {wait_policy!r}")
+
     return (
-        f"n=0; "
+        f"{preamble}"
         f"while [ ! -x {target} ]; do "
-        f"n=$((n+1)); "
-        f'if [ "$n" -gt {attempts} ]; then '
-        f'echo "autostart: {python_bin} never appeared before the session deadline '
-        f'({budget_seconds}s); is /Volumes/Trading mounted?" >&2; exit 75; '
-        f"fi; "
-        f"sleep {MOUNT_POLL_SECONDS}; "
+        f"{guard}"
+        f"{SLEEP_BIN} {MOUNT_POLL_SECONDS}; "
         f"done; "
+        # WorkingDirectory is on the boot volume (launchd must chdir there
+        # before this shell runs at all), so the real project root is entered
+        # here instead — .env and every relative path resolve from it.
+        f'cd {root} || {{ echo "{short_name}: cannot enter {project_root}" >&2; exit 75; }}; '
         f"exec {quoted}"
     )
 
@@ -218,37 +297,65 @@ def _shell_quote(token: str) -> str:
 
 
 def _program_arguments(
-    spec: PlistSpec, *, python_bin: Path, budget_seconds: int
+    spec: PlistSpec,
+    *,
+    python_bin: Path,
+    project_root: Path,
+    deadline_hhmm: str,
 ) -> list[str]:
     args = [str(python_bin), *spec.module_args]
     if spec.prevent_sleep:
         args = [CAFFEINATE_BIN, "-i", "-s", *args]
-    if not spec.wait_for_project:
-        return args
     return [
         SHELL_BIN,
         "-c",
-        _wait_for_project_command(args, python_bin=python_bin, budget_seconds=budget_seconds),
+        _wait_for_project_command(
+            args,
+            python_bin=python_bin,
+            project_root=project_root,
+            short_name=spec.short_name,
+            wait_policy=spec.wait_policy,
+            deadline_hhmm=deadline_hhmm,
+            elapsed_seconds=DASHBOARD_WAIT_SECONDS,
+        ),
     ]
 
 
-def build_plist(spec: PlistSpec, paths: ProjectPaths) -> dict[str, object]:
-    """One plist's content as a plain dict, ready for :func:`plistlib.dumps`."""
+def build_plist(
+    spec: PlistSpec,
+    paths: ProjectPaths,
+    *,
+    launchd_log_root: Path | None = None,
+    working_directory: Path | None = None,
+    deadline_hhmm: str | None = None,
+) -> dict[str, object]:
+    """One plist's content as a plain dict, ready for :func:`plistlib.dumps`.
+
+    Every path launchd itself must prepare — ``WorkingDirectory``,
+    ``StandardOutPath``, ``StandardErrorPath`` — lives on the **boot volume**.
+    launchd resolves all three *before* it runs ``ProgramArguments[0]``, so
+    putting any of them under ``/Volumes/Trading`` would let job setup fail
+    while the volume is still unmounted, and the wait loop below would never
+    get the chance to run. ``PROJECT_ROOT`` still points at the real project:
+    it is an environment variable, not something launchd has to open.
+    """
     python_bin = paths.project_root / ".venv" / "bin" / "python"
-    launchd_log_dir = paths.log_root / "launchd"
+    log_dir = launchd_log_root if launchd_log_root is not None else boot_log_root()
+    work_dir = working_directory if working_directory is not None else boot_working_directory()
+    deadline = deadline_hhmm if deadline_hhmm is not None else session_deadline_hhmm()
 
     document: dict[str, object] = {
         "Label": spec.label,
         "ProgramArguments": _program_arguments(
-            spec, python_bin=python_bin, budget_seconds=mount_wait_seconds()
+            spec,
+            python_bin=python_bin,
+            project_root=paths.project_root,
+            deadline_hhmm=deadline,
         ),
-        # Absolute, explicit working directory — required so `.env` (loaded
-        # relative to CWD by pydantic-settings, see common/config/settings.py)
-        # resolves correctly. launchd starts every agent at "/" otherwise.
-        "WorkingDirectory": str(paths.project_root),
+        "WorkingDirectory": str(work_dir),
         "EnvironmentVariables": {"PROJECT_ROOT": str(paths.project_root)},
-        "StandardOutPath": str(launchd_log_dir / f"{spec.short_name}.out.log"),
-        "StandardErrorPath": str(launchd_log_dir / f"{spec.short_name}.err.log"),
+        "StandardOutPath": str(log_dir / f"{spec.short_name}.out.log"),
+        "StandardErrorPath": str(log_dir / f"{spec.short_name}.err.log"),
         "RunAtLoad": spec.run_at_load,
         "KeepAlive": spec.keep_alive,
     }
@@ -260,12 +367,27 @@ def build_plist(spec: PlistSpec, paths: ProjectPaths) -> dict[str, object]:
     return document
 
 
-def generate_all(root: Path | None = None) -> dict[str, bytes]:
+def generate_all(
+    root: Path | None = None,
+    *,
+    launchd_log_root: Path | None = None,
+    working_directory: Path | None = None,
+    deadline_hhmm: str | None = None,
+) -> dict[str, bytes]:
     """Every plist's filename mapped to its serialised XML content."""
     project_root = root if root is not None else resolve_project_root()
     paths = ProjectPaths(project_root=project_root)
     return {
-        spec.filename: plistlib.dumps(build_plist(spec, paths), fmt=plistlib.FMT_XML)
+        spec.filename: plistlib.dumps(
+            build_plist(
+                spec,
+                paths,
+                launchd_log_root=launchd_log_root,
+                working_directory=working_directory,
+                deadline_hhmm=deadline_hhmm,
+            ),
+            fmt=plistlib.FMT_XML,
+        )
         for spec in PLIST_SPECS
     }
 

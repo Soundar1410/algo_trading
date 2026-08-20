@@ -15,14 +15,14 @@
 	<array>
 		<string>/bin/sh</string>
 		<string>-c</string>
-		<string>n=0; while [ ! -x '/Volumes/Trading/algo_trading/.venv/bin/python' ]; do n=$((n+1)); if [ "$n" -gt 1500 ]; then echo "autostart: /Volumes/Trading/algo_trading/.venv/bin/python never appeared before the session deadline (22500s); is /Volumes/Trading mounted?" &gt;&amp;2; exit 75; fi; sleep 15; done; exec '/usr/bin/caffeinate' '-i' '-s' '/Volumes/Trading/algo_trading/.venv/bin/python' '-m' 'orchestration.auto_start'</string>
+		<string>while [ ! -x '/Volumes/Trading/algo_trading/.venv/bin/python' ]; do if [ "1$(/bin/date +%H%M)" -ge 11515 ]; then echo "autostart: /Volumes/Trading/algo_trading/.venv/bin/python did not appear before the 15:15 session deadline; is /Volumes/Trading mounted?" &gt;&amp;2; exit 75; fi; /bin/sleep 15; done; cd '/Volumes/Trading/algo_trading' || { echo "autostart: cannot enter /Volumes/Trading/algo_trading" &gt;&amp;2; exit 75; }; exec '/usr/bin/caffeinate' '-i' '-s' '/Volumes/Trading/algo_trading/.venv/bin/python' '-m' 'orchestration.auto_start'</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>StandardErrorPath</key>
-	<string>/Volumes/Trading/algo_trading/logs/launchd/autostart.err.log</string>
+	<string>/Users/Soundarraj/Library/Logs/algo_trading/launchd/autostart.err.log</string>
 	<key>StandardOutPath</key>
-	<string>/Volumes/Trading/algo_trading/logs/launchd/autostart.out.log</string>
+	<string>/Users/Soundarraj/Library/Logs/algo_trading/launchd/autostart.out.log</string>
 	<key>StartCalendarInterval</key>
 	<array>
 		<dict>
@@ -67,6 +67,6 @@
 		</dict>
 	</array>
 	<key>WorkingDirectory</key>
-	<string>/Volumes/Trading/algo_trading</string>
+	<string>/Users/Soundarraj</string>
 </dict>
 </plist>
