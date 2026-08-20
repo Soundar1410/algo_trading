@@ -6065,6 +6065,45 @@ outright, before printing anything actionable, while the legacy
 (printing the manual `bootout` command instead), and on a system-timezone
 mismatch. It never loads or unloads the legacy agent itself.
 
+**The install lifecycle, in order.** Directories first, then per label:
+
+```
+mkdir -p ~/Library/LaunchAgents
+mkdir -p ~/Library/Logs/algo_trading/launchd     <- before any bootstrap
+cp <plist> ~/Library/LaunchAgents/
+launchctl print   gui/<uid>/<label>              <- is it loaded?
+launchctl bootout gui/<uid>/<label>              <- only if loaded/unknown
+launchctl enable  gui/<uid>/<label>              <- BEFORE bootstrap
+launchctl bootstrap gui/<uid> <plist>
+```
+
+Two orderings here are load-bearing:
+
+* **`enable` precedes `bootstrap`.** `uninstall` runs `disable`, and a
+  disabled label cannot be bootstrapped — so re-enabling first is the whole
+  reason a reinstall-after-uninstall works at all.
+* **`bootout` is conditional.** On a genuine first install the label was never
+  loaded, and `launchctl bootout` returns non-zero for it. An earlier version
+  aborted on every non-zero result, so `install --execute` could stop *before*
+  `bootstrap` and silently install nothing.
+
+**Expected versus unexpected launchctl failures.** Only an authoritative "this
+service is not loaded" is treated as harmless: return code `3` (`ESRCH`, "No
+such process"), return code `113` ("Could not find specified service"), or
+either of those messages in the output. Every other non-zero result — a
+permission failure, a malformed domain, an I/O error — **fails closed and
+stops the run**, because "we could not tell" is not "it was not there". The
+`launchctl print` probe distinguishes three answers on purpose: loaded, not
+loaded, and *unreadable* — and an unreadable state still gets a `bootout`,
+since skipping it on an unclear answer risks a duplicate load.
+
+**Uninstall is idempotent the same way.** `disable` and `bootout` both
+tolerate the not-loaded result, and the plist removal comes last and
+**unconditionally** — leaving a stale plist behind merely because `bootout`
+said "not loaded" would silently reinstall the agent at the next login. An
+unexpected failure is reported with its return code and message rather than
+being swallowed.
+
 ```bash
 # 1. Validate the generated plists (read-only, always safe).
 .venv/bin/python -m scripts.install_launch_agents validate
@@ -6072,7 +6111,8 @@ mismatch. It never loads or unloads the legacy agent itself.
 # 2. Confirm the generator and the committed files still agree.
 .venv/bin/python -m orchestration.launchd.generate_plists --check
 
-# 3. See exactly what installing would do — still changes nothing.
+# 3. See exactly what installing would do — still changes nothing, and does
+#    not even probe launchctl for what is loaded.
 .venv/bin/python -m scripts.install_launch_agents install
 
 # 4. Actually install and load. Deliberate, explicit.
