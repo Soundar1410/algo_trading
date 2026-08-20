@@ -59,10 +59,35 @@ auto_start:
   telegram_retry_attempts: 3
   telegram_retry_delay_seconds: 5.0
 
-  # NSE trading holidays, ISO dates. Fed straight to MarketSession, so weekend
-  # and holiday rules are the engine's own — never a second copy. An empty list
-  # means weekends only; the operator maintains this each year.
-  holidays: []
+  # Official NSE 2026 Capital Market / Futures & Options trading-holiday
+  # calendar, verified 2026-08-20 against NSE's holiday-master endpoint:
+  # https://www.nseindia.com/api/holiday-master?type=trading
+  #
+  # Weekend dates are retained for an exact audit trail even though
+  # MarketSession already rejects Saturdays and Sundays. NSE may declare
+  # additional ad-hoc closures; re-verify this list after any such circular
+  # and before the first unattended session of each new calendar year.
+  holidays:
+    - "2026-01-15"  # Municipal Corporation Election - Maharashtra
+    - "2026-01-26"  # Republic Day
+    - "2026-02-15"  # Mahashivratri (Sunday)
+    - "2026-03-03"  # Holi
+    - "2026-03-21"  # Id-Ul-Fitr / Ramadan Eid (Saturday)
+    - "2026-03-26"  # Shri Ram Navami
+    - "2026-03-31"  # Shri Mahavir Jayanti
+    - "2026-04-03"  # Good Friday
+    - "2026-04-14"  # Dr. Baba Saheb Ambedkar Jayanti
+    - "2026-05-01"  # Maharashtra Day
+    - "2026-05-28"  # Bakri Id
+    - "2026-06-26"  # Muharram
+    - "2026-08-15"  # Independence Day (Saturday)
+    - "2026-09-14"  # Ganesh Chaturthi
+    - "2026-10-02"  # Mahatma Gandhi Jayanti
+    - "2026-10-20"  # Dussehra
+    - "2026-11-08"  # Diwali Laxmi Pujan / Muhurat session (Sunday)
+    - "2026-11-10"  # Diwali-Balipratipada
+    - "2026-11-24"  # Prakash Gurpurb Sri Guru Nanak Dev
+    - "2026-12-25"  # Christmas
 
 # Defaults inherited by every runtime group; a runtime file overrides key by key.
 runtime_defaults:
