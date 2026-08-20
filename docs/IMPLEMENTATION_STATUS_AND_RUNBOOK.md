@@ -2483,7 +2483,7 @@ guard. See deviation D6.
 | **D53** | **`max_quote_age_ms` defaults to off** | The staleness rule compares the quote's exchange timestamp against the wall clock, which is meaningful live and meaningless on a replayed tape — where every timestamp is historical and *every* order would be refused. Tape replay is this repository's default execution path, and a setting that breaks every replay is one that gets switched off everywhere and then protects nothing. **A live-feed configuration must set it** (e.g. `2000`). |
 | **D54** | **A blocked live strategy's admission is recorded to `errors` and delivered through the notifier, never written to the `notifications` table** | `repository.record_notification` is defined (`common/execution/repository.py`) but has **no caller anywhere in production code** — every existing alarm in `supervisor.py` (the limitation-15 stuck-subscription alarm, the limitation-13 unclosable-feed alarm) already follows this same two-step pattern: `record_error` for the persisted record, `notifier.send(NotificationEvent(...))` for delivery, and nothing calls `record_notification`. Phase 5's mixed-mode admission refusal follows the established pattern rather than becoming the first caller of an unused method; `tests/end_to_end/test_mode_separation.py` asserts delivery against `RecordingNotifier.events`, not a `notifications` table row. Revisit if/when something actually wires `record_notification` up — at that point this deviation and the unused-method fact both need re-examining together, not separately. |
 | **D55** | **Worker-lock acquisition stays in the child process, not the supervisor** | The spec's PID/lock startup flow (section 8, step 4) reads "For each enabled strategy, acquire its worker lock and reject duplicate execution" from inside what the surrounding steps describe as the supervisor's own sequence. The implementation acquires in `run_worker` (`runtimes/intraday_options/worker.py`), inside the spawned child, and Phase 5 keeps it there rather than moving it to match the literal wording. A lock held by the parent across `multiprocessing.spawn` does not transfer to the child that actually trades — the parent and child are different OS processes with independent `flock` state — so parent-side acquisition would protect the wrong process: two children could still race for the same strategy's state while the parent's lock sat acquired and irrelevant. `test_duplicate_worker_startup_is_refused` and Phase 5's own `test_a_live_mode_contender_is_still_refused_as_a_duplicate` both depend on the lock being held by the process whose state it protects. |
-| **D56** | **Positional-options rollout is split: inert scaffolding shipped now, the working supervisor/worker/persistence layer genuinely deferred to Phase 6/9 — corrected from an earlier draft that deferred all of it** | Spec bullet 6 reads "add positional options and intraday stocks one at a time; keep positional stocks a placeholder" — naming three things and treating them differently. An earlier version of this deviation read "no strategy exists yet" as sufficient reason to defer everything, which was too broad: the bullet singling out "positional stocks" as *the* placeholder only makes sense if "no consumer yet" wasn't meant to excuse the other two equally, and **D34** — written back in the reference audit — already said "Intraday stocks are Phase 5", i.e. this project's own earlier documentation expected incremental movement here. Corrected split: (1) `config/runtimes/positional_options.yaml` (`enabled: false`) and `runtimes/positional_options/__init__.py` are real, loadable, and shipped — matching the exact precedent `intraday_options.yaml` set in Phase 1, and completely inert since nothing scans `config/runtimes/*.yaml` on its own. (2) The supervisor/worker/config-adapter layer stays deferred, and this part **is** a genuine structural blocker, not merely "no consumer": `positions`/`strategy_state`/`order_intents` all key their UNIQUE identity on `trading_date` (migration `0001`), which fragments a position held across sessions into unrelated rows, and `SquareOffPolicy` is same-day wall-clock exit with no multi-day concept — both are Phase 6's explicit job ("restore open paper positions... by strategy and mode", not by date; `force_square_off_before_expiry`; settlement simulation). Building it now would mean either reusing same-day-shaped persistence incorrectly or inventing Phase 6's answer out of order. `intraday_stocks` gets no placeholder at all — D34's "needs a real consumer" reasoning for its scanner-driven universe is unchanged and still applies there. |
+| **D56** (superseded 20 Aug 2026: the deferred layer was built — `positional_options` is a real runtime with its own supervisor, composition root and registry entry, started by `orchestration.auto_start` whenever enabled; it is no longer a placeholder, and only its `enabled: false` default still stands) | **Positional-options rollout is split: inert scaffolding shipped now, the working supervisor/worker/persistence layer genuinely deferred to Phase 6/9 — corrected from an earlier draft that deferred all of it** | Spec bullet 6 reads "add positional options and intraday stocks one at a time; keep positional stocks a placeholder" — naming three things and treating them differently. An earlier version of this deviation read "no strategy exists yet" as sufficient reason to defer everything, which was too broad: the bullet singling out "positional stocks" as *the* placeholder only makes sense if "no consumer yet" wasn't meant to excuse the other two equally, and **D34** — written back in the reference audit — already said "Intraday stocks are Phase 5", i.e. this project's own earlier documentation expected incremental movement here. Corrected split: (1) `config/runtimes/positional_options.yaml` (`enabled: false`) and `runtimes/positional_options/__init__.py` are real, loadable, and shipped — matching the exact precedent `intraday_options.yaml` set in Phase 1, and completely inert since nothing scans `config/runtimes/*.yaml` on its own. (2) The supervisor/worker/config-adapter layer stays deferred, and this part **is** a genuine structural blocker, not merely "no consumer": `positions`/`strategy_state`/`order_intents` all key their UNIQUE identity on `trading_date` (migration `0001`), which fragments a position held across sessions into unrelated rows, and `SquareOffPolicy` is same-day wall-clock exit with no multi-day concept — both are Phase 6's explicit job ("restore open paper positions... by strategy and mode", not by date; `force_square_off_before_expiry`; settlement simulation). Building it now would mean either reusing same-day-shaped persistence incorrectly or inventing Phase 6's answer out of order. `intraday_stocks` gets no placeholder at all — D34's "needs a real consumer" reasoning for its scanner-driven universe is unchanged and still applies there. |
 | **D57** | **`discover_enabled_strategies` has no way to scope strategy files to one runtime** | Recorded as its own deviation, separate from D56, because it is a gap in the *mechanism* rather than a deferred *feature*: `StrategyConfig` carries no `runtime_id`, and neither does the spec's own "required resolved strategy fields" list (section 9), so a strategy's runtime membership is established only by filename convention (spec's own example: `io_supertrend_fast_v1`). `discover_enabled_strategies(config_root, runtime_id)` therefore resolves *every* enabled file under `config/strategies/` against whichever `runtime_id` it is called with — correct today because `intraday_options` is the only caller, unsafe the day a second runtime's supervisor calls it against the same directory. See limitation 21. |
 | **D58** | **`_touch_strategy_state` accumulated the wrong thing — fixed while building its first reader** | Phase 6 Part 1 needed `strategy_state.daily_realised_pnl` to mean "today's total realised P&L" in order to restore `DailyRiskGuard` across a restart, and found that it did not: the UPSERT wrote `daily_realised_pnl = excluded.daily_realised_pnl` (overwrite, not accumulate) while its caller passed *the position's own* cumulative `realised_pnl` under the parameter name `realised_delta`. A strategy that closes one contract and opens a **different** one the same day (a different `security_id`, hence a different `positions` row) silently lost the first contract's booked P&L from this column the moment the second contract's first fill landed. Exactly the shape of the `orders.filled_quantity`/`average_fill_price` bug Phase 4 Part 5 already found and fixed on the sibling column (`test_two_fills_on_one_order_accumulate_rather_than_overwrite`) — missed here because nothing had read `daily_realised_pnl` back until now. `ExecutionRepository._upsert_position` now returns the true per-call delta (this fill's own contribution, computed from the position's realised P&L *before* the update, not its new cumulative total), and `_touch_strategy_state`'s SQL adds it to the stored value rather than replacing it. `test_daily_realised_pnl_accumulates_across_contracts_not_just_the_last_one` (`tests/integration/test_execution_persistence.py`) pins it — demonstrated failing against the pre-fix code first, since the single-contract-per-day shape every other test in the file uses cannot distinguish "accumulate" from "overwrite" (there is only ever one value to keep). See limitation 22. |
 | **D59** | **`ExecutionGateway`'s "deliberately narrow, two verbs" Protocol was widened — the first change to it since Phase 3 Part 2b-i** | Phase 6 Part 2 needed a risk manager's reported `stop_price`/`target_price` to reach `positions.stop_price`/`.target_price`, and there was no possible producer for either at any depth: `RiskManager.new_position(self, lots: int = 1) -> None` received no entry price, so no manager — not even a hypothetical Phase 9 one built against the pre-Part-2 interface — could ever compute an absolute price level. Put to the user directly as the one genuine either-way fork in the part (widen now vs. add only inert no-op properties and defer the plumbing to Phase 9); decided: widen now. `RiskManager.new_position` gained an optional `entry_price` kwarg; `RiskManager` gained no-op `stop_price`/`target_price` properties; `ExecutionGateway.buy`/`.sell`, `InMemoryGateway.buy`/`.sell`, `LifecycleGateway.buy`/`.sell`/`._execute` and `PositionManager.open()` each gained optional `stop_price`/`target_price` kwargs (default `None`), threaded to `OrderLifecycle.handle_signal`, which already accepted them (the Phase 1 fixture worker's own existing precedent). Every addition is optional with a `None` default and no existing call site needed to change to keep behaving exactly as before — `tests/integration/test_engine_lifecycle_gateway.py` and the `PositionManager`/`InMemoryGateway` regression suites pass unmodified. `TradingEngine._open()` was reordered to arm the risk manager *before* `positions.open()` (previously the other way around) so a manager's computed levels are known before the entry fill — safe because neither call consulted the other under the old order either. |
@@ -5692,7 +5692,429 @@ started, read, or written to; every Phase 0–8 test still passes unchanged.
 
 **PHASE 9 COMPLETE. READY FOR PAPER FORWARD TESTING. PHASE 10 NOT STARTED.**
 
+### Unattended PAPER auto-start (20 August 2026, `feature-paper-auto-start` branch)
+
+**Status: machinery built and verified; nothing installed, nothing loaded,
+nothing enabled.** Installing the LaunchAgents and flipping
+`auto_start.enabled` are two separate, deliberate operator steps, both
+described below and neither performed by this work.
+
+#### What it does
+
+On every configured NSE trading day the Mac starts the platform by itself at
+09:00 IST, in PAPER mode, and keeps it running for the session. One
+LaunchAgent owns the whole chain, in one process, in this order:
+
+```
+system-timezone check          -> refuse if the Mac is not on Asia/Kolkata
+trading-day + window gate      -> weekend/holiday/early/late: exit 0, no network
+project + .venv availability   -> the Trading volume may mount late
+paper safety + legacy guard    -> every live gate must be off
+environment validation         -> scripts.validate_environment, per runtime
+authentication (retried)       -> until success or the session deadline
+Dhan validation                -> GET /v2/profile must accept the token
+ONE Telegram success message   -> atomic, once per trading date
+start enabled runtime groups   -> then supervise them until they exit
+```
+
+A runtime cannot start before validated authentication: the launch call site
+sits at the end of one function, after the validation step, and there is no
+other. The previous design expressed the same intent as an `auth` agent at
+08:45 and an `intraday_options` agent at 09:00 — two independent triggers,
+which is a hope about scheduling rather than a dependency. Both are gone.
+
+#### 09:00, late login, and wake
+
+| Situation | What happens |
+| --- | --- |
+| Logged in already at 09:00 | The `StartCalendarInterval` trigger fires and the chain runs. |
+| Mac switched on / woken at 09:10 | `RunAtLoad` fires. The calendar trigger has been and gone, so this is what starts the day. |
+| Login at 08:45 | `RunAtLoad` fires, the gate sees 08:45 < `startup_time`, exits 0 and starts nothing. The 09:00 trigger starts it later. |
+| Login at 11:00 with an open weekly cycle | **Starts.** See the note below — this is deliberate. |
+| Login after `latest_start_time` | Exits 0. No new automatic session that day. |
+| Saturday, Sunday, configured holiday | Exits 0 before touching credentials, the network or the broker. |
+
+**Late start runs to the session deadline, not to 10:30.** `latest_start_time`
+defaults to `15:15`, the same value as `session_deadline_time`. A positional
+runtime holding an open `weekly_delta_neutral` cycle must still start at 11:00
+so it can recover and manage that exposure; refusing to start the runtime
+would strand a live position rather than protect anything. Whether a *new
+entry* is permitted at 11:00 is decided where it has always been decided — the
+strategy's own entry window and `SquareOffPolicy.entry_cutoff` — and this
+infrastructure does not pre-empt that. An operator may narrow
+`latest_start_time` deliberately; the shipped default does not.
+
+#### Weekends and holidays
+
+`MarketSession.is_trading_day()` / `is_holiday()` decide, built from a
+`SessionConfig` carrying `auto_start.holidays`. The weekend and holiday rules
+are the engine's own — there is no second copy here. The check runs before the
+project probe, before authentication and before any notifier, so a Saturday
+wake-up costs a filesystem stat and an exit code.
+
+`auto_start.holidays` ships empty, meaning weekends only. **The operator
+maintains the NSE holiday list each year**; an out-of-date list means the
+platform starts on a holiday, finds a closed market, and squares off nothing —
+noisy rather than dangerous, but worth keeping current.
+
+#### Retry classification
+
+Retried at a capped-backoff cadence (30s, x1.5, capped at 300s) until the
+session deadline, then stopped:
+
+* no network, DNS failure, connection timeout;
+* retryable HTTP 5xx, a temporarily unavailable Dhan auth endpoint;
+* `/Volumes/Trading` not mounted yet.
+
+Waited out to the provider's own boundary, then retried if the deadline is
+still ahead — never sooner, because retrying inside a cooldown is what turns
+one rejection into a lockout:
+
+* Dhan rate limiting (`TokenRateLimitedError`);
+* a recorded credential rejection (`RejectionCooldown`, 600s).
+
+**Terminal — tried exactly once, never looped:**
+
+* missing credentials; an invalid PIN or TOTP;
+* malformed configuration, or a strategy config that will not load;
+* any paper-safety / live-gate violation;
+* legacy `Trading_Automation` detected, or its state undeterminable;
+* an unsupported runtime id;
+* a deliberate stop (SIGTERM), or a normal end-of-session exit.
+
+The waiting is a `threading.Event` wait, not `time.sleep`, so a SIGTERM
+delivered mid-backoff returns immediately rather than up to five minutes
+later. There is no busy loop: the interval never drops below the configured
+floor, and a zero interval is refused at construction.
+
+After authentication succeeds, an ordinary feed disconnection is **not** this
+layer's problem — `ReconnectingFeed` and the runtime's own recovery handle it,
+and nothing here restarts a runtime for a recoverable reconnect.
+
+#### The rejected-cached-token trap
+
+When Dhan rejects a token, calling `AuthBootstrap.get_token()` again is
+useless: it returns the same still-unexpired cache entry, and would keep
+returning it until 15:15. `orchestration/auto_start/auth_flow.py` therefore
+calls `refresh(current_token=<the rejected token>)`, which discriminates
+against the known-bad token under the existing shared refresh lock while still
+accepting a replacement another process minted. A *freshly generated* token
+that Dhan then refuses is terminal — a credential or account problem, not a
+transient one.
+
+Authentication success means one thing only: Dhan answered
+`GET https://api.dhan.co/v2/profile` with the token. Never "a token file
+exists", never "the JWT `exp` looks far enough away".
+
+#### Telegram semantics
+
+**Exactly one success message per trading date**, whatever happens: duplicate
+`RunAtLoad` + calendar triggers, several runtime groups, a retry that succeeds
+an hour later, or another process winning the shared refresh lock. The claim,
+the delivery and the record all happen inside one `filelock` — not
+"check the file, then write it", which is a race both triggers can lose.
+
+A **failed delivery is never recorded as delivered**. The day stays unclaimed
+so a later trigger may genuinely try again. Delivery is retried a bounded
+three times, five seconds apart; a Telegram outage is logged and does not stop
+an otherwise safe paper runtime from starting.
+
+The message carries non-secret information only:
+
+```
+Dhan authentication successful
+Time: 2026-08-20 09:00:14 (Asia/Kolkata)
+Token source: cache | environment | generated
+Token expiry: <ISO timestamp, or unknown>
+Execution posture: PAPER ONLY
+Runtimes starting: intraday_options, positional_options
+Strategies starting: ema_cross_9_21_buy, weekly_delta_neutral
+```
+
+No access token, no TOTP, no PIN, no Telegram bot token, and no Dhan client id
+— not even a partial one. `NotificationEvent.rendered()` applies the
+process-wide redactor on top as a second, independent layer.
+
+**One give-up alert per trading date** when startup stops for the day, and one
+only — an alert per retry attempt would turn an outage into a pager storm.
+
+#### What actually starts
+
+Nothing here decides what runs. `auto_start` config names **no runtime and no
+strategy**; `config/runtimes/*.yaml` and `config/strategies/*.yaml`
+`enabled:` flags remain the only authority, read through
+`discover_enabled_strategies` and `load_runtime_config` like everywhere else.
+
+Both real runtime groups start through the same generic path, each via its
+**own** registered composition root:
+
+```
+orchestration.auto_start
+  -> subprocess: supervised_launch --runtime-id intraday_options
+  -> subprocess: supervised_launch --runtime-id positional_options
+       -> scripts._runtimes.resolve_runtime(runtime_id).main(...)
+            -> that runtime's supervisor -> its enabled strategies' workers
+```
+
+A third runtime group is one entry in `scripts/_runtimes.py` and no new
+branch, no new LaunchAgent, and no change here.
+
+**`positional_options` is a real runtime, not a placeholder.** It has its own
+supervisor, composition root and registered entrypoint, and the controller
+starts it alongside intraday whenever it is enabled. Earlier documentation
+describing it as "inert scaffolding" (D56) and claiming "only three real
+LaunchAgent entrypoints exist" (Phase 8) described a state that no longer
+holds; both are corrected here. It runs **every** trading day when enabled —
+never only on Wednesdays — because it may need to manage an existing weekly
+cycle.
+
+#### The controller owns its children
+
+`RuntimeLauncher` does not spawn and exit. It:
+
+* verifies each start against that runtime's **own `supervisor_lock`** — a
+  `Popen` that returned says the fork worked, not that the runtime started; a
+  child that dies before taking its lock is reported as a failed start, and
+  one that never takes it within `runtime_handshake_seconds` is stopped rather
+  than left half-alive;
+* stays alive until every child exits, so `caffeinate -i -s` keeps protecting
+  the session and `launchd` never sees an abandoned job;
+* propagates SIGTERM to every owned child and waits `shutdown_grace_seconds`
+  before escalating to SIGKILL;
+* keeps runtimes isolated — one failing to start, or exiting, never stops the
+  other;
+* **never restarts anything.** Bounded retry belongs to `supervised_launch`
+  one level down, and a deliberate stop must stay stopped.
+
+An already-running runtime (verified live PID on its supervisor lock) is
+skipped, so a duplicate trigger cannot produce duplicate supervisors. The
+existing process locks stay authoritative; nothing here weakens them.
+
+#### The dashboard
+
+The dashboard has exactly one owner: `com.soundarraj.algotrading.dashboard`,
+`RunAtLoad`, no calendar entry. The trading controller does **not** start it —
+two owners would race for one port and would tie the dashboard's availability
+to trading, when the useful behaviour is the opposite: it is read-only, so it
+should be up at weekends and on holidays too.
+
+`scripts/start_dashboard.py` is idempotent twice over: it exits 0 when
+`auto_start.dashboard_auto_start` is false, and exits 0 when something is
+already serving the dashboard port, so a duplicate `RunAtLoad` is a non-event
+rather than a failed bind.
+
+#### The delayed Trading-volume mount
+
+The repository, the `.venv` and the logs all live on `/Volumes/Trading`, which
+at login routinely mounts *after* `launchd` fires. A plist whose
+`ProgramArguments[0]` is the venv interpreter simply fails at that moment, and
+with `KeepAlive=false` nothing tries again.
+
+So the program is `/bin/sh` — on the boot volume, always executable — running
+a generated wait loop that `exec`s the real interpreter once it appears:
+
+```sh
+n=0
+while [ ! -x '/Volumes/Trading/algo_trading/.venv/bin/python' ]; do
+  n=$((n+1))
+  if [ "$n" -gt 1500 ]; then
+    echo "autostart: ... never appeared before the session deadline (22500s); \
+is /Volumes/Trading mounted?" >&2
+    exit 75
+  fi
+  sleep 15
+done
+exec '/usr/bin/caffeinate' -i -s '.../python' -m orchestration.auto_start
+```
+
+**There is deliberately no five-minute cap.** A drive that mounts at 09:06
+must still trade — there is no second calendar trigger that day. The wrapper
+cannot read repository configuration before the volume exists, so the
+generator derives its budget from the committed schedule itself
+(`session_deadline_time - startup_time`, currently 22500s = 06:15), and Python
+re-reads the *actual* configured deadline and re-validates the window the
+moment the project is importable. The shell bound is a floor for the
+boot-volume phase; it is never the authority on when trading may start.
+
+The loop contains only absolute paths generated from the project root. No
+secret is interpolated, and the generator refuses outright to build a command
+containing a quote character.
+
+#### Configuration
+
+`config/global.yaml`, top-level `auto_start:` block — a sibling of
+`runtime_defaults:` / `strategy_defaults:`, deliberately *not* inside
+`global:`, so no auto-start value can be mistaken for one of the live gates
+that block holds. Strict and frozen like every other section: a typo is a load
+error, not a silently ignored key.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | The hard gate. While false, the controller exits 0 and starts nothing, even with the agent loaded. |
+| `timezone` | `Asia/Kolkata` | Every decision is made in this zone. |
+| `require_system_timezone_match` | `true` | Refuse if the Mac's zone differs — see below. |
+| `startup_time` | `09:00` | Earliest eligible start. |
+| `latest_start_time` | `15:15` | Latest eligible start for a new session. |
+| `session_deadline_time` | `15:15` | Hard stop for every retry. |
+| `retry_interval_seconds` | `30.0` | Base backoff. |
+| `retry_backoff_multiplier` | `1.5` | Growth factor. |
+| `retry_max_interval_seconds` | `300.0` | Backoff cap. |
+| `runtime_handshake_seconds` | `120.0` | How long a runtime has to take its supervisor lock. |
+| `shutdown_grace_seconds` | `30.0` | SIGTERM grace before SIGKILL. |
+| `dashboard_auto_start` | `true` | Read by `scripts.start_dashboard`. |
+| `telegram_retry_attempts` | `3` | Bounded delivery retries. |
+| `telegram_retry_delay_seconds` | `5.0` | Between them. |
+| `holidays` | `[]` | ISO dates, fed to `MarketSession`. |
+
+#### Timezone: why it fails closed
+
+`StartCalendarInterval` fires in the **Mac's local timezone**. A Mac on
+`America/New_York` fires the "09:00" trigger at 09:00 EDT, which is 18:30 IST
+— long past the session. Every decision this code makes is in `Asia/Kolkata`
+regardless, so a wrong-instant trigger is gated out rather than acted on; but
+the day would simply never start, silently.
+
+So the default is to refuse: the controller treats a system-zone mismatch as a
+terminal refusal with one Telegram alert, and `scripts.install_launch_agents`
+refuses to install on a mismatched Mac. The check passes on a name match *or*
+a UTC-offset match, so `Asia/Calcutta` is correctly accepted as the same zone.
+An operator who understands the consequence may set
+`require_system_timezone_match: false`.
+
+**The Mac must be set to Asia/Kolkata for the 09:00 trigger to mean 09:00 IST.**
+
+#### Log locations
+
+```
+logs/launchd/autostart.out.log      launchd stdout  (pre-logger failures)
+logs/launchd/autostart.err.log      launchd stderr  (volume-mount messages)
+logs/launchd/dashboard.out.log      dashboard stdout
+logs/launchd/dashboard.err.log      dashboard stderr
+logs/auto_start.log                 the controller's own redacted log
+```
+
+#### Installation — a separate operator step, not part of this work
+
+**None of the following was executed.** No LaunchAgent was installed, loaded,
+bootstrapped or kickstarted; no runtime or dashboard was started; no Dhan or
+Telegram request was made.
+
+`scripts/install_launch_agents.py` is **dry-run by default** — it prints the
+exact commands and changes nothing until `--execute` is passed. It refuses
+outright, before printing anything actionable, while the legacy
+`Trading_Automation` agent is loaded or its state cannot be determined
+(printing the manual `bootout` command instead), and on a system-timezone
+mismatch. It never loads or unloads the legacy agent itself.
+
+```bash
+# 1. Validate the generated plists (read-only, always safe).
+.venv/bin/python -m scripts.install_launch_agents validate
+
+# 2. Confirm the generator and the committed files still agree.
+.venv/bin/python -m orchestration.launchd.generate_plists --check
+
+# 3. See exactly what installing would do — still changes nothing.
+.venv/bin/python -m scripts.install_launch_agents install
+
+# 4. Actually install and load. Deliberate, explicit.
+.venv/bin/python -m scripts.install_launch_agents install --execute
+
+# 5. Dry operational verification — runs the chain once, now.
+#    With auto_start.enabled still false this exits 0 having started nothing.
+launchctl kickstart -k gui/$UID/com.soundarraj.algotrading.autostart
+```
+
+#### Status
+
+```bash
+.venv/bin/python -m scripts.install_launch_agents status
+launchctl print gui/$UID/com.soundarraj.algotrading.autostart
+launchctl list | grep com.soundarraj.algotrading
+
+# What the controller would decide right now — no auth, no runtime start.
+.venv/bin/python -m orchestration.auto_start --dry-run
+
+.venv/bin/python -m scripts.install_launch_agents logs
+tail -f logs/launchd/autostart.err.log logs/auto_start.log
+```
+
+#### Rollback / uninstall
+
+```bash
+# Print the rollback commands, change nothing.
+.venv/bin/python -m scripts.install_launch_agents uninstall
+
+# Actually disable, unload and remove.
+.venv/bin/python -m scripts.install_launch_agents uninstall --execute
+
+# Equivalent by hand:
+launchctl disable gui/$UID/com.soundarraj.algotrading.autostart
+launchctl bootout  gui/$UID/com.soundarraj.algotrading.autostart
+rm -f ~/Library/LaunchAgents/com.soundarraj.algotrading.autostart.plist
+# ... and the same three for .dashboard
+
+# The fastest kill switch, no launchctl needed: set auto_start.enabled: false
+# in config/global.yaml. The agent still fires and still exits 0.
+```
+
+#### Enablement checklist — operator, one step at a time
+
+Every item is a deliberate decision. None was performed by this work.
+
+1. Confirm the Mac's timezone is `Asia/Kolkata`.
+2. Fill `auto_start.holidays` with the current NSE holiday list.
+3. Confirm `.env` carries `DHAN_CLIENT_ID`, `DHAN_PIN`, `DHAN_TOTP_SECRET` and
+   the Telegram pair; run `scripts.validate_environment` for each runtime.
+4. Decide which runtimes and strategies to run, and set their own `enabled:`
+   flags in `config/runtimes/*.yaml` and `config/strategies/*.yaml`. The
+   auto-start block cannot do this and must not be asked to.
+5. Confirm every live gate is still off:
+   `.venv/bin/python -m scripts.assert_no_live_config_committed`.
+6. Install the LaunchAgents (step 4 of the installation block above).
+7. `--dry-run` the controller and read what it says it would do.
+8. **Only then** set `auto_start.enabled: true`.
+9. Watch `logs/auto_start.log` on the first live morning.
+
+#### Paper-only posture
+
+This facility is PAPER-only by construction. Before any runtime starts,
+`orchestration/auto_start/paper_safety.py` asserts:
+
+* `global.live_trading_enabled` is false;
+* every enabled runtime has `live_execution_allowed: false`;
+* every enabled strategy has `mode: paper` and `live_approved: false`;
+* `scripts.assert_no_live_config_committed` passes;
+* legacy `Trading_Automation` is not active (fail-closed: "cannot verify"
+  blocks too);
+* `scripts.validate_environment` passes for each enabled runtime.
+
+Any violation blocks the automatic start **completely**. A strategy configured
+`mode: live` is never rerouted into paper and traded anyway — it stops the
+whole start. There is no code path here that flips a mode, an `enabled` flag,
+`live_approved`, `live_execution_allowed` or `live_trading_enabled`.
+
+Paper-evaluation length remains an explicit operator choice — 15, 30, 60, 90
+days or another chosen duration. Nothing in this work introduces a mandatory
+duration, and completing a paper evaluation never enables live trading
+automatically: that stays gated behind CLAUDE.md's separate approval.
+
+---
+
 ### Phase 8 — LaunchAgent validation — **Complete**
+
+> **Superseded in part (20 August 2026 — see "Unattended PAPER auto-start"
+> above).** This phase shipped three plists — `auth` @08:45,
+> `intraday_options` @09:00 and `dashboard` @RunAtLoad — and recorded that only
+> three entrypoints were real, `positional_options` being a placeholder. Both
+> statements have since stopped being true. `positional_options` gained a real
+> supervisor and composition root in the positional work, and the `auth` and
+> `intraday_options` plists have been **removed**: two independent triggers
+> cannot express "no runtime before validated authentication". One
+> `autostart` controller now owns that ordering and starts every *enabled*
+> runtime through the `scripts._runtimes` registry. The committed set is now
+> `autostart` + `dashboard`. Everything below describes the design as it stood
+> at the end of Phase 8 and is kept for its reasoning, not as current fact.
+
 
 Approved plan, verbatim scope: spec section 12's LaunchAgent design (absolute
 paths, the project `.venv` interpreter, an explicit working directory, an

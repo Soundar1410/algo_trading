@@ -14,6 +14,7 @@ from .loader import (
     deep_merge,
     discover_enabled_strategies,
     discover_strategies,
+    load_auto_start_config,
     load_global_config,
     load_resolved_config,
     load_runtime_config,
@@ -21,6 +22,7 @@ from .loader import (
 )
 from .models import (
     AccountRiskConfig,
+    AutoStartConfig,
     EngineKind,
     ExecutionMode,
     GlobalConfig,
@@ -41,6 +43,7 @@ from .settings import Settings, load_settings
 
 __all__ = [
     "AccountRiskConfig",
+    "AutoStartConfig",
     "ConfigError",
     "EngineKind",
     "ExecutionMode",
@@ -65,6 +68,7 @@ __all__ = [
     "discover_strategies",
     "effective_live_gate",
     "fingerprint",
+    "load_auto_start_config",
     "load_global_config",
     "load_paths",
     "load_resolved_config",

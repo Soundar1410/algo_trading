@@ -14,13 +14,45 @@ import scripts.start_runtime as start_runtime
 import scripts.start_strategy as start_strategy
 
 
+def _replacing(registry, runtime_id: str, main):
+    """That runtime's registry entry with `main` swapped in, codes untouched.
+
+    Replacing the whole entry rather than mutating a separate callable map is
+    what keeps one authoritative table: there is no second mapping a test could
+    patch and leave the real one stale.
+    """
+    original = registry.RUNTIMES[runtime_id]
+    return runtimes_registry.RuntimeEntrypoint(
+        main=main,
+        terminal_exit_codes=original.terminal_exit_codes,
+        retryable_exit_codes=original.retryable_exit_codes,
+    )
+
+
 def test_resolve_entrypoint_knows_both_runtimes() -> None:
     assert runtimes_registry.resolve_entrypoint("intraday_options") is (
-        runtimes_registry.ENTRYPOINTS["intraday_options"]
+        runtimes_registry.RUNTIMES["intraday_options"].main
     )
     assert runtimes_registry.resolve_entrypoint("positional_options") is (
-        runtimes_registry.ENTRYPOINTS["positional_options"]
+        runtimes_registry.RUNTIMES["positional_options"].main
     )
+
+
+def test_there_is_exactly_one_runtime_table() -> None:
+    """A derived ENTRYPOINTS copy would be a drift hazard, so it must not exist."""
+    assert not hasattr(runtimes_registry, "ENTRYPOINTS")
+
+
+def test_each_entry_carries_its_own_exit_code_classification() -> None:
+    import runtimes.intraday_options.__main__ as intraday
+    import runtimes.positional_options.__main__ as positional
+
+    entry = runtimes_registry.RUNTIMES["positional_options"]
+    assert entry.classify(positional.EXIT_RUNTIME_DISABLED) == "terminal"
+    assert entry.classify(positional.EXIT_NO_CREDENTIALS) == "retryable"
+    # Intraday's disabled code (3) means nothing to positional; it must not be
+    # silently accepted as terminal just because intraday says so.
+    assert entry.classify(intraday.EXIT_RUNTIME_DISABLED) == "unknown"
 
 
 def test_resolve_entrypoint_fails_closed_on_an_unknown_runtime() -> None:
@@ -44,7 +76,9 @@ def test_start_runtime_calls_the_registered_entrypoint_for_positional(
         return 0
 
     monkeypatch.setitem(
-        runtimes_registry.ENTRYPOINTS, "positional_options", _fake_positional_main
+        runtimes_registry.RUNTIMES,
+        "positional_options",
+        _replacing(runtimes_registry, "positional_options", _fake_positional_main),
     )
     exit_code = start_runtime.main(["positional_options", "--config-root", str(tmp_path)])
     assert exit_code == 0
@@ -67,7 +101,9 @@ def test_start_strategy_still_uses_the_strategy_id_flag_for_intraday(
         return 0
 
     monkeypatch.setitem(
-        runtimes_registry.ENTRYPOINTS, "intraday_options", _fake_intraday_main
+        runtimes_registry.RUNTIMES,
+        "intraday_options",
+        _replacing(runtimes_registry, "intraday_options", _fake_intraday_main),
     )
     exit_code = start_strategy.main(
         ["ema_cross_9_21_buy", "--runtime-id", "intraday_options", "--config-root", str(tmp_path)]
@@ -112,7 +148,9 @@ def test_start_strategy_delegates_a_correctly_named_positional_strategy(
         return 0
 
     monkeypatch.setitem(
-        runtimes_registry.ENTRYPOINTS, "positional_options", _fake_positional_main
+        runtimes_registry.RUNTIMES,
+        "positional_options",
+        _replacing(runtimes_registry, "positional_options", _fake_positional_main),
     )
     exit_code = start_strategy.main(
         [

@@ -110,9 +110,19 @@ CONTROL_SCRIPTS = {
 #: intentional operational mutation.
 CONFIRMATION_SCRIPTS = {"live_confirmation.py"}
 
+#: Installs, inspects and removes LaunchAgents. Not read-only — with
+#: ``--execute`` it copies plists and calls ``launchctl`` — but it touches no
+#: broker, no database and no trading table at all: the most it can do is make
+#: the Mac run ``orchestration.auto_start`` on a schedule, which is itself
+#: gated separately by ``auto_start.enabled``. What must hold is that it stays
+#: dry-run by default and refuses while the legacy system is loaded, both
+#: proven in ``tests/unit/test_install_launch_agents.py``.
+AGENT_INSTALL_SCRIPTS = {"install_launch_agents.py"}
+
 READ_ONLY_FILES = [p for p in SCRIPT_FILES if p.name in READ_ONLY_SCRIPTS]
 CONTROL_FILES = [p for p in SCRIPT_FILES if p.name in CONTROL_SCRIPTS]
 CONFIRMATION_FILES = [p for p in SCRIPT_FILES if p.name in CONFIRMATION_SCRIPTS]
+AGENT_INSTALL_FILES = [p for p in SCRIPT_FILES if p.name in AGENT_INSTALL_SCRIPTS]
 
 #: Tables a control script must never write directly — trades, positions and
 #: the state that gates them. Contrast ``audit_events``, which every control
@@ -132,8 +142,10 @@ FORBIDDEN_TRADING_TABLES = (
 def test_the_scripts_directory_is_what_we_think_it_is():
     """Guards every parametrisation below: an empty glob would pass everything."""
     names = {path.name for path in SCRIPT_FILES}
-    assert names == READ_ONLY_SCRIPTS | CONTROL_SCRIPTS | CONFIRMATION_SCRIPTS
-    tiers = (READ_ONLY_SCRIPTS, CONTROL_SCRIPTS, CONFIRMATION_SCRIPTS)
+    assert names == (
+        READ_ONLY_SCRIPTS | CONTROL_SCRIPTS | CONFIRMATION_SCRIPTS | AGENT_INSTALL_SCRIPTS
+    )
+    tiers = (READ_ONLY_SCRIPTS, CONTROL_SCRIPTS, CONFIRMATION_SCRIPTS, AGENT_INSTALL_SCRIPTS)
     assert all(left.isdisjoint(right) for i, left in enumerate(tiers) for right in tiers[i + 1 :])
 
 
@@ -150,6 +162,25 @@ def test_confirmation_workflow_cannot_reach_a_broker_or_trading_table(script: Pa
         assert not re.search(rf"\b{re.escape(table)}\b", source, re.IGNORECASE)
     assert "live_confirmations" in source
     assert "live_confirmation_events" in source
+
+
+@pytest.mark.parametrize("script", AGENT_INSTALL_FILES, ids=lambda p: p.name)
+def test_the_agent_installer_reaches_no_broker_database_or_trading_table(script: Path):
+    assert _broker_imports(script) == set(), f"{script.name} imports a broker"
+    source = script.read_text(encoding="utf-8")
+    for table in FORBIDDEN_TRADING_TABLES:
+        assert not re.search(rf"\b{re.escape(table)}\b", source, re.IGNORECASE)
+    assert "ExecutionRepository" not in source
+    assert "connect_readonly" not in source
+
+
+@pytest.mark.parametrize("script", AGENT_INSTALL_FILES, ids=lambda p: p.name)
+def test_the_agent_installer_never_loads_anything_without_execute(script: Path):
+    """Loading a LaunchAgent is what turns files into a Mac that trades by
+    itself. It must be an explicit act, never a default."""
+    source = script.read_text(encoding="utf-8")
+    assert "args.execute" in source or "execute=" in source
+    assert "dry run" in source
 
 
 # ============================================================== read-only tier

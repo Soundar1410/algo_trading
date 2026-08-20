@@ -11,24 +11,37 @@ LaunchAgent's ``ProgramArguments`` points at instead of
 ``runtimes.intraday_options.__main__`` directly.
 
 Each attempt runs :mod:`scripts.validate_environment` once up front (fail
-before touching the feed at all) and then
-:func:`runtimes.intraday_options.__main__.main` up to ``--max-attempts``
-times. Exit codes split into two groups:
+before touching the feed at all) and then **that runtime's own composition
+root**, resolved through :func:`scripts._runtimes.resolve_runtime`, up to
+``--max-attempts`` times. Exit codes split into two groups:
 
-* **Terminal** — stop immediately, whatever the code:
-  ``EXIT_OK``, ``EXIT_RUNTIME_DISABLED``, ``EXIT_STRATEGY_NOT_FOUND``,
-  ``EXIT_LEGACY_SYSTEM_ACTIVE``, ``EXIT_SAFETY_SHUTDOWN``. None of these mean
-  "try again": a disabled runtime is still disabled next attempt, and a
-  deliberate shutdown must never loop — spec section 12's own words.
-* **Retryable, bounded** — ``EXIT_FAILED``, ``EXIT_NO_CREDENTIALS``: a
-  transient auth/network failure, not a structural refusal to start. Retried
-  up to ``--max-attempts`` times with a fixed backoff between attempts; once
-  exhausted, this process itself exits non-zero and stops — ``launchd``'s own
-  restart of *this* process, bounded by whatever ``ThrottleInterval`` the
-  plist sets, is what finally recovers from a transient outage that outlasts
-  every in-process retry.
+* **Terminal** — stop immediately: a clean stop, a disabled runtime, a missing
+  strategy, a detected legacy system, a deliberate safety shutdown. None of
+  these mean "try again": a disabled runtime is still disabled next attempt,
+  and a deliberate shutdown must never loop — spec section 12's own words.
+* **Retryable, bounded** — a transient auth/network failure, not a structural
+  refusal to start. Retried up to ``--max-attempts`` times with a fixed
+  backoff between attempts.
 
-An **unexpected exception** raised out of :func:`supervisor_main.main` itself
+The *numbers* behind those groups are per runtime and deliberately not
+hardcoded here: ``intraday_options`` and ``positional_options`` disagree on
+almost all of them (positional's disabled is ``10``, intraday's is ``3``), so
+each runtime's own constants are read from the registry. Until this was fixed,
+this module imported intraday's ``__main__`` as both the universal entrypoint
+*and* the universal exit-code vocabulary, which meant ``--runtime-id
+positional_options`` ran intraday's supervisor and then misread its own
+runtime's codes — a deliberately disabled positional runtime would have been
+retried until the attempt budget ran out. An unrecognised code is reported as
+unknown and treated as terminal rather than looped on.
+
+**Exhaustion is final for the day.** Every runtime LaunchAgent this project
+generates sets ``KeepAlive=false``, so ``launchd`` does *not* restart this
+process when it exits, and no ``ThrottleInterval`` is set. Recovery from an
+outage that outlasts every in-process retry comes from the next scheduled
+``orchestration.auto_start`` trigger, not from ``launchd`` restarting this.
+An earlier version of this docstring claimed the opposite; it was wrong.
+
+An **unexpected exception** raised out of the runtime's ``main`` itself
 (a bug, not a classified exit code) is caught and folded into the same
 retryable path rather than left to escape ``run()`` — the whole reason this
 module exists is to bound restarts in-process instead of leaning on
@@ -65,26 +78,17 @@ from pathlib import Path
 
 from common.config import load_paths, load_settings
 from common.logging import get_logger
-from runtimes.intraday_options import __main__ as supervisor_main
 from scripts import validate_environment
 from scripts._operator_common import open_audit_repository
+from scripts._runtimes import RuntimeEntrypoint, resolve_runtime
 
 _log = get_logger(__name__)
 
-#: Codes that must never be retried — see the module docstring.
-TERMINAL_EXIT_CODES = frozenset(
-    {
-        supervisor_main.EXIT_OK,
-        supervisor_main.EXIT_RUNTIME_DISABLED,
-        supervisor_main.EXIT_STRATEGY_NOT_FOUND,
-        supervisor_main.EXIT_LEGACY_SYSTEM_ACTIVE,
-        supervisor_main.EXIT_SAFETY_SHUTDOWN,
-    }
-)
-
-#: Codes worth one more attempt — a transient auth/network failure, not a
-#: structural refusal to start.
-RETRYABLE_EXIT_CODES = frozenset({supervisor_main.EXIT_FAILED, supervisor_main.EXIT_NO_CREDENTIALS})
+#: A generic failure code used when this wrapper never reached the runtime at
+#: all (an unknown runtime id, say). Deliberately *not* one runtime's own
+#: ``EXIT_FAILED``: the two real runtimes happen to agree that 1 means failure,
+#: but nothing in the registry requires a third one to.
+EXIT_CODE_UNREACHED = 1
 
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_BACKOFF_SECONDS = 30.0
@@ -143,6 +147,20 @@ def _record_attempt(
     )
 
 
+def _resolve(runtime_id: str) -> RuntimeEntrypoint | None:
+    """This runtime's entrypoint, or ``None`` after logging an unknown id.
+
+    An unsupported runtime id is a terminal configuration error, never
+    something to retry — and never, as it once was, a silent fallback to
+    ``intraday_options``'s composition root.
+    """
+    try:
+        return resolve_runtime(runtime_id)
+    except KeyError as exc:
+        _log.error("refusing to start: %s", exc)
+        return None
+
+
 def run(
     *,
     runtime_id: str,
@@ -150,24 +168,28 @@ def run(
     max_attempts: int,
     backoff_seconds: float,
 ) -> int:
+    runtime = _resolve(runtime_id)
+    if runtime is None:
+        return EXIT_PREFLIGHT_FAILED
+
     if not _run_preflight(runtime_id):
         _log.error("preflight failed; refusing to start %s", runtime_id)
         return EXIT_PREFLIGHT_FAILED
 
-    exit_code = supervisor_main.EXIT_FAILED
+    exit_code = EXIT_CODE_UNREACHED
     last_exception: Exception | None = None
     for attempt in range(1, max_attempts + 1):
         _log.info("supervised launch attempt %d/%d for %s", attempt, max_attempts, runtime_id)
         last_exception = None
         try:
-            exit_code = supervisor_main.main(
+            exit_code = runtime.main(
                 ["--runtime-id", runtime_id, "--config-root", str(config_root)]
             )
         except Exception as exc:  # intentionally broad — see module docstring
             # Deliberately not `except BaseException`: SystemExit/KeyboardInterrupt
             # must keep propagating untouched, never be folded into this retry path.
             last_exception = exc
-            exit_code = supervisor_main.EXIT_FAILED
+            exit_code = EXIT_CODE_UNREACHED
             _log.exception(
                 "supervised launch attempt %d/%d for %s raised an unexpected exception",
                 attempt,
@@ -175,8 +197,17 @@ def run(
                 runtime_id,
             )
 
-        if last_exception is None and exit_code in TERMINAL_EXIT_CODES:
-            severity = "INFO" if exit_code == supervisor_main.EXIT_OK else "WARNING"
+        classification = runtime.classify(exit_code)
+        if last_exception is None and classification == "unknown":
+            # Not in either set. Looping on a code nobody has classified would
+            # hide it behind the attempt budget, so stop and say so.
+            _log.error(
+                "%s returned unclassified exit_code=%d; treating it as terminal",
+                runtime_id,
+                exit_code,
+            )
+        if last_exception is None and classification != "retryable":
+            severity = "INFO" if classification == "terminal" and exit_code == 0 else "WARNING"
             _record_attempt(
                 runtime_id=runtime_id,
                 attempt=attempt,

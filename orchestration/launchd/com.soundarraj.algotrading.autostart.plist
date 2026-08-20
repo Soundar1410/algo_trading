@@ -10,24 +10,19 @@
 	<key>KeepAlive</key>
 	<false/>
 	<key>Label</key>
-	<string>com.soundarraj.algotrading.intraday_options</string>
+	<string>com.soundarraj.algotrading.autostart</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/usr/bin/caffeinate</string>
-		<string>-i</string>
-		<string>-s</string>
-		<string>/Volumes/Trading/algo_trading/.venv/bin/python</string>
-		<string>-m</string>
-		<string>orchestration.process_control.supervised_launch</string>
-		<string>--runtime-id</string>
-		<string>intraday_options</string>
+		<string>/bin/sh</string>
+		<string>-c</string>
+		<string>n=0; while [ ! -x '/Volumes/Trading/algo_trading/.venv/bin/python' ]; do n=$((n+1)); if [ "$n" -gt 1500 ]; then echo "autostart: /Volumes/Trading/algo_trading/.venv/bin/python never appeared before the session deadline (22500s); is /Volumes/Trading mounted?" &gt;&amp;2; exit 75; fi; sleep 15; done; exec '/usr/bin/caffeinate' '-i' '-s' '/Volumes/Trading/algo_trading/.venv/bin/python' '-m' 'orchestration.auto_start'</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>StandardErrorPath</key>
-	<string>/Volumes/Trading/algo_trading/logs/launchd/intraday_options.err.log</string>
+	<string>/Volumes/Trading/algo_trading/logs/launchd/autostart.err.log</string>
 	<key>StandardOutPath</key>
-	<string>/Volumes/Trading/algo_trading/logs/launchd/intraday_options.out.log</string>
+	<string>/Volumes/Trading/algo_trading/logs/launchd/autostart.out.log</string>
 	<key>StartCalendarInterval</key>
 	<array>
 		<dict>

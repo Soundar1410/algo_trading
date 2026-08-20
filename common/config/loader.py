@@ -29,6 +29,7 @@ from typing import Any
 import yaml
 
 from .models import (
+    AutoStartConfig,
     GlobalConfig,
     ResolvedConfig,
     RuntimeConfig,
@@ -120,6 +121,28 @@ def load_global_config(config_root: Path) -> GlobalConfig:
     if not isinstance(section, dict):
         raise ConfigError("The 'global' block in global.yaml must be a mapping")
     result: GlobalConfig = _build(GlobalConfig, section, "global.yaml")
+    return result
+
+
+def load_auto_start_config(config_root: Path) -> AutoStartConfig:
+    """Load the ``auto_start:`` block of ``config/global.yaml``.
+
+    A sibling top-level block rather than a key inside ``global:`` — it is
+    operational scheduling, not an account-wide *safety permission*, and
+    keeping it out of :class:`GlobalConfig` means no auto-start value can ever
+    be mistaken for one of the live gates that block also holds.
+
+    An absent block is not an error: every field has a fail-closed default and
+    ``enabled`` is false, so a config that never heard of auto-start simply
+    does not auto-start.
+    """
+    raw = _read_yaml(config_root / "global.yaml")
+    section = raw.get("auto_start", {})
+    if section is None:
+        section = {}
+    if not isinstance(section, dict):
+        raise ConfigError("The 'auto_start' block in global.yaml must be a mapping")
+    result: AutoStartConfig = _build(AutoStartConfig, section, "global.yaml")
     return result
 
 

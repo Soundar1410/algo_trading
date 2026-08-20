@@ -12,10 +12,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from common.risk.squareoff import ExpiryPolicy
+from common.utils.timeutils import parse_hhmm
 
 
 class ExecutionMode(StrEnum):
@@ -64,6 +66,97 @@ class GlobalConfig(_StrictModel):
     #: key is derived from the authenticated broker account itself; see
     #: common.broker.live_preflight.check_account_identity.
     live_account_display_name: str | None = None
+
+
+class AutoStartConfig(_StrictModel):
+    """Unattended pre-market startup (``auto_start:`` in ``global.yaml``).
+
+    Account-wide rather than per-runtime: one controller establishes the
+    trading-day/auth ordering once, then starts *whichever* runtimes are
+    enabled. Deliberately lists **no strategy or runtime ids** — runtime and
+    strategy YAML ``enabled:`` flags stay the only authority on what runs, so
+    this block can never enable something the safety config disabled.
+
+    ``enabled`` is false in committed config and stays that way: installing the
+    LaunchAgent and flipping this are two separate, deliberate operator steps.
+    """
+
+    enabled: bool = False
+    timezone: str = "Asia/Kolkata"
+    #: ``StartCalendarInterval`` fires in the Mac's *local* zone, so a Mac that
+    #: is not on :attr:`timezone` fires at the wrong instant. Every decision
+    #: here is made in :attr:`timezone` regardless, but a mismatched Mac can
+    #: still fire hours early or late — so the default is to refuse rather than
+    #: trade on an unverifiable clock. See ``orchestration.auto_start.gate``.
+    require_system_timezone_match: bool = True
+    #: Earliest eligible start. A login before this exits 0 and defers to the
+    #: scheduled trigger; it never starts trading early.
+    startup_time: str = "09:00"
+    #: Latest eligible start for a *new* automatic session. Defaults to the
+    #: session deadline on purpose: a positional runtime with an open cycle
+    #: must still start at 11:00 to recover and manage that exposure. Whether a
+    #: new *entry* is allowed is decided by the strategy/engine entry gates
+    #: (``MarketSession.can_enter``, ``SquareOffPolicy.entry_cutoff``), never by
+    #: refusing to start the runtime at all. An operator may narrow this.
+    latest_start_time: str = "15:15"
+    #: Hard stop for the whole attempt, including every retry.
+    session_deadline_time: str = "15:15"
+    retry_interval_seconds: float = Field(default=30.0, gt=0)
+    retry_backoff_multiplier: float = Field(default=1.5, ge=1.0)
+    retry_max_interval_seconds: float = Field(default=300.0, gt=0)
+    #: How long a spawned runtime has to take its own supervisor lock before
+    #: the launch is reported as a failed startup handshake.
+    runtime_handshake_seconds: float = Field(default=120.0, gt=0)
+    #: Grace period a child gets after SIGTERM before SIGKILL.
+    shutdown_grace_seconds: float = Field(default=30.0, gt=0)
+    #: The dashboard is started by its own RunAtLoad LaunchAgent, never by the
+    #: trading controller — one owner. This flag is read by
+    #: ``scripts.start_dashboard``.
+    dashboard_auto_start: bool = True
+    telegram_retry_attempts: int = Field(default=3, gt=0)
+    telegram_retry_delay_seconds: float = Field(default=5.0, gt=0)
+    #: ISO dates, fed straight to ``common.engine.config.SessionConfig`` so the
+    #: weekend/holiday rules are ``MarketSession``'s, not a second copy.
+    holidays: tuple[str, ...] = ()
+
+    @field_validator("timezone")
+    @classmethod
+    def _known_timezone(cls, v: str) -> str:
+        try:
+            ZoneInfo(v)
+        except Exception as exc:
+            raise ValueError(f"Unknown IANA timezone {v!r}") from exc
+        return v
+
+    @field_validator("startup_time", "latest_start_time", "session_deadline_time")
+    @classmethod
+    def _valid_hhmm(cls, v: str) -> str:
+        parse_hhmm(v)  # raises ValueError on anything unparseable
+        return v
+
+    @model_validator(mode="after")
+    def _window_is_ordered(self) -> AutoStartConfig:
+        start = parse_hhmm(self.startup_time)
+        latest = parse_hhmm(self.latest_start_time)
+        deadline = parse_hhmm(self.session_deadline_time)
+        if not (start <= latest <= deadline):
+            raise ValueError(
+                "auto_start times must satisfy "
+                "startup_time <= latest_start_time <= session_deadline_time "
+                f"(got {self.startup_time}, {self.latest_start_time}, "
+                f"{self.session_deadline_time})."
+            )
+        if self.retry_max_interval_seconds < self.retry_interval_seconds:
+            raise ValueError(
+                "auto_start.retry_max_interval_seconds must be >= retry_interval_seconds "
+                f"(got {self.retry_max_interval_seconds} < {self.retry_interval_seconds})."
+            )
+        return self
+
+    @property
+    def holiday_dates(self) -> tuple[str, ...]:
+        """The holiday calendar, as ``SessionConfig`` wants it."""
+        return self.holidays
 
 
 class HealthConfig(_StrictModel):

@@ -12,6 +12,58 @@ global:
   live_trading_enabled: false
   timezone: Asia/Kolkata
 
+# Unattended PAPER-mode startup (orchestration.auto_start).
+#
+# `enabled: false` is a hard gate, separate from installing the LaunchAgent:
+# the agent may be installed and loaded while this stays false, and nothing
+# will start. Flipping it is a deliberate operator step — see the runbook's
+# auto-start enablement checklist.
+#
+# This block deliberately names NO runtime or strategy. What actually starts is
+# decided entirely by `enabled:` in config/runtimes/*.yaml and
+# config/strategies/*.yaml, which this cannot override.
+auto_start:
+  enabled: false
+
+  # Every decision is made in this zone regardless of the Mac's own setting.
+  # launchd's StartCalendarInterval, however, fires in the Mac's LOCAL zone —
+  # so a Mac on the wrong zone fires at the wrong instant. The default is to
+  # refuse rather than trade on a clock we cannot vouch for.
+  timezone: Asia/Kolkata
+  require_system_timezone_match: true
+
+  # A login before startup_time exits 0 and waits for the 09:00 trigger.
+  startup_time: "09:00"
+  # Late-start eligibility deliberately runs to the session deadline: a
+  # positional runtime with an open weekly cycle must still start at 11:00 to
+  # recover and manage that exposure. Whether a NEW entry is permitted is the
+  # strategy's own entry-cutoff decision, never this file's.
+  latest_start_time: "15:15"
+  session_deadline_time: "15:15"
+
+  # Transient-failure retry (no network, DNS, timeout, 5xx, unmounted volume).
+  # Credential rejection and malformed config are terminal and never retried.
+  retry_interval_seconds: 30.0
+  retry_backoff_multiplier: 1.5
+  retry_max_interval_seconds: 300.0
+
+  # A spawned runtime must take its own supervisor lock within this window or
+  # the launch is reported as failed — Popen returning is not "started".
+  runtime_handshake_seconds: 120.0
+  shutdown_grace_seconds: 30.0
+
+  # The dashboard has exactly one owner: its own RunAtLoad LaunchAgent. The
+  # trading controller never starts it. This flag is what that agent reads.
+  dashboard_auto_start: true
+
+  telegram_retry_attempts: 3
+  telegram_retry_delay_seconds: 5.0
+
+  # NSE trading holidays, ISO dates. Fed straight to MarketSession, so weekend
+  # and holiday rules are the engine's own — never a second copy. An empty list
+  # means weekends only; the operator maintains this each year.
+  holidays: []
+
 # Defaults inherited by every runtime group; a runtime file overrides key by key.
 runtime_defaults:
   enabled: false

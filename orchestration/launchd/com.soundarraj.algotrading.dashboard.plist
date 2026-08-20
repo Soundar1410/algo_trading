@@ -13,9 +13,9 @@
 	<string>com.soundarraj.algotrading.dashboard</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/Volumes/Trading/algo_trading/.venv/bin/python</string>
-		<string>-m</string>
-		<string>scripts.start_dashboard</string>
+		<string>/bin/sh</string>
+		<string>-c</string>
+		<string>n=0; while [ ! -x '/Volumes/Trading/algo_trading/.venv/bin/python' ]; do n=$((n+1)); if [ "$n" -gt 1500 ]; then echo "autostart: /Volumes/Trading/algo_trading/.venv/bin/python never appeared before the session deadline (22500s); is /Volumes/Trading mounted?" &gt;&amp;2; exit 75; fi; sleep 15; done; exec '/Volumes/Trading/algo_trading/.venv/bin/python' '-m' 'scripts.start_dashboard'</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
