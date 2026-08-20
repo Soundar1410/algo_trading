@@ -59,48 +59,57 @@ auto_start:
   telegram_retry_attempts: 3
   telegram_retry_delay_seconds: 5.0
 
-  # NSE trading holidays, ISO dates. Fed straight to MarketSession, so weekend
-  # and holiday rules are the engine's own — never a second copy.
+  # Official NSE 2026 Capital Market / Futures & Options trading-holiday
+  # calendar, verified 2026-08-20 against NSE's holiday-master endpoint:
+  # https://www.nseindia.com/api/holiday-master?type=trading
   #
-  # PROVENANCE (read before trusting this list): compiled 2026-08-20 by
-  # cross-checking three independent published calendars (ClearTax, Groww,
-  # Bajaj AMC), which agree on all sixteen dates. Every day-of-week was then
-  # verified programmatically. This is NOT NSE's own circular — nseindia.com's
-  # holiday API was unreachable at the time of writing — so an operator MUST
-  # reconcile this against the official circular
-  # (https://www.nseindia.com, "Market Timings & Holidays") before enabling
-  # unattended startup, and re-check it whenever NSE issues an amendment.
-  # NSE does add holidays mid-year by circular: 2026-01-15 below is exactly
-  # such a case (Maharashtra municipal elections).
+  # Independently cross-checked the same day against three published calendars
+  # (ClearTax, Groww, Bajaj AMC): all sixteen *weekday* closures below match
+  # exactly, and every day-of-week was verified programmatically. Two
+  # separately-derived lists agreeing is the reason to trust this one.
   #
-  # WHICH DIRECTION IS DANGEROUS: a *missing* holiday is noisy but harmless —
-  # the platform starts, finds a closed market and trades nothing. A *spurious*
-  # holiday is the dangerous one: the platform does not start at all, and an
-  # open weekly_delta_neutral cycle goes unmanaged for a full session. Never
-  # add a date here that has not been verified.
+  # Weekend dates are retained for an exact audit trail even though
+  # MarketSession already rejects Saturdays and Sundays — keeping the file
+  # line-for-line comparable with NSE's own circular is what makes the next
+  # reconciliation cheap. They change no behaviour. In particular, listing
+  # 2026-11-08 does NOT make the platform trade the Diwali Muhurat session:
+  # that is a one-hour Sunday evening special, the weekend rule excludes it,
+  # and a 09:00 unattended start must never attempt it. Trading it, if ever
+  # wanted, is a separate manual decision.
   #
-  # Weekend-falling holidays are deliberately omitted: MarketSession already
-  # excludes Saturdays and Sundays, so listing them would be redundant. That
-  # also means the Sunday 2026-11-08 Diwali Muhurat session (a one-hour
-  # evening special) is not a trading day for this platform — a 09:00
-  # unattended start must not attempt it.
+  # WHICH DIRECTION IS DANGEROUS, because the two are not symmetric: a
+  # *missing* holiday is noisy but harmless — the platform starts, finds a
+  # closed market and trades nothing. A *spurious* holiday is the dangerous
+  # one — the platform does not start at all, and an open weekly_delta_neutral
+  # cycle goes unmanaged for a whole session. Never add a date here that has
+  # not been verified against NSE's own circular.
+  #
+  # NSE may declare additional ad-hoc closures; re-verify this list after any
+  # such circular and before the first unattended session of each new calendar
+  # year. 2026-01-15 (Maharashtra municipal elections) is exactly such a case.
+  # This list is ANNUAL: a 2027 list must be committed before January 2027, or
+  # every 2027 holiday will be treated as an ordinary trading day.
   holidays:
-    - "2026-01-15"  # Thu — Municipal Corporation Election, Maharashtra
-    - "2026-01-26"  # Mon — Republic Day
-    - "2026-03-03"  # Tue — Holi
-    - "2026-03-26"  # Thu — Shri Ram Navami
-    - "2026-03-31"  # Tue — Shri Mahavir Jayanti
-    - "2026-04-03"  # Fri — Good Friday
-    - "2026-04-14"  # Tue — Dr. Baba Saheb Ambedkar Jayanti
-    - "2026-05-01"  # Fri — Maharashtra Day
-    - "2026-05-28"  # Thu — Bakri Id
-    - "2026-06-26"  # Fri — Muharram
-    - "2026-09-14"  # Mon — Ganesh Chaturthi
-    - "2026-10-02"  # Fri — Mahatma Gandhi Jayanti
-    - "2026-10-20"  # Tue — Dussehra
-    - "2026-11-10"  # Tue — Diwali Balipratipada
-    - "2026-11-24"  # Tue — Prakash Gurpurb Sri Guru Nanak Dev
-    - "2026-12-25"  # Fri — Christmas
+    - "2026-01-15"  # Municipal Corporation Election - Maharashtra
+    - "2026-01-26"  # Republic Day
+    - "2026-02-15"  # Mahashivratri (Sunday)
+    - "2026-03-03"  # Holi
+    - "2026-03-21"  # Id-Ul-Fitr / Ramadan Eid (Saturday)
+    - "2026-03-26"  # Shri Ram Navami
+    - "2026-03-31"  # Shri Mahavir Jayanti
+    - "2026-04-03"  # Good Friday
+    - "2026-04-14"  # Dr. Baba Saheb Ambedkar Jayanti
+    - "2026-05-01"  # Maharashtra Day
+    - "2026-05-28"  # Bakri Id
+    - "2026-06-26"  # Muharram
+    - "2026-08-15"  # Independence Day (Saturday)
+    - "2026-09-14"  # Ganesh Chaturthi
+    - "2026-10-02"  # Mahatma Gandhi Jayanti
+    - "2026-10-20"  # Dussehra
+    - "2026-11-08"  # Diwali Laxmi Pujan / Muhurat session (Sunday)
+    - "2026-11-10"  # Diwali-Balipratipada
+    - "2026-11-24"  # Prakash Gurpurb Sri Guru Nanak Dev
+    - "2026-12-25"  # Christmas
 
 # Defaults inherited by every runtime group; a runtime file overrides key by key.
 runtime_defaults:

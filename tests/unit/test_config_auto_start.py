@@ -134,12 +134,32 @@ def test_every_committed_holiday_is_a_parseable_iso_date():
         assert date.fromisoformat(raw).isoformat() == raw, f"{raw} is not a plain ISO date"
 
 
-def test_no_committed_holiday_falls_on_a_weekend():
-    """MarketSession already excludes Saturday and Sunday, so a weekend entry
-    is dead weight — and much more likely to be a transcription error than a
-    real exchange closure worth recording."""
-    for day in _committed_holidays():
-        assert day.weekday() < 5, f"{day} is a {day.strftime('%A')}"
+def test_weekend_entries_are_kept_deliberately_and_change_no_behaviour():
+    """The committed list mirrors NSE's circular line-for-line, weekend
+    closures included, so the next reconciliation is a straight comparison.
+    Those entries must be inert: MarketSession rejects Saturday and Sunday
+    regardless, so listing them can only ever be documentation."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from orchestration.auto_start.gate import build_session
+
+    cfg = load_auto_start_config(REPO_CONFIG)
+    weekend = [d for d in _committed_holidays() if d.weekday() >= 5]
+    assert weekend, "the committed list is expected to mirror the full circular"
+
+    # Same calendar with every weekend entry removed: behaviour must be identical.
+    weekday_only = cfg.model_copy(
+        update={"holidays": tuple(d.isoformat() for d in _committed_holidays() if d.weekday() < 5)}
+    )
+    full, trimmed = build_session(cfg), build_session(weekday_only)
+    ist = ZoneInfo(cfg.timezone)
+    for day in weekend:
+        moment = datetime(day.year, day.month, day.day, 9, 30, tzinfo=ist)
+        assert not full.is_trading_day(moment)
+        assert not trimmed.is_trading_day(moment), (
+            f"{day} is excluded by the weekend rule, not by being listed"
+        )
 
 
 def test_the_committed_holidays_are_unique_and_sorted():
@@ -152,6 +172,22 @@ def test_the_committed_holidays_cover_the_expected_year():
     days = _committed_holidays()
     assert days, "an empty calendar means weekends only — populate it before enabling"
     assert {d.year for d in days} == {2026}, "one calendar year per committed list"
+
+
+def test_every_weekday_closure_in_the_committed_calendar_is_the_expected_set():
+    """Pinned explicitly so a silent edit to a trading-affecting date fails.
+
+    Only weekday entries are pinned — those are the ones that change whether
+    the platform starts. Two independently-derived lists agreed on exactly
+    these sixteen.
+    """
+    expected = {
+        date(2026, 1, 15), date(2026, 1, 26), date(2026, 3, 3), date(2026, 3, 26),
+        date(2026, 3, 31), date(2026, 4, 3), date(2026, 4, 14), date(2026, 5, 1),
+        date(2026, 5, 28), date(2026, 6, 26), date(2026, 9, 14), date(2026, 10, 2),
+        date(2026, 10, 20), date(2026, 11, 10), date(2026, 11, 24), date(2026, 12, 25),
+    }
+    assert {d for d in _committed_holidays() if d.weekday() < 5} == expected
 
 
 def test_a_committed_holiday_is_actually_treated_as_a_non_trading_day():
@@ -197,9 +233,11 @@ def test_an_ordinary_weekday_is_still_a_trading_day():
 
 
 def test_the_sunday_muhurat_session_is_not_a_trading_day():
-    """Diwali Muhurat 2026-11-08 is a one-hour Sunday evening special. A 09:00
-    unattended start must not attempt it, and the weekend rule already says so
-    without the date being listed."""
+    """Diwali Muhurat 2026-11-08 is a one-hour Sunday evening special.
+
+    It appears in the committed list as an audit-trail entry, and that must
+    not be mistaken for permission to trade it: a 09:00 unattended start must
+    never attempt it, and the weekend rule is what guarantees so."""
     from datetime import datetime
     from zoneinfo import ZoneInfo
 

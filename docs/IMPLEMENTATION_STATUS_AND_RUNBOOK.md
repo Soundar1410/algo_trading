@@ -5752,20 +5752,27 @@ are the engine's own — there is no second copy here. The check runs before the
 project probe, before authentication and before any notifier, so a Saturday
 wake-up costs a filesystem stat and an exit code.
 
-`auto_start.holidays` carries the **2026** NSE equity calendar — sixteen
-weekday closures, listed in `config/global.yaml` with the day and festival
-against each date.
+`auto_start.holidays` carries the **2026** NSE calendar — twenty entries in
+`config/global.yaml`, of which sixteen are weekday closures that actually
+affect whether the platform starts.
 
-**Provenance, stated plainly:** compiled 2026-08-20 by cross-checking three
-independent published calendars (ClearTax, Groww, Bajaj AMC), which agree on
-all sixteen dates; every day-of-week was then verified programmatically, and a
-test asserts the committed list stays parseable, unique, sorted, weekend-free
-and confined to one calendar year. This is **not** NSE's own circular —
-nseindia.com's holiday API was unreachable when the list was compiled — so
-reconcile it against the official circular ("Market Timings & Holidays" at
-nseindia.com) before enabling unattended startup, and again whenever NSE
-issues an amendment. NSE does add closures mid-year: 2026-01-15 (Maharashtra
-municipal elections) is exactly such a case.
+**Provenance:** verified 2026-08-20 against NSE's own holiday-master endpoint
+(`nseindia.com/api/holiday-master?type=trading`), and independently
+cross-checked the same day against three published calendars (ClearTax, Groww,
+Bajaj AMC) — all sixteen weekday closures match exactly, and every day-of-week
+was verified programmatically. Two separately-derived lists agreeing is the
+reason to trust this one. Tests pin the sixteen weekday dates explicitly and
+assert the committed list stays parseable, unique, sorted and confined to one
+calendar year.
+
+**Weekend entries are deliberate and inert.** Four closures fall on a Saturday
+or Sunday and are kept so the file stays line-for-line comparable with NSE's
+circular, which is what makes the next reconciliation cheap. `MarketSession`
+rejects weekends regardless, and a test proves removing them changes nothing.
+In particular, listing 2026-11-08 does **not** mean the platform trades the
+Diwali **Muhurat** session — that is a one-hour Sunday evening special, the
+weekend rule excludes it, and a 09:00 unattended start must never attempt it.
+Trading it, if ever wanted, is a separate manual decision.
 
 **The two failure directions are not symmetric**, which is why the list should
 be edited conservatively:
@@ -5776,15 +5783,10 @@ be edited conservatively:
   all, and an open `weekly_delta_neutral` cycle goes unmanaged for a whole
   session.
 
-Weekend-falling closures are deliberately not listed: `MarketSession` already
-excludes Saturdays and Sundays. That also settles the Diwali **Muhurat**
-session (Sunday 2026-11-08, one hour in the evening) — it is not a trading day
-for this platform, and a 09:00 unattended start must not attempt it. Trading
-that session, if ever wanted, is a separate manual decision.
-
-**The calendar is annual.** A 2027 list must be committed before the first
-trading day of 2027, or every 2027 holiday will be treated as an ordinary
-trading day.
+NSE declares ad-hoc closures mid-year — 2026-01-15 (Maharashtra municipal
+elections) is exactly such a case — so re-verify after any circular. **The
+list is annual:** a 2027 list must be committed before the first trading day
+of 2027, or every 2027 holiday will be treated as an ordinary trading day.
 
 #### Retry classification
 
@@ -6043,7 +6045,7 @@ error, not a silently ignored key.
 | `dashboard_auto_start` | `true` | Read by `scripts.start_dashboard`. |
 | `telegram_retry_attempts` | `3` | Bounded delivery retries. |
 | `telegram_retry_delay_seconds` | `5.0` | Between them. |
-| `holidays` | 2026 NSE list (16 dates) | ISO dates, fed to `MarketSession`. Annual — a 2027 list is needed before January 2027. |
+| `holidays` | 2026 NSE list (20 entries, 16 weekday) | ISO dates, fed to `MarketSession`. Annual — a 2027 list is needed before January 2027. |
 
 #### Timezone: why it fails closed
 
