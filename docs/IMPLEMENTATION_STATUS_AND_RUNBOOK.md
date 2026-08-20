@@ -5752,10 +5752,39 @@ are the engine's own — there is no second copy here. The check runs before the
 project probe, before authentication and before any notifier, so a Saturday
 wake-up costs a filesystem stat and an exit code.
 
-`auto_start.holidays` ships empty, meaning weekends only. **The operator
-maintains the NSE holiday list each year**; an out-of-date list means the
-platform starts on a holiday, finds a closed market, and squares off nothing —
-noisy rather than dangerous, but worth keeping current.
+`auto_start.holidays` carries the **2026** NSE equity calendar — sixteen
+weekday closures, listed in `config/global.yaml` with the day and festival
+against each date.
+
+**Provenance, stated plainly:** compiled 2026-08-20 by cross-checking three
+independent published calendars (ClearTax, Groww, Bajaj AMC), which agree on
+all sixteen dates; every day-of-week was then verified programmatically, and a
+test asserts the committed list stays parseable, unique, sorted, weekend-free
+and confined to one calendar year. This is **not** NSE's own circular —
+nseindia.com's holiday API was unreachable when the list was compiled — so
+reconcile it against the official circular ("Market Timings & Holidays" at
+nseindia.com) before enabling unattended startup, and again whenever NSE
+issues an amendment. NSE does add closures mid-year: 2026-01-15 (Maharashtra
+municipal elections) is exactly such a case.
+
+**The two failure directions are not symmetric**, which is why the list should
+be edited conservatively:
+
+* a **missing** holiday is noisy but harmless — the platform starts, finds a
+  closed market and trades nothing;
+* a **spurious** holiday is the dangerous one — the platform does not start at
+  all, and an open `weekly_delta_neutral` cycle goes unmanaged for a whole
+  session.
+
+Weekend-falling closures are deliberately not listed: `MarketSession` already
+excludes Saturdays and Sundays. That also settles the Diwali **Muhurat**
+session (Sunday 2026-11-08, one hour in the evening) — it is not a trading day
+for this platform, and a 09:00 unattended start must not attempt it. Trading
+that session, if ever wanted, is a separate manual decision.
+
+**The calendar is annual.** A 2027 list must be committed before the first
+trading day of 2027, or every 2027 holiday will be treated as an ordinary
+trading day.
 
 #### Retry classification
 
@@ -6014,7 +6043,7 @@ error, not a silently ignored key.
 | `dashboard_auto_start` | `true` | Read by `scripts.start_dashboard`. |
 | `telegram_retry_attempts` | `3` | Bounded delivery retries. |
 | `telegram_retry_delay_seconds` | `5.0` | Between them. |
-| `holidays` | `[]` | ISO dates, fed to `MarketSession`. |
+| `holidays` | 2026 NSE list (16 dates) | ISO dates, fed to `MarketSession`. Annual — a 2027 list is needed before January 2027. |
 
 #### Timezone: why it fails closed
 
@@ -6162,7 +6191,8 @@ rm -f ~/Library/LaunchAgents/com.soundarraj.algotrading.autostart.plist
 Every item is a deliberate decision. None was performed by this work.
 
 1. Confirm the Mac's timezone is `Asia/Kolkata`.
-2. Fill `auto_start.holidays` with the current NSE holiday list.
+2. Reconcile `auto_start.holidays` against NSE's official circular for the
+   current year, and confirm a list exists for the year ahead.
 3. Confirm `.env` carries `DHAN_CLIENT_ID`, `DHAN_PIN`, `DHAN_TOTP_SECRET` and
    the Telegram pair; run `scripts.validate_environment` for each runtime.
 4. Decide which runtimes and strategies to run, and set their own `enabled:`
