@@ -134,7 +134,7 @@ def test_the_shared_supertrend_indicator_is_untouched_by_this_strategy():
 
     Also pins the specific seam this port deliberately did **not** move: the
     indicator's own ``warmup_requirement()`` still declares ``min_bars=self.period``.
-    Raising the warm-up floor to a full session is the *strategy's* decision, made in
+    Raising the warm-up floor to 75 completed buckets is the *strategy's* decision, made in
     its own ``warmup_spec()``, so no other consumer of ``SuperTrend`` inherits it.
     """
     source = (REPO_ROOT / "common" / "indicators" / "supertrend.py").read_text(

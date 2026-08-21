@@ -77,17 +77,24 @@ from common.warmup.requirements import StrategyWarmupSpec
 #: latched and path-dependent, so a replay of one recent candle would seed a direction
 #: outright and could then read the first live crossing as a fresh flip that never
 #: happened — or hold the opposite direction and swallow a real one. The bar count
-#: therefore has to express "at least a full session of continuous history", which is
-#: what this constant does; ``continuity_required`` (inherited from the indicator)
-#: remains the categorical gate on top of it.
+#: therefore has to express a length of genuinely continuous history, which is what
+#: this constant does; ``continuity_required`` (inherited from the indicator) remains
+#: the categorical gate on top of it.
 #:
-#: Sizing: the canonical 5-minute grid for a 09:15-15:20 session holds **73** full
-#: buckets (09:15 through the 15:15-15:20 bar) — ``common.warmup.session_buckets.
-#: session_bucket_count``. 75 is therefore deliberately *more* than one session, so
-#: the required suffix always spans two trading sessions and a start right at the open
-#: cannot be satisfied by a partial day. ``WarmupManager`` walks the extra sessions
-#: through ``MarketSession.prior_trading_day``, so weekends and configured holidays
-#: are legitimate gaps rather than false ones.
+#: **This is a conservative 75-completed-bucket trust floor, not "one session".** The
+#: distinction matters: the canonical 5-minute grid for a 09:15-15:20 lifecycle holds
+#: **73** completed buckets (09:15 through the 15:15-15:20 bar) —
+#: ``common.warmup.session_buckets.session_bucket_count``. 75 therefore intentionally
+#: **spans trading sessions**, and always does:
+#:
+#: * at market open — the previous session's 73 completed buckets plus two buckets
+#:   from the preceding valid session;
+#: * mid-session — the latest 75 completed buckets across the current and previous
+#:   valid sessions;
+#: * weekends and configured holidays remain legitimate boundaries, walked by
+#:   ``MarketSession.prior_trading_day`` rather than read as missing buckets.
+#:
+#: A start right at the open therefore cannot be satisfied by a partial day.
 DEFAULT_WARMUP_MIN_BARS = 75
 
 
@@ -259,14 +266,15 @@ class SupertrendBuy1x1p2Strategy(BaseStrategy):
         )
 
     def warmup_spec(self) -> StrategyWarmupSpec | None:
-        """Spec section 7 — a full session of continuous history, not one ATR bar.
+        """Spec section 7 — a conservative 75-bucket trust floor, not one ATR bar.
 
         Starts from the indicator's own declared requirement (which is where
         ``continuity_required=True`` comes from, and must keep coming from — this
         strategy does not restate the indicator's categorical contract) and raises
         only the bar floor to :data:`DEFAULT_WARMUP_MIN_BARS`. See that constant for
         why ``min_bars = period = 1`` is not a safe warm-up requirement even though it
-        is a correct *ATR readiness* requirement.
+        is a correct *ATR readiness* requirement, and for why 75 buckets deliberately
+        span trading sessions rather than describing one.
 
         ``max`` rather than an outright override, so a future indicator change that
         raised the component's own floor above this one would win rather than be

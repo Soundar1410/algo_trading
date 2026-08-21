@@ -121,6 +121,24 @@ Requirements:
 
 Choose the minimum warm-up bar count from the existing SuperTrend component’s continuity contract and repository conventions. Do not reduce it merely to make a test pass. Record the chosen value and reasoning in the final report.
 
+### 7.1 Recorded decision — `min_bars = 75` (operator-approved)
+
+**Chosen value: `min_bars = 75`, `continuity_required = true`.**
+
+`SuperTrend.warmup_requirement()` declares `min_bars = period`, which is `1` for this strategy. That number is a correct statement about **ATR readiness** and an unsafe one about **trend-context trust**: the SuperTrend direction is latched and path-dependent, so a replay of a single recent candle seeds a direction outright and the first live crossing can then be read as a fresh flip that never happened — or the opposite direction held and a real flip swallowed. ATR calculation readiness and trustworthy trend-context reconstruction are different requirements, and the bar count must express the second.
+
+The floor is raised inside the strategy’s own `warmup_spec()` (`max(indicator_min_bars, 75)`, inheriting `continuity_required` from the indicator). The shared `common/indicators/supertrend.py` contract is **not** modified, so no other `SuperTrend` consumer inherits this strategy’s trading-risk decision, and no `TradingEngine` branch is added.
+
+**Describe the value accurately.** A 09:15–15:20 lifecycle contains **73** completed five-minute buckets (09:15 through the 15:15–15:20 bar — `common.warmup.session_buckets.session_bucket_count`). `75` is therefore **not** “one complete session”. It is a conservative 75-completed-bucket trust floor that **intentionally spans trading sessions**:
+
+- **At market open** — the previous session’s 73 completed buckets plus two buckets from the preceding valid session.
+- **Mid-session** — the latest 75 completed buckets across the current and previous valid sessions.
+- **Weekends and configured holidays remain legitimate boundaries**, walked by `MarketSession.prior_trading_day` rather than read as missing buckets. This is why the committed configuration declares `parameters.holidays`.
+- Missing, stale, unordered, duplicate or in-session-gapped coverage remains non-`WARMED`, and `StrategyWarmupSpec.entry_blocked_by` latches entries off for the whole day.
+- Warm-up replay still seeds indicator state only and never emits an order.
+
+Sizing consequence: `WarmupManager._lookback_sessions` requests `ceil(75 / 73) = 2` prior sessions plus today, which the committed `warmup_max_lookback_sessions: 3` accommodates.
+
 ## 8. Contract Selection and Quantity
 
 On an actionable fresh flip:

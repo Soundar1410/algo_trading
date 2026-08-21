@@ -1,0 +1,226 @@
+# supertrend_buy_1_1p2 — NIFTY 5-minute SuperTrend(1, 1.2), ATM weekly options,
+# BUY-only, intraday. Full spec: strategies/intraday_options/
+# supertrend_buy_1_1p2/SUPERTREND_BUY_1_1P2_ALGO_TRADING_SPEC.md.
+#
+# Parity source is the legacy Trading_Automation `supertrend_fast` strategy's own
+# code, config and tests. The legacy tree's
+# NiftyFixedStrikeSuperTrend_Master_Specification.md is deliberately NOT a parity
+# source: it documents a different strategy (one strike fixed at 09:16 all day,
+# SuperTrend on the CE/PE premium charts, multiplier 1, two simultaneous
+# positions).
+#
+# DISABLED AND PAPER-ONLY AT DELIVERY. `enabled: false` below is what keeps the
+# unattended startup from spawning it — orchestration.auto_start names no
+# strategy of its own, it starts exactly what each strategies/*.yaml enables.
+# Setting mode to `live` would additionally NOT start a live strategy: the
+# broker factory consults the live gate (common.config.models.
+# effective_live_gate) and refuses while global.live_trading_enabled and the
+# runtime's live_execution_allowed stay false. Enabling this strategy for paper
+# is a separate, deliberate operator decision after review.
+
+strategy_id: supertrend_buy_1_1p2
+runtime_id: intraday_options
+enabled: false
+
+mode: paper
+live_approved: false
+
+# Single-leg engine family. parameters.strategy_ref below is what actually tells
+# runtimes/intraday_options/config_adapter.py to drive the ported TradingEngine
+# rather than the Phase 1 fixture path — see that module's docstring for why
+# EngineKind alone cannot be the discriminator.
+engine: trading_engine
+
+risk:
+  # Spec section 5. entry_start feeds EngineWorkerConfig.session_start_time;
+  # entry_cutoff/square_off_at feed the SquareOffPolicy that both the
+  # entry-cutoff gate and the mandatory hard square-off derive from
+  # (common.engine.config.SessionConfig.from_square_off_policy) — one
+  # configured pair, not two independently configured times that can drift.
+  #
+  # 15:15 is enforced as a strict `<` (MarketSession.can_enter), so a signal at
+  # exactly 15:15:00 opens nothing. The exit half of a reversal is NOT window-
+  # gated, so an opposite flip at or after the cutoff still closes the open leg
+  # and simply leaves the book flat — spec section 9.
+  entry_start: "09:15"
+  entry_cutoff: "15:15"
+  square_off_at: "15:20"
+
+parameters:
+  # ------------------------------------------------------- required, both paths
+  instrument: NIFTY
+  # NIFTY index security id (common.market_data.scrip_master.INDEX_REGISTRY).
+  security_id: "13"
+
+  # ------------------------------------------------- engine-path discriminator
+  strategy_ref: "strategies.intraday_options.supertrend_buy_1_1p2.strategy:SupertrendBuy1x1p2Strategy"
+
+  # SupertrendBuy1x1p2Strategy's own constructor kwargs. Travels through
+  # config_adapter.py verbatim -- see its _build_engine_worker_config docstring.
+  strategy_kwargs:
+    # Spec section 6. The legacy values; changing either is a strategy-spec
+    # change, not a tuning knob.
+    supertrend_period: 1
+    supertrend_multiplier: 1.2
+    # lots_per_trade is a sizing CHOICE (config); lot_size is NOT configured
+    # anywhere here -- it is resolved from the scrip master at runtime (see
+    # contract_resolver below) and multiplied in by
+    # OpenPosition.quantity = lots * contract.lot_size. Order quantity for
+    # this strategy = 10 * <scrip-master NIFTY weekly lot size>.
+    #
+    # Ten lots is LEGACY PARITY for paper testing. It is not a statement that
+    # this size is safe for live capital, and it authorises nothing.
+    lots_per_trade: 10
+    # Spec section 10: 4% activates the best-close trail only; the momentum
+    # structure leg has no activation gate and can fire from the second
+    # completed premium candle after entry, including at a loss. Both
+    # thresholds are inclusive (>=); the momentum rule is strict (<).
+    trail_percentage: 8.0
+    activation_minimum_favourable_move_percentage: 4.0
+    # Spec section 7.1, operator-approved. NOT the indicator's own
+    # min_bars = period = 1, which states when the ATR has a value and says
+    # nothing about whether a latched, path-dependent trend can be trusted.
+    #
+    # A conservative 75-COMPLETED-BUCKET trust floor, deliberately NOT "one
+    # session": a 09:15-15:20 lifecycle contributes 73 completed 5-minute
+    # buckets, so 75 intentionally spans sessions -- at market open, the
+    # previous session's 73 plus two from the preceding valid session;
+    # mid-session, the latest 75 across the current and previous valid
+    # sessions. Weekends and the configured holidays below remain legitimate
+    # boundaries, walked by MarketSession.prior_trading_day.
+    warmup_min_bars: 75
+    # Minimal per-position backstop, disabled by default -- the premium-candle
+    # combined exit above is the primary exit. The legacy config selected
+    # `sl_lock_trail` with all four of its thresholds null, i.e. a per-tick
+    # rupee rule that never fires; `hard_stop` with its own disabled default is
+    # the behavioural equivalent under this repository's RiskManager contract.
+    risk_manager_name: hard_stop
+    risk_manager_params:
+      catastrophic_stop_rupees_per_lot: none
+
+  # ------------------------------------------------------------- candle/session
+  # Spec section 5: signals come only from COMPLETED 5-minute underlying
+  # candles, and the premium exit from the traded option's own completed
+  # 5-minute candles. One timeframe drives both builders.
+  timeframe: "5m"
+
+  # --------------------------------------------------------- option resolution
+  # "dhan" resolves real NIFTY weekly contracts (strike, expiry AND lot size)
+  # from the exchange's own daily instrument master at runtime -- spec section
+  # 8. Never hardcode a lot size or a weekly-expiry date, so there is
+  # deliberately NO `lot_size:` key here (straddle_920's pattern, not
+  # ema_cross_9_21_buy's documented-but-ignored `lot_size: 75`). The legacy
+  # config's `lot_size: 65` cross-check is not carried over.
+  #
+  # Known asymmetry, stated rather than assumed away: the MULTI-LEG branch of
+  # config_adapter raises ConfigError when contract_resolver is "simulated"
+  # with no explicit lot_size, but the SINGLE-LEG branch this strategy uses
+  # silently defaults it to 50 (_build_engine_worker_config). So omitting the
+  # key does not by itself make an accidental switch to "simulated" fail
+  # loudly on this path -- it would quietly size 10 lots x 50. What actually
+  # guards that here is `contract_resolver: dhan` being pinned by
+  # tests/unit/test_supertrend_buy_1_1p2_config.py, plus the fact that the
+  # "dhan" resolver ignores this value entirely. Closing the asymmetry in the
+  # adapter would be a shared-code change affecting every existing simulated
+  # fixture, so it is reported rather than made here.
+  contract_resolver: dhan
+  strike_step: 50
+  # null => the resolver's own nearest listed expiry, which already carries the
+  # exchange's actual (holiday-shifted) expiry date from the daily master.
+  expiry: null
+  # Overrides for an underlying not in INDEX_REGISTRY; empty => registry value.
+  index_security_id: ""
+  index_segment: ""
+  fno_segment: ""
+  scrip_master_cache_dir: ""
+
+  # ----------------------------------------------------- daily 3% live-MTM cap
+  # Spec section 12. capital_base = Rs 10,00,000 (the legacy paper_trading
+  # starting_capital), so daily_max_loss_pct converts to an ABSOLUTE
+  # 0.03 * 1_000_000 = Rs 30,000, evaluated every tick on live MTM (realised so
+  # far + this position's open unrealised P&L) --
+  # common.engine.daily_guard.DailyRiskGuard.check_open_mtm, wired by
+  # TradingEngine itself. The trip is inclusive (<= -30,000). Latching: squares
+  # off and halts new entries for the rest of the day, and survives a same-day
+  # worker restart because the realised half is rebuilt from strategy_state.
+  capital_base: 1000000
+  daily_max_loss_pct: 3.0
+
+  # ------------------------------------------------------------------- warm-up
+  # SuperTrend is continuity_required (common/indicators/supertrend.py), so BOTH
+  # of the next two lines are mandatory: TradingEngine.__init__ raises
+  # InvalidWarmupConfig if warmup_from_history is false OR no warm-up manager is
+  # supplied, and any replay that does not return WARMED latches entries off for
+  # the whole day. warmup_max_lookback_sessions must be >= 2, because
+  # WarmupManager._lookback_sessions asks for ceil(75 / 73) = 2 prior sessions
+  # plus today to satisfy the 75-bucket floor; 3 leaves headroom.
+  warmup_from_history: true
+  warmup_source: dhan
+  warmup_max_lookback_sessions: 3
+
+  # ----------------------------------------------------------- trading calendar
+  # The engine's own MarketSession reads its holidays from HERE, not from
+  # config/global.yaml (whose list feeds only the unattended auto-start gate).
+  # Declaring them matters twice: no entry on a closed day, and -- less
+  # obviously -- a correct warm-up walk-back, since the 75-bucket floor spans
+  # sessions and MarketSession.prior_trading_day is what decides which prior
+  # sessions those are. An undeclared holiday would make the walk-back expect
+  # buckets that never existed and downgrade a perfectly good replay to PARTIAL.
+  #
+  # Copied verbatim from config/global.yaml's verified NSE 2026 Capital Market /
+  # F&O trading-holiday calendar (checked 2026-08-20 against NSE's holiday-master
+  # endpoint and cross-checked against three published calendars). Weekend dates
+  # are retained for an exact audit trail even though MarketSession already
+  # rejects Saturdays and Sundays -- keeping this list line-for-line comparable
+  # with global.yaml is what makes the next reconciliation cheap. In particular,
+  # listing 2026-11-08 does NOT make this strategy trade the Diwali Muhurat
+  # session: that is a one-hour Sunday evening special and the weekend rule
+  # excludes it.
+  #
+  # This list is ANNUAL. A 2027 list must be committed before January 2027, or
+  # every 2027 holiday will be treated as an ordinary trading day.
+  holidays:
+    - "2026-01-15"  # Municipal Corporation Election - Maharashtra
+    - "2026-01-26"  # Republic Day
+    - "2026-02-15"  # Mahashivratri (Sunday)
+    - "2026-03-03"  # Holi
+    - "2026-03-21"  # Id-Ul-Fitr / Ramadan Eid (Saturday)
+    - "2026-03-26"  # Shri Ram Navami
+    - "2026-03-31"  # Shri Mahavir Jayanti
+    - "2026-04-03"  # Good Friday
+    - "2026-04-14"  # Dr. Baba Saheb Ambedkar Jayanti
+    - "2026-05-01"  # Maharashtra Day
+    - "2026-05-28"  # Bakri Id
+    - "2026-06-26"  # Muharram
+    - "2026-08-15"  # Independence Day (Saturday)
+    - "2026-09-14"  # Ganesh Chaturthi
+    - "2026-10-02"  # Mahatma Gandhi Jayanti
+    - "2026-10-20"  # Dussehra
+    - "2026-11-08"  # Diwali Laxmi Pujan / Muhurat session (Sunday)
+    - "2026-11-10"  # Diwali-Balipratipada
+    - "2026-11-24"  # Prakash Gurpurb Sri Guru Nanak Dev
+    - "2026-12-25"  # Christmas
+
+  regime_enabled: false
+
+  # ------------------------------------------------------------ paper execution
+  # Spec section 13, and the one intentional architecture-level deviation from
+  # the legacy simulator: the legacy config ran `slippage_points: 0.0` and no
+  # latency at all. That is not reproduced. This block is ema_cross_9_21_buy's
+  # canonical intraday paper block, so the two single-leg intraday strategies
+  # are filled by the same model and their results stay comparable.
+  #
+  # Charges are deliberately NOT overridden here: no strategy YAML sets
+  # `cost_rates`, so this inherits common.broker.costs.CostRates' defaults, the
+  # same rates ema_cross_9_21_buy and straddle_920 book against.
+  paper_execution:
+    slippage:
+      options:
+        mode: ticks
+        market_order_ticks: 1
+    submission_latency_ms: 250
+    tick_size: 0.05
+    allow_ltp_fallback: true
+    ltp_fallback_extra_ticks: 1
+    # Live feed: reject a quote older than 2s rather than fill on stale data.
+    max_quote_age_ms: 2000

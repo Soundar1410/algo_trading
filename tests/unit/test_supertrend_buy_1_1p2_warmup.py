@@ -18,10 +18,11 @@ supertrend_buy_1_1p2.strategy.DEFAULT_WARMUP_MIN_BARS` (75) inside ``warmup_spec
 leaving the shared indicator untouched.
 
 Sizing, verified rather than assumed: the canonical 5-minute grid for a 09:15-15:20
-session holds **73** full buckets (``session_bucket_count``), the 09:15 through
-15:15-15:20 bars. 75 is therefore deliberately more than one complete session, so the
-required suffix always spans two trading sessions and a start right at the open cannot
-be satisfied by a partial day.
+lifecycle holds **73** completed buckets (``session_bucket_count``), the 09:15 through
+15:15-15:20 bars. 75 is therefore a conservative completed-bucket trust floor that
+intentionally **spans trading sessions** — at market open the previous session's 73
+plus two from the preceding valid session; mid-session the latest 75 across the
+current and previous valid sessions — never a description of "one session".
 
 Calendar used throughout (verified weekdays): 2026-08-17 Mon, 08-18 Tue, 08-19 Wed,
 08-20 Thu, 08-21 Fri; 2026-08-12 Wed, 08-13 Thu, 08-14 Fri.
@@ -80,7 +81,7 @@ def _candle(start_at: datetime, close: float) -> Candle:
 
 
 def _grid(session: MarketSession, day: date) -> list[datetime]:
-    """The canonical production bucket-starts for one session — the same helper the
+    """The canonical production bucket-starts for one trading day — the same helper the
     manager's own completeness check and the historical fetch filter use."""
     return session_bucket_starts(session, day, TIMEFRAME_MINUTES)
 
@@ -155,8 +156,9 @@ def _suffix_ending_at_previous_close(
 
 
 # ------------------------------------------------------------------ the premise
-def test_one_full_session_holds_seventy_three_buckets_so_75_spans_two_sessions():
-    """The arithmetic the 75 rests on, pinned rather than assumed."""
+def test_a_session_holds_seventy_three_buckets_so_the_75_floor_spans_sessions():
+    """The arithmetic the 75 rests on, pinned rather than assumed — and the reason the
+    floor must never be documented as "one complete session"."""
     session = _session()
     assert session_bucket_count(session, TIMEFRAME_MINUTES) == 73
     assert DEFAULT_WARMUP_MIN_BARS == 75
@@ -237,10 +239,10 @@ def test_exactly_seventy_five_contiguous_buckets_at_the_open_is_warmed():
     """Mandated proofs 3 and 4 together: exactly 75 valid contiguous completed
     buckets, ending at the previous session's final bar, taken at today's open.
 
-    Because one session is 73 buckets, this necessarily spans two sessions — Wed's
-    full 73 plus Tue's last two (15:10 and 15:15) — which is the coverage the spec's
-    "at market open, the required suffix may be the previous valid trading session"
-    case actually resolves to."""
+    Because a session contributes 73 completed buckets, the 75-bucket floor necessarily
+    spans two sessions — Wednesday's 73 plus Tuesday's last two (15:10 and 15:15).
+    That is what "at market open" actually resolves to, and why the floor is described
+    as a 75-completed-bucket trust requirement rather than as "one session"."""
     session = _session()
     now = datetime(2026, 8, 20, 9, 15, tzinfo=IST)  # Thu open, no completed bucket yet
     starts = _suffix_ending_at_previous_close(
@@ -401,4 +403,4 @@ def test_the_required_two_session_suffix_fits_the_configured_lookback_budget():
     )
     assert starved_requested == [1]
     assert starved.status == "PARTIAL"
-    assert starved.candles_replayed == 73  # one session reached, 75 needed
+    assert starved.candles_replayed == 73  # one session's worth reached, 75 needed

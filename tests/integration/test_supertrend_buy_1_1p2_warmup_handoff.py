@@ -12,9 +12,10 @@ Fully real engine over a simulated tape, mirroring
 internals, a hand-built ``WarmupManager``/``WarmupSource`` injected directly (a real
 Dhan fetch is :mod:`common.warmup.historical`'s own concern, covered elsewhere).
 
-Calendar: warm-up covers the 75 buckets ending Wednesday 2026-08-19 15:15 — that
-session's full 73 plus Tuesday 2026-08-18's last two, because one 09:15-15:20 session
-holds only 73 five-minute buckets. The live tape is Thursday 2026-08-20's open.
+Calendar: warm-up covers the 75 completed buckets ending Wednesday 2026-08-19 15:15 —
+that session's 73 plus Tuesday 2026-08-18's last two, because a 09:15-15:20 lifecycle
+contributes only 73 completed five-minute buckets and the 75-bucket trust floor
+therefore spans sessions by design. The live tape is Thursday 2026-08-20's open.
 
 Every number below was walked through the real ``SuperTrend(1, 1.2)`` before being
 hard-coded: the warm-up series contains **ten** genuine flips and leaves the indicator
@@ -106,7 +107,8 @@ def _warmup_closes() -> list[float]:
 
 
 def _warmup_candles(session: MarketSession) -> list[Candle]:
-    """The 75 buckets ending Wednesday 2026-08-19 15:15."""
+    """The 75 completed buckets ending Wednesday 2026-08-19 15:15 — Wednesday's 73
+    plus Tuesday's last two."""
     starts = (
         session_bucket_starts(session, date(2026, 8, 18), TIMEFRAME_MINUTES)
         + session_bucket_starts(session, date(2026, 8, 19), TIMEFRAME_MINUTES)
