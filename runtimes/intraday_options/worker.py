@@ -359,6 +359,33 @@ class WorkerConfig:
     account_shared_database_path: Path | None = None
     token_cache_dir: Path | None = None
 
+    @property
+    def requires_tick_channel(self) -> bool:
+        """Whether this worker is tick-driven and must be registered with a
+        tick (and control) channel.
+
+        The single source of truth for that question. Both engine paths read
+        their market data from the raw-tick channel and neither can run
+        without one: :func:`runtimes.intraday_options.engine_worker.run_engine`
+        and :func:`runtimes.intraday_options.multi_leg_engine_worker.
+        run_multi_leg_engine` each refuse to start when the supervisor handed
+        them no tick queue. Only the fixture (non-engine) path runs off the
+        candle channel alone.
+
+        This exists because the composition root
+        (``runtimes/intraday_options/__main__.py::build_supervisor``) used to
+        spell the predicate out as ``worker_config.engine is not None``, which
+        silently assumed the single-leg engine was the only tick-driven one.
+        ``straddle_920`` — the first ``multi_leg_engine`` strategy — was
+        therefore registered without a tick channel and died at startup on
+        exactly the refusal above, in a real paper session. Adding a
+        ``multi_leg_engine`` term at that one call site would have fixed that
+        strategy and left the next engine kind to rediscover the same defect,
+        so the question is answered here, next to the fields it is asked
+        about, and every caller asks it the same way.
+        """
+        return self.engine is not None or self.multi_leg_engine is not None
+
 
 @dataclass
 class WorkerOutcome:

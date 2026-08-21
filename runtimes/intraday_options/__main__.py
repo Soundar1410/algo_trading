@@ -232,7 +232,12 @@ def build_supervisor(
             # ``effective_live_gate`` silently re-applied its fail-closed default.
             supervisor.add_worker(
                 worker_config,
-                tick_channel=worker_config.engine is not None,
+                # Every tick-driven engine kind, not just the single-leg one:
+                # this used to read ``worker_config.engine is not None``, so
+                # ``straddle_920`` (the first ``multi_leg_engine`` strategy)
+                # was registered with no tick channel and refused to start.
+                # See ``WorkerConfig.requires_tick_channel``.
+                tick_channel=worker_config.requires_tick_channel,
                 live_gate=effective_live_gate(
                     cfg, preflight_passed=live_preflight_passed
                 ),

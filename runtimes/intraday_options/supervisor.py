@@ -315,12 +315,19 @@ class IntradayOptionsSupervisor:
         runtime subscriptions it makes. Both are handed to the child at spawn
         (Part 2b-ii-B-2); they were created and never delivered until then.
 
-        **A worker configured with an engine needs this flag.** It is not inferred
-        from ``WorkerConfig.engine``, because the opt-in also governs what the *hub*
-        publishes and that decision belongs to the group, not to one strategy's
-        configuration. An engine worker spawned without it refuses to start rather
-        than silently running the fixture path — see
-        :func:`runtimes.intraday_options.engine_worker.run_engine`.
+        **A worker configured with any engine needs this flag** — the single-leg
+        ``engine`` and the ``multi_leg_engine`` alike. It is not inferred here,
+        because the opt-in also governs what the *hub* publishes and that
+        decision belongs to the group, not to one strategy's configuration.
+        Callers that do want it decided by the configuration ask
+        :attr:`~runtimes.intraday_options.worker.WorkerConfig.
+        requires_tick_channel`, which covers both engine kinds; do not
+        re-spell that predicate at a call site. An engine worker spawned
+        without a tick channel refuses to start rather than silently running
+        the fixture path — see
+        :func:`runtimes.intraday_options.engine_worker.run_engine` and
+        :func:`runtimes.intraday_options.multi_leg_engine_worker.
+        run_multi_leg_engine`.
 
         Args:
             live_gate: the caller's :func:`~common.config.models.effective_live_gate`

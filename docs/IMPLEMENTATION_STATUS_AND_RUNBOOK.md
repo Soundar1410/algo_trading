@@ -9616,3 +9616,85 @@ limitation (paper fills through `PaperBroker`'s bid/ask-crossing model
 instead — see 11.8), never described as complete. No config, gate, or
 auto-start file was touched. No order-capable Dhan endpoint was called
 anywhere in this phase.
+
+### Production-wiring defect — multi-leg workers were registered without a tick channel (21 August 2026)
+
+Found by the first real paper-mode auto-start that had all three verified
+strategies enabled. `ema_cross_9_21_buy` (intraday, single-leg engine) and
+`weekly_delta_neutral` (positional runtime) both started. `straddle_920`
+died at startup with its own fail-closed refusal:
+
+```
+this worker is configured for the multi-leg engine but was given no tick
+queue; the supervisor must register it with tick_channel=True
+```
+
+**Root cause.** `runtimes/intraday_options/__main__.py::build_supervisor`
+spelled the tick-channel predicate out at the call site as
+`tick_channel=worker_config.engine is not None`. That recognises
+`EngineWorkerConfig` and ignores `WorkerConfig.multi_leg_engine`, which
+`config_adapter.py` populates instead for `engine: multi_leg_engine`. Both
+engines read their market data from the raw-tick channel and neither can
+run without one, so the multi-leg worker was registered with no tick queue
+and no control queue, and `multi_leg_engine_worker.run_multi_leg_engine`
+refused to start — correctly. The refusal worked; the registration was
+wrong. This was a composition-root wiring defect only: no strategy rule,
+engine, config value, gate or mode was involved, and the error was never a
+risk of trading anything incorrectly, only of `straddle_920` not starting.
+
+Notably the whole multi-leg engine path was covered by tests that
+hand-built a `WorkerConfig` and called `add_worker(..., tick_channel=True)`
+directly. Every one of them passed the entire time production was broken,
+because none of them went through `build_supervisor` — the one place that
+decides the flag.
+
+**Fix.** The predicate moved off the call site and onto the data it asks
+about: `WorkerConfig.requires_tick_channel` returns true when *either*
+engine field is set, and `build_supervisor` now passes
+`tick_channel=worker_config.requires_tick_channel`. Deliberately generic —
+no `straddle_920` branch — so a future third tick-driven engine kind is
+covered by construction rather than by remembering to widen a boolean
+expression. `IntradayOptionsSupervisor.add_worker` still does not infer the
+flag itself (the opt-in also governs what the *hub* publishes, which is a
+group decision, not one strategy's); its docstring now points callers at
+the property instead of re-spelling the predicate.
+
+**Every other tick-channel decision was checked.**
+`runtimes/positional_options/supervisor.py::add_worker` passes
+`tick_channel=True` unconditionally — there is no fixture path in that
+runtime, so it never had the single-engine assumption, which is why
+`weekly_delta_neutral` started fine. `common/feed/hub.py::build_channel`
+only honours the flag it is given. `worker.py`'s `deferred = config.engine
+is not None or config.multi_leg_engine is not None` (the notifier's
+deferred-send decision) already covered both kinds and is a different
+question, left as is. No other `add_worker` call site outside tests exists.
+
+**Regression tests** — `tests/unit/test_supervisor_tick_channel_registration.py`,
+all asserting the *registration* through the real `build_supervisor`, never a
+hand-built `WorkerConfig`: single-leg engine worker gets tick + control
+queues; multi-leg engine worker gets tick + control queues; a fixture worker
+with neither engine field still gets neither; and, against the **real
+committed `config/` tree**, both enabled intraday strategies (`straddle_920`
+and `ema_cross_9_21_buy`, parametrised) are registered with a tick channel.
+Verified to fail without the fix: reverting the one-line predicate turns the
+multi-leg and committed-`straddle_920` cases red, and nothing else.
+
+**Verification.** Full suite 2782 passed, 3 failed — all three pre-existing
+on this branch and unrelated, confirmed by re-running them with these
+changes stashed: `test_config_auto_start.py::
+test_the_committed_config_ships_disabled` and `test_config_loader.py::
+test_shipped_positional_options_runtime_is_valid_and_disabled` both assert
+the *shipped-disabled* state that this branch's earlier auto-start commits
+deliberately changed, and `test_scripts_are_read_only.py::
+test_start_dashboard_refuses_cleanly_when_the_venv_has_no_streamlit` fails
+because a dashboard is actually serving on port 8501 on this machine.
+`ruff check .` clean; `mypy common strategies runtimes dashboards scripts
+--strict` clean over 233 files; `python -m scripts.assert_no_live_config_
+committed` OK. No runtime, dashboard, broker or live-feed diagnostic was
+started and no order-capable endpoint was called.
+
+**Safety.** No strategy rule, enabled flag, paper/live mode, auto-start
+configuration, LaunchAgent or live gate was touched — the diff is three
+source files (a property, a one-line call-site change, a docstring) plus one
+new test file. `OPERATIONAL LIVE ACTIVATION ELIGIBLE` remains **NO —
+BLOCKED**, unchanged.
