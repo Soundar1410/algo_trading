@@ -9698,3 +9698,139 @@ configuration, LaunchAgent or live gate was touched — the diff is three
 source files (a property, a one-line call-site change, a docstring) plus one
 new test file. `OPERATIONAL LIVE ACTIVATION ELIGIBLE` remains **NO —
 BLOCKED**, unchanged.
+
+---
+
+## Test isolation defect: real Telegram messages sent from `pytest`
+
+**Status:** fixed on `feature-paper-auto-start`. Not a phase — a defect fix,
+recorded here because it changes a safety property of every future test run.
+
+### The incident
+
+A previous `pytest` run delivered **hundreds of real Telegram messages** to the
+operator's bot. They identified `strategy_id=skelfix` — a test fixture, not a
+configured strategy — and repeated `worker_started`, `order_filled` and
+`worker_stopped`. Test and spawned-worker processes had inherited real Telegram
+credentials and constructed the production notifier.
+
+### Root cause
+
+Three ordinary facts combined:
+
+1. `Settings` declares `env_file=".env"` — a **relative** path, resolved against
+   the *working directory* of whichever process constructs it, on every
+   construction.
+2. `tests/end_to_end/test_supervisor_signal.py` starts its child with
+   `cwd=str(REPO_ROOT)` and `env=dict(os.environ)`. That child therefore reads
+   this repository's own `.env`, which carries real Telegram credentials.
+3. `IntradayOptionsSupervisor` spawns every worker with
+   `NOTIFIER_FROM_SETTINGS`, whose whole contract is "build your own production
+   notifier here, from your own freshly-loaded `Settings`". Each `skelfix`
+   worker did exactly that, got a working `TelegramNotifier`, and notified for
+   real through its full lifecycle.
+
+`tests/conftest.py`'s `isolated_env` fixture already deleted every `DHAN_*` /
+`TELEGRAM_*` / `ALGO_*` variable and chdir'd to a `tmp_path`, and it stopped
+none of this. **The credentials were never in the environment.** They were in a
+file, re-read from disk by a different process with a different working
+directory. A guard placed upstream of credential loading cannot hold; it has to
+sit downstream of it.
+
+### The guard
+
+`common/notifications/guard.py` — `ALGO_DISABLE_EXTERNAL_NOTIFICATIONS`,
+defaulting to **off**, so production is byte-for-byte unchanged when it is
+absent. Checked in two places, both *after* credentials are known:
+
+* `build_notifier()` returns a `NullNotifier` while the guard is set, **before**
+  it looks at `settings.has_telegram_credentials()` — real, valid, freshly
+  loaded credentials lose to it.
+* `TelegramNotifier.send()` re-reads the guard on every call, immediately before
+  the socket would open, covering any caller that constructed the class directly
+  instead of going through the factory.
+
+An environment variable specifically, because the processes that sent the
+messages were *other interpreters*: a `spawn` worker and a `subprocess` child,
+each re-importing everything from scratch. No monkeypatch, import hook or
+module-level flag survives that boundary; the environment does. It is set at
+**module import time** in a new repository-root `conftest.py`, before pytest
+collects — and therefore before any test module's import side effects — and
+`isolated_env` now exempts and re-asserts it rather than sweeping it away with
+the other `ALGO_*` variables. `tests/smoke/conftest.py` never restores it from
+its snapshot either: an opted-in `ALGO_LIVE_SMOKE=1` run legitimately gets real
+Dhan credentials back and must still be incapable of notifying anyone.
+
+`TelegramNotifier` also gained an injectable `transport`, so the tests that
+exercise real send/parse logic do it against a fake and never a socket. The
+narrow, per-test escape hatch is the `allow_external_notifications` fixture;
+`monkeypatch` unwinds it at the end of the test that asked for it.
+
+### Every Telegram-capable path
+
+Grepped exhaustively (`api.telegram.org`, `sendMessage`, `TelegramNotifier(`,
+`urlopen`): the class is constructed in exactly one non-test place —
+`build_notifier` — and `common/notifications/telegram.py` holds the only
+outbound call in the package. Both are guarded. `orchestration/auto_start/
+controller.py::_deliver` retries against an **injected** notifier, which in
+production comes from `build_notifier`, so it inherits the guard rather than
+needing its own.
+
+### Tests
+
+New: `tests/unit/test_notification_guard.py` (23 tests) and
+`tests/end_to_end/test_notification_guard_spawn.py` with its
+`notification_guard_child.py`. They prove, with fake-but-real-shaped
+credentials that are always *demonstrably loadable* first (an assertion that
+found no credentials would prove nothing):
+
+* real-looking credentials + guard ⇒ `NullNotifier`, including when they were
+  just read from a `.env` sitting in the working directory;
+* no HTTP call and no socket connection is attempted — `urlopen` and
+  `socket.connect` are both booby-trapped;
+* a real `spawn`ed child inherits the guard across the process boundary and
+  builds a null channel from a populated `.env`;
+* a **real `skelfix` lifecycle** — real supervisor, real spawned worker via
+  `NOTIFIER_FROM_SETTINGS`, two real fills — makes zero external requests, with
+  the worker's own log confirming its factory took the guarded branch;
+* production still builds and delivers through a real `TelegramNotifier` when
+  the guard is absent and a fake transport is injected;
+* no token reaches logs, stdout or stderr.
+
+Egress is *measured*, not inferred: a `sitecustomize.py` on `PYTHONPATH` — so
+every descendant interpreter, including `spawn`ed grandchildren, picks it up —
+records and refuses every non-loopback `connect`. The sentinel was itself
+verified against a deliberate outbound connection before being trusted.
+
+### Three stale tests reconciled
+
+All three predate this defect and are unrelated to it. None was weakened.
+
+| Test | Was | Now |
+|---|---|---|
+| `test_config_auto_start.py::test_the_committed_config_ships_disabled` | `auto_start.enabled is False` | Renamed to `..._is_deliberately_enabled` (asserts `True`), plus two **stronger** replacements that walk the real tree: every runtime's `live_execution_allowed` false, every *enabled* strategy paper with `live_approved` false and `effective_live_gate` refusing even after a passed preflight, and every strategy file — disabled ones included — paper-only |
+| `test_config_loader.py::test_shipped_positional_options_runtime_is_valid_and_disabled` | `runtime.enabled is False` | `..._is_valid_and_paper_only`: `live_execution_allowed is False`. A safety test that can be satisfied by switching an *enablement* flag back was asserting the wrong thing |
+| `test_scripts_are_read_only.py::test_start_dashboard_refuses_cleanly_when_the_venv_has_no_streamlit` | `main([])` — probed the default port 8501, where the operator's real dashboard is served, so it returned "already serving, nothing to do" | Probes an **isolated ephemeral port**. The real `port_is_serving` still runs, against a port that is genuinely closed; the running dashboard is neither contacted nor disturbed |
+
+### Verification
+
+Full suite **2794 passed, 18 skipped, 0 failed**, run in an isolated copy of the
+tree that has **no `.env` and no `data/`** — `resolve_project_root()` confirmed
+to resolve inside the copy, so no production operational database was reachable
+— with the network sentinel active throughout. **The egress log was never
+created: zero outbound connection attempts.** The end-to-end suite, including
+`test_supervisor_signal.py` (the flood's origin), was additionally run against
+the real tree under the sentinel: 51 passed, zero egress.
+
+`ruff check .` clean. `mypy common strategies runtimes dashboards scripts
+--strict` clean over 234 files. `python -m scripts.assert_no_live_config_
+committed` OK.
+
+### Safety
+
+No Telegram request was made at any point. No secret was read, printed or
+altered. No runtime, dashboard or LaunchAgent was started, stopped or modified.
+No Dhan or order-capable endpoint was called. No strategy rule, `enabled` flag,
+mode, `auto_start.enabled` value or live gate was changed — `config/` is
+untouched by this diff. `OPERATIONAL LIVE ACTIVATION ELIGIBLE` remains **NO —
+BLOCKED**, unchanged.

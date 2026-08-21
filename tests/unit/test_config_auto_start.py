@@ -13,7 +13,18 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from common.config import AutoStartConfig, ConfigError, load_auto_start_config
+from common.config import (
+    AutoStartConfig,
+    ConfigError,
+    ExecutionMode,
+    Settings,
+    discover_enabled_strategies,
+    effective_live_gate,
+    load_auto_start_config,
+    load_global_config,
+    load_runtime_config,
+    load_strategy_config,
+)
 
 REPO_CONFIG = Path(__file__).resolve().parents[2] / "config"
 
@@ -23,9 +34,73 @@ def test_auto_start_is_disabled_by_default():
     assert AutoStartConfig().enabled is False
 
 
-def test_the_committed_config_ships_disabled():
-    """Installing the LaunchAgent and enabling trading are separate steps."""
-    assert load_auto_start_config(REPO_CONFIG).enabled is False
+def test_the_committed_auto_start_is_deliberately_enabled():
+    """This deployment is activated, and that is an operator decision on record.
+
+    Superseded ``test_the_committed_config_ships_disabled``, which asserted
+    ``enabled is False``. That assertion described a repository that had not
+    been activated yet; it does not describe this one, and leaving it in place
+    would have meant either a permanently red suite or — far worse — pressure
+    to switch a *live-safety* flag back to make a test pass. The property
+    worth protecting was never "nothing is enabled": it is that switching
+    unattended paper startup on cannot switch anything live on. That is what
+    :func:`test_the_activated_deployment_is_paper_only_with_every_live_gate_shut`
+    asserts, exhaustively, over the same committed tree.
+    """
+    assert load_auto_start_config(REPO_CONFIG).enabled is True
+
+
+def test_the_activated_deployment_is_paper_only_with_every_live_gate_shut():
+    """Every enabled strategy is paper, and every live gate is false.
+
+    Walked over the real committed tree rather than a fixture, and driven by
+    what is *in* the tree rather than a hard-coded list of names, so a strategy
+    or runtime added later is covered the day it is added. Three tiers, all
+    checked: the account-wide switch, each runtime group's permission, and
+    each strategy's own mode and approval.
+    """
+    global_config = load_global_config(REPO_CONFIG)
+    assert global_config.live_trading_enabled is False, "the master live switch must stay shut"
+
+    runtime_ids = sorted(path.stem for path in (REPO_CONFIG / "runtimes").glob("*.yaml"))
+    assert runtime_ids, "no runtime configs found — this test would prove nothing"
+
+    checked_strategies: list[str] = []
+    for runtime_id in runtime_ids:
+        runtime = load_runtime_config(REPO_CONFIG, runtime_id)
+        assert runtime.live_execution_allowed is False, (
+            f"{runtime_id}: live_execution_allowed must stay false"
+        )
+
+        for resolved in discover_enabled_strategies(REPO_CONFIG, runtime_id, settings=Settings()):
+            strategy = resolved.strategy
+            assert strategy.enabled is True  # by construction; states the premise
+            assert strategy.mode is ExecutionMode.PAPER, f"{strategy.strategy_id} is not paper"
+            assert strategy.live_approved is False, (
+                f"{strategy.strategy_id}: live_approved must stay false"
+            )
+            assert effective_live_gate(resolved, preflight_passed=True).allowed is False, (
+                f"{strategy.strategy_id}: the live gate must refuse even after a passed preflight"
+            )
+            checked_strategies.append(strategy.strategy_id)
+
+    assert checked_strategies, "no enabled strategy was checked — this test would prove nothing"
+
+
+def test_every_committed_strategy_file_is_paper_including_the_disabled_ones():
+    """A disabled strategy is one ``enabled: true`` away from running.
+
+    ``discover_enabled_strategies`` above deliberately sees only enabled files;
+    this covers the rest, so a live-designated strategy cannot sit dormant in
+    the tree waiting for someone to flip a single unrelated flag.
+    """
+    strategy_files = sorted((REPO_CONFIG / "strategies").glob("*.yaml"))
+    assert strategy_files, "no strategy configs found — this test would prove nothing"
+
+    for path in strategy_files:
+        strategy = load_strategy_config(REPO_CONFIG, path.stem)
+        assert strategy.mode is ExecutionMode.PAPER, f"{path.name} is not paper"
+        assert strategy.live_approved is False, f"{path.name}: live_approved must stay false"
 
 
 def test_the_defaults_are_ist_and_0900():

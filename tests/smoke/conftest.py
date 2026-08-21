@@ -29,6 +29,11 @@ import pytest
 
 _MANAGED_PREFIXES = ("DHAN_", "TELEGRAM_", "ALGO_")
 
+#: Never restored from the snapshot and never lifted here. These smoke tests
+#: are about the *market feed*; an opted-in live run legitimately restores real
+#: Dhan credentials, and it must still be incapable of notifying anyone.
+_NOTIFICATION_GUARD_ENV = "ALGO_DISABLE_EXTERNAL_NOTIFICATIONS"
+
 #: Taken while conftest.py is imported during collection, i.e. before any
 #: fixture (including isolated_env) has had a chance to clear anything.
 _REAL_LIVE_SMOKE_ENV = {
@@ -42,4 +47,7 @@ def _restore_live_smoke_credentials(isolated_env: None, monkeypatch: pytest.Monk
     if _REAL_LIVE_SMOKE_ENV.get("ALGO_LIVE_SMOKE") != "1":
         return
     for key, value in _REAL_LIVE_SMOKE_ENV.items():
+        if key == _NOTIFICATION_GUARD_ENV:
+            continue
         monkeypatch.setenv(key, value)
+    monkeypatch.setenv(_NOTIFICATION_GUARD_ENV, "1")

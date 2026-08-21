@@ -293,11 +293,30 @@ def test_start_dashboard_refuses_cleanly_when_the_venv_has_no_streamlit(
 ):
     """No `os.execv` (and so no real streamlit process) when the interpreter
     it would exec does not exist — proven by letting the real check run
-    against a tmp_path with no `.venv` at all, rather than mocking it away."""
-    monkeypatch.setenv("PROJECT_ROOT", str(tmp_path))
-    from scripts.start_dashboard import main
+    against a tmp_path with no `.venv` at all, rather than mocking it away.
 
-    assert main([]) == 1
+    Runs against an **isolated ephemeral port**, never the default 8501. The
+    original version called ``main([])``, which probes 8501 — so on the
+    operator's own machine, where the real dashboard is served by its
+    LaunchAgent, ``start_dashboard`` correctly reported "already serving,
+    nothing to do" and returned 0, and this test failed for a reason that had
+    nothing to do with what it is about. The probe itself is still the real
+    one: an ephemeral port that has just been released is genuinely closed, so
+    the "not already serving" branch is exercised for real, and the running
+    dashboard is neither contacted nor disturbed.
+    """
+    monkeypatch.setenv("PROJECT_ROOT", str(tmp_path))
+    from scripts.start_dashboard import main, port_is_serving
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        free_port = probe.getsockname()[1]
+    assert free_port != 8501
+    assert port_is_serving(free_port, timeout=0.1) is False, (
+        "the chosen port was taken; this test needs a closed one"
+    )
+
+    assert main(["--port", str(free_port)]) == 1
 
 
 def test_authenticate_is_a_pure_alias_for_auth_bootstrap():

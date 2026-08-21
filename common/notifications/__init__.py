@@ -10,9 +10,14 @@ from .base import (
     SafeNotifier,
 )
 from .factory import build_notifier
+from .guard import (
+    DISABLE_EXTERNAL_NOTIFICATIONS_ENV,
+    external_notifications_disabled,
+)
 from .telegram import TelegramNotifier
 
 __all__ = [
+    "DISABLE_EXTERNAL_NOTIFICATIONS_ENV",
     "NotificationEvent",
     "Notifier",
     "NullNotifier",
@@ -20,4 +25,5 @@ __all__ = [
     "SafeNotifier",
     "TelegramNotifier",
     "build_notifier",
+    "external_notifications_disabled",
 ]

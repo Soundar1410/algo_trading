@@ -63,6 +63,15 @@ class Settings(BaseSettings):
     # must never be able to turn real-money trading on.
     algo_live_trading_enabled: str | None = None
 
+    # Kill switch only, in the same spirit: makes every external notification
+    # channel inert (``common.notifications.guard``). Absent — the committed
+    # default, and what production runs with — notifications behave exactly as
+    # before. The test bootstrap sets the matching environment variable so no
+    # test process, and no worker it spawns, can reach Telegram even when a
+    # populated ``.env`` sits in its working directory. See that module's
+    # docstring for the real incident that made this necessary.
+    algo_disable_external_notifications: str | None = None
+
     def has_dhan_credentials(self) -> bool:
         """True when every Dhan credential needed by the auth bootstrap is present.
 

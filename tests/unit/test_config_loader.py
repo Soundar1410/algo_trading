@@ -444,19 +444,22 @@ def test_shipped_repository_config_cannot_reach_a_live_allow(populated_config: P
     assert load_global_config(repo_config).live_trading_enabled is False
 
 
-def test_shipped_positional_options_runtime_is_valid_and_disabled():
-    """The committed positional_options runtime loads, and ships disabled.
+def test_shipped_positional_options_runtime_is_valid_and_paper_only():
+    """The committed positional_options runtime loads, and cannot execute live.
 
     It is no longer "inert scaffolding" — it has a real supervisor, a real
     composition root and a registered entrypoint, and `orchestration.auto_start`
-    starts it alongside intraday whenever it is enabled. What has not changed is
-    the safety posture this test guards: enabling it is an operator decision
-    recorded in the repository, never a default.
+    starts it alongside intraday. This test used to assert ``enabled is False``;
+    that runtime has since been deliberately enabled for paper forward testing,
+    and an assertion that a *safety* test can be satisfied by switching an
+    enablement flag back is the wrong assertion to keep. The safety posture it
+    was really guarding is the second line below, which is unchanged and now
+    stated on its own: enabled or not, this runtime may not execute live.
     """
     repo_config = Path(__file__).resolve().parents[2] / "config"
     runtime = load_runtime_config(repo_config, "positional_options")
     assert runtime.runtime_id == "positional_options"
-    assert runtime.enabled is False
+    assert runtime.live_execution_allowed is False
 
 
 # ------------------------------------------------------------- fingerprint
