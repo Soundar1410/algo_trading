@@ -23,7 +23,7 @@ global:
 # decided entirely by `enabled:` in config/runtimes/*.yaml and
 # config/strategies/*.yaml, which this cannot override.
 auto_start:
-  enabled: false
+  enabled: true
 
   # Every decision is made in this zone regardless of the Mac's own setting.
   # launchd's StartCalendarInterval, however, fires in the Mac's LOCAL zone —
