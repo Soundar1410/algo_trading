@@ -139,6 +139,28 @@ The floor is raised inside the strategy’s own `warmup_spec()` (`max(indicator_
 
 Sizing consequence: `WarmupManager._lookback_sessions` requests `ceil(75 / 73) = 2` prior sessions plus today, which the committed `warmup_max_lookback_sessions: 3` accommodates.
 
+### 7.2 Recorded decision — strategy-scoped trading calendar (operator-approved)
+
+The engine's own `MarketSession` reads its holiday calendar from `parameters.holidays`
+in the strategy configuration. `config/global.yaml`'s verified NSE list feeds only the
+unattended auto-start gate, and no strategy configuration in this repository had ever
+declared one — so every running engine's session relied on the weekday rule alone.
+
+`config/strategies/supertrend_buy_1_1p2.yaml` therefore carries the verified NSE 2026
+calendar, copied from `config/global.yaml`. **This is strategy-scoped**: it applies to
+`supertrend_buy_1_1p2` only, changes nothing for `ema_cross_9_21_buy` or
+`straddle_920`, and is not affected by edits to `config/global.yaml`.
+
+It matters twice: no entry on a closed day (acceptance row 18.1 "Holiday/weekend"),
+and a correct warm-up walk-back — the 75-completed-bucket trust floor spans sessions,
+and `MarketSession.prior_trading_day` is what decides which prior sessions those are.
+
+**Maintenance obligation.** The list is annual. A 2027 calendar must be committed
+before January 2027, or every 2027 holiday will be treated as an ordinary trading day
+by this strategy, and its warm-up will expect buckets that never existed — downgrading
+a good replay to `PARTIAL` and blocking entries for that day. Re-verify against NSE's
+own circular after any ad-hoc closure, in both this file and `config/global.yaml`.
+
 ## 8. Contract Selection and Quantity
 
 On an actionable fresh flip:

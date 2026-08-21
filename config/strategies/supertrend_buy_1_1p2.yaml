@@ -177,8 +177,22 @@ parameters:
   # session: that is a one-hour Sunday evening special and the weekend rule
   # excludes it.
   #
-  # This list is ANNUAL. A 2027 list must be committed before January 2027, or
-  # every 2027 holiday will be treated as an ordinary trading day.
+  # OWNERSHIP AND MAINTENANCE (operator-approved decision, recorded here because
+  # this is the only place it is enforced for this strategy):
+  #
+  #   * This calendar is STRATEGY-SCOPED. It applies to supertrend_buy_1_1p2 only.
+  #     Editing config/global.yaml's list does NOT change it, and editing this one
+  #     does NOT change any other strategy or the unattended auto-start gate. The
+  #     two lists are maintained together, deliberately duplicated so they stay
+  #     line-for-line comparable.
+  #   * It is ANNUAL and it must be maintained when the calendar year changes. A
+  #     2027 list must be committed here before January 2027, or every 2027 holiday
+  #     is treated as an ordinary trading day by this strategy's MarketSession --
+  #     which would also make its warm-up walk-back expect buckets that never
+  #     existed, downgrading an otherwise-good replay to PARTIAL and blocking
+  #     entries for the day. Re-verify against NSE's own circular, never by
+  #     copying an unverified source.
+  #   * Re-verify after any ad-hoc NSE closure circular, in BOTH files.
   holidays:
     - "2026-01-15"  # Municipal Corporation Election - Maharashtra
     - "2026-01-26"  # Republic Day
