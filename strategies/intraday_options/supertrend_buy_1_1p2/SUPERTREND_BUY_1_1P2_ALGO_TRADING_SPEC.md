@@ -193,6 +193,32 @@ Ten lots is a parity requirement, not a recommendation that the size is safe for
 
 Contract selection must happen again on every new entry or reversal. Do not reuse a stale ATM contract from an earlier signal.
 
+### 8.1 Recorded clarification — expiry resolution timing (operator-approved)
+
+The bullets above, read together, could be misread as "expiry is re-resolved on
+every entry." That is not the accurate description of what the implementation
+does, and the distinction matters for anyone reasoning about which entries in a
+long-running session could ever land on a different expiry:
+
+- **ATM strike, contract security ID and exchange lot size are resolved fresh
+  for every new entry or reversal.** Each signal computes its own strike from
+  the spot at signal time and looks that strike up in the already-loaded scrip
+  master, which returns that row's own security ID and lot size.
+- **Weekly expiry is selected once, when the Dhan option-chain resolver is
+  constructed** — i.e. when the worker process starts, from the scrip master's
+  nearest listed expiry at that moment
+  (`common.engine.selection.DhanOptionChainResolver.__init__`, whose own
+  docstring states this explicitly: "The expiry is fixed for the session at
+  construction ... so every contract a run selects belongs to the same series
+  even if the run crosses an expiry boundary at midnight"). It is **not**
+  re-resolved by `OptionSelector.select()` on each individual signal.
+- **The normal daily worker restart is what refreshes it.** Each new worker
+  process rebuilds the resolver from scratch and therefore picks up the
+  scrip master's then-current nearest listed (holiday-shifted, if applicable)
+  expiry at that restart — which is the mechanism spec row 18.2's "Weekly
+  expiry shifted by holiday" acceptance criterion actually relies on, not a
+  per-signal re-resolution inside a single continuous run.
+
 ## 9. Entry and Reversal Execution
 
 - Position side is always BUY.

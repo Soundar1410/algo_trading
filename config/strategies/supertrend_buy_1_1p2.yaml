@@ -126,7 +126,11 @@ parameters:
   contract_resolver: dhan
   strike_step: 50
   # null => the resolver's own nearest listed expiry, which already carries the
-  # exchange's actual (holiday-shifted) expiry date from the daily master.
+  # exchange's actual (holiday-shifted) expiry date from the daily master. Chosen
+  # ONCE, when the resolver is constructed at worker start -- not re-resolved on
+  # every entry. Strike, security ID and lot size ARE resolved fresh for every
+  # entry/reversal; expiry is refreshed only by the next normal worker restart
+  # rebuilding the resolver from the then-current scrip master (spec section 8.1).
   expiry: null
   # Overrides for an underlying not in INDEX_REGISTRY; empty => registry value.
   index_security_id: ""

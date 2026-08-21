@@ -9863,12 +9863,16 @@ config and tests.
   (`SuperTrendState.flipped`) is the only entry signal; the seeding candle and every
   repeated-trend candle produce nothing. DOWN→UP buys the current ATM weekly CE,
   UP→DOWN buys the current ATM weekly PE, BUY-only, one position at a time.
-- Contract and strike are resolved afresh on every entry/reversal from the
-  Dhan-listed scrip master (`contract_resolver: dhan`): ATM strike from the live
-  spot at signal time, nearest weekly expiry (already holiday-shifted by the daily
-  instrument master), and the **exchange's own lot size** — never a hardcoded 65 or
-  any other constant. Order quantity is `10 lots x resolved lot size`, matching the
-  legacy strategy's parity sizing; ten lots is a PAPER parity choice and authorises
+- ATM strike, the contract's security ID and its exchange lot size are resolved
+  fresh for every new entry/reversal from the Dhan-listed scrip master
+  (`contract_resolver: dhan`) — never a hardcoded lot size such as 65. Weekly
+  expiry is selected once, when the Dhan option-chain resolver is constructed at
+  worker start, from the scrip master's then-current nearest listed (already
+  holiday-shifted) expiry — **not** re-resolved on each individual entry; a
+  normal daily worker restart is what refreshes it (spec section 8.1, corrected
+  22 August 2026 after this section originally overstated it as per-entry).
+  Order quantity is `10 lots x resolved lot size`, matching the legacy
+  strategy's parity sizing; ten lots is a PAPER parity choice and authorises
   nothing about live sizing.
 - Reversal (close-before-open), the entry cutoff, the mandatory square-off, one-
   position-at-a-time and fail-closed exit handling are entirely engine-owned
