@@ -13,7 +13,7 @@
 # itself refuses to start while this stays false.
 
 runtime_id: positional_options
-enabled: false
+enabled: true
 live_execution_allowed: false
 shared_market_feed: true
 database: data/operational/positional_options.db

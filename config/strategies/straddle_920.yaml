@@ -25,7 +25,7 @@ runtime_id: intraday_options
 # live Dhan instrument master; (3) environment validation; (4) a database
 # backup and migration validation. Do not flip this to true without all
 # four having actually happened.
-enabled: false
+enabled: true
 
 mode: paper
 live_approved: false

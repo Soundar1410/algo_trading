@@ -13,7 +13,7 @@
 
 strategy_id: weekly_delta_neutral
 runtime_id: positional_options
-enabled: false
+enabled: true
 
 mode: paper
 live_approved: false
