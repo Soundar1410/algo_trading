@@ -9834,3 +9834,231 @@ No Dhan or order-capable endpoint was called. No strategy rule, `enabled` flag,
 mode, `auto_start.enabled` value or live gate was changed — `config/` is
 untouched by this diff. `OPERATIONAL LIVE ACTIVATION ELIGIBLE` remains **NO —
 BLOCKED**, unchanged.
+
+### `strategy-supertrend-buy-1-1p2` branch addendum — 21 August 2026 (unmerged)
+
+Cut from `feature-paper-auto-start` at `f3969ae` onto a dedicated feature branch,
+`strategy-supertrend-buy-1-1p2`, in an isolated `git worktree` so the running PAPER
+supervisor and dashboard were never touched — **not merged into
+`feature-paper-auto-start` or `main`.** Ports the `Trading_Automation` legacy
+`supertrend_fast` strategy's trading behaviour exactly, as `supertrend_buy_1_1p2`,
+onto the existing single-leg `TradingEngine` — no new engine, no shared/common file
+change. `ema_cross_9_21_buy`, `straddle_920` and every other committed strategy are
+unchanged; every committed live gate remains disabled (`enabled: false`,
+`mode: paper`, `live_approved: false`, confirmed by
+`scripts.assert_no_live_config_committed`).
+
+**Parity source, decided explicitly.** The legacy tree also holds
+`NiftyFixedStrikeSuperTrend_Master_Specification.md`, which describes a *different*
+strategy (one strike fixed at 09:16 for the whole day, SuperTrend run on the CE/PE
+premium charts, multiplier 1, two simultaneous positions). It contradicts the legacy
+`supertrend_fast` code on every one of those points and was **not** used. The
+authoritative parity source is the legacy `supertrend_fast` strategy's own code,
+config and tests.
+
+#### Strategy rules and parameters
+
+- NIFTY, 5-minute completed underlying candles, `SuperTrend(period=1,
+  multiplier=1.2)` — `common/indicators/supertrend.py`, unmodified. A fresh flip
+  (`SuperTrendState.flipped`) is the only entry signal; the seeding candle and every
+  repeated-trend candle produce nothing. DOWN→UP buys the current ATM weekly CE,
+  UP→DOWN buys the current ATM weekly PE, BUY-only, one position at a time.
+- Contract and strike are resolved afresh on every entry/reversal from the
+  Dhan-listed scrip master (`contract_resolver: dhan`): ATM strike from the live
+  spot at signal time, nearest weekly expiry (already holiday-shifted by the daily
+  instrument master), and the **exchange's own lot size** — never a hardcoded 65 or
+  any other constant. Order quantity is `10 lots x resolved lot size`, matching the
+  legacy strategy's parity sizing; ten lots is a PAPER parity choice and authorises
+  nothing about live sizing.
+- Reversal (close-before-open), the entry cutoff, the mandatory square-off, one-
+  position-at-a-time and fail-closed exit handling are entirely engine-owned
+  (`TradingEngine._on_candle_close`, `PositionManager.close`,
+  `LifecycleGateway._require_a_fill`) — the strategy only ever emits a plain `ENTER`
+  on a fresh flip.
+- Premium exit reuses `common/exit/combined_candle_exit.py` unmodified, evaluated on
+  the traded option's own completed 5-minute premium candles: momentum exit on a
+  strict `close < previous completed low`, best-close trail activating at exactly
+  4% favourable move and exiting at exactly 8% retracement from the highest
+  completed close (both boundaries inclusive, `>=`), OR'd with a granular combined
+  reason. A premium-candle gap suppresses exactly the first post-gap momentum
+  comparison while preserving the best-close/activation state; an underlying-candle
+  gap is a distinct mechanism (`TradingEngine._on_underlying_tick`'s `spans_gap`
+  path) that is never fed to the indicator and never resets it.
+- Daily risk: starting-capital reference ₹10,00,000, maximum daily loss 3%
+  (₹30,000), evaluated on realised plus open unrealised P&L, inclusive at the exact
+  boundary. A breach squares off and blocks entries for the rest of the day; the
+  block survives a same-day worker restart (rebuilt from the real `strategy_state`
+  row) and resets only on the next trading date.
+
+#### Warm-up: a conservative 75-completed-bucket cross-session trust floor
+
+`SuperTrend.warmup_requirement()` declares `min_bars = period` (i.e. `1`) — a
+correct statement about when the ATR has a value, and an unsafe one about whether a
+latched, path-dependent trend can be trusted: a one-candle replay seeds a direction
+outright and the first live crossing can then be read as a fabricated flip. ATR
+readiness and trustworthy trend-context reconstruction are different requirements.
+
+`SupertrendBuy1x1p2Strategy.warmup_spec()` therefore raises the bar floor to **75**
+locally (`max(indicator_min_bars, 75)`), inheriting `continuity_required` from the
+indicator unchanged — the shared `common/indicators/supertrend.py` contract is not
+modified, and no `TradingEngine` branch was added.
+
+75 is deliberately **not** "one complete session": a 09:15–15:20 lifecycle
+contributes only **73** completed 5-minute buckets
+(`common.warmup.session_buckets.session_bucket_count`), so the 75-bucket floor
+*always* spans trading sessions —
+
+- at market open, the previous session's 73 completed buckets plus two buckets from
+  the preceding valid session;
+- mid-session, the latest 75 completed buckets across the current and previous
+  valid sessions;
+- weekends and configured holidays remain legitimate boundaries, walked by
+  `MarketSession.prior_trading_day` rather than read as missing buckets.
+
+Only a verified-complete (`WARMED`) replay grants trusted context; anything else
+(`PARTIAL`, `COLD_START`, stale, truncated, unordered, duplicated, gapped or
+missing-`now`) latches entries off for the whole day while leaving exits, the daily
+guard and the hard square-off fully active. Warm-up replay feeds the strategy's
+ordinary `on_candle` through a sink that discards every signal, so historical flips
+never place an order — proven with a 75-candle replay containing ten genuine flips
+that reaches the order path zero times.
+
+#### Strategy-scoped, annual NSE holiday calendar
+
+`MarketSession` reads its holiday calendar from `parameters.holidays` in the
+*strategy* configuration, not from `config/global.yaml` (whose verified list feeds
+only the unattended auto-start gate) — and no strategy configuration in this
+repository had ever declared one, so every other running engine's session relies on
+the weekday rule alone. `config/strategies/supertrend_buy_1_1p2.yaml` carries the
+verified NSE 2026 calendar, copied from `config/global.yaml`.
+
+This is **strategy-scoped**: it applies to `supertrend_buy_1_1p2` only, changes
+nothing for `ema_cross_9_21_buy` or `straddle_920`, and is not affected by edits to
+`config/global.yaml`. It matters twice — no entry on a closed day, and a correct
+warm-up walk-back, since the 75-bucket floor spans sessions and
+`MarketSession.prior_trading_day` decides which prior sessions those are. **It is an
+annual list and an ongoing maintenance obligation**: a 2027 calendar must be
+committed to this file before January 2027, or every 2027 holiday is treated as an
+ordinary trading day by this strategy — which would also make its warm-up
+walk-back expect buckets that never existed, downgrading an otherwise-good replay
+to `PARTIAL` and blocking entries for that day.
+
+#### Intentional deviation: current paper execution, not legacy zero slippage
+
+The legacy simulator ran `slippage_points: 0.0` and no submission latency. This port
+deliberately does not reproduce that: the committed configuration uses the same
+canonical intraday paper-execution block `ema_cross_9_21_buy` uses (one-tick
+slippage, 250ms submission latency, 2s max quote age, LTP fallback), so the two
+single-leg intraday strategies are filled by the same model and stay comparable.
+Charges are the repository's `CostRates` defaults — no `cost_rates` override.
+
+#### A known, disclosed shared-code asymmetry — left unchanged, as directed
+
+`runtimes/intraday_options/config_adapter.py`'s **multi-leg** branch
+(`_build_multi_leg_engine_worker_config`) raises `ConfigError` when
+`contract_resolver: simulated` carries no explicit `lot_size`. The **single-leg**
+branch this strategy uses (`_build_engine_worker_config`) does not: it silently
+defaults to 50. `supertrend_buy_1_1p2.yaml` names no `lot_size` at all — correct,
+because the committed `contract_resolver: dhan` ignores it and always supplies the
+exchange's own value — but that omission does not, by itself, make an accidental
+switch to the simulated resolver fail loudly the way it would on the multi-leg path.
+What guards this strategy is `contract_resolver: dhan` itself, pinned by
+`tests/unit/test_supertrend_buy_1_1p2_config.py`. Closing the adapter asymmetry
+would be a shared-code change affecting every existing simulated fixture across the
+repository and was explicitly left out of this strategy port; it is disclosed here
+and pinned by test (`test_the_single_leg_adapter_would_silently_default_a_simulated_lot_size`)
+so the weaker guarantee is never mistaken for the stronger one.
+
+#### Restart, recovery and gap behaviour — proven against real persistence
+
+Phase 3 drove every restart/recovery scenario through a real `TradingEngine` over a
+real `ExecutionRepository` on temporary SQLite databases (two sequential engine runs
+per database, exactly modelling a worker restart) — no persisted row was
+fabricated; every one was written by production `LifecycleGateway` /
+`OrderLifecycle` / `merge_payload` code and read back by the production
+`recover_position` / `recover_exit_state` / `recover_daily_risk` readers. Proven:
+open-position adoption without a duplicate entry (against a genuinely re-signalling
+second run, not a silent one); the highest completed premium close and trail
+activation restored exactly, with the restored trail firing at exactly −8.00% from
+the *previous process's* peak; the momentum comparison re-primed rather than
+spanning the process gap (negative and positive cases); no duplication of an
+already-confirmed exit; a stale/partial restart replay blocking entries while still
+managing and exiting the adopted position; the daily-loss latch surviving a same-day
+restart and resetting only on the next trading date; a rejected reversal close
+refusing the replacement entry; and both legs of a rejected close-then-square-off
+leaving the position genuinely open in the database and raising loudly rather than
+reporting a false "flat" state.
+
+#### Operational status
+
+**Disabled and PAPER-only, as delivered.** Committed
+`config/strategies/supertrend_buy_1_1p2.yaml`: `enabled: false`, `mode: paper`,
+`live_approved: false`. `discover_strategies()` sees it (so the dashboard and the
+supervisor's mode-transition exposure check do too); `discover_enabled_strategies()`
+does not, so the unattended auto-start controller and the real
+`runtimes.intraday_options.__main__.build_supervisor` composition root spawn no
+worker, no tick queue and no control queue for it — proven against the real
+committed config, and proven again that flipping only its `enabled` flag in a
+fixture copy adds it as a **third**, fully isolated worker with its own queues and
+correlation token, alongside the two strategies that remain unaffected. The
+dashboard's `discover_strategy_options()` labels it `DISABLED` against the real
+committed config with no database at all, and — once real persisted rows exist for
+it — every read model's `strategy_id` filter isolates its data from a
+differently-named strategy trading the identical contract in the same database.
+`auto_start.enabled`, every live gate, and every other strategy's `enabled`/`mode`/
+`live_approved` are unchanged by this branch.
+
+**Implementation completion does not authorise enabling this strategy, paper
+auto-start, or any live activation.** Enabling it for PAPER evaluation, and any
+future live consideration, remain separate, explicitly reviewed operator decisions.
+
+#### Files
+
+New: `strategies/intraday_options/supertrend_buy_1_1p2/{__init__.py,strategy.py,
+SUPERTREND_BUY_1_1P2_ALGO_TRADING_SPEC.md}`,
+`config/strategies/supertrend_buy_1_1p2.yaml` (disabled/paper), and
+`tests/unit/test_supertrend_buy_1_1p2_{strategy,warmup,config}.py`,
+`tests/unit/test_no_supertrend_buy_1_1p2_branches.py`,
+`tests/integration/test_supertrend_buy_1_1p2_{engine,warmup_handoff,recovery,
+risk_and_gaps,supervisor_composition,dashboard}.py`,
+`tests/integration/_supertrend_buy_1_1p2_fixtures.py`. No file under `common/`,
+`runtimes/`, `dashboards/`, `scripts/`, `orchestration/`, `config/global.yaml`,
+`config/runtimes/`, another strategy's config, or any migration was changed —
+verified by `git diff` against the source branch and by a source-text negative-space
+test (recursively over every `.py` file in `common/`, `runtimes/`, `dashboards/`,
+`scripts/` and `orchestration/`) asserting the strategy id never appears as a
+literal or a branch condition outside its own package.
+
+#### Verification
+
+149 tests for this strategy (all new, all passing): unit/integration for the
+strategy itself plus the acceptance matrix, warm-up trust, recovery, risk/gap and
+dashboard suites listed above. Named regressions run explicitly — 1160 passed, 4
+skipped, across the indicator, exit-engine, warm-up, `ema_cross_9_21_buy`,
+`straddle_920`, `weekly_delta_neutral`, positional, shared-feed/tick-channel,
+config/adapter, dashboard, auto-start, notification-guard, process-lock/heartbeat
+and end-to-end supervisor families. Full repository suite: 2938+ passed / 18 skipped
+(all pre-existing and environmental: live-feed smoke tests needing real Dhan
+credentials, dashboard page shims, a legacy-plist check). `ruff check .` clean;
+`mypy common strategies runtimes dashboards scripts --strict` clean over 236 source
+files; `python -m scripts.assert_no_live_config_committed` OK.
+`python -m orchestration.launchd.generate_plists --check` passes against the real
+checkout ("2 plist(s) match the generator"); it reports drift only when run inside
+this branch's isolated git worktree, because the generator derives the project root
+from the checkout path — the committed plists were deliberately not regenerated
+from the worktree.
+
+#### Safety
+
+Development happened entirely in an isolated `git worktree`
+(`/Volumes/Trading/algo_trading_supertrend_buy_1_1p2`); the running PAPER
+supervisor, its LaunchAgents and the Streamlit dashboard in the primary checkout
+were never touched. No runtime, dashboard or LaunchAgent was started, stopped, or
+modified. No Dhan or order-capable endpoint, and no Telegram endpoint, was called —
+all persistence/recovery/execution tests ran against `PaperBroker`/
+`InMemoryGateway` and temporary SQLite databases under the existing notification
+test guard. No secret was read, printed or altered. No branch was merged.
+`auto_start.enabled`, `global.live_trading_enabled`, every runtime's
+`live_execution_allowed`, and every other strategy's `enabled`/`mode`/
+`live_approved` are unchanged. `OPERATIONAL LIVE ACTIVATION ELIGIBLE` remains
+**NO — BLOCKED**, unaffected by this branch.

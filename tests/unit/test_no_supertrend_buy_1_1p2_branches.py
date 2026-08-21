@@ -49,9 +49,24 @@ GENERIC_TARGETS: tuple[Path, ...] = (
     REPO_ROOT / "common" / "execution" / "lifecycle.py",
     REPO_ROOT / "common" / "reconciliation",
     REPO_ROOT / "common" / "risk",
-    REPO_ROOT / "orchestration" / "auto_start",
-    REPO_ROOT / "dashboards" / "data",
+    # Phase 4 widening: the dashboard, script and orchestration checks below no
+    # longer sample a handful of files — every .py file under each of these three
+    # top-level packages is walked (recursively, including subpackages), so the
+    # dashboard's page shims and every operator script are covered without having
+    # to name each one.
+    REPO_ROOT / "orchestration",
+    REPO_ROOT / "dashboards",
+    REPO_ROOT / "scripts",
 )
+
+
+def _all_python_files(root: Path) -> list[Path]:
+    """Every ``.py`` file under ``root``, recursively — unlike :func:`_python_files`
+    below (kept for the two file-or-shallow-directory targets above), this walks
+    subpackages such as ``dashboards/pages`` and ``orchestration/auto_start``."""
+    if root.is_file():
+        return [root]
+    return sorted(root.rglob("*.py"))
 
 #: A literal naming this strategy — the identity a generic file must never branch on.
 #: Deliberately narrow (the exact quoted strategy_id) rather than "supertrend" alone,
@@ -88,7 +103,7 @@ def _strategy_id_equality_lines(path: Path) -> list[int]:
 def test_no_generic_module_contains_the_strategy_id_as_a_literal():
     offenders: dict[str, list[int]] = {}
     for target in GENERIC_TARGETS:
-        for path in _python_files(target):
+        for path in _all_python_files(target):
             lines = path.read_text(encoding="utf-8").splitlines()
             hits = [i + 1 for i, line in enumerate(lines) if _LITERAL_RE.search(line)]
             if hits:

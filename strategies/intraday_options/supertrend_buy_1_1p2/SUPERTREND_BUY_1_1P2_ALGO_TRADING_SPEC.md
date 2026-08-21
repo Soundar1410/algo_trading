@@ -53,6 +53,22 @@ The strategy requirements were extracted from these legacy files:
 
 When the legacy implementation and prose disagree, stop and report the exact conflict before choosing behavior. Do not silently invent a rule.
 
+### 3.1 Recorded conflict and resolution (operator-approved)
+
+`NiftyFixedStrikeSuperTrend_Master_Specification.md` describes a **different**
+strategy from `supertrend_fast`'s actual code: it documents a strike fixed at
+09:16 for the whole trading day, SuperTrend applied to the CE and PE **premium**
+charts (not the underlying), multiplier `1` (not `1.2`), and two simultaneous
+open positions (CE and PE independently). None of that matches `strategy.py`,
+`config/config.yaml` or `tests/test_strategy.py`, which are mutually
+consistent with each other and with this document's own rules (sections 4–14).
+
+**Resolution: the authoritative parity source for this port is the legacy
+`supertrend_fast` strategy's own code, config and tests.**
+`NiftyFixedStrikeSuperTrend_Master_Specification.md` is deliberately **not**
+used as a parity source — it is listed above only because it was reviewed and
+the conflict it presents is recorded here, not silently discarded.
+
 ## 4. Strategy Summary
 
 The strategy observes completed 5-minute NIFTY underlying candles and maintains a stateful SuperTrend indicator.
