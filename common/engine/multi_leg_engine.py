@@ -47,7 +47,9 @@ alongside the next candle. A VIX tick is never mistaken for an underlying one.
 from __future__ import annotations
 
 import threading
+import uuid
 from collections.abc import Callable
+from dataclasses import replace as dataclass_replace
 from datetime import datetime
 from typing import Any
 
@@ -62,13 +64,19 @@ from .daily_guard import DailyRiskConfig, DailyRiskGuard
 from .feed import MarketDataFeed
 from .multi_leg_models import (
     AdjustmentLifecycle,
+    AdjustmentRequest,
+    AdjustmentTarget,
     Basket,
     BasketAction,
+    BasketRollState,
     BasketSignal,
     LegInstance,
+    LegIntent,
     LegRole,
     LegState,
     MultiLegDurabilityError,
+    RollClaim,
+    RollLedgerPort,
     UnmanageableBasketState,
 )
 from .multi_leg_strategy import BaseMultiLegStrategy
@@ -112,6 +120,7 @@ class MultiLegEngine:
         persist_basket: Callable[[Basket], None] | None = None,
         persist_leg: Callable[[LegInstance], None] | None = None,
         record_incident: Callable[[str, str], None] | None = None,
+        roll_ledger: RollLedgerPort | None = None,
         clock: Callable[[], datetime] = now_ist,
         trading_date: str = "",
     ) -> None:
@@ -153,6 +162,12 @@ class MultiLegEngine:
         # None and incidents are logged only, never silently dropped either way
         # (see _record_incident).
         self._record_incident_cb = record_incident
+        # Phase 2 (strategy-rolling-strangle-otm1). None (every existing
+        # offline/test engine construction) is an explicit, supported "roll
+        # ledger not available" mode — see RollLedgerPort's own docstring —
+        # under which _close_adjusted_legs falls back to the single-target
+        # _close_adjusted_leg it replaces, unchanged.
+        self._roll_ledger = roll_ledger
         self._trading_date = trading_date
 
         interval = parse_timeframe_minutes(cfg.timeframe)
@@ -490,6 +505,13 @@ class MultiLegEngine:
             self._exit_leg_signal(signal, ts)
         elif signal.action is BasketAction.EXIT_ALL:
             self._exit_all_signal(signal, ts)
+        # Phase 2 (strategy-rolling-strangle-otm1): a strategy's own native
+        # multi-target roll request. The legacy EXIT_LEG + ExitReason.
+        # ADJUSTMENT form (straddle_920's own signal) is normalised into
+        # this same call from _exit_leg_signal below — one internal path,
+        # no strategy branch.
+        elif signal.action is BasketAction.ADJUST_LEGS and signal.adjustment is not None:
+            self._close_adjusted_legs(signal.adjustment, ts)
 
     def _enter_legs(self, signal: BasketSignal, ts: datetime) -> None:
         if self._entry_blocked is not None or self._basket.day_blocked_reason is not None:
@@ -500,38 +522,56 @@ class MultiLegEngine:
             return
 
         if signal.action is BasketAction.ENTER_LEG:
-            # Correction (P0-2): only a basket genuinely AWAITING_NEXT_CANDLE
-            # may produce a replacement (spec section 12.3 step 5) — the
-            # engine is the last line of defence against a stray/duplicate
-            # ENTER_LEG signal, independent of whatever gate the strategy
-            # itself applies.
-            awaiting = AdjustmentLifecycle.AWAITING_NEXT_CANDLE.value
-            if self._basket.pending_replacement_state != awaiting:
-                log.error(
-                    "%s: ENTER_LEG signal received while pending_replacement_state=%s "
-                    "(expected AWAITING_NEXT_CANDLE) — refusing to enter a replacement",
-                    self.label,
-                    self._basket.pending_replacement_state,
+            if self._roll_ledger is None:
+                # Unchanged legacy single-slot gate (P0-2): only a basket
+                # genuinely AWAITING_NEXT_CANDLE may produce a replacement
+                # (spec section 12.3 step 5) — the engine is the last line
+                # of defence against a stray/duplicate ENTER_LEG signal,
+                # independent of whatever gate the strategy itself applies.
+                awaiting = AdjustmentLifecycle.AWAITING_NEXT_CANDLE.value
+                if self._basket.pending_replacement_state != awaiting:
+                    log.error(
+                        "%s: ENTER_LEG signal received while "
+                        "pending_replacement_state=%s (expected "
+                        "AWAITING_NEXT_CANDLE) — refusing to enter a replacement",
+                        self.label,
+                        self._basket.pending_replacement_state,
+                    )
+                    return
+                # The one-shot replacement attempt is consumed *before* any
+                # contract resolution/subscription — durably, so a crash
+                # between "decided to replace" and "leg pending" cannot
+                # leave this basket able to retry the replacement on a
+                # later candle (spec section 12.3 step 5: the attempt
+                # happens once, on this candle, never again). Critical:
+                # this is the same "consume before acting" pre-effect
+                # checkpoint as the primary entry's in _on_candle_close.
+                self._basket.pending_replacement_role = None
+                self._basket.pending_replacement_state = (
+                    AdjustmentLifecycle.REPLACEMENT_PENDING.value
                 )
-                return
-            # The one-shot replacement attempt is consumed *before* any
-            # contract resolution/subscription — durably, so a crash between
-            # "decided to replace" and "leg pending" cannot leave this basket
-            # able to retry the replacement on a later candle (spec section
-            # 12.3 step 5: the attempt happens once, on this candle, never
-            # again). Critical: this is the same "consume before acting"
-            # pre-effect checkpoint as the primary entry's in _on_candle_close.
-            self._basket.pending_replacement_role = None
-            self._basket.pending_replacement_state = AdjustmentLifecycle.REPLACEMENT_PENDING.value
-            try:
-                self._persist_basket(critical=True)
-            except MultiLegDurabilityError:
-                log.error(
-                    "%s: could not durably consume the replacement attempt; "
-                    "refusing to enter a replacement leg this candle",
-                    self.label,
-                )
-                return
+                try:
+                    self._persist_basket(critical=True)
+                except MultiLegDurabilityError:
+                    log.error(
+                        "%s: could not durably consume the replacement attempt; "
+                        "refusing to enter a replacement leg this candle",
+                        self.label,
+                    )
+                    return
+            else:
+                # Phase 2: per-role/claim-group-aware gate. Every requested
+                # role must have its own eligible (AWAITING_NEXT_CANDLE)
+                # claim; every member's one-shot attempt is consumed
+                # durably, atomically together (all-or-nothing —
+                # _consume_replacement_claims), before any contract
+                # resolution/subscription, and a replacement leg must never
+                # coexist with the adjusted-out leg it replaces still OPEN
+                # or unresolved — enforced structurally: the adjusted-out
+                # leg reached CLOSED (never OPEN/CLOSE_SUBMISSION_UNKNOWN)
+                # before its claim could ever reach AWAITING_NEXT_CANDLE.
+                if not self._consume_replacement_claims(signal.legs):
+                    return
 
         for intent in signal.legs:
             option_type = _ROLE_TO_OPTION_TYPE.get(intent.role)
@@ -600,6 +640,64 @@ class MultiLegEngine:
                 contract.symbol,
             )
 
+    def _consume_replacement_claims(self, legs: tuple[LegIntent, ...]) -> bool:
+        """Phase 2: the per-role/claim-group-aware replacement gate. Every
+        requested role in ``legs`` must have its own eligible
+        (``AWAITING_NEXT_CANDLE``) claim; every member's one-shot attempt
+        is consumed atomically together — see
+        :meth:`~common.engine.multi_leg_models.RollLedgerPort.
+        consume_group_replacement` for why a sequence of independent
+        single-row updates is not safe here. Returns ``False`` (nothing
+        consumed) if any requested role is not eligible — all-or-nothing,
+        matching the legacy single-slot gate's own refusal behaviour.
+        """
+        assert self._roll_ledger is not None
+        roll_state = self._basket.roll_state
+        if roll_state is None:
+            log.error(
+                "%s: ENTER_LEG requested but no roll state is available; refusing",
+                self.label,
+            )
+            return False
+        eligible: list[RollClaim] = []
+        awaiting = AdjustmentLifecycle.AWAITING_NEXT_CANDLE.value
+        for intent in legs:
+            claim = roll_state.active_claim(intent.role)
+            if claim is None or claim.lifecycle_state != awaiting:
+                log.error(
+                    "%s: ENTER_LEG requested for role %s with no eligible "
+                    "(AWAITING_NEXT_CANDLE) claim; refusing the whole replacement "
+                    "request (all-or-nothing)",
+                    self.label,
+                    intent.role.value,
+                )
+                return False
+            eligible.append(claim)
+
+        members = tuple((claim.leg_role, claim.roll_sequence) for claim in eligible)
+        try:
+            self._roll_ledger.consume_group_replacement(
+                basket_id=self._basket.basket_id, members=members
+            )
+        except Exception as exc:
+            log.error(
+                "%s: could not durably consume %d replacement attempt(s) (%s); "
+                "refusing to enter any replacement leg this candle",
+                self.label,
+                len(members),
+                exc,
+            )
+            self._block_entries(f"replacement attempt consumption failed: {exc}")
+            self._record_incident(
+                self._basket.basket_id, f"replacement attempt consumption failed: {exc}"
+            )
+            return False
+
+        pending = AdjustmentLifecycle.REPLACEMENT_PENDING.value
+        for claim in eligible:
+            self._update_local_claim(claim.leg_role, claim.roll_sequence, pending)
+        return True
+
     def _open_leg(self, leg: LegInstance, price: float, ts: datetime) -> None:
         assert leg.contract is not None
         self.positions.open(
@@ -654,7 +752,14 @@ class MultiLegEngine:
             return
         reason = signal.exit_reason or ExitReason.STRATEGY_EXIT
         if reason is ExitReason.ADJUSTMENT:
-            self._close_adjusted_leg(leg, ts)
+            # Normalise the legacy single-target signal into the generic
+            # AdjustmentRequest form — the same claim machinery a native
+            # ADJUST_LEGS signal drives (Phase 2). straddle_920 keeps
+            # emitting this exact EXIT_LEG/ADJUSTMENT signal unchanged.
+            request = AdjustmentRequest(
+                targets=(AdjustmentTarget(leg_id=leg.leg_id, role=leg.role),)
+            )
+            self._close_adjusted_legs(request, ts)
         else:
             self._close_leg_safely(
                 leg, leg.last_price if leg.last_price is not None else 0.0, ts, reason
@@ -710,6 +815,481 @@ class MultiLegEngine:
         # bookkeeping about *which* of those two happened, not the trading
         # event itself.
         self._persist_basket()
+
+    # --------------------------------------------------- durable roll claims
+    # Phase 2 (strategy-rolling-strangle-otm1). Generic — no strategy-name
+    # branch. See RollLedgerPort's own docstring for the None-wired
+    # fallback contract, and migration 0013's header for the full design.
+    def _find_resumable_claim_group(
+        self, request: AdjustmentRequest
+    ) -> tuple[str, dict[str, RollClaim]] | None:
+        """If every target in ``request`` already has a matching ``CLAIMED``
+        claim (same ``target_leg_id``, same role) sharing one
+        ``claim_group_id``, return that id and the per-leg claim mapping so
+        the caller can resume it instead of claiming fresh. ``None`` means
+        the normal, fresh-claim path applies.
+
+        Only a ``CLAIMED`` match is resumable — see the call site's own
+        comment for why ``EXIT_SUBMISSION_PENDING`` must never reach this
+        method's "resume" treatment. A partial match (some targets have one,
+        some do not) or a match spanning more than one ``claim_group_id`` is
+        refused (``None``, logged) rather than guessed at — ``commit_claims``'s
+        own group-wide atomicity means a genuine crash cannot produce either
+        situation; if one is observed, it is a code defect, not a race.
+        """
+        roll_state = self._basket.roll_state
+        if roll_state is None:
+            return None
+        matches: dict[str, RollClaim] = {}
+        for target in request.targets:
+            claim = roll_state.active_claim(target.role)
+            if claim is None or claim.target_leg_id != target.leg_id:
+                continue
+            if claim.lifecycle_state != AdjustmentLifecycle.CLAIMED.value:
+                log.error(
+                    "%s: adjustment target %s already has an active claim in "
+                    "state %s (expected CLAIMED to safely resume, or nothing at "
+                    "all) — refusing rather than risk a duplicate reservation",
+                    self.label,
+                    target.leg_id,
+                    claim.lifecycle_state,
+                )
+                return None
+            matches[target.leg_id] = claim
+        if not matches:
+            return None
+        if len(matches) != len(request.targets):
+            log.error(
+                "%s: %d of %d requested roll targets already have an active CLAIMED "
+                "claim and %d do not — refusing to resume a partial group (commit_"
+                "claims' own atomicity means this should not arise from a genuine "
+                "crash; treating as an inconsistency)",
+                self.label,
+                len(matches),
+                len(request.targets),
+                len(request.targets) - len(matches),
+            )
+            return None
+        group_ids = {claim.claim_group_id for claim in matches.values()}
+        if len(group_ids) != 1:
+            log.error(
+                "%s: requested roll targets resolve to more than one existing "
+                "claim_group_id (%s) — refusing to resume",
+                self.label,
+                sorted(group_ids),
+            )
+            return None
+        return next(iter(group_ids)), matches
+
+    def _close_adjusted_legs(self, request: AdjustmentRequest, ts: datetime) -> None:
+        if not request.targets:
+            return
+        if self._roll_ledger is None:
+            if len(request.targets) != 1:
+                log.error(
+                    "%s: a %d-target adjustment was requested but no roll ledger is "
+                    "wired; refusing (only a single-target roll is representable "
+                    "without one — see RollLedgerPort)",
+                    self.label,
+                    len(request.targets),
+                )
+                return
+            target = request.targets[0]
+            leg = self._basket.legs.get(target.leg_id)
+            if leg is None or leg.state is not LegState.OPEN or leg.contract is None:
+                return
+            self._close_adjusted_leg(leg, ts)
+            return
+        self._close_adjusted_legs_with_ledger(request, ts)
+
+    def _close_adjusted_legs_with_ledger(self, request: AdjustmentRequest, ts: datetime) -> None:
+        """The durable, repeated-roll-capable claim/close/reconcile flow
+        (Phase 2 required lifecycle, sections 1-4):
+
+        1. every target is validated before anything changes; the atomic
+           claim (every target's row, the anchor, and the basket
+           compatibility projection) commits in one transaction, or none of
+           it does;
+        2. each target is then reserved (durably, atomically associated
+           with its own claim row) and submitted independently;
+        3. a confirmed fill reaches EXIT_CONFIRMED; a definitively
+           rejected/cancelled close reaches FAILED (leg stays OPEN, budget
+           consumed, no replacement); anything else reaches EXIT_UNKNOWN
+           (leg marked CLOSE_SUBMISSION_UNKNOWN, entries blocked, never
+           retried on the strength of an open position);
+        4. the group advances to AWAITING_NEXT_CANDLE only once every
+           target is EXIT_CONFIRMED — one FAILED/EXIT_UNKNOWN target blocks
+           replacement for the whole group.
+        """
+        assert self._roll_ledger is not None
+        legs: list[LegInstance] = []
+        for target in request.targets:
+            leg = self._basket.legs.get(target.leg_id)
+            if leg is None or leg.state is not LegState.OPEN or leg.contract is None:
+                log.error(
+                    "%s: adjustment target %s is not a currently open leg; refusing "
+                    "the whole claim group (all-or-nothing)",
+                    self.label,
+                    target.leg_id,
+                )
+                return
+            legs.append(leg)
+
+        # A crash after an earlier attempt's claim commits, but before its
+        # reservation, must resume that same claim — never consume another
+        # roll for it. Only a CLAIMED match is resumable this way: a match
+        # already at EXIT_SUBMISSION_PENDING means its close was already
+        # reserved/authorised, and must be resolved (via reconciliation's
+        # own close_intent_id lookup, never re-reserved here) rather than
+        # re-attempted — reaching that state at this point indicates
+        # startup reconciliation was skipped or failed, a problem worth
+        # refusing loudly rather than risking a duplicate reservation for.
+        resumable = self._find_resumable_claim_group(request)
+        if resumable is not None:
+            group_id, claims_by_leg = resumable
+            log.info(
+                "%s: resuming existing roll claim group %s for %d target(s) — no "
+                "new claim, no roll count consumed again",
+                self.label,
+                group_id,
+                len(request.targets),
+            )
+            for target, leg in zip(request.targets, legs, strict=True):
+                self._close_one_roll_target(
+                    leg, target, group_id, claims_by_leg[target.leg_id].roll_sequence, ts
+                )
+            self._maybe_advance_claim_group(group_id)
+            return
+
+        claim_group_id = f"{self._basket.basket_id}:{uuid.uuid4().hex[:12]}"
+        claimed_at = self._now()
+
+        # Speculative in-memory mutation of the scalar compatibility
+        # projection — generalises _close_adjusted_leg's own `+= 1` to N
+        # targets. Rolled back below if the durable commit fails.
+        previous_count = self._basket.adjustment_count
+        previous_role = self._basket.pending_replacement_role
+        previous_state = self._basket.pending_replacement_state
+        self._basket.adjustment_count += len(request.targets)
+        self._basket.pending_replacement_role = (
+            request.targets[0].role if len(request.targets) == 1 else None
+        )
+        self._basket.pending_replacement_state = AdjustmentLifecycle.EXIT_SUBMISSION_PENDING.value
+
+        try:
+            assigned = self._roll_ledger.commit_claims(
+                self._basket,
+                claim_group_id=claim_group_id,
+                targets=request.targets,
+                anchor=request.anchor,
+                claim_candle_ts=ts,
+                claimed_at=claimed_at,
+            )
+        except Exception as exc:
+            log.error(
+                "%s: could not durably claim %d roll target(s) (%s); no close will "
+                "be attempted this candle; entries blocked",
+                self.label,
+                len(request.targets),
+                exc,
+            )
+            self._basket.adjustment_count = previous_count
+            self._basket.pending_replacement_role = previous_role
+            self._basket.pending_replacement_state = previous_state
+            self._block_entries(f"roll claim commit failed: {exc}")
+            self._record_incident(self._basket.basket_id, f"roll claim commit failed: {exc}")
+            self._rehydrate_basket()
+            return
+
+        self._append_local_claims(claim_group_id, request, ts, claimed_at, assigned)
+
+        for target, leg in zip(request.targets, legs, strict=True):
+            self._close_one_roll_target(leg, target, claim_group_id, assigned[target.leg_id], ts)
+
+        self._maybe_advance_claim_group(claim_group_id)
+
+    def _close_one_roll_target(
+        self,
+        leg: LegInstance,
+        target: AdjustmentTarget,
+        claim_group_id: str,
+        roll_sequence: int,
+        ts: datetime,
+    ) -> None:
+        assert self._roll_ledger is not None
+        assert leg.contract is not None
+        price = leg.last_price if leg.last_price is not None else 0.0
+        try:
+            reserved = self.positions.reserve_close(
+                leg.contract.security_id,
+                price,
+                ts,
+                ExitReason.ADJUSTMENT,
+                leg_role=target.role.value,
+                roll_sequence=roll_sequence,
+                basket_id=self._basket.basket_id,
+                leg_id=leg.leg_id,
+            )
+        except Exception as exc:
+            # The reservation's own atomic write failed — nothing was
+            # authorised, so the row stays CLAIMED, safely resumable (never
+            # NEVER_PLACED-then-retried blindly; see migration 0013's
+            # header). No close was ever attempted for this target.
+            log.error(
+                "%s: could not durably reserve the roll close for %s (%s); leg "
+                "stays open, claim remains CLAIMED and resumable",
+                self.label,
+                leg.leg_id,
+                exc,
+            )
+            self._block_entries(f"roll close reservation failed for {leg.leg_id}: {exc}")
+            self._record_incident(
+                self._basket.basket_id, f"roll close reservation failed for {leg.leg_id}: {exc}"
+            )
+            return
+
+        close_intent_id = reserved.close_intent_id
+        try:
+            trade = self.positions.submit_close(reserved)
+        except Exception as exc:
+            outcome = "UNKNOWN"
+            if close_intent_id is not None:
+                try:
+                    outcome = self._roll_ledger.resolve_close_intent(close_intent_id)
+                except Exception:
+                    log.exception(
+                        "%s: could not resolve the roll close intent's authoritative "
+                        "outcome for %s",
+                        self.label,
+                        leg.leg_id,
+                    )
+            self._resolve_roll_target_failure(leg, target, roll_sequence, outcome, exc)
+            return
+
+        leg.state = LegState.CLOSED
+        leg.exit_price = trade.exit_price
+        leg.exit_time = ts
+        leg.exit_reason = ExitReason.ADJUSTMENT
+        leg.exit_correlation_id = trade.exit_correlation_id
+        leg.realized_gross_pnl = trade.gross_pnl
+        self._persist_leg(leg)
+        if self._daily_guard is not None:
+            self._daily_guard.register_trade(trade.net_pnl)
+        self.feed.unsubscribe(leg.contract.security_id)
+        self._notify(
+            "exit",
+            f"{trade.side.value} {trade.contract.symbol} @ {trade.exit_price:.2f} "
+            f"reason=ADJUSTMENT gross={trade.gross_pnl:.2f}",
+        )
+        self.strategy.on_leg_closed(trade, leg, self._basket)
+        self._record_roll_outcome(
+            target.role, roll_sequence, AdjustmentLifecycle.EXIT_CONFIRMED.value
+        )
+
+    def _resolve_roll_target_failure(
+        self,
+        leg: LegInstance,
+        target: AdjustmentTarget,
+        roll_sequence: int,
+        outcome: str,
+        exc: Exception,
+    ) -> None:
+        if outcome == "FILLED":
+            # Rare race: the close may genuinely have landed despite the
+            # in-process exception. Conservative and safe: do not fabricate
+            # a Trade here — degrade to the unresolved branch below so
+            # nothing retries it; a restart's own reconciliation reads the
+            # authoritative fill directly and fully resolves it.
+            outcome = "UNKNOWN"
+        if outcome == "TERMINAL_NO_FILL":
+            # Authoritative proof the close did not happen. The leg was
+            # never mutated above — it remains OPEN, untouched, exactly as
+            # a later hard square-off's own (separate, non-roll) close
+            # attempt on it requires (spec section 10.1/target-leg-id
+            # multi-attempt reconciliation).
+            self._record_roll_outcome(target.role, roll_sequence, AdjustmentLifecycle.FAILED.value)
+            log.warning(
+                "%s: roll close for %s was definitively rejected/cancelled; leg "
+                "remains OPEN, roll budget consumed, no replacement for this claim",
+                self.label,
+                leg.leg_id,
+            )
+            return
+        # UNKNOWN: never retried merely because the position is still open.
+        # Mark the leg itself unresolved too — mirrors _close_leg_safely
+        # exactly — so nothing, including a later square-off sweep,
+        # attempts a second close on it.
+        leg.state = LegState.CLOSE_SUBMISSION_UNKNOWN
+        self._persist_leg(leg)
+        self._record_roll_outcome(
+            target.role, roll_sequence, AdjustmentLifecycle.EXIT_UNKNOWN.value
+        )
+        self._block_entries(f"leg {leg.leg_id} roll close outcome unknown: {exc}")
+        self._record_incident(
+            self._basket.basket_id,
+            f"leg {leg.leg_id} roll close raised and its outcome is unknown: {exc}",
+        )
+
+    def _maybe_advance_claim_group(self, claim_group_id: str) -> None:
+        roll_state = self._basket.roll_state
+        if roll_state is None:
+            return
+        members = roll_state.claims_for_group(claim_group_id)
+        if not members:
+            return
+        confirmed = AdjustmentLifecycle.EXIT_CONFIRMED.value
+        if any(claim.lifecycle_state != confirmed for claim in members):
+            return  # a FAILED/EXIT_UNKNOWN (or not-yet-processed) member blocks the group
+        for claim in members:
+            self._record_roll_outcome(
+                claim.leg_role,
+                claim.roll_sequence,
+                AdjustmentLifecycle.AWAITING_NEXT_CANDLE.value,
+            )
+        self._basket.pending_replacement_role = members[0].leg_role if len(members) == 1 else None
+        self._basket.pending_replacement_state = AdjustmentLifecycle.AWAITING_NEXT_CANDLE.value
+        self._persist_basket()
+
+    def _record_roll_outcome(
+        self,
+        role: LegRole,
+        roll_sequence: int,
+        lifecycle_state: str,
+        *,
+        replacement_leg_id: str | None = None,
+    ) -> None:
+        """Best-effort: the trading outcome this records has already
+        happened (a confirmed fill, a definitive rejection, ...) — a
+        failure to durably persist the record must never undo or reverse
+        it, matching :meth:`_persist_leg`'s own non-critical write
+        philosophy exactly."""
+        self._update_local_claim(
+            role, roll_sequence, lifecycle_state, replacement_leg_id=replacement_leg_id
+        )
+        if self._roll_ledger is None:
+            return
+        try:
+            self._roll_ledger.record_outcome(
+                basket_id=self._basket.basket_id,
+                leg_role=role,
+                roll_sequence=roll_sequence,
+                lifecycle_state=lifecycle_state,
+                replacement_leg_id=replacement_leg_id,
+            )
+        except Exception as exc:
+            log.exception(
+                "%s: could not durably record roll outcome %s for %s roll #%d "
+                "(best-effort)",
+                self.label,
+                lifecycle_state,
+                role.value,
+                roll_sequence,
+            )
+            self._record_incident(
+                self._basket.basket_id,
+                f"roll outcome record failed ({role.value} #{roll_sequence} -> "
+                f"{lifecycle_state}): {exc}",
+            )
+
+    def _append_local_claims(
+        self,
+        claim_group_id: str,
+        request: AdjustmentRequest,
+        ts: datetime,
+        claimed_at: datetime,
+        assigned: dict[str, int],
+    ) -> None:
+        """Mirror freshly-committed CLAIMED rows onto ``self._basket.roll_state``
+        locally, so the rest of this call (and any later same-day read)
+        sees them without a full reload. ``assigned`` (from
+        :meth:`RollLedgerPort.commit_claims`) is the authoritative
+        ``target_leg_id -> roll_sequence`` mapping — never recomputed here."""
+        roll_state = self._basket.roll_state
+        if roll_state is None:
+            roll_state = BasketRollState(reference_price=None, anchor_candle_ts=None)
+        reference_price = (
+            request.anchor.price if request.anchor is not None else roll_state.reference_price
+        )
+        anchor_candle_ts = (
+            request.anchor.candle_ts if request.anchor is not None else roll_state.anchor_candle_ts
+        )
+        new_claims = list(roll_state.claims)
+        for target in request.targets:
+            new_claims.append(
+                RollClaim(
+                    claim_group_id=claim_group_id,
+                    leg_role=target.role,
+                    roll_sequence=assigned[target.leg_id],
+                    lifecycle_state=AdjustmentLifecycle.CLAIMED.value,
+                    target_leg_id=target.leg_id,
+                    close_correlation_id=None,
+                    close_intent_id=None,
+                    replacement_leg_id=None,
+                    reference_price_at_claim=reference_price,
+                    claim_candle_ts=ts,
+                    claimed_at=claimed_at,
+                )
+            )
+        self._basket.roll_state = BasketRollState(
+            reference_price=reference_price, anchor_candle_ts=anchor_candle_ts,
+            claims=tuple(new_claims),
+        )
+
+    def _update_local_claim(
+        self,
+        role: LegRole,
+        roll_sequence: int,
+        lifecycle_state: str,
+        *,
+        replacement_leg_id: str | None = None,
+    ) -> None:
+        roll_state = self._basket.roll_state
+        if roll_state is None:
+            return
+        new_claims = []
+        for claim in roll_state.claims:
+            if claim.leg_role is role and claim.roll_sequence == roll_sequence:
+                claim = dataclass_replace(
+                    claim,
+                    lifecycle_state=lifecycle_state,
+                    replacement_leg_id=(
+                        replacement_leg_id
+                        if replacement_leg_id is not None
+                        else claim.replacement_leg_id
+                    ),
+                )
+            new_claims.append(claim)
+        self._basket.roll_state = BasketRollState(
+            reference_price=roll_state.reference_price,
+            anchor_candle_ts=roll_state.anchor_candle_ts,
+            claims=tuple(new_claims),
+        )
+
+    def _rehydrate_basket(self) -> None:
+        """Re-fetch durable state after a critical roll-claim write
+        failure: in-memory state must never diverge from what is actually
+        durable. Reuses the same ``recover_basket`` callable
+        :meth:`_adopt_recovered_basket` uses at startup — calling it again
+        mid-session is safe, a pure read+reconcile against the repository
+        with no side effect of its own. A ``None`` result (nothing durable
+        to adopt — should not happen here, since a basket already exists)
+        or a callback that itself fails leaves the in-memory basket as is,
+        with entries already blocked by the caller."""
+        if self._recover_basket is None:
+            return
+        try:
+            recovered = self._recover_basket()
+        except UnmanageableBasketState:
+            raise
+        except Exception:
+            log.exception(
+                "%s: could not rehydrate basket state after a roll claim commit "
+                "failure; continuing with the in-memory view, entries remain blocked",
+                self.label,
+            )
+            return
+        if recovered is not None:
+            self._basket = recovered
 
     def _exit_all_signal(self, signal: BasketSignal, ts: datetime) -> None:
         reason = signal.exit_reason or ExitReason.STRATEGY_EXIT

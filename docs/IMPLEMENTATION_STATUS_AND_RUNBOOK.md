@@ -10215,3 +10215,173 @@ every runtime's `live_execution_allowed`, and every other strategy's
 by this branch. Implementation completion of this phase does not authorise
 PAPER enablement or any further phase — Phase 2 (generic engine lifecycle and
 reconciliation) is next, stopping for review before it begins.
+
+### `strategy-rolling-strangle-otm1` Phase 2 addendum — 22 August 2026 (unmerged)
+
+Generic multi-leg engine lifecycle and restart reconciliation for durable
+repeated rolling — the atomic claim/reserve/submit/outcome/replacement
+machinery Phase 0 found missing and Phase 1's data model exists to serve.
+**Still not complete.** No strategy code, config, dashboard or enablement —
+those remain Phase 3+.
+
+#### Reserve-then-submit split (`common/execution/lifecycle.py`, `common/engine/gateway.py`, `common/engine/positions.py`)
+
+`OrderLifecycle.handle_signal` is split into `reserve()` (record_signal
+through `reserve_intent`/`reserve_roll_close_intent`, durable, no broker
+call) and `submit()` (the broker call and everything after); `handle_signal`
+becomes `submit(reserve(...))` — byte-identical behaviour for every existing
+caller. A real bug was found and fixed during the split: `apply_fill`'s
+`last_candle_end_at` must be `signal.candle.end_at`, not `intent.created_at`
+(a different value `submit()` no longer has direct access to) — caught by
+tracing every substituted field against the pre-split source rather than
+assuming the refactor was safe, and confirmed by the full lifecycle/account-
+risk/square-off regression suites passing unchanged. `LifecycleGateway`
+gains `reserve_sell`/`reserve_buy`/`submit_reserved`, used exclusively by
+the roll-close path; `sell`/`buy` are untouched. `PositionManager` gains the
+matching `reserve_close`/`submit_close`, mirroring `close()`'s own Trade-
+building tail exactly, split at the two phases — the position is untouched
+until `submit_close` succeeds.
+
+#### `RollLedgerPort` / `RollLedger` (`common/engine/multi_leg_models.py`, `common/engine/multi_leg_state.py`)
+
+A new `MultiLegEngine(..., roll_ledger=...)` constructor parameter, mirroring
+the existing `persist_basket`/`persist_leg`/`recover_basket` callable-
+injection pattern exactly: `None` (every existing offline/test construction,
+unchanged) is an explicit, supported "no roll ledger" mode under which
+`_close_adjusted_legs` falls back to the original single-target
+`_close_adjusted_leg` it replaces, byte-for-byte. The real
+`RollLedger` (backed by `ExecutionRepository`) is wired **generically** in
+the worker — for any multi-leg strategy, including `straddle_920`, whose own
+`EXIT_LEG` + `ExitReason.ADJUSTMENT` is normalised into the same
+`ADJUST_LEGS`/`AdjustmentRequest` claim machinery `rolling_strangle_otm1`
+will use, gaining the same durable close-attempt identity tracking with no
+change to its externally observable behaviour (proven by its full worker-
+level restart suite passing with `roll_ledger` now wired, and a new test in
+`test_rolling_multi_leg_engine.py` exercising exactly that combination,
+which no pre-Phase-2 test covered).
+
+#### Atomic claim, per-target reserve/submit, outcome resolution (`common/engine/multi_leg_engine.py`)
+
+`_close_adjusted_legs(request, ts)` replaces the sole call site of
+`_close_adjusted_leg`; `_apply_signal` gains `ADJUST_LEGS`. Every target is
+validated before anything changes; the claim (every target's row, the
+anchor, and the basket compatibility projection) commits in one transaction
+via `RollLedgerPort.commit_claims`, or none of it does — proven by an
+injected mid-transaction failure leaving zero rows and zero broker calls,
+and by the in-memory basket being **replaced**, not merely rolled back, via
+`_rehydrate_basket` (re-invoking the same `recover_basket` callable startup
+uses). Each target is then reserved (atomically associated with its claim
+row, `CLAIMED -> EXIT_SUBMISSION_PENDING`) and submitted independently; a
+confirmed fill reaches `EXIT_CONFIRMED`, a definitive rejection reaches
+`FAILED` (leg stays `OPEN`, budget consumed, no replacement), anything else
+reaches `EXIT_UNKNOWN` (leg marked `CLOSE_SUBMISSION_UNKNOWN`, entries
+blocked, never retried on the strength of an open position — resolved via
+the *same* `resolve_intent_outcome` classifier restart recovery uses, so a
+live exception and a post-crash restart resolve identically). A group
+advances to `AWAITING_NEXT_CANDLE` only once every member is
+`EXIT_CONFIRMED`.
+
+**A real gap found and closed during implementation, not merely in the
+Phase 0 design:** a crash after a claim commits but before its target is
+reserved must resume the *same* claim, never consume another roll for it.
+`_find_resumable_claim_group` checks every target's role for a matching
+`CLAIMED` claim before claiming fresh; a match already at
+`EXIT_SUBMISSION_PENDING` is refused rather than resumed (that state must
+only be resolved via reconciliation's own `close_intent_id` lookup, never
+re-reserved — reaching it here would mean startup reconciliation was
+skipped or failed). Both-leg re-entry's replacement-attempt consumption is
+made atomic across every role in one transaction
+(`consume_group_replacement`), closing a distinct atomicity gap the
+per-claim-write design would otherwise have left for the both-leg case.
+
+#### Generalised reconciliation (`runtimes/intraday_options/multi_leg_engine_worker.py`)
+
+`_reconcile_basket_rolls` reconciles every non-terminal roll claim by its
+own `close_intent_id` — never by scanning a leg's full order history, since
+a leg may now legitimately carry more than one exit attempt. An
+unrecognised durable `lifecycle_state` fails the whole basket closed rather
+than being silently skipped (`_RECOGNIZED_ROLL_LIFECYCLE_STATES`, derived
+from `AdjustmentLifecycle` itself, never hand-duplicated). Stale-open
+detection for a pending replacement now uses the roll ledger's own concrete
+`target_leg_id` per claim, with the pre-Phase-2 role-wide heuristic kept as
+a defence-in-depth fallback for data written before migration `0013`
+existed. `realized_gross_pnl` is backfilled from the authoritative
+`trade_ledger` (new `trade_ledger_gross_pnl_for_exit`) when the best-effort
+projection write was lost — required because the combined stop sums
+realised P&L across rolled-out legs.
+
+**`_reconcile_leg`'s exit-attempt handling is generalised — a required fix,
+not merely a latent gap left for later, and it touches one existing
+`straddle_920` test's own assertion.** `len(exit_rows) > 1` is no longer an
+automatic contradiction: `_classify_exit_attempts` allows a leg to carry
+multiple exit attempts (a rejected roll/adjustment close followed, later, by
+an unrelated square-off closing the same leg — proven end to end by new
+tests), with two or more confirmed fills still failing closed as a genuine
+over-close contradiction. Separately, and more consequentially: **only a
+definitive `TERMINAL_NO_FILL` outcome may revert a `CLOSE_SUBMISSION_
+UNKNOWN` leg to `OPEN`** — a merely ambiguous/pending exit attempt no longer
+does, since a still-open position never proved the close was never
+submitted and reverting on that basis alone risked a second close racing
+the original one's independent resolution. One existing test,
+`test_close_submission_unknown_with_a_still_open_position_reverts_to_open`,
+asserted exactly that unsafe behaviour for a genuinely ambiguous
+(`status=None`) exit order; per explicit operator direction (this was
+surfaced as a conflict and not resolved unilaterally) it was rewritten —
+`test_close_submission_unknown_with_a_definitive_rejection_reverts_to_open`
+now proves the same revert-to-OPEN outcome using an authoritative
+`REJECTED` status instead, and a new
+`test_close_submission_unknown_with_a_genuinely_ambiguous_exit_fails_closed`
+proves the corrected behaviour for the case the old test wrongly asserted.
+No other existing assertion, in this file or any other, needed to change.
+
+#### Files and tests
+
+Modified: `common/execution/lifecycle.py`, `common/engine/gateway.py`,
+`common/engine/positions.py`, `common/engine/multi_leg_models.py`,
+`common/engine/multi_leg_state.py`, `common/engine/multi_leg_engine.py`,
+`common/execution/repository.py` (`resolve_intent_outcome` extracted as a
+shared module-level classifier; `order_intent_by_id`,
+`reserve_roll_close_intent`, `update_basket_roll_outcome`,
+`consume_group_replacement`, `trade_ledger_gross_pnl_for_exit` added),
+`runtimes/intraday_options/multi_leg_engine_worker.py` (`RollLedger` wired;
+`_reconcile_basket_rolls`, `_classify_exit_attempts`,
+`_backfill_realized_gross_pnl` added; `_resolve_intent_outcome` now a thin
+alias for the shared classifier), `tests/integration/
+test_straddle_920_reconciliation.py` (one test corrected, one new test
+added, per the conflict above). New: `tests/integration/
+test_rolling_multi_leg_engine.py` (20 tests, generic — proves the shared
+machinery directly, not tied to any strategy).
+
+#### Verification
+
+Full suite: exit code 0. `ruff check .` clean. `mypy common strategies
+runtimes dashboards scripts --strict` clean over 236 source files.
+`scripts.assert_no_live_config_committed`: OK (still no config for this
+strategy). Every explicitly mandated regression suite re-run individually —
+`test_straddle_920_engine.py`, `test_straddle_920_durability.py`,
+`test_straddle_920_reconciliation.py`, `test_straddle_920_restart.py`,
+`test_straddle_920_correlation.py`, `test_straddle_920_acceptance_gaps.py`,
+`test_no_straddle_920_branches.py`, `test_straddle_920_risk_separation.py`,
+`test_leg_role_extension_is_additive.py`, `test_migrations.py`,
+`test_worker_import_boundary.py` — 124 passed. Square-off/execution-
+lifecycle suites touched by the reserve/submit split
+(`test_engine_square_off_authority.py`, `test_wall_clock_square_off.py`,
+`test_engine_square_off.py`, `test_lifecycle_account_risk.py`,
+`test_wall_clock_square_off_threads.py`, `test_engine_lifecycle_gateway.py`)
+re-run and pass. `test_only_one_adjustment_per_day` passes unchanged.
+
+#### Safety
+
+Development happened entirely in an isolated `git worktree`
+(`/Volumes/Trading/algo_trading_rolling_strangle_otm1`); the running PAPER
+supervisor, its LaunchAgents and the Streamlit dashboard in the primary
+checkout were never touched. No runtime, dashboard or LaunchAgent was
+started, stopped or modified. No Dhan or order-capable endpoint, and no
+Telegram endpoint, was called — every test ran against a scripted in-
+process fake broker or `InMemoryGateway`, never a real network call. No
+secret was read, printed or altered. No branch was merged. No config file
+exists yet for this strategy. `auto_start.enabled`, `global.
+live_trading_enabled`, every runtime's `live_execution_allowed`, and every
+other strategy's `enabled`/`mode`/`live_approved` are unchanged.
+`OPERATIONAL LIVE ACTIVATION ELIGIBLE` remains **NO — BLOCKED**. Phase 3
+(strategy implementation) is next, stopping for review before it begins.

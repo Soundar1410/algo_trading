@@ -20,6 +20,8 @@ from common.models import ExitReason, OptionType, OrderSide
 
 from .models import OptionContract
 from .multi_leg_models import (
+    AdjustmentTarget,
+    AnchorUpdate,
     Basket,
     BasketRollState,
     LegInstance,
@@ -30,7 +32,7 @@ from .multi_leg_models import (
 
 if TYPE_CHECKING:
     from common.config.models import ExecutionMode
-    from common.execution.repository import ExecutionRepository
+    from common.execution.repository import BasketRollClaimSeed, ExecutionRepository
 
 log = get_logger(__name__)
 
@@ -328,3 +330,126 @@ def _row_to_leg(row) -> LegInstance:  # type: ignore[no-untyped-def]
 
 
 _ROLE_TO_OPTION_TYPE = {LegRole.CE: OptionType.CE, LegRole.PE: OptionType.PE}
+
+
+class RollLedger:
+    """The production :class:`~common.engine.multi_leg_models.RollLedgerPort`
+    (migration ``0013``, Phase 2) — backed by :class:`ExecutionRepository`,
+    generic to any multi-leg strategy. A worker wires one instance into
+    ``MultiLegEngine(roll_ledger=...)`` regardless of which strategy it is
+    running; an offline/test engine that never wires one gets the
+    unchanged single-target fallback (see the port's own docstring).
+    """
+
+    def __init__(
+        self,
+        repository: ExecutionRepository,
+        *,
+        runtime_id: str,
+        strategy_id: str,
+        execution_mode: ExecutionMode,
+        trading_date: str,
+    ) -> None:
+        self._repository = repository
+        self._runtime_id = runtime_id
+        self._strategy_id = strategy_id
+        self._execution_mode = execution_mode
+        self._trading_date = trading_date
+
+    def commit_claims(
+        self,
+        basket: Basket,
+        *,
+        claim_group_id: str,
+        targets: tuple[AdjustmentTarget, ...],
+        anchor: AnchorUpdate | None,
+        claim_candle_ts: datetime,
+        claimed_at: datetime,
+    ) -> dict[str, int]:
+        from common.execution.repository import BasketRollClaimSeed
+
+        roll_state = basket.roll_state
+        reference_price = anchor.price if anchor is not None else (
+            roll_state.reference_price if roll_state is not None else None
+        )
+        seen_this_call: dict[LegRole, int] = {}
+        seeds: list[BasketRollClaimSeed] = []
+        assigned: dict[str, int] = {}
+        for target in targets:
+            already = roll_state.roll_count(target.role) if roll_state is not None else 0
+            bump = seen_this_call.get(target.role, 0) + 1
+            seen_this_call[target.role] = bump
+            roll_sequence = already + bump
+            assigned[target.leg_id] = roll_sequence
+            seeds.append(
+                BasketRollClaimSeed(
+                    claim_group_id=claim_group_id,
+                    leg_role=target.role.value,
+                    roll_sequence=roll_sequence,
+                    target_leg_id=target.leg_id,
+                    reference_price_at_claim=reference_price,
+                    claim_candle_ts=claim_candle_ts.isoformat(),
+                    claimed_at=claimed_at.isoformat(),
+                )
+            )
+
+        # Mirrors persist_basket's own field mapping (duplicated rather than
+        # reused: persist_basket owns a single, already-tested transaction
+        # of its own — upsert_strategy_basket — and must stay untouched;
+        # this call instead needs that same row written atomically alongside
+        # the anchor/claims below, via commit_basket_state).
+        self._repository.commit_basket_state(
+            runtime_id=self._runtime_id,
+            strategy_id=self._strategy_id,
+            execution_mode=self._execution_mode,
+            trading_date=self._trading_date,
+            basket_id=basket.basket_id,
+            lifecycle_state=basket.lifecycle_state,
+            entries_consumed=basket.entries_consumed,
+            day_blocked_reason=basket.day_blocked_reason,
+            adjustment_count=basket.adjustment_count,
+            pending_replacement_role=(
+                basket.pending_replacement_role.value
+                if basket.pending_replacement_role is not None
+                else None
+            ),
+            pending_replacement_state=basket.pending_replacement_state,
+            original_combined_basis=basket.original_combined_basis,
+            square_off_state=basket.square_off_state,
+            anchor=(
+                (anchor.price, anchor.candle_ts.isoformat()) if anchor is not None else None
+            ),
+            new_claims=tuple(seeds),
+        )
+        return assigned
+
+    def record_outcome(
+        self,
+        *,
+        basket_id: str,
+        leg_role: LegRole,
+        roll_sequence: int,
+        lifecycle_state: str,
+        replacement_leg_id: str | None = None,
+    ) -> None:
+        self._repository.update_basket_roll_outcome(
+            basket_id=basket_id,
+            leg_role=leg_role.value,
+            roll_sequence=roll_sequence,
+            lifecycle_state=lifecycle_state,
+            replacement_leg_id=replacement_leg_id,
+        )
+
+    def resolve_close_intent(self, close_intent_id: int) -> str:
+        from common.execution.repository import resolve_intent_outcome
+
+        row = self._repository.order_intent_by_id(close_intent_id)
+        return resolve_intent_outcome(row)
+
+    def consume_group_replacement(
+        self, *, basket_id: str, members: tuple[tuple[LegRole, int], ...]
+    ) -> None:
+        self._repository.consume_group_replacement(
+            basket_id=basket_id,
+            members=tuple((role.value, roll_sequence) for role, roll_sequence in members),
+        )

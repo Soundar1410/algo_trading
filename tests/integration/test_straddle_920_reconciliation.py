@@ -493,12 +493,23 @@ def test_close_submission_unknown_with_a_filled_exit_is_resolved_closed(tmp_path
     assert leg.exit_correlation_id == exit_corr
 
 
-def test_close_submission_unknown_with_a_still_open_position_reverts_to_open(tmp_path) -> None:  # type: ignore[no-untyped-def]
-    """The close never actually took (still ambiguous/rejected) but real
-    exposure remains — adopted back as OPEN so square-off can still manage
-    it, per the correction's explicit "do not merely tell the operator to
-    close manually" instruction. Also proves the "basket marked closed
-    while exposure remains" case: lifecycle_state is corrected back to OPEN."""
+def test_close_submission_unknown_with_a_definitive_rejection_reverts_to_open(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Phase 2 correction: only a *definitive* proof that the close never
+    happened (here, an authoritative REJECTED order status — not merely an
+    unconfirmed/ambiguous one) may revert this leg to OPEN. Real exposure
+    remains — adopted back as OPEN so square-off can still manage it, per
+    the correction's explicit "do not merely tell the operator to close
+    manually" instruction. Also proves the "basket marked closed while
+    exposure remains" case: lifecycle_state is corrected back to OPEN.
+
+    Before this correction, the same outcome was asserted for a merely
+    *unconfirmed* (``status=None``, genuinely ambiguous) exit order —
+    which Phase 2 review established is unsafe: a still-open position does
+    not prove a close was never submitted, and reverting on that basis
+    risks a second close racing the original one's independent resolution.
+    See ``test_close_submission_unknown_with_a_genuinely_ambiguous_exit_fails_closed``
+    below for that corrected case.
+    """
     repository = _repository(tmp_path)
     session_id = _session_id(repository)
     repository.upsert_strategy_basket(
@@ -520,11 +531,12 @@ def test_close_submission_unknown_with_a_still_open_position_reverts_to_open(tmp
         repository, session_id=session_id, security_id=CE1, side=OrderSide.SELL, quantity=750,
         basket_id=BASKET_ID, leg_id=CE1_LEG_ID, status=OrderStatus.FILLED, fill_price=100.0,
     )
-    # The close was reserved but never confirmed — the position is still
-    # genuinely OPEN in the authoritative table.
+    # The close was submitted and definitively REJECTED at the broker — not
+    # merely unconfirmed — so the position is, correctly and provably,
+    # still OPEN in the authoritative table.
     _place_order(
         repository, session_id=session_id, security_id=CE1, side=OrderSide.BUY, quantity=750,
-        basket_id=BASKET_ID, leg_id=CE1_LEG_ID, status=None,
+        basket_id=BASKET_ID, leg_id=CE1_LEG_ID, status=OrderStatus.REJECTED,
     )
     _seed_leg(
         repository, leg_id=CE1_LEG_ID, security_id=CE1, role="CE", sequence=1, side="SELL",
@@ -540,6 +552,36 @@ def test_close_submission_unknown_with_a_still_open_position_reverts_to_open(tmp
     assert leg.entry_price == 100.0
     assert leg.exit_price is None
     assert basket.lifecycle_state == "OPEN", "the stale CLOSED label must be corrected"
+
+
+def test_close_submission_unknown_with_a_genuinely_ambiguous_exit_fails_closed(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Phase 2 correction: a still-open position does NOT prove the close
+    was never submitted — the exit order here is reserved but genuinely
+    unconfirmed (``status=None``), which could still resolve independently
+    at the broker. Reverting to OPEN on the strength of the open position
+    alone would risk a second close racing that resolution, so this must
+    fail closed instead — never guessing the leg is safe to manage again."""
+    repository = _repository(tmp_path)
+    session_id = _session_id(repository)
+    _seed_basket(repository)
+    ce_corr = _place_order(
+        repository, session_id=session_id, security_id=CE1, side=OrderSide.SELL, quantity=750,
+        basket_id=BASKET_ID, leg_id=CE1_LEG_ID, status=OrderStatus.FILLED, fill_price=100.0,
+    )
+    # Reserved but never confirmed — genuinely ambiguous, not a definitive
+    # rejection. The position is still OPEN in the authoritative table.
+    _place_order(
+        repository, session_id=session_id, security_id=CE1, side=OrderSide.BUY, quantity=750,
+        basket_id=BASKET_ID, leg_id=CE1_LEG_ID, status=None,
+    )
+    _seed_leg(
+        repository, leg_id=CE1_LEG_ID, security_id=CE1, role="CE", sequence=1, side="SELL",
+        quantity=750, entry_price=100.0, entry_correlation_id=ce_corr,
+        state="CLOSE_SUBMISSION_UNKNOWN",
+    )
+
+    with pytest.raises(UnmanageableBasketState):
+        recover_basket(_config(), repository)
 
 
 # --------------------------------------------------------- direct-fn probe

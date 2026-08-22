@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable
+from dataclasses import replace as dataclass_replace
 from datetime import datetime
 from importlib import import_module
 from pathlib import Path
@@ -52,12 +53,14 @@ from common.engine.gateway import LifecycleGateway
 from common.engine.hub_feed import HubTickFeed
 from common.engine.multi_leg_engine import MultiLegEngine
 from common.engine.multi_leg_models import (
+    AdjustmentLifecycle,
     Basket,
+    BasketRollState,
     LegInstance,
     LegState,
     UnmanageableBasketState,
 )
-from common.engine.multi_leg_state import BasketRowInconsistent
+from common.engine.multi_leg_state import BasketRowInconsistent, RollLedger
 from common.engine.multi_leg_state import load_basket as _load_basket
 from common.engine.multi_leg_state import persist_basket as _persist_basket_row
 from common.engine.multi_leg_state import persist_leg as _persist_leg_row
@@ -71,6 +74,7 @@ from common.engine.selection import (
 )
 from common.engine.square_off import PersistedSquareOffAuthority, SquareOffAuthority
 from common.execution import ExecutionRepository, OrderLifecycle
+from common.execution.repository import resolve_intent_outcome
 from common.health import HealthState, HeartbeatWriter
 from common.logging import get_logger
 from common.models import OrderSide
@@ -98,6 +102,13 @@ from .worker import (
 log = get_logger(__name__)
 
 _DRAIN_JOIN_SECONDS = 2.0
+
+#: Phase 2 (strategy-rolling-strangle-otm1): every lifecycle_state value
+#: this reconciliation pass recognises — derived from AdjustmentLifecycle
+#: itself, never hand-duplicated, so it cannot silently drift from the
+#: real vocabulary. See _reconcile_basket_rolls for why an unrecognised
+#: value must fail closed rather than be silently skipped.
+_RECOGNIZED_ROLL_LIFECYCLE_STATES = frozenset(state.value for state in AdjustmentLifecycle)
 
 
 # --------------------------------------------------------------- strategy loading
@@ -234,12 +245,37 @@ def _reconcile_basket(
                 f"{basket.basket_id!r} claims it"
             )
 
-    # Correction requirement: replacement awaiting entry while the
-    # adjusted-out leg is still open. AWAITING_NEXT_CANDLE/REPLACEMENT_PENDING
-    # both mean "a replacement may be entered/was entered for this role" —
-    # neither may coexist with an OPEN or unresolved leg of that same role
-    # other than the just-adopted replacement itself (sequence check: the
-    # replacement, if any, always has a higher sequence than what it replaced).
+    # Phase 2 (strategy-rolling-strangle-otm1): replacement awaiting entry
+    # while the adjusted-out leg is still open — checked precisely against
+    # the roll ledger's own concrete target_leg_id per claim, not a
+    # role-wide "not is_replacement" heuristic. That heuristic breaks the
+    # moment a *second* roll closes a leg that is itself a replacement
+    # (is_replacement=True) — exactly the repeated-roll case this ledger
+    # exists for — since it would then silently treat that leg's own
+    # staleness as invisible. basket.roll_state is never None (see
+    # Basket.__post_init__/load_basket) — an empty claims tuple (every
+    # straddle_920 basket that has never rolled) makes this a no-op.
+    if basket.roll_state is not None:
+        for claim in basket.roll_state.claims:
+            if claim.lifecycle_state != "AWAITING_NEXT_CANDLE":
+                continue
+            target_leg = basket.legs.get(claim.target_leg_id)
+            if target_leg is not None and target_leg.state is LegState.OPEN:
+                mismatches.append(
+                    f"basket {basket.basket_id!r} has a replacement pending for "
+                    f"{claim.leg_role.value} (roll #{claim.roll_sequence}) while its "
+                    f"adjusted-out leg {claim.target_leg_id!r} is still OPEN"
+                )
+
+    # Correction requirement (pre-Phase-2 legacy data, kept as a
+    # defence-in-depth fallback): replacement awaiting entry while *some*
+    # non-replacement leg of that role is still open. AWAITING_NEXT_CANDLE/
+    # REPLACEMENT_PENDING both mean "a replacement may be entered/was
+    # entered for this role" — neither may coexist with an OPEN or
+    # unresolved leg of that same role other than the just-adopted
+    # replacement itself. Covers a basket whose pending_replacement_role
+    # was written before migration 0013 existed and so has no
+    # strategy_basket_rolls row for the check above to find.
     if basket.pending_replacement_role is not None:
         role = basket.pending_replacement_role
         stale_open = [
@@ -253,6 +289,8 @@ def _reconcile_basket(
                 f"while leg(s) {[leg.leg_id for leg in stale_open]} of that role are still OPEN"
             )
 
+    mismatches.extend(_reconcile_basket_rolls(repository, basket))
+
     if not mismatches and basket.lifecycle_state == "CLOSED" and open_positions:
         # A leg reverted back to OPEN above (a square-off close that never
         # actually took) makes this label stale rather than wrong — correct
@@ -263,6 +301,176 @@ def _reconcile_basket(
         basket.square_off_state = "PENDING"
 
     return mismatches
+
+
+def _reconcile_basket_rolls(repository: ExecutionRepository, basket: Basket) -> list[str]:
+    """Phase 2 (strategy-rolling-strangle-otm1): reconcile every
+    non-terminal ``strategy_basket_rolls`` claim against its **own**
+    reserved ``close_intent_id`` — never by scanning a leg's full order
+    history (:func:`_reconcile_leg`'s own multi-attempt handling is a
+    separate, independent concern: a later, unrelated square-off attempt
+    on the same leg must not leak into a roll claim's own outcome; see
+    migration ``0013``'s header). Mutates ``basket.roll_state`` in place
+    with the resolved outcomes, mirroring ``_reconcile_basket``'s own
+    "correct in place from authoritative data" contract for legs.
+
+    A ``CLAIMED`` target (``close_intent_id`` still ``NULL``) is left
+    exactly as it is — nothing was ever dispatched under any identity, so
+    it is unconditionally safe to resume with a fresh submission; no
+    authoritative lookup is needed or possible.
+
+    An ``EXIT_SUBMISSION_PENDING`` target's ``close_intent_id`` is, by
+    construction, always populated (the atomic reserve-and-associate
+    write) — resolved via the same :func:`~common.execution.repository.
+    resolve_intent_outcome` classification restart recovery already uses
+    for legs, so a live exception and a post-crash restart resolve
+    identically:
+
+    * ``FILLED`` -> ``EXIT_CONFIRMED``;
+    * ``TERMINAL_NO_FILL`` -> ``FAILED`` (the leg's own OPEN reconstruction
+      is :func:`_reconcile_leg`'s job, via that leg's own order history);
+    * anything else (``UNKNOWN``, or the structurally-unreachable
+      ``NEVER_PLACED``) -> ``EXIT_UNKNOWN`` — never retried merely because
+      a position is still open.
+
+    Once every member of one ``claim_group_id`` reaches ``EXIT_CONFIRMED``,
+    the whole group advances to ``AWAITING_NEXT_CANDLE`` together — mirrors
+    ``MultiLegEngine._maybe_advance_claim_group`` for the case where that
+    confirmation only became knowable through reconciliation (e.g. the
+    second target's own best-effort outcome write was lost).
+
+    Returns every discrepancy that could not be safely resolved — for now,
+    only a structurally-impossible ``EXIT_SUBMISSION_PENDING`` row with no
+    ``close_intent_id`` (a code defect, not a real-world race) — mirroring
+    ``_reconcile_basket``'s own fail-closed contract.
+    """
+    if basket.roll_state is None or not basket.roll_state.claims:
+        return []
+
+    mismatches: list[str] = []
+    resolved: dict[tuple[str, int], str] = {}
+    for claim in basket.roll_state.claims:
+        if claim.lifecycle_state not in _RECOGNIZED_ROLL_LIFECYCLE_STATES:
+            # An unrecognised durable lifecycle_state must never be
+            # silently treated as terminal, eligible, replaceable or safe
+            # to continue — RollClaim.lifecycle_state is deliberately kept
+            # as a permissive str on load (see that class's own docstring)
+            # precisely so a future vocabulary extension is representable
+            # rather than raising there; the fail-closed obligation lives
+            # here instead, at the point a decision would otherwise be made
+            # from it. Fails the whole basket closed via the normal
+            # mismatches path — UnmanageableBasketState, entries blocked, a
+            # critical incident recorded, exposure preserved untouched.
+            mismatches.append(
+                f"basket {basket.basket_id!r} roll claim ({claim.leg_role.value} "
+                f"#{claim.roll_sequence}) has an unrecognised lifecycle_state "
+                f"{claim.lifecycle_state!r} — refusing to reconcile or manage it "
+                "automatically"
+            )
+            continue
+        if claim.lifecycle_state != "EXIT_SUBMISSION_PENDING":
+            continue
+        if claim.close_intent_id is None:
+            mismatches.append(
+                f"basket {basket.basket_id!r} roll claim ({claim.leg_role.value} "
+                f"#{claim.roll_sequence}) is EXIT_SUBMISSION_PENDING with no "
+                "close_intent_id on record — structurally impossible under migration "
+                "0013's atomic reserve-and-associate write"
+            )
+            continue
+        row = repository.order_intent_by_id(claim.close_intent_id)
+        outcome = resolve_intent_outcome(row)
+        if outcome == "FILLED":
+            new_state = "EXIT_CONFIRMED"
+        elif outcome == "TERMINAL_NO_FILL":
+            new_state = "FAILED"
+        else:  # UNKNOWN, or the structurally-unreachable NEVER_PLACED
+            new_state = "EXIT_UNKNOWN"
+        repository.update_basket_roll_outcome(
+            basket_id=basket.basket_id,
+            leg_role=claim.leg_role.value,
+            roll_sequence=claim.roll_sequence,
+            lifecycle_state=new_state,
+        )
+        resolved[(claim.leg_role.value, claim.roll_sequence)] = new_state
+
+    if resolved:
+        basket.roll_state = BasketRollState(
+            reference_price=basket.roll_state.reference_price,
+            anchor_candle_ts=basket.roll_state.anchor_candle_ts,
+            claims=tuple(
+                dataclass_replace(claim, lifecycle_state=resolved[key])
+                if (key := (claim.leg_role.value, claim.roll_sequence)) in resolved
+                else claim
+                for claim in basket.roll_state.claims
+            ),
+        )
+
+    confirmed = "EXIT_CONFIRMED"
+    advancing: list[str] = []
+    for group_id in {claim.claim_group_id for claim in basket.roll_state.claims}:
+        members = basket.roll_state.claims_for_group(group_id)
+        if members and all(member.lifecycle_state == confirmed for member in members):
+            advancing.append(group_id)
+    if advancing:
+        for group_id in advancing:
+            for member in basket.roll_state.claims_for_group(group_id):
+                repository.update_basket_roll_outcome(
+                    basket_id=basket.basket_id,
+                    leg_role=member.leg_role.value,
+                    roll_sequence=member.roll_sequence,
+                    lifecycle_state="AWAITING_NEXT_CANDLE",
+                )
+        advancing_set = set(advancing)
+        basket.roll_state = BasketRollState(
+            reference_price=basket.roll_state.reference_price,
+            anchor_candle_ts=basket.roll_state.anchor_candle_ts,
+            claims=tuple(
+                dataclass_replace(claim, lifecycle_state="AWAITING_NEXT_CANDLE")
+                if claim.claim_group_id in advancing_set
+                else claim
+                for claim in basket.roll_state.claims
+            ),
+        )
+
+    return mismatches
+
+
+def _classify_exit_attempts(exit_rows: list[Any]) -> tuple[str, Any]:
+    """Phase 2 (strategy-rolling-strangle-otm1): classify potentially
+    *multiple* exit-side ``order_intents`` rows for one leg into a single
+    authoritative outcome. A leg may legitimately carry more than one exit
+    attempt — a definitively rejected adjustment/roll close followed,
+    later, by an unrelated hard square-off closing the same leg — which
+    the previous unconditional ``len(exit_rows) > 1`` refusal could not
+    tolerate. Never treats this as corruption by count alone; still fails
+    closed on genuine ambiguity or a genuine over-close.
+
+    Returns ``(outcome, definitive_row)``:
+
+    * exactly one row ``FILLED`` -> ``("FILLED", that row)`` — authoritative
+      regardless of how many ``TERMINAL_NO_FILL`` rows exist alongside it;
+    * two or more rows ``FILLED`` -> ``("OVER_CLOSE", None)`` — a genuine
+      contradiction (real exposure closed twice), never resolved
+      automatically;
+    * no row ``FILLED`` but at least one ``UNKNOWN`` ->
+      ``("UNKNOWN", None)`` — the leg's true status cannot be established
+      with confidence from any attempt;
+    * no rows at all, or every row ``TERMINAL_NO_FILL`` ->
+      ``("TERMINAL_NO_FILL", None)`` — safe: nothing has ever closed this
+      leg through any attempt on record.
+    """
+    if not exit_rows:
+        return "TERMINAL_NO_FILL", None
+    classified = [(row, _resolve_intent_outcome(row)) for row in exit_rows]
+    filled = [row for row, outcome in classified if outcome == "FILLED"]
+    if len(filled) > 1:
+        return "OVER_CLOSE", None
+    if len(filled) == 1:
+        return "FILLED", filled[0]
+    if any(outcome == "UNKNOWN" for _row, outcome in classified):
+        return "UNKNOWN", None
+    return "TERMINAL_NO_FILL", None
 
 
 def _reconcile_leg(
@@ -279,12 +487,15 @@ def _reconcile_leg(
     exit_rows = [r for r in history if r["side"] != entry_side]
     if len(entry_rows) > 1:
         return f"leg {leg.leg_id!r} has {len(entry_rows)} entry order_intents rows (expected <= 1)"
-    if len(exit_rows) > 1:
-        return f"leg {leg.leg_id!r} has {len(exit_rows)} exit order_intents rows (expected <= 1)"
     entry_row = entry_rows[0] if entry_rows else None
-    exit_row = exit_rows[0] if exit_rows else None
     entry_outcome = _resolve_intent_outcome(entry_row)
-    exit_outcome = _resolve_intent_outcome(exit_row)
+    exit_outcome, definitive_exit_row = _classify_exit_attempts(exit_rows)
+    if exit_outcome == "OVER_CLOSE":
+        return (
+            f"leg {leg.leg_id!r} has more than one CONFIRMED closing fill across its "
+            f"{len(exit_rows)} exit attempt(s) — an over-close contradiction that cannot "
+            "be resolved automatically"
+        )
     position = open_positions.get(leg.contract.security_id) if leg.contract is not None else None
 
     if leg.state is LegState.OPEN:
@@ -342,28 +553,45 @@ def _reconcile_leg(
 
     if leg.state is LegState.CLOSE_SUBMISSION_UNKNOWN:
         if exit_outcome == "FILLED":
-            _resolve_unknown_close(leg, exit_row)
+            _resolve_unknown_close(leg, definitive_exit_row)
+            _backfill_realized_gross_pnl(repository, leg)
             return None
-        if position is not None:
-            # The close never actually took (rejected/cancelled/never even
-            # submitted/still ambiguous) and the position is still OPEN at
-            # the authoritative table — real exposure remains. Adopt it back
-            # as OPEN so square-off can manage it, rather than leaving it
-            # invisible to this process.
-            _revert_unresolved_close_to_open(leg, position)
-            return None
+        if exit_outcome == "TERMINAL_NO_FILL":
+            # Phase 2 correction: only a *definitive* proof that every exit
+            # attempt on record failed (rejected/cancelled/expired, or
+            # risk-blocked) may revert this leg to OPEN. A merely
+            # ambiguous/pending attempt does NOT prove the close was never
+            # submitted — see the UNKNOWN branch below — so this branch, not
+            # "position is still open" alone, is what makes a revert safe.
+            if position is not None:
+                _revert_unresolved_close_to_open(leg, position)
+                return None
+            return (
+                f"leg {leg.leg_id!r}'s close attempt(s) all definitively failed but no "
+                "open position exists to adopt back — cannot establish whether real "
+                "exposure remains"
+            )
+        # UNKNOWN: at least one exit attempt is still genuinely pending or
+        # ambiguous. Never reverted to OPEN-and-eligible merely because a
+        # position row still shows open — that close may yet resolve
+        # independently, and reverting risks a second, duplicate close
+        # attempt racing it. Fail closed instead; only an operator or a
+        # later authoritative resolution may clear this.
         return (
-            f"leg {leg.leg_id!r}'s close outcome is unresolved ({exit_outcome}) and no open "
-            "position exists to adopt back — cannot establish whether real exposure remains"
+            f"leg {leg.leg_id!r}'s close outcome is unresolved ({exit_outcome}) — at least "
+            "one exit attempt is still pending or ambiguous; cannot safely conclude "
+            "whether real exposure remains without guessing"
         )
 
     # Terminal states (CLOSED/FAILED/EXPIRED): the one contradiction that
     # matters is real exposure the projection believes is gone.
-    if leg.state is LegState.CLOSED and position is not None:
-        return (
-            f"leg {leg.leg_id!r} is CLOSED in the projection but position "
-            f"{leg.contract.security_id if leg.contract else '?'} is still OPEN"
-        )
+    if leg.state is LegState.CLOSED:
+        if position is not None:
+            return (
+                f"leg {leg.leg_id!r} is CLOSED in the projection but position "
+                f"{leg.contract.security_id if leg.contract else '?'} is still OPEN"
+            )
+        _backfill_realized_gross_pnl(repository, leg)
     return None
 
 
@@ -371,28 +599,15 @@ def _resolve_intent_outcome(row: Any) -> str:
     """Classify one ``leg_order_history`` row (or ``None``) into the outcome
     :func:`_reconcile_leg` needs to decide what, if anything, to do.
 
-    ``"NEVER_PLACED"``: no intent row at all for this side.
-    ``"TERMINAL_NO_FILL"``: risk-blocked, or the order reached a terminal
-    non-fill state (REJECTED/CANCELLED/EXPIRED) — nothing happened at the
-    broker, safe to treat as if no attempt occurred.
-    ``"FILLED"``: a confirmed fill.
-    ``"UNKNOWN"``: reserved but the submission outcome was never recorded
-    (a crash between ``reserve_intent`` and ``record_submission``), still
-    non-terminal (SUBMITTED/ACKNOWLEDGED/PENDING/UNKNOWN), or partially
-    filled — genuinely ambiguous, never guessed through.
+    Phase 2 (strategy-rolling-strangle-otm1): this is now a thin alias for
+    :func:`~common.execution.repository.resolve_intent_outcome` — the single
+    shared classifier restart reconciliation and the engine's same-process
+    close-outcome resolution both use, so the two can never drift apart.
+    Kept as a module-level name here (rather than updating every call site
+    below to the qualified import) to keep this diff minimal; behaviour is
+    byte-identical to the classifier this used to define locally.
     """
-    if row is None:
-        return "NEVER_PLACED"
-    if row["risk_decision"] == "BLOCKED":
-        return "TERMINAL_NO_FILL"
-    status = row["order_status"]
-    if status is None:
-        return "UNKNOWN"
-    if status == "FILLED":
-        return "FILLED"
-    if status in ("REJECTED", "CANCELLED", "EXPIRED"):
-        return "TERMINAL_NO_FILL"
-    return "UNKNOWN"  # PENDING, SUBMITTED, ACKNOWLEDGED, PARTIALLY_FILLED, UNKNOWN
+    return resolve_intent_outcome(row)
 
 
 def _upgrade_pending_leg_to_open(leg: LegInstance, entry_row: Any, position: Any) -> None:
@@ -420,6 +635,23 @@ def _resolve_unknown_close(leg: LegInstance, exit_row: Any) -> None:
     leg.state = LegState.CLOSED
     leg.exit_price = exit_row["order_average_fill_price"]
     leg.exit_correlation_id = exit_row["correlation_id"]
+
+
+def _backfill_realized_gross_pnl(repository: ExecutionRepository, leg: LegInstance) -> None:
+    """Phase 2 (strategy-rolling-strangle-otm1): reconstruct
+    ``strategy_legs.realized_gross_pnl`` from the authoritative
+    ``trade_ledger`` when the best-effort post-close projection write was
+    lost. Required because ``rolling_strangle_otm1``'s combined stop sums
+    realised P&L across rolled-out legs (spec section 10.1) — a silently
+    missing value would under-count it after a restart and could fail to
+    trigger. Only fills a genuinely missing value; never overwrites an
+    existing one (the projection's own figure, when present, is already
+    the exact number the strategy's own risk formula used at the time)."""
+    if leg.realized_gross_pnl is not None or leg.exit_correlation_id is None:
+        return
+    value = repository.trade_ledger_gross_pnl_for_exit(leg.exit_correlation_id)
+    if value is not None:
+        leg.realized_gross_pnl = value
 
 
 def _revert_unresolved_close_to_open(leg: LegInstance, position: Any) -> None:
@@ -737,6 +969,20 @@ def _build(
             message=f"basket={basket_id}: {message}",
         )
 
+    # Phase 2 (strategy-rolling-strangle-otm1). Wired generically for any
+    # multi-leg strategy — including straddle_920, whose own EXIT_LEG +
+    # ExitReason.ADJUSTMENT is normalised into the same claim machinery
+    # (MultiLegEngine._close_adjusted_legs), gaining the same durable
+    # close-attempt identity tracking with no change to its externally
+    # observable behaviour. See RollLedgerPort's own docstring.
+    roll_ledger = RollLedger(
+        repository,
+        runtime_id=config.runtime_id,
+        strategy_id=config.strategy_id,
+        execution_mode=config.execution_mode,
+        trading_date=config.trading_date,
+    )
+
     engine = MultiLegEngine(
         cfg,
         feed=feed,
@@ -765,6 +1011,7 @@ def _build(
         persist_basket=_persist_basket_cb,
         persist_leg=_persist_leg_cb,
         record_incident=_record_incident_cb,
+        roll_ledger=roll_ledger,
         trading_date=config.trading_date,
     )
     holder.append(engine)

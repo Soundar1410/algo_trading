@@ -39,6 +39,7 @@ because a rejected order is still an order.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -51,7 +52,7 @@ from .positions import FillOutcome
 from .state_payload import OPEN_POSITION_KEY, merge_payload
 
 if TYPE_CHECKING:  # typing only: keeps common.execution out of the import graph
-    from common.execution.lifecycle import ExecutionResult, OrderLifecycle
+    from common.execution.lifecycle import ExecutionResult, OrderLifecycle, ReservedIntent
     from common.execution.repository import ExecutionRepository
 
 log = get_logger(__name__)
@@ -73,6 +74,21 @@ class GatewayExecutionError(RuntimeError):
     caller is :class:`~common.engine.positions.PositionManager`, whose next act
     would be to record a position that does not exist or to forget one that does.
     """
+
+
+@dataclass(frozen=True)
+class ReservedExecution:
+    """Phase 2 (strategy-rolling-strangle-otm1): a durably reserved close,
+    not yet submitted — returned by :meth:`LifecycleGateway.reserve_sell`/
+    ``reserve_buy``, passed to :meth:`LifecycleGateway.submit_reserved` to
+    actually call the broker. Opaque outside this module beyond ``side``/
+    ``contract``/``lots`` (needed to interpret ``submit_reserved``'s own
+    result the same way :meth:`_execute` already does)."""
+
+    reserved_intent: ReservedIntent
+    side: Side
+    contract: OptionContract
+    lots: int
 
 
 class LifecycleGateway:
@@ -157,6 +173,122 @@ class LifecycleGateway:
             leg_id=leg_id,
             cycle_id=cycle_id,
         )
+
+    # --------------------------------------------------- roll-close reservation
+    # Phase 2 (strategy-rolling-strangle-otm1). Used exclusively by
+    # MultiLegEngine's roll-close path (via PositionManager.reserve_close/
+    # submit_close) — square-off, the combined stop and every other close
+    # keep using sell()/buy() unchanged. See migration 0013's header for why
+    # a roll's close-attempt identity must be reserved, and atomically
+    # associated with its durable claim row, before the broker is ever
+    # called — separately from actually submitting it.
+    def reserve_sell(
+        self,
+        contract: OptionContract,
+        lots: int,
+        *,
+        ref_price: float,
+        ts: datetime,
+        basket_id: str | None,
+        leg_id: str | None,
+        leg_role: str,
+        roll_sequence: int,
+    ) -> ReservedExecution:
+        return self._reserve(
+            OrderSide.SELL,
+            contract,
+            lots,
+            ref_price=ref_price,
+            ts=ts,
+            basket_id=basket_id,
+            leg_id=leg_id,
+            leg_role=leg_role,
+            roll_sequence=roll_sequence,
+        )
+
+    def reserve_buy(
+        self,
+        contract: OptionContract,
+        lots: int,
+        *,
+        ref_price: float,
+        ts: datetime,
+        basket_id: str | None,
+        leg_id: str | None,
+        leg_role: str,
+        roll_sequence: int,
+    ) -> ReservedExecution:
+        return self._reserve(
+            OrderSide.BUY,
+            contract,
+            lots,
+            ref_price=ref_price,
+            ts=ts,
+            basket_id=basket_id,
+            leg_id=leg_id,
+            leg_role=leg_role,
+            roll_sequence=roll_sequence,
+        )
+
+    def _reserve(
+        self,
+        side: Side,
+        contract: OptionContract,
+        lots: int,
+        *,
+        ref_price: float,
+        ts: datetime,
+        basket_id: str | None,
+        leg_id: str | None,
+        leg_role: str,
+        roll_sequence: int,
+    ) -> ReservedExecution:
+        # Deferred: common.execution stays out of this module's module-level
+        # import graph (see the TYPE_CHECKING block above) — this is the one
+        # runtime need for a real (not type-only) reference to it.
+        from common.execution.lifecycle import RollCloseAssociation
+
+        quantity = lots * contract.lot_size
+        start_at, end_at = self._window(contract.symbol, ts)
+        signal = Signal(
+            strategy_id=self._strategy_id,
+            execution_mode=self._mode,
+            instrument=contract.symbol,
+            security_id=contract.security_id,
+            side=side,
+            quantity=quantity,
+            candle=Candle(
+                security_id=contract.security_id,
+                instrument=contract.symbol,
+                open=ref_price,
+                high=ref_price,
+                low=ref_price,
+                close=ref_price,
+                volume=0,
+                start_at=start_at,
+                end_at=end_at,
+            ),
+            reference_price=ref_price,
+            evaluated_at=ts,
+            reason=f"engine roll-close {side.value} {lots} lot(s) of {contract.symbol}",
+        )
+        reserved_intent = self._lifecycle.reserve(
+            signal,
+            trading_date=self._trading_date,
+            basket_id=basket_id,
+            leg_id=leg_id,
+            roll_association=RollCloseAssociation(leg_role=leg_role, roll_sequence=roll_sequence),
+        )
+        return ReservedExecution(
+            reserved_intent=reserved_intent, side=side, contract=contract, lots=lots
+        )
+
+    def submit_reserved(self, reserved: ReservedExecution) -> FillOutcome:
+        result = self._lifecycle.submit(reserved.reserved_intent)
+        self._require_a_fill(result, reserved.side, reserved.contract)
+        self.executions += 1
+        self._record_contract(reserved.contract, reserved.lots, reserved.side, result)
+        return self._outcome(result)
 
     # ------------------------------------------------------------- the plumbing
     def _execute(

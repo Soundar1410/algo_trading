@@ -32,7 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from common.models import ExitReason, OrderSide
 
@@ -57,6 +57,7 @@ __all__ = [
     "LegState",
     "MultiLegDurabilityError",
     "RollClaim",
+    "RollLedgerPort",
     "UnmanageableBasketState",
 ]
 
@@ -496,6 +497,87 @@ class BasketRollState:
         return tuple(c for c in self.claims if c.claim_group_id == claim_group_id)
 
 
+@runtime_checkable
+class RollLedgerPort(Protocol):
+    """The multi-leg engine's durable-roll-ledger seam (migration ``0013``,
+    Phase 2). Mirrors the ``persist_basket``/``persist_leg``/
+    ``recover_basket`` callable-injection pattern
+    :class:`~common.engine.multi_leg_engine.MultiLegEngine` already uses:
+    **``None`` wired is an explicit, supported "roll ledger not available"
+    mode** — every existing offline/test engine construction (every
+    ``straddle_920`` durability/engine/acceptance test, unchanged) — under
+    which ``MultiLegEngine._close_adjusted_legs`` falls back to the
+    original single-target ``_close_adjusted_leg`` it replaces, byte-
+    identical to before Phase 2.
+
+    A real worker wires a real implementation backed by
+    :class:`~common.execution.repository.ExecutionRepository` generically
+    for *any* multi-leg strategy — including ``straddle_920``, whose own
+    ``EXIT_LEG`` + ``ExitReason.ADJUSTMENT`` is normalised into this same
+    claim machinery, gaining the same close-attempt identity tracking
+    ``rolling_strangle_otm1`` needs, with zero behavioural change to its
+    externally observable outcomes.
+    """
+
+    def commit_claims(
+        self,
+        basket: Basket,
+        *,
+        claim_group_id: str,
+        targets: tuple[AdjustmentTarget, ...],
+        anchor: AnchorUpdate | None,
+        claim_candle_ts: datetime,
+        claimed_at: datetime,
+    ) -> dict[str, int]:
+        """Atomically write, in **one transaction**: ``basket``'s scalar
+        compatibility projection (mirroring
+        :func:`~common.engine.multi_leg_state.persist_basket`'s own field
+        mapping), the anchor re-anchor if ``anchor`` is given, and one
+        freshly-``CLAIMED`` row per target. Raises on any failure — never
+        partially applies (see migration ``0013``'s header).
+
+        Returns the ``target_leg_id -> roll_sequence`` this claim assigned
+        each target, so the caller does not have to re-derive it from
+        ``basket.roll_state`` a second time."""
+        ...
+
+    def record_outcome(
+        self,
+        *,
+        basket_id: str,
+        leg_role: LegRole,
+        roll_sequence: int,
+        lifecycle_state: str,
+        replacement_leg_id: str | None = None,
+    ) -> None:
+        """Progress one already-claimed row's ``lifecycle_state`` (e.g.
+        ``EXIT_CONFIRMED``, ``FAILED``, ``EXIT_UNKNOWN``,
+        ``AWAITING_NEXT_CANDLE``, ``REPLACEMENT_PENDING``, ...). Best-effort
+        from the caller's own perspective — see
+        ``MultiLegEngine._close_adjusted_legs_with_ledger`` for how a write
+        failure here is handled (never lets a bookkeeping write undo or
+        block a trading event that already happened)."""
+        ...
+
+    def resolve_close_intent(self, close_intent_id: int) -> str:
+        """The authoritative outcome for one already-reserved close intent
+        — ``NEVER_PLACED`` / ``TERMINAL_NO_FILL`` / ``FILLED`` / ``UNKNOWN``,
+        the same classification restart recovery uses
+        (:func:`~common.execution.repository.resolve_intent_outcome`) — so
+        a live exception is resolved identically to a post-crash one."""
+        ...
+
+    def consume_group_replacement(
+        self, *, basket_id: str, members: tuple[tuple[LegRole, int], ...]
+    ) -> None:
+        """Atomically consume every member's one-shot replacement attempt
+        (transition to ``'REPLACEMENT_PENDING'``) in **one transaction** —
+        a both-leg claim group's re-entry must never durably consume one
+        role's attempt while another's fails partway. Raises, committing
+        nothing, if any member cannot be progressed."""
+        ...
+
+
 @dataclass
 class Basket:
     """One logical basket — e.g. the straddle for one trading day.
@@ -523,15 +605,20 @@ class Basket:
     square_off_state: str = "PENDING"
     lifecycle_state: str = "OPEN"
     created_at: datetime | None = None
-    #: Hydrated, read-only durable roll state (migration ``0013``). The
-    #: constructor default (``None``) means only "not yet loaded from
-    #: durable storage" — :func:`~common.engine.multi_leg_state.load_basket`
-    #: always sets this to a real :class:`BasketRollState`, with empty
-    #: ``claims`` and a ``None`` reference price when the basket has never
-    #: claimed a roll (including every ``straddle_920`` basket, which does
-    #: not use this table), so a strategy reading a loaded basket never has
-    #: to distinguish "never loaded" from "loaded, nothing yet".
+    #: Hydrated, read-only durable roll state (migration ``0013``). Pass
+    #: ``None`` (the default) at construction and ``__post_init__`` below
+    #: fills in a real, empty :class:`BasketRollState` — so a strategy never
+    #: has to distinguish "freshly constructed", "loaded with no roll
+    #: history" (every ``straddle_920`` basket, which does not use this
+    #: table) and "loaded with roll history": all three read the same
+    #: shape. :func:`~common.engine.multi_leg_state.load_basket` overwrites
+    #: this with the real hydrated value after construction, for a basket
+    #: that has one.
     roll_state: BasketRollState | None = None
+
+    def __post_init__(self) -> None:
+        if self.roll_state is None:
+            self.roll_state = BasketRollState(reference_price=None, anchor_candle_ts=None)
 
     # ------------------------------------------------------------- queries
     def open_legs(self) -> list[LegInstance]:

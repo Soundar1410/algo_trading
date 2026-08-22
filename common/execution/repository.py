@@ -48,6 +48,42 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def resolve_intent_outcome(row: sqlite3.Row | None) -> str:
+    """Classify one ``leg_order_history``/``order_intent_by_id`` row (or
+    ``None``) into an authoritative outcome. The single shared classifier
+    for both restart-time reconciliation
+    (``runtimes.intraday_options.multi_leg_engine_worker._reconcile_leg``,
+    which imports and uses this directly rather than keeping its own
+    parallel copy) and same-process resolution after a close exception
+    (``common.engine.multi_leg_engine``, via a ``RollLedgerPort``
+    implementation) — a live exception is resolved identically to a
+    post-crash one, which is the whole point: the classification must never
+    drift between the two call sites.
+
+    ``"NEVER_PLACED"``: no intent row at all for this attempt.
+    ``"TERMINAL_NO_FILL"``: risk-blocked, or the order reached a terminal
+    non-fill state (REJECTED/CANCELLED/EXPIRED) — nothing happened at the
+    broker, safe to treat as if no attempt occurred.
+    ``"FILLED"``: a confirmed fill.
+    ``"UNKNOWN"``: reserved but the submission outcome was never recorded
+    (a crash between ``reserve_intent`` and ``record_submission``), still
+    non-terminal (SUBMITTED/ACKNOWLEDGED/PENDING/UNKNOWN), or partially
+    filled — genuinely ambiguous, never guessed through.
+    """
+    if row is None:
+        return "NEVER_PLACED"
+    if row["risk_decision"] == "BLOCKED":
+        return "TERMINAL_NO_FILL"
+    status = row["order_status"]
+    if status is None:
+        return "UNKNOWN"
+    if status == "FILLED":
+        return "FILLED"
+    if status in ("REJECTED", "CANCELLED", "EXPIRED"):
+        return "TERMINAL_NO_FILL"
+    return "UNKNOWN"  # PENDING, SUBMITTED, ACKNOWLEDGED, PARTIALLY_FILLED, UNKNOWN
+
+
 @dataclass(frozen=True)
 class BasketRollClaimSeed:
     """One target's create-time fields for :meth:`ExecutionRepository.
@@ -1754,6 +1790,31 @@ class ExecutionRepository:
         )
         return row
 
+    def trade_ledger_gross_pnl_for_exit(self, exit_correlation_id: str) -> float | None:
+        """The authoritative gross P&L already booked for one closing fill —
+        used to backfill ``strategy_legs.realized_gross_pnl`` when that
+        best-effort projection write was lost (Phase 2:
+        ``rolling_strangle_otm1``'s combined stop sums realised P&L across
+        rolled-out legs, so a silently-missing value would under-count it
+        after a restart). ``trade_ledger`` (migration ``0008``) is
+        append-only and keyed ``UNIQUE (exit_correlation_id,
+        exit_broker_fill_id)`` — summed defensively in case of more than
+        one row (this project represents no partial fills today, so exactly
+        one is expected in practice). Returns ``None`` if no row exists for
+        this correlation id at all, distinct from a genuine zero P&L."""
+        row = (
+            self._db.connect()
+            .execute(
+                "SELECT COUNT(*) AS n, COALESCE(SUM(gross_pnl), 0.0) AS total "
+                "FROM trade_ledger WHERE exit_correlation_id = ?",
+                (exit_correlation_id,),
+            )
+            .fetchone()
+        )
+        if row is None or int(row["n"]) == 0:
+            return None
+        return float(row["total"])
+
     def reserve_roll_close_intent(
         self,
         *,
@@ -2076,6 +2137,102 @@ class ExecutionRepository:
             )
             .fetchall()
         )
+
+    def _write_roll_outcome_row(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        basket_id: str,
+        leg_role: str,
+        roll_sequence: int,
+        lifecycle_state: str,
+        replacement_leg_id: str | None,
+    ) -> None:
+        """The single-row outcome UPDATE on an already-open connection/
+        transaction — extracted so :meth:`consume_group_replacement` can
+        progress several rows atomically without duplicating this SQL. Not
+        part of this class's public surface; use
+        :meth:`update_basket_roll_outcome` or
+        :meth:`consume_group_replacement`."""
+        updated = conn.execute(
+            """
+            UPDATE strategy_basket_rolls
+            SET lifecycle_state = ?,
+                replacement_leg_id = COALESCE(?, replacement_leg_id),
+                version = version + 1,
+                updated_at = ?
+            WHERE basket_id = ? AND leg_role = ? AND roll_sequence = ?
+            """,
+            (lifecycle_state, replacement_leg_id, _now(), basket_id, leg_role, roll_sequence),
+        )
+        if updated.rowcount != 1:
+            raise ValueError(
+                f"no strategy_basket_rolls row for basket_id={basket_id!r} "
+                f"leg_role={leg_role!r} roll_sequence={roll_sequence!r} — refusing to "
+                "record an outcome with no claim to progress"
+            )
+
+    def update_basket_roll_outcome(
+        self,
+        *,
+        basket_id: str,
+        leg_role: str,
+        roll_sequence: int,
+        lifecycle_state: str,
+        replacement_leg_id: str | None = None,
+    ) -> None:
+        """Progress one already-claimed row's ``lifecycle_state`` (and,
+        optionally, the replacement leg it produced) — the targeted
+        counterpart of :meth:`upsert_basket_roll` for a caller that only
+        knows the *outcome*, not the claim's own immutable origin fields
+        (``target_leg_id``/``reference_price_at_claim``/``claim_candle_ts``/
+        ``claimed_at``), which this leaves untouched. Used by
+        ``common.engine.multi_leg_state.RollLedger.record_outcome`` to
+        record ``EXIT_CONFIRMED``/``FAILED``/``EXIT_UNKNOWN``/
+        ``AWAITING_NEXT_CANDLE``/``REPLACEMENT_PENDING``/... without
+        re-supplying the claim's own creation-time fields.
+
+        ``replacement_leg_id`` (optional): when given, overwrites the
+        stored value; when omitted (``None``), the stored value is left as
+        it is via ``COALESCE`` — the same "only touch what the caller
+        actually knows" discipline. Raises ``ValueError`` if no matching
+        row exists — never silently creates one (this method must not be
+        able to originate a claim, only progress an existing one).
+        """
+        with self._db.transaction() as conn:
+            self._write_roll_outcome_row(
+                conn,
+                basket_id=basket_id,
+                leg_role=leg_role,
+                roll_sequence=roll_sequence,
+                lifecycle_state=lifecycle_state,
+                replacement_leg_id=replacement_leg_id,
+            )
+
+    def consume_group_replacement(
+        self, *, basket_id: str, members: tuple[tuple[str, int], ...]
+    ) -> None:
+        """Atomically transition every ``(leg_role, roll_sequence)`` in
+        ``members`` to ``'REPLACEMENT_PENDING'``, in **one transaction** —
+        either every member's one-shot replacement attempt is consumed
+        together, or none is. A both-leg claim group's re-entry must never
+        durably consume role A's attempt while role B's fails partway
+        (which a sequence of independent single-row updates could leave):
+        a stray later retry could then double-consume or permanently
+        strand the other role. Raises (and commits nothing) if any member
+        does not resolve to exactly one row — the same fail-closed
+        discipline as :meth:`update_basket_roll_outcome`.
+        """
+        with self._db.transaction() as conn:
+            for leg_role, roll_sequence in members:
+                self._write_roll_outcome_row(
+                    conn,
+                    basket_id=basket_id,
+                    leg_role=leg_role,
+                    roll_sequence=roll_sequence,
+                    lifecycle_state="REPLACEMENT_PENDING",
+                    replacement_leg_id=None,
+                )
 
     def commit_basket_state(
         self,

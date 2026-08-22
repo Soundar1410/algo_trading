@@ -36,7 +36,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from common.broker.costs import ChargesCalculator, CostRates
 from common.logging import get_logger
@@ -60,6 +60,47 @@ class FillOutcome:
     #: order); ``InMemoryGateway`` never does (there is no persisted order
     #: to name) — ``None`` there is honest, not a gap.
     correlation_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ReservedClose:
+    """Phase 2 (strategy-rolling-strangle-otm1): a durably reserved close,
+    not yet submitted — returned by :meth:`PositionManager.reserve_close`,
+    passed to :meth:`PositionManager.submit_close` to actually call the
+    broker. The position itself is **untouched** until ``submit_close``
+    succeeds — reserving must never mutate open-position bookkeeping, since
+    the close might still fail, or (a crash between reserve and submit)
+    never even be attempted this process; a restart finding this
+    reservation abandoned resumes it from the same durable claim (migration
+    ``0013``), never duplicating it.
+
+    ``execution`` is the gateway's own reservation token
+    (``common.engine.gateway.ReservedExecution`` in production) — opaque
+    here by design, so this class has no dependency on any one gateway
+    implementation.
+    """
+
+    position_id: str
+    execution: Any
+    ts: datetime
+    reason: ExitReason
+    exit_regime: str | None
+    session_tags: str
+
+    @property
+    def close_intent_id(self) -> int | None:
+        """Best-effort extraction of the reservation's own durable intent
+        id, if the gateway's reservation token exposes one
+        (``common.engine.gateway.ReservedExecution.reserved_intent.
+        intent_id`` in production). Duck-typed rather than importing the
+        gateway's type, so this class stays gateway-agnostic; ``None`` for
+        any gateway whose token carries no such concept (offline fakes) is
+        honest, not a gap."""
+        reserved_intent = getattr(self.execution, "reserved_intent", None)
+        if reserved_intent is None:
+            return None
+        value = getattr(reserved_intent, "intent_id", None)
+        return int(value) if value is not None else None
 
 
 @runtime_checkable
@@ -468,6 +509,134 @@ class PositionManager:
             pos.contract.symbol,
             result.fill_price,
             reason.value,
+            gross,
+            total_charges,
+            trade.net_pnl,
+        )
+        del self._positions[position_id]
+        return trade
+
+    def reserve_close(
+        self,
+        position_id: str,
+        ref_price: float,
+        ts: datetime,
+        reason: ExitReason,
+        *,
+        leg_role: str,
+        roll_sequence: int,
+        basket_id: str | None = None,
+        leg_id: str | None = None,
+        exit_regime: str | None = None,
+        session_tags: str = "",
+    ) -> ReservedClose:
+        """Phase 2 (strategy-rolling-strangle-otm1): the first half of a
+        durable two-phase close — reserve the exit intent (and, for a
+        capable gateway, atomically associate it with its roll-claim row)
+        without calling the broker. Pass the result to :meth:`submit_close`
+        to actually attempt the close. Requires a gateway implementing
+        ``reserve_sell``/``reserve_buy`` (``common.engine.gateway.
+        LifecycleGateway`` in production) — see :meth:`submit_close` for why
+        a gateway lacking this pair (``InMemoryGateway`` and every offline
+        test fake) is a caller error, not something this method falls back
+        from silently: the multi-leg engine only calls this pair when its
+        own ``roll_ledger`` is wired, which a real worker always pairs with
+        a capable gateway.
+        """
+        pos = self._positions.get(position_id)
+        if pos is None:
+            raise RuntimeError(f"Cannot close: no open position for {position_id}.")
+
+        if pos.side is OrderSide.BUY:
+            execution = self._gateway.reserve_sell(  # type: ignore[attr-defined]
+                pos.contract,
+                pos.lots,
+                ref_price=ref_price,
+                ts=ts,
+                basket_id=basket_id,
+                leg_id=leg_id,
+                leg_role=leg_role,
+                roll_sequence=roll_sequence,
+            )
+        else:
+            execution = self._gateway.reserve_buy(  # type: ignore[attr-defined]
+                pos.contract,
+                pos.lots,
+                ref_price=ref_price,
+                ts=ts,
+                basket_id=basket_id,
+                leg_id=leg_id,
+                leg_role=leg_role,
+                roll_sequence=roll_sequence,
+            )
+        return ReservedClose(
+            position_id=position_id,
+            execution=execution,
+            ts=ts,
+            reason=reason,
+            exit_regime=exit_regime,
+            session_tags=session_tags,
+        )
+
+    def submit_close(self, reserved: ReservedClose) -> Trade:
+        """The second half of :meth:`reserve_close` — call the broker and
+        build the closed :class:`Trade`, identically to :meth:`close`'s own
+        tail. Raises exactly when the underlying ``submit_reserved`` call
+        raises (no fill) — the position stays exactly as the database has
+        it, untouched, same as a failed :meth:`close`; the caller (the
+        multi-leg engine's roll-close path) is responsible for resolving
+        the *authoritative* outcome afterward rather than guessing from
+        this exception (see migration ``0013``'s header)."""
+        position_id = reserved.position_id
+        pos = self._positions.get(position_id)
+        if pos is None:
+            raise RuntimeError(f"Cannot submit close: no open position for {position_id}.")
+
+        result = self._gateway.submit_reserved(reserved.execution)  # type: ignore[attr-defined]
+        if pos.side is OrderSide.BUY:
+            gross = (result.fill_price - pos.entry_price) * pos.quantity
+        else:
+            gross = (pos.entry_price - result.fill_price) * pos.quantity
+
+        entry_charges = self._entry_charges.pop(position_id, 0.0)
+        entry_breakdown = self._entry_breakdown.pop(position_id, {})
+        entry_regime = self._entry_regime.pop(position_id, None)
+        entry_regime_features = self._entry_regime_features.pop(position_id, "{}")
+        exit_breakdown = result.charges_breakdown or {}
+        total_charges = entry_charges + result.charges
+        breakdown = self._merge_breakdowns(entry_breakdown, exit_breakdown)
+
+        pos.update_price(result.fill_price)
+
+        trade = Trade(
+            contract=pos.contract,
+            side=pos.side,
+            lots=pos.lots,
+            quantity=pos.quantity,
+            entry_price=pos.entry_price,
+            exit_price=result.fill_price,
+            entry_time=pos.entry_time,
+            exit_time=reserved.ts,
+            exit_reason=reserved.reason,
+            gross_pnl=gross,
+            charges=total_charges,
+            charges_breakdown=breakdown,
+            mfe=pos.max_favorable_pnl,
+            mae=pos.max_adverse_pnl,
+            entry_regime=entry_regime,
+            exit_regime=reserved.exit_regime,
+            session_tags=reserved.session_tags,
+            entry_regime_features=entry_regime_features,
+            entry_correlation_id=pos.entry_correlation_id,
+            exit_correlation_id=result.correlation_id,
+        )
+        self._trades.append(trade)
+        log.info(
+            "CLOSE %s %s @ %.2f | reason=%s | gross %.2f charges %.2f net %.2f",
+            pos.side.value,
+            pos.contract.symbol,
+            result.fill_price,
+            reserved.reason.value,
             gross,
             total_charges,
             trade.net_pnl,

@@ -85,6 +85,51 @@ class ExecutionResult:
         return self.order is not None
 
 
+@dataclass(frozen=True)
+class RollCloseAssociation:
+    """Phase 2 (strategy-rolling-strangle-otm1): identifies which durable
+    roll-claim row a reservation must be atomically associated with —
+    passed to :meth:`OrderLifecycle.reserve` only by the multi-leg engine's
+    roll-close path (``common.engine.gateway.LifecycleGateway.reserve_sell``/
+    ``reserve_buy``). Every existing caller passes ``None`` (the default),
+    routing to the original :meth:`~common.execution.repository.
+    ExecutionRepository.reserve_intent` unchanged. See migration ``0013``'s
+    header for why the association must land in the same transaction as the
+    intent reservation."""
+
+    leg_role: str
+    roll_sequence: int
+
+
+@dataclass(frozen=True)
+class ReservedIntent:
+    """The output of :meth:`OrderLifecycle.reserve` — either a durably
+    reserved intent ready for :meth:`OrderLifecycle.submit`, or an already-
+    terminal outcome (a duplicate signal or a risk-blocked intent, ``result``
+    set) that :meth:`submit` returns immediately without calling the broker.
+
+    Deliberately opaque beyond that: :attr:`intent`/:attr:`intent_id` are
+    ``None`` exactly when :attr:`result` is set, so a caller only ever needs
+    to check ``result is not None`` — never reach into the other fields
+    directly (:meth:`submit` is the only sanctioned consumer).
+    """
+
+    intent: OrderIntent | None
+    intent_id: int | None
+    quote: Quote
+    trading_date: str
+    stop_price: float | None
+    target_price: float | None
+    cycle_id: str | None
+    #: ``signal.candle.end_at.isoformat()`` — captured at reserve time
+    #: because ``submit()`` no longer holds the original ``Signal`` (only
+    #: the persisted ``OrderIntent``, which carries no candle window).
+    #: **Not** ``intent.created_at``: that is wall-clock intent-creation
+    #: time, a different value ``apply_fill`` never accepts here.
+    candle_end_at: str
+    result: ExecutionResult | None
+
+
 class OrderLifecycle:
     """Drives one strategy's signals through to persisted positions."""
 
@@ -159,6 +204,51 @@ class OrderLifecycle:
         reasons: ``basket_id`` is the generic multi-leg correlation identity
         (``order_intents``/``orders``/``fills``), ``cycle_id`` is what makes
         ``positions`` itself cross-day-resolvable.
+
+        Phase 2 (strategy-rolling-strangle-otm1): a pure composition of
+        :meth:`reserve` and :meth:`submit`, split out so the multi-leg
+        engine's roll-close path can durably reserve an exit intent — and
+        atomically associate it with its roll-claim row — *before* the
+        broker is ever called, then submit separately once that commit has
+        landed. Every existing caller of this method is unaffected: the
+        split changes nothing about what runs or in what order when no roll
+        association is involved.
+        """
+        return self.submit(
+            self.reserve(
+                signal,
+                trading_date=trading_date,
+                stop_price=stop_price,
+                target_price=target_price,
+                basket_id=basket_id,
+                leg_id=leg_id,
+                cycle_id=cycle_id,
+            )
+        )
+
+    def reserve(
+        self,
+        signal: Signal,
+        *,
+        trading_date: str,
+        stop_price: float | None = None,
+        target_price: float | None = None,
+        basket_id: str | None = None,
+        leg_id: str | None = None,
+        cycle_id: str | None = None,
+        roll_association: RollCloseAssociation | None = None,
+    ) -> ReservedIntent:
+        """Durably reserve one intent — everything :meth:`handle_signal` did
+        up to and including ``reserve_intent`` — without calling the broker.
+
+        ``roll_association`` (Phase 2, optional): when given, the intent
+        reservation and its association onto the named
+        ``strategy_basket_rolls`` row commit in the *same* transaction (via
+        :meth:`~common.execution.repository.ExecutionRepository.
+        reserve_roll_close_intent` instead of plain ``reserve_intent``) —
+        see migration ``0013``'s header for why this must not be two
+        separate writes. ``None`` (every existing caller) is byte-identical
+        to this method's behaviour before the split.
         """
         signal_id = self._repo.record_signal(
             session_id=self._session_id,
@@ -173,7 +263,17 @@ class OrderLifecycle:
                 signal.strategy_id,
                 signal.candle.end_at.isoformat(),
             )
-            return ExecutionResult(skipped_reason="duplicate signal for this candle")
+            return ReservedIntent(
+                intent=None,
+                intent_id=None,
+                quote=self._quote_for(signal),
+                trading_date=trading_date,
+                stop_price=stop_price,
+                target_price=target_price,
+                cycle_id=cycle_id,
+                candle_end_at=signal.candle.end_at.isoformat(),
+                result=ExecutionResult(skipped_reason="duplicate signal for this candle"),
+            )
 
         sequence = self._repo.next_sequence_number(
             strategy_id=self._strategy_id,
@@ -223,7 +323,15 @@ class OrderLifecycle:
         # a recoverable record, keyed by a correlation ID that already exists.
         # Persisted regardless of risk_decision — a blocked intent is a normal
         # recorded outcome, not something the audit trail should be missing.
-        intent_id = self._repo.reserve_intent(session_id=self._session_id, intent=intent)
+        if roll_association is None:
+            intent_id = self._repo.reserve_intent(session_id=self._session_id, intent=intent)
+        else:
+            intent_id = self._repo.reserve_roll_close_intent(
+                session_id=self._session_id,
+                intent=intent,
+                leg_role=roll_association.leg_role,
+                roll_sequence=roll_association.roll_sequence,
+            )
 
         if risk_decision is RiskDecision.BLOCKED:
             _log.warning(
@@ -231,13 +339,47 @@ class OrderLifecycle:
                 correlation_id,
                 risk_reason,
             )
-            return ExecutionResult(
-                correlation_id=correlation_id,
-                skipped_reason=f"account risk blocked: {risk_reason}",
+            return ReservedIntent(
+                intent=intent,
+                intent_id=intent_id,
+                quote=quote,
+                trading_date=trading_date,
+                stop_price=stop_price,
+                target_price=target_price,
+                cycle_id=cycle_id,
+                candle_end_at=signal.candle.end_at.isoformat(),
+                result=ExecutionResult(
+                    correlation_id=correlation_id,
+                    skipped_reason=f"account risk blocked: {risk_reason}",
+                ),
             )
 
+        return ReservedIntent(
+            intent=intent,
+            intent_id=intent_id,
+            quote=quote,
+            trading_date=trading_date,
+            stop_price=stop_price,
+            target_price=target_price,
+            cycle_id=cycle_id,
+            candle_end_at=signal.candle.end_at.isoformat(),
+            result=None,
+        )
+
+    def submit(self, reserved: ReservedIntent) -> ExecutionResult:
+        """Take an already-reserved intent to a persisted position — the
+        broker call and everything after it, split out of
+        :meth:`handle_signal`. Returns ``reserved.result`` immediately,
+        without calling the broker, when :meth:`reserve` already reached a
+        terminal outcome (duplicate signal or risk-blocked)."""
+        if reserved.result is not None:
+            return reserved.result
+        intent = reserved.intent
+        intent_id = reserved.intent_id
+        assert intent is not None and intent_id is not None
+
         try:
-            order = self._broker.submit(intent, quote)
+            order = self._broker.submit(intent, reserved.quote)
         except BrokerError as exc:
             self._repo.record_error(
                 runtime_id=self._runtime_id,
@@ -246,10 +388,10 @@ class OrderLifecycle:
                 severity="ERROR",
                 component="broker.submit",
                 message=str(exc),
-                context=correlation_id,
+                context=intent.correlation_id,
             )
             rejected = Order(
-                correlation_id=correlation_id,
+                correlation_id=intent.correlation_id,
                 strategy_id=self._strategy_id,
                 execution_mode=self._mode,
                 status=OrderStatus.REJECTED,
@@ -259,9 +401,9 @@ class OrderLifecycle:
             self._repo.record_submission(
                 intent_id=intent_id, order=rejected, runtime_id=self._runtime_id
             )
-            self._sync_account_reservation(correlation_id, OrderStatus.REJECTED)
+            self._sync_account_reservation(intent.correlation_id, OrderStatus.REJECTED)
             return ExecutionResult(
-                correlation_id=correlation_id,
+                correlation_id=intent.correlation_id,
                 order=rejected,
                 skipped_reason=f"broker rejected: {exc}",
             )
@@ -277,38 +419,38 @@ class OrderLifecycle:
                 runtime_id=self._runtime_id,
                 fill=fill,
                 order_status=order.status,
-                instrument=signal.instrument,
-                security_id=signal.security_id,
-                side=signal.side,
-                trading_date=trading_date,
-                stop_price=stop_price,
-                target_price=target_price,
-                last_candle_end_at=signal.candle.end_at.isoformat(),
-                cycle_id=cycle_id,
+                instrument=intent.instrument,
+                security_id=intent.security_id,
+                side=intent.side,
+                trading_date=reserved.trading_date,
+                stop_price=reserved.stop_price,
+                target_price=reserved.target_price,
+                last_candle_end_at=reserved.candle_end_at,
+                cycle_id=reserved.cycle_id,
             )
             if self._account_reservation_gate is not None and self._account_key is not None:
                 self._account_reservation_gate.record_fill(
                     account_key=self._account_key,
                     runtime_id=self._runtime_id,
                     strategy_id=self._strategy_id,
-                    trading_date=trading_date,
-                    security_id=signal.security_id,
-                    side=signal.side,
+                    trading_date=reserved.trading_date,
+                    security_id=intent.security_id,
+                    side=intent.side,
                     fill=fill,
                     position=position,
                 )
 
-        self._sync_account_reservation(correlation_id, order.status)
+        self._sync_account_reservation(intent.correlation_id, order.status)
 
         _log.info(
             "order filled correlation_id=%s side=%s qty=%d price=%s",
-            correlation_id,
-            signal.side.value,
+            intent.correlation_id,
+            intent.side.value,
             order.filled_quantity,
             order.average_fill_price,
         )
         return ExecutionResult(
-            correlation_id=correlation_id,
+            correlation_id=intent.correlation_id,
             order=order,
             position=position,
         )
