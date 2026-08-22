@@ -62,6 +62,7 @@ from common.utils.timeutils import now_ist, parse_timeframe_minutes
 from .config import EngineConfig
 from .daily_guard import DailyRiskConfig, DailyRiskGuard
 from .feed import MarketDataFeed
+from .models import OptionContract
 from .multi_leg_models import (
     AdjustmentLifecycle,
     AdjustmentRequest,
@@ -70,6 +71,7 @@ from .multi_leg_models import (
     BasketAction,
     BasketRollState,
     BasketSignal,
+    BasketStateCommit,
     LegInstance,
     LegIntent,
     LegRole,
@@ -440,16 +442,28 @@ class MultiLegEngine:
         # could then re-derive the same "consume the primary attempt" decision
         # and place a second, undetectable order. Critical, and cheap, since
         # this runs once per closed underlying candle, not per tick.
-        try:
-            self._persist_basket(critical=True)
-        except MultiLegDurabilityError:
-            log.error(
-                "%s: basket bookkeeping from this candle could not be durably "
-                "persisted; suppressing any signal it produced — no order will "
-                "be submitted for this candle",
-                self.label,
-            )
-            return
+        #
+        # A strategy that instead returns a typed BasketStateCommit (Phase 1's
+        # command surface, generic to any multi-leg strategy — see that
+        # class's own docstring) never mutates basket directly, so its
+        # bookkeeping is applied and durably committed here rather than
+        # merely re-persisted from whatever the strategy already wrote onto
+        # `self._basket` in place. straddle_920 never sets state_commit, so
+        # it always takes the unchanged plain-persist branch below.
+        if strat_signal is not None and strat_signal.state_commit is not None:
+            if not self._apply_state_commit(strat_signal.state_commit, ts):
+                return
+        else:
+            try:
+                self._persist_basket(critical=True)
+            except MultiLegDurabilityError:
+                log.error(
+                    "%s: basket bookkeeping from this candle could not be durably "
+                    "persisted; suppressing any signal it produced — no order will "
+                    "be submitted for this candle",
+                    self.label,
+                )
+                return
 
         log.info(
             "%s bar evaluated_at=%s | %s",
@@ -496,6 +510,140 @@ class MultiLegEngine:
         if not self.session.can_enter(tick.exchange_time):
             return
         self._open_leg(leg, tick.last_price, tick.exchange_time)
+
+    # ------------------------------------------------------- state commits
+    def _apply_state_commit(self, commit: BasketStateCommit, ts: datetime) -> bool:
+        """Durably apply a strategy's :class:`BasketStateCommit` — the
+        primary-entry/day-bookkeeping counterpart of a roll claim's own
+        atomic commit (:meth:`_close_adjusted_legs_with_ledger`).
+
+        Generic to any multi-leg strategy — no strategy-name branch. This
+        completes the typed command surface :class:`BasketStateCommit`
+        (migration ``0013``'s header, Phase 1) was designed for: a strategy
+        built on the "never mutates basket" contract otherwise has no
+        durable write path at all for the reference-spot anchor at primary
+        entry (:attr:`Basket.roll_state` is read-only by design), which
+        Phase 2 wired for a roll claim's own anchor
+        (:attr:`~common.engine.multi_leg_models.AdjustmentRequest.anchor`)
+        but not yet for this earlier, entry-time case — found while
+        implementing rolling_strangle_otm1 (spec section 8 step 3).
+        ``straddle_920`` never returns a ``state_commit`` (it keeps mutating
+        ``basket`` directly, per its own module docstring), so this method
+        is never reached on its path — zero behavioural change there.
+
+        Returns ``True`` once every requested piece of bookkeeping is
+        durable and the caller may proceed to apply the signal's own order
+        effect (if any). Returns ``False`` if the commit could not be made
+        durable — entries are already blocked and an incident already
+        recorded, mirroring a failed critical ``_persist_basket`` exactly;
+        the caller must suppress the whole signal, not just retry the
+        commit.
+        """
+        previous_entries_consumed = self._basket.entries_consumed
+        previous_block_reason = self._basket.day_blocked_reason
+        if commit.consume_entry_attempt:
+            self._basket.entries_consumed = True
+        if commit.block_day_reason is not None:
+            self._basket.day_blocked_reason = commit.block_day_reason
+
+        def _rollback() -> None:
+            self._basket.entries_consumed = previous_entries_consumed
+            self._basket.day_blocked_reason = previous_block_reason
+
+        if commit.anchor is not None and self._roll_ledger is None:
+            log.error(
+                "%s: state commit carries an anchor update but no roll ledger "
+                "is wired; refusing (the anchor has no durable home without "
+                "one) — suppressing this candle's signal entirely",
+                self.label,
+            )
+            _rollback()
+            return False
+
+        if self._roll_ledger is None:
+            # No anchor requested (checked above) — the existing plain
+            # critical persist already durably commits everything else this
+            # method may have set (entries_consumed, day_blocked_reason).
+            try:
+                self._persist_basket(critical=True)
+            except MultiLegDurabilityError:
+                _rollback()
+                return False
+        else:
+            claim_group_id = f"{self._basket.basket_id}:state:{uuid.uuid4().hex[:12]}"
+            claimed_at = self._now()
+            try:
+                # Zero targets: this reuses the roll ledger's own atomic
+                # basket-row + anchor writer with no claim rows, rather than
+                # duplicating that transaction's shape here.
+                self._roll_ledger.commit_claims(
+                    self._basket,
+                    claim_group_id=claim_group_id,
+                    targets=(),
+                    anchor=commit.anchor,
+                    claim_candle_ts=ts,
+                    claimed_at=claimed_at,
+                )
+            except Exception as exc:
+                log.error(
+                    "%s: could not durably commit basket state (%s); "
+                    "suppressing this candle's signal entirely",
+                    self.label,
+                    exc,
+                )
+                _rollback()
+                self._block_entries(f"basket state commit failed: {exc}")
+                self._record_incident(
+                    self._basket.basket_id, f"basket state commit failed: {exc}"
+                )
+                self._rehydrate_basket()
+                return False
+            if commit.anchor is not None:
+                self._append_local_claims(
+                    claim_group_id,
+                    AdjustmentRequest(targets=(), anchor=commit.anchor),
+                    ts,
+                    claimed_at,
+                    {},
+                )
+
+        if commit.expire_replacement_for:
+            self._expire_replacements(commit.expire_replacement_for)
+
+        return True
+
+    def _expire_replacements(self, roles: tuple[LegRole, ...]) -> None:
+        """Spec section 9.4: a claim genuinely ``AWAITING_NEXT_CANDLE`` whose
+        next completed candle lands at or after the cutoff must expire
+        rather than attempt a replacement. Best-effort — see
+        :meth:`_record_roll_outcome`'s own docstring: whichever side is
+        expiring is *not* opening a new order either way, so a failure to
+        durably record the expiry never risks a duplicate/undetected effect,
+        only a stale read-model until the next successful write.
+        """
+        awaiting = AdjustmentLifecycle.AWAITING_NEXT_CANDLE.value
+        if self._roll_ledger is not None:
+            roll_state = self._basket.roll_state
+            for role in roles:
+                claim = roll_state.active_claim(role) if roll_state is not None else None
+                if claim is None or claim.lifecycle_state != awaiting:
+                    continue
+                self._record_roll_outcome(
+                    role, claim.roll_sequence, AdjustmentLifecycle.REPLACEMENT_EXPIRED.value
+                )
+        else:
+            # Legacy single-slot projection (no roll ledger wired) — mirrors
+            # straddle_920's own cutoff-expiry assignment exactly, though
+            # straddle_920 itself never reaches this path (it never sets
+            # state_commit).
+            if (
+                self._basket.pending_replacement_role in roles
+                and self._basket.pending_replacement_state == awaiting
+            ):
+                self._basket.pending_replacement_role = None
+                self._basket.pending_replacement_state = (
+                    AdjustmentLifecycle.REPLACEMENT_EXPIRED.value
+                )
 
     # ----------------------------------------------------------- signal apply
     def _apply_signal(self, signal: BasketSignal, ts: datetime) -> None:
@@ -573,6 +721,17 @@ class MultiLegEngine:
                 if not self._consume_replacement_claims(signal.legs):
                     return
 
+        # Resolve every requested leg's contract *before* creating or
+        # committing any of them (spec section 6.4 point 8): a primary
+        # ENTER_BASKET must fail the whole entry closed if its resolved
+        # legs disagree on lot size, rather than open a basket with
+        # mismatched per-leg quantities. Generic to any multi-leg strategy
+        # (keyed off ENTER_BASKET's own multi-leg semantics, not a
+        # strategy name) — straddle_920's CE+PE are checked identically
+        # and, since NIFTY CE/PE always share one lot size in both the
+        # simulated and Dhan resolvers, this changes nothing about its
+        # observed behaviour (see test_straddle_920_engine.py, unchanged).
+        resolutions: list[tuple[LegIntent, OptionType | None, OptionContract | None]] = []
         for intent in signal.legs:
             option_type = _ROLE_TO_OPTION_TYPE.get(intent.role)
             if option_type is None:
@@ -581,7 +740,39 @@ class MultiLegEngine:
                     self.label,
                     intent.role,
                 )
+                resolutions.append((intent, None, None))
                 continue
+            try:
+                contract = self.selector.select(
+                    self._spot,
+                    option_type,
+                    intent.option_selection.moneyness,
+                    intent.option_selection.steps,
+                )
+            except Exception as exc:
+                log.error(
+                    "%s: could not resolve a contract for %s: %s", self.label, intent.role, exc
+                )
+                resolutions.append((intent, option_type, None))
+                continue
+            resolutions.append((intent, option_type, contract))
+
+        if signal.action is BasketAction.ENTER_BASKET:
+            resolved_lot_sizes = {
+                resolved.lot_size for _, _, resolved in resolutions if resolved is not None
+            }
+            if len(resolved_lot_sizes) > 1:
+                message = (
+                    f"resolved contracts disagree on lot size {sorted(resolved_lot_sizes)}; "
+                    "refusing the whole primary entry rather than open a basket with "
+                    "mismatched per-leg quantities"
+                )
+                log.error("%s: %s", self.label, message)
+                self._block_entries(message)
+                self._record_incident(self._basket.basket_id, message)
+                return
+
+        for intent, option_type, resolved_contract in resolutions:
             leg_id = self._basket.next_leg_id(intent.role)
             leg = LegInstance(
                 leg_id=leg_id,
@@ -594,22 +785,13 @@ class MultiLegEngine:
                 state=LegState.PENDING_CONTRACT,
             )
             self._basket.legs[leg_id] = leg
-            try:
-                contract = self.selector.select(
-                    self._spot,
-                    option_type,
-                    intent.option_selection.moneyness,
-                    intent.option_selection.steps,
-                )
-            except Exception as exc:
-                log.error(
-                    "%s: could not resolve a contract for %s: %s", self.label, intent.role, exc
-                )
+            if option_type is None or resolved_contract is None:
                 leg.state = LegState.FAILED
                 # Best-effort: no order was ever possible without a resolved
                 # contract, so there is no pre-effect claim to fail closed on.
                 self._persist_leg(leg)
                 continue
+            contract = resolved_contract
             leg.contract = contract
             leg.state = LegState.PENDING_ORDER
             try:
@@ -725,7 +907,42 @@ class MultiLegEngine:
         # — there is nothing left to abort.
         self._persist_leg(leg)
         self._maybe_capture_original_basis()
+        self._maybe_record_replacement_filled(leg)
         self._notify("fill", f"{leg.side.value} {leg.contract.symbol} @ {price:.2f}")
+
+    def _maybe_record_replacement_filled(self, leg: LegInstance) -> None:
+        """Spec section 9.5 / ``AdjustmentLifecycle``'s own docstring (item
+        7): a replacement leg's confirmed fill advances its originating
+        claim from ``REPLACEMENT_PENDING`` to ``REPLACEMENT_FILLED`` —
+        completing the one transition Phase 2 left unwired. Generic (no
+        strategy-name branch): any replacement leg for any multi-leg
+        strategy using the roll ledger reaches this, including
+        ``straddle_920``'s own — found while implementing
+        rolling_strangle_otm1's own end-to-end replacement test, since
+        Phase 2's suite never exercised a replacement fill's roll-ledger
+        outcome this far. Best-effort, like every other post-fill
+        bookkeeping write here: the fill already happened durably through
+        the order/fill tables regardless of whether this write lands.
+        """
+        if self._roll_ledger is None or not leg.is_replacement or leg.replaces_leg_id is None:
+            return
+        roll_state = self._basket.roll_state
+        if roll_state is None:
+            return
+        pending = AdjustmentLifecycle.REPLACEMENT_PENDING.value
+        for claim in roll_state.claims:
+            if (
+                claim.leg_role is leg.role
+                and claim.target_leg_id == leg.replaces_leg_id
+                and claim.lifecycle_state == pending
+            ):
+                self._record_roll_outcome(
+                    leg.role,
+                    claim.roll_sequence,
+                    AdjustmentLifecycle.REPLACEMENT_FILLED.value,
+                    replacement_leg_id=leg.leg_id,
+                )
+                return
 
     def _maybe_capture_original_basis(self) -> None:
         """Spec section 13.4: B_original is captured once, at the moment the

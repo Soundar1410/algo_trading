@@ -10385,3 +10385,151 @@ live_trading_enabled`, every runtime's `live_execution_allowed`, and every
 other strategy's `enabled`/`mode`/`live_approved` are unchanged.
 `OPERATIONAL LIVE ACTIVATION ELIGIBLE` remains **NO — BLOCKED**. Phase 3
 (strategy implementation) is next, stopping for review before it begins.
+
+### `strategy-rolling-strangle-otm1` Phase 3 addendum — 22 August 2026 (unmerged)
+
+The pure multi-leg strategy package: `strategies/intraday_options/
+rolling_strangle_otm1/{__init__.py,strategy.py}`, `RollingStrangleOtm1Strategy
+(BaseMultiLegStrategy)`. No config, no dashboard, no runtime enablement —
+those remain Phase 4+. Never mutates `Basket`/`BasketRollState`; every
+durable transition is requested through the typed `BasketStateCommit`/
+`AdjustmentRequest`/`AnchorUpdate` command surface Phase 1 defined.
+
+#### Three generic engine completions found necessary during implementation
+
+Phase 0's own instruction ("do not reopen the approved durability
+architecture unless a genuine implementation blocker is found") was
+invoked three times, each generic (no strategy-name branch), each verified
+to leave `straddle_920`'s regression suite passing unchanged, each fixing a
+gap Phase 2 left the *typed command surface* short of actually wiring end
+to end — not a new design.
+
+1. **`BasketSignal.state_commit` was never consumed.** Phase 1 defined
+   `BasketStateCommit` as the strategy's sanctioned way to request
+   `consume_entry_attempt`/`anchor`/`block_day_reason`/
+   `expire_replacement_for`, but `_on_candle_close` only ever re-persisted
+   whatever a strategy had mutated directly onto `Basket` — there was no
+   durable write path *at all* for a primary entry's reference-spot anchor
+   (`Basket.roll_state` is read-only by design). `MultiLegEngine.
+   _apply_state_commit`/`_expire_replacements` (new) apply it atomically —
+   reusing the roll ledger's own `commit_claims` with zero targets as the
+   anchor-only writer — before any order effect the same signal
+   authorises, mirroring `_close_adjusted_legs_with_ledger`'s own ordering.
+   `straddle_920` never sets `state_commit`, so it is byte-identical on
+   this path.
+2. **No cross-leg lot-size check existed for a primary `ENTER_BASKET`.**
+   Spec section 6.4 point 8 requires failing the whole entry closed if
+   resolved CE/PE contracts disagree on lot size, but `_enter_legs`
+   resolved and committed each leg sequentially — one leg could already be
+   subscribed before the other's contract was even resolved. `_enter_legs`
+   now resolves every requested leg's contract first, compares lot sizes
+   across an `ENTER_BASKET`'s resolutions, and refuses the whole entry
+   before creating or subscribing any leg if they disagree. `straddle_920`
+   is checked identically; since NIFTY CE/PE always share one lot size in
+   both resolvers, this changes nothing about its observed behaviour.
+3. **A replacement leg's confirmed fill never advanced its roll claim past
+   `REPLACEMENT_PENDING`.** `AdjustmentLifecycle`'s own docstring documents
+   `REPLACEMENT_FILLED` as the intended terminal outcome, but nothing in
+   `_open_leg` ever wrote it — found by this phase's own end-to-end
+   replacement test, since Phase 2's suite never asserted a roll claim's
+   state after its replacement's fill confirmed. `_maybe_record_
+   replacement_filled` (new, called from `_open_leg`) advances the
+   originating claim (matched by role + `target_leg_id == leg.
+   replaces_leg_id`, still `REPLACEMENT_PENDING`) to `REPLACEMENT_FILLED`.
+   Best-effort, like every other post-fill bookkeeping write in that
+   method. No prior test asserted the old (incomplete) behaviour, so
+   nothing regressed; this is a strict completeness fix, generic to any
+   multi-leg strategy's replacement leg.
+
+None of the three add a strategy-name branch, a new persistence table, or a
+new `RollLedgerPort` method — each reuses machinery Phase 1/2 already built
+(`commit_claims`, `_record_roll_outcome`, the resolve-then-commit
+restructuring stays entirely inside `_enter_legs`).
+
+#### Strategy rules implemented
+
+Primary entry at 09:45 (spec section 8): durably consumes the day's one
+attempt and anchors `reference_spot` in one atomic `state_commit`, before
+any contract selection; blackout dates consume the attempt and place
+nothing. OTM selection: `steps = max(1, round(otm_distance_points /
+strike_step))`, `Moneyness.OTM` for both legs — the sign (CE above/PE
+below ATM) is handled entirely by `common.engine.selection.resolve_strike`,
+already CE/PE-aware.
+
+Rolling (spec section 9): the trigger (`abs(candle.close - reference_spot)
+>= roll_trigger_points`, inclusive both ways) is read from the durable
+`BasketRollState.reference_price` — never a private field — and evaluated
+only before the cutoff. Single-leg mode (default) claims and closes only
+the threatened role, gated on that role's own `roll_count` against its own
+configured maximum; `single_leg_roll: false` requires both roles open and
+under budget and claims both atomically in one `AdjustmentRequest` sharing
+one claim group. A roll re-anchors `reference_spot` to the trigger candle's
+close via `AdjustmentRequest.anchor`, at claim time, never at replacement
+fill time. Replacement is proposed only when a role's own `active_claim` is
+genuinely `AWAITING_NEXT_CANDLE` (an engine-guaranteed group-wide
+invariant — see the durable-state-discipline test proving a partially-
+confirmed both-leg group never surfaces as eligible for either role); a
+role stuck `AWAITING_NEXT_CANDLE` at or after the cutoff is durably expired
+via `state_commit.expire_replacement_for` instead of replaced.
+
+Risk (spec section 10.1): `on_leg_tick` evaluates
+`basket.total_gross_pnl()` (realised, including every rolled-out leg, plus
+unrealised on currently open legs) against `-lots_per_leg *
+combined_stop_per_lot`, inclusive, on every fresh tick; a day already
+blocked short-circuits both `on_candle` and `on_leg_tick`. No leg-level
+adjustment trigger, profit target, VIX/Greeks filter, trailing stop,
+warm-up, margin filter, or extra confirmation candle exists anywhere in
+this file — verified by grep as well as by the required-tests list simply
+having no such row to write.
+
+`reset()` is a true no-op (asserted by test): every fact this strategy
+needs is already durable on `Basket`/`BasketRollState`, which the engine
+rebuilds fresh each day: same discipline as `straddle_920`.
+
+#### Files and tests
+
+New: `strategies/intraday_options/rolling_strangle_otm1/__init__.py`,
+`strategies/intraday_options/rolling_strangle_otm1/strategy.py`;
+`tests/unit/test_rolling_strangle_otm1_strategy.py` (48 tests — pure
+decision logic against hand-built `Basket`/`BasketRollState` fixtures, no
+engine: entry boundaries/blackout/OTM-step rounding, single-leg roll
+trigger inclusivity/budget independence/cutoff/expiry, both-leg mode
+gating, risk-formula boundaries and lot scaling, durable-state-discipline
+proofs that `on_candle`/`on_leg_tick` never mutate the `Basket` object they
+are handed even when they do return a signal); `tests/integration/
+test_rolling_strangle_otm1_engine.py` (9 tests — a real `MultiLegEngine` +
+`ExecutionRepository`/`RollLedger` + `LifecycleGateway` over a scripted
+broker: OTM strike/lot-size resolution, the mismatched-lot-size fail-closed
+check, fresh-tick fill gating, a full single-leg roll-claim-close-replace
+cycle proven against the durable roll ledger, two-roll budget exhaustion,
+cutoff expiry, both-leg atomic close/replace, and the combined stop).
+Modified (the three completions above): `common/engine/multi_leg_engine.py`.
+
+#### Regression
+
+Every explicitly mandated suite re-run: `test_straddle_920_engine.py`,
+`test_straddle_920_durability.py`, `test_straddle_920_reconciliation.py`,
+`test_straddle_920_restart.py`, `test_straddle_920_acceptance_gaps.py`,
+`test_straddle_920_correlation.py`, `test_no_straddle_920_branches.py`,
+`test_straddle_920_risk_separation.py`, `test_rolling_multi_leg_engine.py`
+(the Phase 2 generic suite), `test_migrations.py` — all pass unchanged.
+Full `pytest`: exit 0. `ruff check .`: clean. `mypy common strategies
+runtimes dashboards scripts --strict`: clean (238 source files — tests are
+outside this project's mypy gate, matching the pre-existing Phase 2 suite's
+own standing type-check exclusions).
+`python -m scripts.assert_no_live_config_committed`: OK — no config exists
+yet for this strategy. The plist generator was not re-checked: no
+LaunchAgent/config file was touched this phase.
+
+#### Safety
+
+Same isolated worktree as Phases 0-2; no runtime, dashboard, or LaunchAgent
+started/stopped/modified; no Dhan or Telegram endpoint called; every test
+ran against a scripted in-process fake broker, never a real network call;
+no secret read/printed/altered; no branch merged; no config file created;
+every existing live gate (`global.live_trading_enabled`,
+`live_execution_allowed`, `auto_start.enabled`, every other strategy's
+`enabled`/`mode`/`live_approved`) unchanged.
+`OPERATIONAL LIVE ACTIVATION ELIGIBLE` remains **NO — BLOCKED**. Phase 4
+(runtime/config/composition) is next, stopping for review before it
+begins.
