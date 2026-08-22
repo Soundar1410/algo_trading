@@ -43,14 +43,20 @@ __all__ = [
     "TERMINAL_LEG_STATES",
     "UNRESOLVED_LEG_STATES",
     "AdjustmentLifecycle",
+    "AdjustmentRequest",
+    "AdjustmentTarget",
+    "AnchorUpdate",
     "Basket",
     "BasketAction",
+    "BasketRollState",
     "BasketSignal",
+    "BasketStateCommit",
     "LegInstance",
     "LegIntent",
     "LegRole",
     "LegState",
     "MultiLegDurabilityError",
+    "RollClaim",
     "UnmanageableBasketState",
 ]
 
@@ -185,12 +191,26 @@ class AdjustmentLifecycle(StrEnum):
        made (a leg is pending or the attempt failed) and will not be retried.
     7. ``REPLACEMENT_FILLED`` / ``REPLACEMENT_FAILED`` / ``REPLACEMENT_EXPIRED``
        — terminal outcomes for the day's one adjustment cycle.
+
+    ``FAILED`` — a distinct terminal outcome from ``EXIT_UNKNOWN``, added for
+    repeated-roll strategies (rolling_strangle_otm1, Phase 1): the adjusted
+    leg's own close was **definitively** rejected/cancelled/expired (proven,
+    not merely unresolved — see ``common.execution.repository.
+    ExecutionRepository.order_intent_by_id`` and the intent-outcome
+    classification restart recovery already uses). The leg is reconstructed
+    ``OPEN``; the roll count that claimed this attempt is *not* refunded; no
+    replacement is attempted for it. ``straddle_920``'s single-adjustment
+    engine never produces this value today (its adjustment either confirms
+    or reaches ``EXIT_UNKNOWN``), but nothing prevents it from doing so in
+    future — this is a purely additive vocabulary extension, the same way
+    the four positional roles were added to :class:`LegRole`.
     """
 
     CLAIMED = "CLAIMED"
     EXIT_SUBMISSION_PENDING = "EXIT_SUBMISSION_PENDING"
     EXIT_UNKNOWN = "EXIT_UNKNOWN"
     EXIT_CONFIRMED = "EXIT_CONFIRMED"
+    FAILED = "FAILED"
     AWAITING_NEXT_CANDLE = "AWAITING_NEXT_CANDLE"
     REPLACEMENT_PENDING = "REPLACEMENT_PENDING"
     REPLACEMENT_FILLED = "REPLACEMENT_FILLED"
@@ -209,6 +229,14 @@ class BasketAction(StrEnum):
     EXIT_LEG = "EXIT_LEG"
     #: Close every currently open/pending leg and block further action today.
     EXIT_ALL = "EXIT_ALL"
+    #: Claim and close one or more legs together as one atomic roll event
+    #: (see :class:`AdjustmentRequest`) — the generic, repeated-roll-capable
+    #: counterpart of a strategy-driven ``EXIT_LEG`` carrying
+    #: ``ExitReason.ADJUSTMENT``, which the engine normalises into this same
+    #: claim machinery (migration ``0013``'s header; Phase 2 wiring). Added
+    #: for repeated-roll strategies (rolling_strangle_otm1, Phase 1) —
+    #: ``straddle_920`` keeps emitting ``EXIT_LEG``/``ADJUSTMENT`` unchanged.
+    ADJUST_LEGS = "ADJUST_LEGS"
     #: No action this call — distinct from returning ``None`` only where a
     #: strategy wants to be explicit; the engine treats both identically.
     NONE = "NONE"
@@ -227,6 +255,69 @@ class LegIntent:
 
 
 @dataclass(frozen=True)
+class AnchorUpdate:
+    """A durable re-anchor of the basket's shared reference spot (migration
+    ``0013``'s ``strategy_basket_roll_anchor``) — the strategy's only
+    sanctioned way to communicate a new reference price/candle to the
+    engine. Carried inside :class:`BasketStateCommit` (primary entry) or
+    :class:`AdjustmentRequest` (a roll claim); the engine, never the
+    strategy, performs the durable write.
+    """
+
+    price: float
+    candle_ts: datetime
+
+
+@dataclass(frozen=True)
+class AdjustmentTarget:
+    """One leg to close as part of one atomic roll event."""
+
+    leg_id: str
+    role: LegRole
+
+
+@dataclass(frozen=True)
+class AdjustmentRequest:
+    """One atomic roll event, carried on :attr:`BasketSignal.adjustment`
+    (action ``ADJUST_LEGS``) — one or more :class:`AdjustmentTarget` closed
+    together, claimed in one durable transaction before either close is
+    submitted (migration ``0013``'s header). A single-leg roll has exactly
+    one target; the both-leg recentre mode (spec section 9.3) has exactly
+    two, sharing one ``claim_group_id`` so replacement is permitted only
+    once every target in the group has confirmed.
+    """
+
+    targets: tuple[AdjustmentTarget, ...]
+    #: The triggering candle's spot, re-anchoring the shared reference price
+    #: at durable claim time (spec section 9.2 step 5) — not at replacement
+    #: fill time.
+    anchor: AnchorUpdate | None = None
+
+
+@dataclass(frozen=True)
+class BasketStateCommit:
+    """Durable basket-level bookkeeping a strategy needs committed
+    atomically with, and before, whatever order effect its
+    :class:`BasketSignal` authorises — carried on
+    :attr:`BasketSignal.state_commit`.
+
+    Restores the invariant :class:`~common.engine.multi_leg_strategy.
+    BaseMultiLegStrategy`'s own docstring already states ("the strategy
+    never mutates basket") for trading-critical fields a strategy previously
+    had no sanctioned way to set durably except by mutating ``Basket``
+    directly, the way ``straddle_920`` does today relying on the engine's
+    post-hoc critical persist in ``_on_candle_close`` (unchanged, out of
+    scope here — migrating it onto this typed commit is a separate,
+    future decision).
+    """
+
+    consume_entry_attempt: bool = False
+    anchor: AnchorUpdate | None = None
+    block_day_reason: str | None = None
+    expire_replacement_for: tuple[LegRole, ...] = ()
+
+
+@dataclass(frozen=True)
 class BasketSignal:
     """Emitted by a multi-leg strategy — the counterpart of ``StrategySignal``."""
 
@@ -237,6 +328,15 @@ class BasketSignal:
     exit_reason: ExitReason | None = None
     #: For ``EXIT_LEG``: which existing leg instance is targeted.
     target_leg_id: str | None = None
+    #: For ``ADJUST_LEGS``: the atomic roll event to claim and close. Every
+    #: existing construction site omits this (defaults to ``None``), so
+    #: ``straddle_920``'s emitted surface is unchanged.
+    adjustment: AdjustmentRequest | None = None
+    #: Durable basket-level bookkeeping to commit atomically with, and
+    #: before, this signal's own order effect (or with no order effect at
+    #: all — e.g. a primary-entry attempt consumed on a blackout date).
+    #: Every existing construction site omits this (defaults to ``None``).
+    state_commit: BasketStateCommit | None = None
 
 
 @dataclass
@@ -306,6 +406,96 @@ class LegInstance:
             self.max_adverse_pnl = pnl
 
 
+#: AdjustmentLifecycle values for which a roll claim is done — no further
+#: close, replacement or retry will ever touch that row again. Used by
+#: :meth:`RollClaim.is_terminal`.
+_TERMINAL_ROLL_LIFECYCLE_STATES = frozenset(
+    {
+        AdjustmentLifecycle.EXIT_UNKNOWN.value,
+        AdjustmentLifecycle.FAILED.value,
+        AdjustmentLifecycle.REPLACEMENT_FILLED.value,
+        AdjustmentLifecycle.REPLACEMENT_FAILED.value,
+        AdjustmentLifecycle.REPLACEMENT_EXPIRED.value,
+    }
+)
+
+
+@dataclass(frozen=True)
+class RollClaim:
+    """One durable row of ``strategy_basket_rolls`` (migration ``0013``) —
+    a read-only fact for a strategy built on
+    :class:`~common.engine.multi_leg_strategy.BaseMultiLegStrategy`. Never
+    mutated outside the engine; see that class's "never mutates basket"
+    invariant, which this extends to roll state. See migration ``0013``'s
+    header for the full design rationale.
+    """
+
+    claim_group_id: str
+    leg_role: LegRole
+    roll_sequence: int
+    #: An :class:`AdjustmentLifecycle` value, kept as ``str`` rather than the
+    #: enum itself so a value this code does not yet recognise is still
+    #: representable rather than raising on load — :meth:`is_terminal`
+    #: below is conservative (``False``, i.e. "still needs managing") for
+    #: any value it does not recognise as terminal.
+    lifecycle_state: str
+    target_leg_id: str
+    #: Nullable: populated atomically, together, only once this claim
+    #: transitions off ``CLAIMED`` — see migration ``0013``'s header. Never
+    #: the leg's only exit intent in general (a later, unrelated square-off
+    #: close of the same leg is legitimate); this claim's own recovery is
+    #: keyed on this identity alone, never on ``target_leg_id`` broadly.
+    close_correlation_id: str | None
+    close_intent_id: int | None
+    replacement_leg_id: str | None
+    reference_price_at_claim: float | None
+    claim_candle_ts: datetime
+    claimed_at: datetime
+
+    @property
+    def is_terminal(self) -> bool:
+        """True once this specific attempt is done."""
+        return self.lifecycle_state in _TERMINAL_ROLL_LIFECYCLE_STATES
+
+
+@dataclass(frozen=True)
+class BasketRollState:
+    """Read-only, hydrated durable roll state for one basket (migration
+    ``0013``) — the shared reference spot plus every roll claim ever made,
+    across every role. Handed to a strategy alongside :class:`Basket`;
+    never mutated by it. See that migration's header for the full design
+    rationale and :mod:`common.engine.multi_leg_state` for where this is
+    hydrated from durable storage.
+    """
+
+    reference_price: float | None
+    anchor_candle_ts: datetime | None
+    claims: tuple[RollClaim, ...] = ()
+
+    def roll_count(self, role: LegRole) -> int:
+        """This role's current roll count — ``MAX(roll_sequence)`` across
+        every claim for it, whatever each claim's own outcome. A ``FAILED``
+        claim's ``roll_sequence`` is never refunded (spec section 9.5), so
+        this counts it exactly like a successfully replaced one."""
+        sequences = [c.roll_sequence for c in self.claims if c.leg_role is role]
+        return max(sequences) if sequences else 0
+
+    def active_claim(self, role: LegRole) -> RollClaim | None:
+        """The role's current in-flight claim, if any — the highest-sequence
+        claim for it whose ``lifecycle_state`` is not yet terminal. ``None``
+        means this role has no roll in flight right now (never rolled, or
+        its last roll fully resolved)."""
+        candidates = [c for c in self.claims if c.leg_role is role and not c.is_terminal]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda c: c.roll_sequence)
+
+    def claims_for_group(self, claim_group_id: str) -> tuple[RollClaim, ...]:
+        """Every claim sharing one atomic roll event's ``claim_group_id`` —
+        one member for a single-leg roll, two for a both-leg recentre."""
+        return tuple(c for c in self.claims if c.claim_group_id == claim_group_id)
+
+
 @dataclass
 class Basket:
     """One logical basket — e.g. the straddle for one trading day.
@@ -333,6 +523,15 @@ class Basket:
     square_off_state: str = "PENDING"
     lifecycle_state: str = "OPEN"
     created_at: datetime | None = None
+    #: Hydrated, read-only durable roll state (migration ``0013``). The
+    #: constructor default (``None``) means only "not yet loaded from
+    #: durable storage" — :func:`~common.engine.multi_leg_state.load_basket`
+    #: always sets this to a real :class:`BasketRollState`, with empty
+    #: ``claims`` and a ``None`` reference price when the basket has never
+    #: claimed a roll (including every ``straddle_920`` basket, which does
+    #: not use this table), so a strategy reading a loaded basket never has
+    #: to distinguish "never loaded" from "loaded, nothing yet".
+    roll_state: BasketRollState | None = None
 
     # ------------------------------------------------------------- queries
     def open_legs(self) -> list[LegInstance]:

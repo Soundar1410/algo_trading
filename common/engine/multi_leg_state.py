@@ -12,13 +12,21 @@ not a checkpoint alongside ``positions``, because a leg with no fill yet has no
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from common.logging import get_logger
 from common.models import ExitReason, OptionType, OrderSide
 
 from .models import OptionContract
-from .multi_leg_models import Basket, LegInstance, LegRole, LegState
+from .multi_leg_models import (
+    Basket,
+    BasketRollState,
+    LegInstance,
+    LegRole,
+    LegState,
+    RollClaim,
+)
 
 if TYPE_CHECKING:
     from common.config.models import ExecutionMode
@@ -160,12 +168,104 @@ def load_basket(
         leg = _row_to_leg(row)
         basket.legs[leg.leg_id] = leg
 
+    basket.roll_state = load_basket_roll_state(
+        repository,
+        strategy_id=strategy_id,
+        execution_mode=execution_mode,
+        trading_date=trading_date,
+        basket_id=basket.basket_id,
+    )
+
     return basket
 
 
-def _row_to_leg(row) -> LegInstance:  # type: ignore[no-untyped-def]
-    from datetime import datetime
+def load_basket_roll_state(
+    repository: ExecutionRepository,
+    *,
+    strategy_id: str,
+    execution_mode: ExecutionMode,
+    trading_date: str,
+    basket_id: str,
+) -> BasketRollState:
+    """Rebuild the durable :class:`BasketRollState` (migration ``0013``) for
+    one basket — the shared reference spot plus every roll claim ever made,
+    across every role.
 
+    Never returns ``None``: a basket with no roll history (including every
+    ``straddle_920`` basket, which does not use this table) gets an empty
+    :class:`BasketRollState` with ``reference_price=None`` and no claims, so
+    a strategy reading a loaded basket never has to distinguish "never
+    loaded" from "loaded, nothing yet" — see :attr:`~.multi_leg_models.
+    Basket.roll_state`'s own docstring.
+
+    Raises :class:`BasketRowInconsistent` on an unrecognised ``leg_role`` —
+    never silently drops or guesses (same discipline as :func:`load_basket`
+    itself). Deliberately does **not** validate ``lifecycle_state`` against
+    a closed set: :class:`~.multi_leg_models.RollClaim` keeps it as a plain
+    ``str`` precisely so a value this code does not yet recognise (a future
+    vocabulary extension) is still representable rather than raising —
+    see that class's own docstring.
+    """
+    anchor_row = repository.load_basket_roll_anchor(
+        strategy_id=strategy_id,
+        execution_mode=execution_mode,
+        trading_date=trading_date,
+        basket_id=basket_id,
+    )
+    reference_price = (
+        float(anchor_row["reference_price"])
+        if anchor_row is not None and anchor_row["reference_price"] is not None
+        else None
+    )
+    anchor_candle_ts = (
+        datetime.fromisoformat(anchor_row["anchor_candle_ts"])
+        if anchor_row is not None and anchor_row["anchor_candle_ts"]
+        else None
+    )
+
+    claims = tuple(
+        _row_to_roll_claim(row) for row in repository.load_basket_rolls(basket_id=basket_id)
+    )
+
+    return BasketRollState(
+        reference_price=reference_price,
+        anchor_candle_ts=anchor_candle_ts,
+        claims=claims,
+    )
+
+
+def _row_to_roll_claim(row) -> RollClaim:  # type: ignore[no-untyped-def]
+    try:
+        role = LegRole(row["leg_role"])
+    except ValueError as exc:
+        raise BasketRowInconsistent(
+            f"strategy_basket_rolls row (basket_id={row['basket_id']!r}, "
+            f"roll_sequence={row['roll_sequence']!r}) has leg_role={row['leg_role']!r}, "
+            "not a recognised LegRole"
+        ) from exc
+
+    return RollClaim(
+        claim_group_id=row["claim_group_id"],
+        leg_role=role,
+        roll_sequence=int(row["roll_sequence"]),
+        lifecycle_state=row["lifecycle_state"],
+        target_leg_id=row["target_leg_id"],
+        close_correlation_id=row["close_correlation_id"],
+        close_intent_id=(
+            int(row["close_intent_id"]) if row["close_intent_id"] is not None else None
+        ),
+        replacement_leg_id=row["replacement_leg_id"],
+        reference_price_at_claim=(
+            float(row["reference_price_at_claim"])
+            if row["reference_price_at_claim"] is not None
+            else None
+        ),
+        claim_candle_ts=datetime.fromisoformat(row["claim_candle_ts"]),
+        claimed_at=datetime.fromisoformat(row["claimed_at"]),
+    )
+
+
+def _row_to_leg(row) -> LegInstance:  # type: ignore[no-untyped-def]
     try:
         role = LegRole(row["leg_role"])
         state = LegState(row["state"])

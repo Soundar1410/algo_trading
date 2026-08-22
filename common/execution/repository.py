@@ -49,6 +49,27 @@ def _now() -> str:
 
 
 @dataclass(frozen=True)
+class BasketRollClaimSeed:
+    """One target's create-time fields for :meth:`ExecutionRepository.
+    commit_basket_state` (migration ``0013``) — deliberately not the full
+    ``strategy_basket_rolls`` row shape: a freshly claimed row's
+    ``lifecycle_state`` is always ``'CLAIMED'`` and its
+    ``close_correlation_id``/``close_intent_id``/``replacement_leg_id`` are
+    always ``None``, so this carries only what a fresh claim actually needs.
+    This module must not import ``common.engine``, so this is a local,
+    plain type rather than a reuse of that module's ``AdjustmentTarget``.
+    """
+
+    claim_group_id: str
+    leg_role: str
+    roll_sequence: int
+    target_leg_id: str
+    reference_price_at_claim: float | None
+    claim_candle_ts: str
+    claimed_at: str
+
+
+@dataclass(frozen=True)
 class SessionRecord:
     """A runtime session row — the anchor for everything a process writes."""
 
@@ -1373,6 +1394,69 @@ class ExecutionRepository:
     # `TYPE_CHECKING`-only imports) — the row <-> `Basket`/`LegInstance`
     # conversion lives in `common.engine.multi_leg_state`, the caller of these
     # methods.
+    def _write_strategy_basket_row(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        runtime_id: str,
+        strategy_id: str,
+        execution_mode: ExecutionMode,
+        trading_date: str,
+        basket_id: str,
+        lifecycle_state: str,
+        entries_consumed: bool,
+        day_blocked_reason: str | None,
+        adjustment_count: int,
+        pending_replacement_role: str | None,
+        pending_replacement_state: str | None,
+        original_combined_basis: float | None,
+        square_off_state: str,
+    ) -> None:
+        """The ``strategy_baskets`` upsert itself, on an already-open
+        connection/transaction — extracted so :meth:`commit_basket_state`
+        (migration ``0013``) can write this row atomically alongside the
+        roll anchor/claims in one transaction, without duplicating this SQL.
+        Not part of this class's public surface; use
+        :meth:`upsert_strategy_basket` or :meth:`commit_basket_state`."""
+        conn.execute(
+            """
+            INSERT INTO strategy_baskets
+                (runtime_id, strategy_id, execution_mode, trading_date, basket_id,
+                 lifecycle_state, entries_consumed, day_blocked_reason, adjustment_count,
+                 pending_replacement_role, pending_replacement_state,
+                 original_combined_basis, square_off_state, version, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+            ON CONFLICT (strategy_id, execution_mode, trading_date, basket_id) DO UPDATE SET
+                lifecycle_state = excluded.lifecycle_state,
+                entries_consumed = excluded.entries_consumed,
+                day_blocked_reason = excluded.day_blocked_reason,
+                adjustment_count = excluded.adjustment_count,
+                pending_replacement_role = excluded.pending_replacement_role,
+                pending_replacement_state = excluded.pending_replacement_state,
+                original_combined_basis = excluded.original_combined_basis,
+                square_off_state = excluded.square_off_state,
+                version = strategy_baskets.version + 1,
+                updated_at = excluded.updated_at
+            """,
+            (
+                runtime_id,
+                strategy_id,
+                execution_mode.value,
+                trading_date,
+                basket_id,
+                lifecycle_state,
+                int(entries_consumed),
+                day_blocked_reason,
+                adjustment_count,
+                pending_replacement_role,
+                pending_replacement_state,
+                original_combined_basis,
+                square_off_state,
+                _now(),
+                _now(),
+            ),
+        )
+
     def upsert_strategy_basket(
         self,
         *,
@@ -1391,43 +1475,21 @@ class ExecutionRepository:
         square_off_state: str,
     ) -> None:
         with self._db.transaction() as conn:
-            conn.execute(
-                """
-                INSERT INTO strategy_baskets
-                    (runtime_id, strategy_id, execution_mode, trading_date, basket_id,
-                     lifecycle_state, entries_consumed, day_blocked_reason, adjustment_count,
-                     pending_replacement_role, pending_replacement_state,
-                     original_combined_basis, square_off_state, version, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-                ON CONFLICT (strategy_id, execution_mode, trading_date, basket_id) DO UPDATE SET
-                    lifecycle_state = excluded.lifecycle_state,
-                    entries_consumed = excluded.entries_consumed,
-                    day_blocked_reason = excluded.day_blocked_reason,
-                    adjustment_count = excluded.adjustment_count,
-                    pending_replacement_role = excluded.pending_replacement_role,
-                    pending_replacement_state = excluded.pending_replacement_state,
-                    original_combined_basis = excluded.original_combined_basis,
-                    square_off_state = excluded.square_off_state,
-                    version = strategy_baskets.version + 1,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    runtime_id,
-                    strategy_id,
-                    execution_mode.value,
-                    trading_date,
-                    basket_id,
-                    lifecycle_state,
-                    int(entries_consumed),
-                    day_blocked_reason,
-                    adjustment_count,
-                    pending_replacement_role,
-                    pending_replacement_state,
-                    original_combined_basis,
-                    square_off_state,
-                    _now(),
-                    _now(),
-                ),
+            self._write_strategy_basket_row(
+                conn,
+                runtime_id=runtime_id,
+                strategy_id=strategy_id,
+                execution_mode=execution_mode,
+                trading_date=trading_date,
+                basket_id=basket_id,
+                lifecycle_state=lifecycle_state,
+                entries_consumed=entries_consumed,
+                day_blocked_reason=day_blocked_reason,
+                adjustment_count=adjustment_count,
+                pending_replacement_role=pending_replacement_role,
+                pending_replacement_state=pending_replacement_state,
+                original_combined_basis=original_combined_basis,
+                square_off_state=square_off_state,
             )
 
     def load_strategy_basket(
@@ -1647,6 +1709,456 @@ class ExecutionRepository:
             )
             .fetchall()
         )
+
+    # ------------------------------------------------- rolling multi-leg baskets
+    # Migration 0013 (strategy-rolling-strangle-otm1). Generic to any multi-leg
+    # strategy that rolls a threatened leg repeatedly with independent per-role
+    # budgets — see that migration's own header for the full design rationale,
+    # in particular why strategy_basket_rolls is a deliberate hybrid of the
+    # strategy_cycle_adjustments (0010) and strategy_cycle_entry_stage (0012)
+    # patterns rather than a copy of either. Same discipline as the multi-leg
+    # basket methods above: this module must not import common.engine; the row
+    # <-> RollClaim/BasketRollState conversion lives in
+    # common.engine.multi_leg_state.
+
+    def order_intent_by_id(self, intent_id: int) -> sqlite3.Row | None:
+        """One exact ``order_intents`` row (``LEFT JOIN orders``), scoped to
+        a single stable identity — the same column shape as one row of
+        :meth:`leg_order_history` but never scanning every exit attempt for
+        a leg. A leg may legitimately carry more than one exit-side intent
+        (a rejected roll close followed, later, by hard square-off closing
+        the same leg) — a roll claim's own recovery must reconcile through
+        *this* method with its own ``close_intent_id``, never by scanning
+        ``leg_order_history(leg_id=target_leg_id)`` (migration ``0013``'s
+        header)."""
+        row: sqlite3.Row | None = (
+            self._db.connect()
+            .execute(
+                """
+                SELECT
+                    oi.id AS intent_id, oi.correlation_id, oi.side, oi.quantity,
+                    oi.risk_decision, oi.risk_reason, oi.sequence_number,
+                    oi.submission_reserved,
+                    o.status AS order_status,
+                    o.filled_quantity AS order_filled_quantity,
+                    o.average_fill_price AS order_average_fill_price,
+                    o.broker_order_id AS order_broker_order_id,
+                    o.rejection_reason AS order_rejection_reason
+                FROM order_intents oi
+                LEFT JOIN orders o ON o.intent_id = oi.id
+                WHERE oi.id = ?
+                """,
+                (intent_id,),
+            )
+            .fetchone()
+        )
+        return row
+
+    def reserve_roll_close_intent(
+        self,
+        *,
+        session_id: int,
+        intent: OrderIntent,
+        leg_role: str,
+        roll_sequence: int,
+    ) -> int:
+        """Reserve one roll target's close-attempt intent and atomically
+        associate its identity onto its ``strategy_basket_rolls`` row, in
+        **one transaction** — the smallest generic extension of
+        :meth:`reserve_intent` that closes the gap between "the intent is
+        reserved" and "the roll claim knows its own identity" (migration
+        ``0013``'s header). Either both writes land or neither does; there
+        is no window where the ``order_intents`` row exists but the roll
+        row does not yet know its own ``close_intent_id``, or vice versa.
+
+        Transitions that row's ``lifecycle_state`` to
+        ``'EXIT_SUBMISSION_PENDING'`` (the literal
+        ``common.engine.multi_leg_models.AdjustmentLifecycle.
+        EXIT_SUBMISSION_PENDING.value`` — this module must not import
+        ``common.engine``, so the value is duplicated as a string here, the
+        same discipline every other status literal in this class already
+        follows) in the same transaction — never before, per that
+        migration's header on why the transition happens exactly here.
+
+        ``intent.basket_id`` identifies which basket's roll this belongs to;
+        combined with ``leg_role``/``roll_sequence`` it identifies the exact
+        ``strategy_basket_rolls`` row. Raises ``ValueError`` if that row
+        does not exist or is not currently ``CLAIMED`` — this method must
+        never silently create or overwrite a claim it was not asked to
+        associate with.
+        """
+        if intent.basket_id is None:
+            raise ValueError("reserve_roll_close_intent requires intent.basket_id")
+        with self._db.transaction() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO order_intents
+                    (correlation_id, correlation_namespace, session_id, signal_id, runtime_id,
+                     strategy_id, execution_mode, trading_date, sequence_number, instrument,
+                     security_id, side, quantity, order_type, limit_price, trigger_price,
+                     product_type, basket_id, leg_id, config_fingerprint, risk_decision,
+                     risk_reason, submission_reserved, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                """,
+                (
+                    intent.correlation_id,
+                    intent.execution_mode.value,
+                    session_id,
+                    intent.signal_id,
+                    intent.runtime_id,
+                    intent.strategy_id,
+                    intent.execution_mode.value,
+                    intent.trading_date,
+                    intent.sequence_number,
+                    intent.instrument,
+                    intent.security_id,
+                    intent.side.value,
+                    intent.quantity,
+                    intent.order_type.value,
+                    intent.limit_price,
+                    intent.trigger_price,
+                    intent.product_type,
+                    intent.basket_id,
+                    intent.leg_id,
+                    intent.config_fingerprint,
+                    intent.risk_decision.value,
+                    intent.risk_reason,
+                    intent.created_at.isoformat(),
+                ),
+            )
+            intent_id = int(cursor.lastrowid or 0)
+            updated = conn.execute(
+                """
+                UPDATE strategy_basket_rolls
+                SET close_correlation_id = ?, close_intent_id = ?,
+                    lifecycle_state = 'EXIT_SUBMISSION_PENDING',
+                    version = version + 1, updated_at = ?
+                WHERE basket_id = ? AND leg_role = ? AND roll_sequence = ?
+                    AND lifecycle_state = 'CLAIMED'
+                """,
+                (
+                    intent.correlation_id,
+                    intent_id,
+                    _now(),
+                    intent.basket_id,
+                    leg_role,
+                    roll_sequence,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise ValueError(
+                    f"no CLAIMED strategy_basket_rolls row for basket_id={intent.basket_id!r} "
+                    f"leg_role={leg_role!r} roll_sequence={roll_sequence!r} — refusing to "
+                    "reserve a close intent with nothing to associate it to"
+                )
+            return intent_id
+
+    def _write_basket_roll_anchor_row(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        runtime_id: str,
+        strategy_id: str,
+        execution_mode: ExecutionMode,
+        trading_date: str,
+        basket_id: str,
+        reference_price: float | None,
+        anchor_candle_ts: str | None,
+    ) -> None:
+        """The ``strategy_basket_roll_anchor`` upsert on an already-open
+        connection/transaction — extracted so :meth:`commit_basket_state`
+        can write this row atomically alongside the basket projection and
+        any new claims, without duplicating this SQL."""
+        conn.execute(
+            """
+            INSERT INTO strategy_basket_roll_anchor
+                (runtime_id, strategy_id, execution_mode, trading_date, basket_id,
+                 reference_price, anchor_candle_ts, version, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+            ON CONFLICT (strategy_id, execution_mode, trading_date, basket_id) DO UPDATE SET
+                reference_price = excluded.reference_price,
+                anchor_candle_ts = excluded.anchor_candle_ts,
+                version = strategy_basket_roll_anchor.version + 1,
+                updated_at = excluded.updated_at
+            """,
+            (
+                runtime_id,
+                strategy_id,
+                execution_mode.value,
+                trading_date,
+                basket_id,
+                reference_price,
+                anchor_candle_ts,
+                _now(),
+                _now(),
+            ),
+        )
+
+    def upsert_basket_roll_anchor(
+        self,
+        *,
+        runtime_id: str,
+        strategy_id: str,
+        execution_mode: ExecutionMode,
+        trading_date: str,
+        basket_id: str,
+        reference_price: float | None,
+        anchor_candle_ts: str | None,
+    ) -> None:
+        """Durable shared reference spot for one basket's rolls (migration
+        ``0013``) — a dedicated side table, never an ``ALTER TABLE`` on
+        ``strategy_baskets`` (see that migration's own header). One row per
+        ``basket_id``, upserted in place exactly like
+        :meth:`upsert_strategy_basket` itself."""
+        with self._db.transaction() as conn:
+            self._write_basket_roll_anchor_row(
+                conn,
+                runtime_id=runtime_id,
+                strategy_id=strategy_id,
+                execution_mode=execution_mode,
+                trading_date=trading_date,
+                basket_id=basket_id,
+                reference_price=reference_price,
+                anchor_candle_ts=anchor_candle_ts,
+            )
+
+    def load_basket_roll_anchor(
+        self,
+        *,
+        strategy_id: str,
+        execution_mode: ExecutionMode,
+        trading_date: str,
+        basket_id: str,
+    ) -> sqlite3.Row | None:
+        row: sqlite3.Row | None = (
+            self._db.connect()
+            .execute(
+                """
+                SELECT * FROM strategy_basket_roll_anchor
+                WHERE strategy_id = ? AND execution_mode = ? AND trading_date = ?
+                    AND basket_id = ?
+                """,
+                (strategy_id, execution_mode.value, trading_date, basket_id),
+            )
+            .fetchone()
+        )
+        return row
+
+    def _write_basket_roll_row(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        runtime_id: str,
+        strategy_id: str,
+        execution_mode: ExecutionMode,
+        trading_date: str,
+        basket_id: str,
+        claim_group_id: str,
+        leg_role: str,
+        roll_sequence: int,
+        lifecycle_state: str,
+        target_leg_id: str,
+        close_correlation_id: str | None,
+        close_intent_id: int | None,
+        replacement_leg_id: str | None,
+        reference_price_at_claim: float | None,
+        claim_candle_ts: str,
+        claimed_at: str,
+    ) -> None:
+        """The ``strategy_basket_rolls`` upsert on an already-open
+        connection/transaction — extracted so :meth:`commit_basket_state`
+        can write one or more claims atomically alongside the basket
+        projection and anchor, without duplicating this SQL.
+
+        One row per ``(basket_id, leg_role, roll_sequence)`` — created at
+        claim time with ``lifecycle_state='CLAIMED'`` and mutated in place
+        through its lifecycle via this same upsert, mirroring
+        ``append_cycle_adjustment``'s actual ``ON CONFLICT ... DO UPDATE``
+        shape (see migration ``0013``'s header for why this table's mutable
+        claim differs from that precedent's "written once, at a terminal
+        outcome" framing). Only the fields that genuinely change over a
+        claim's lifecycle are in the ``DO UPDATE SET`` clause —
+        ``target_leg_id``, ``reference_price_at_claim``, ``claim_candle_ts``
+        and ``claimed_at`` describe the claim's origin and are immutable
+        once first written; a repeat call for the same
+        ``(basket_id, leg_role, roll_sequence)`` cannot silently rewrite
+        them. ``UNIQUE (basket_id, leg_role, roll_sequence)`` is what makes
+        a post-crash retry of the *same* claim idempotent rather than a
+        silent double-claim.
+        """
+        conn.execute(
+            """
+            INSERT INTO strategy_basket_rolls
+                (runtime_id, strategy_id, execution_mode, trading_date, basket_id,
+                 claim_group_id, leg_role, roll_sequence, lifecycle_state, target_leg_id,
+                 close_correlation_id, close_intent_id, replacement_leg_id,
+                 reference_price_at_claim, claim_candle_ts, claimed_at, version, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            ON CONFLICT (basket_id, leg_role, roll_sequence) DO UPDATE SET
+                lifecycle_state = excluded.lifecycle_state,
+                close_correlation_id = excluded.close_correlation_id,
+                close_intent_id = excluded.close_intent_id,
+                replacement_leg_id = excluded.replacement_leg_id,
+                version = strategy_basket_rolls.version + 1,
+                updated_at = excluded.updated_at
+            """,
+            (
+                runtime_id,
+                strategy_id,
+                execution_mode.value,
+                trading_date,
+                basket_id,
+                claim_group_id,
+                leg_role,
+                roll_sequence,
+                lifecycle_state,
+                target_leg_id,
+                close_correlation_id,
+                close_intent_id,
+                replacement_leg_id,
+                reference_price_at_claim,
+                claim_candle_ts,
+                claimed_at,
+                _now(),
+            ),
+        )
+
+    def upsert_basket_roll(
+        self,
+        *,
+        runtime_id: str,
+        strategy_id: str,
+        execution_mode: ExecutionMode,
+        trading_date: str,
+        basket_id: str,
+        claim_group_id: str,
+        leg_role: str,
+        roll_sequence: int,
+        lifecycle_state: str,
+        target_leg_id: str,
+        close_correlation_id: str | None,
+        close_intent_id: int | None,
+        replacement_leg_id: str | None,
+        reference_price_at_claim: float | None,
+        claim_candle_ts: str,
+        claimed_at: str,
+    ) -> None:
+        """Create or progress one roll claim. See
+        :meth:`_write_basket_roll_row` for the full shape/rationale."""
+        with self._db.transaction() as conn:
+            self._write_basket_roll_row(
+                conn,
+                runtime_id=runtime_id,
+                strategy_id=strategy_id,
+                execution_mode=execution_mode,
+                trading_date=trading_date,
+                basket_id=basket_id,
+                claim_group_id=claim_group_id,
+                leg_role=leg_role,
+                roll_sequence=roll_sequence,
+                lifecycle_state=lifecycle_state,
+                target_leg_id=target_leg_id,
+                close_correlation_id=close_correlation_id,
+                close_intent_id=close_intent_id,
+                replacement_leg_id=replacement_leg_id,
+                reference_price_at_claim=reference_price_at_claim,
+                claim_candle_ts=claim_candle_ts,
+                claimed_at=claimed_at,
+            )
+
+    def load_basket_rolls(self, *, basket_id: str) -> list[sqlite3.Row]:
+        return list(
+            self._db.connect()
+            .execute(
+                "SELECT * FROM strategy_basket_rolls WHERE basket_id = ? "
+                "ORDER BY leg_role, roll_sequence",
+                (basket_id,),
+            )
+            .fetchall()
+        )
+
+    def commit_basket_state(
+        self,
+        *,
+        runtime_id: str,
+        strategy_id: str,
+        execution_mode: ExecutionMode,
+        trading_date: str,
+        basket_id: str,
+        lifecycle_state: str,
+        entries_consumed: bool,
+        day_blocked_reason: str | None,
+        adjustment_count: int,
+        pending_replacement_role: str | None,
+        pending_replacement_state: str | None,
+        original_combined_basis: float | None,
+        square_off_state: str,
+        anchor: tuple[float | None, str | None] | None = None,
+        new_claims: tuple[BasketRollClaimSeed, ...] = (),
+    ) -> None:
+        """Write the basket projection, an optional anchor re-anchor, and
+        zero or more freshly-``CLAIMED`` roll rows — **all in one
+        transaction**. Either every write lands or none does; this is the
+        atomic commit protocol a strategy's ``BasketStateCommit``/
+        ``AdjustmentRequest`` (see ``common.engine.multi_leg_models``)
+        ultimately rides on. ``anchor``, when given, is
+        ``(reference_price, anchor_candle_ts)``. ``new_claims`` seeds one row
+        per target of one atomic roll event (§6.3/§7.2 of the Phase 0
+        report) — every seed's ``lifecycle_state`` is always ``'CLAIMED'``
+        and its ``close_correlation_id``/``close_intent_id``/
+        ``replacement_leg_id`` are always ``None`` at creation, so
+        :class:`BasketRollClaimSeed` carries only the fields a fresh claim
+        actually needs.
+        """
+        with self._db.transaction() as conn:
+            self._write_strategy_basket_row(
+                conn,
+                runtime_id=runtime_id,
+                strategy_id=strategy_id,
+                execution_mode=execution_mode,
+                trading_date=trading_date,
+                basket_id=basket_id,
+                lifecycle_state=lifecycle_state,
+                entries_consumed=entries_consumed,
+                day_blocked_reason=day_blocked_reason,
+                adjustment_count=adjustment_count,
+                pending_replacement_role=pending_replacement_role,
+                pending_replacement_state=pending_replacement_state,
+                original_combined_basis=original_combined_basis,
+                square_off_state=square_off_state,
+            )
+            if anchor is not None:
+                reference_price, anchor_candle_ts = anchor
+                self._write_basket_roll_anchor_row(
+                    conn,
+                    runtime_id=runtime_id,
+                    strategy_id=strategy_id,
+                    execution_mode=execution_mode,
+                    trading_date=trading_date,
+                    basket_id=basket_id,
+                    reference_price=reference_price,
+                    anchor_candle_ts=anchor_candle_ts,
+                )
+            for seed in new_claims:
+                self._write_basket_roll_row(
+                    conn,
+                    runtime_id=runtime_id,
+                    strategy_id=strategy_id,
+                    execution_mode=execution_mode,
+                    trading_date=trading_date,
+                    basket_id=basket_id,
+                    claim_group_id=seed.claim_group_id,
+                    leg_role=seed.leg_role,
+                    roll_sequence=seed.roll_sequence,
+                    lifecycle_state="CLAIMED",
+                    target_leg_id=seed.target_leg_id,
+                    close_correlation_id=None,
+                    close_intent_id=None,
+                    replacement_leg_id=None,
+                    reference_price_at_claim=seed.reference_price_at_claim,
+                    claim_candle_ts=seed.claim_candle_ts,
+                    claimed_at=seed.claimed_at,
+                )
 
     # ------------------------------------------------------ positional cycles
     # Migration 0010 (strategy-weekly-delta-neutral). Generic to any

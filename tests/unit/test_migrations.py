@@ -299,6 +299,7 @@ def test_shipped_migrations_start_at_the_walking_skeleton():
         "0010",
         "0011",
         "0012",
+        "0013",
     ]
     assert shipped[0].name == "walking_skeleton"
     assert shipped[1].name == "feed_and_auth_health"
@@ -319,6 +320,8 @@ def test_shipped_migrations_start_at_the_walking_skeleton():
     assert shipped[10].name == "strategy_cycle_margin_snapshots"
     # Phase 5A: bounded staged-entry timeout (spec section 5.3).
     assert shipped[11].name == "positional_entry_stage_deadline"
+    # strategy-rolling-strangle-otm1: durable repeated-roll support (Phase 1).
+    assert shipped[12].name == "basket_roll_state"
 
 
 def test_shipped_migrations_apply_to_a_fresh_database(tmp_path: Path):
@@ -348,6 +351,7 @@ def test_shipped_migrations_apply_to_a_fresh_database(tmp_path: Path):
         "0010",
         "0011",
         "0012",
+        "0013",
     ]
     assert database.integrity_check() == []
     assert database.foreign_key_check() == []
@@ -417,6 +421,7 @@ def test_later_migrations_upgrade_a_database_created_by_0001_alone(tmp_path: Pat
         "0010",
         "0011",
         "0012",
+        "0013",
     ]
     with database.connect() as conn:
         survivors = conn.execute("SELECT COUNT(*) FROM runtime_sessions").fetchone()[0]
@@ -906,7 +911,7 @@ def test_migration_0010_upgrades_a_database_created_by_0009_with_real_rows(tmp_p
     )
 
     applied = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
-    assert [m.version for m in applied] == ["0010", "0011", "0012"]
+    assert [m.version for m in applied] == ["0010", "0011", "0012", "0013"]
 
     assert database.integrity_check() == []
     assert database.foreign_key_check() == []
@@ -1081,4 +1086,129 @@ def test_cycle_position_bindings_enforce_one_position_per_cycle_security(tmp_pat
         conn.execute(
             "INSERT INTO cycle_position_bindings (cycle_id, security_id, position_id, "
             "created_at) VALUES ('wdn:2026-08-19', '54321', 2, 'now')"
+        )
+
+
+# ----------------------------------------- 0013 (strategy-rolling-strangle-otm1)
+def test_migration_0013_upgrades_a_database_created_by_0012_with_real_rows(tmp_path: Path):
+    """The real upgrade path for 0013: seed a database through 0001-0012 only,
+    insert a real ``strategy_baskets`` row exactly as 0009 already shipped it,
+    then apply 0013 and prove that row survives completely untouched, the two
+    new tables exist with working constraints, and a second run does not
+    re-apply anything."""
+    from common.persistence.migrations import VERSIONS_DIR
+
+    up_to_0012 = tmp_path / "up_to_0012"
+    up_to_0012.mkdir()
+    for migration in discover_migrations(VERSIONS_DIR):
+        # Zero-padded version strings sort lexicographically the same as
+        # numerically -- excludes 0013 *and* every later migration, not just
+        # 0013 by name, so this test's own "seed through 0012 only" intent
+        # survives a future migration being added.
+        if migration.version >= "0013":
+            continue
+        (up_to_0012 / migration.path.name).write_text(
+            migration.path.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+
+    database = Database(tmp_path / "operational" / "intraday_options.db")
+    MigrationRunner(database, versions_dir=up_to_0012).run_pending()
+
+    with database.transaction() as conn:
+        conn.execute(
+            "INSERT INTO strategy_baskets (runtime_id, strategy_id, execution_mode, "
+            "trading_date, basket_id, entries_consumed, adjustment_count, "
+            "square_off_state, created_at, updated_at) VALUES "
+            "('intraday_options', 'rolling_strangle_otm1', 'paper', '2026-08-17', "
+            "'rolling_strangle_otm1:2026-08-17', 1, 0, 'PENDING', 'now', 'now')"
+        )
+    before = dict(
+        database.connect().execute("SELECT * FROM strategy_baskets").fetchone()
+    )
+
+    applied = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
+    assert [m.version for m in applied] == ["0013"]
+
+    assert database.integrity_check() == []
+    assert database.foreign_key_check() == []
+
+    with database.connect() as conn:
+        after = dict(conn.execute("SELECT * FROM strategy_baskets").fetchone())
+        assert after == before, "0013 must not touch any existing strategy_baskets row"
+
+        tables = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        assert {"strategy_basket_roll_anchor", "strategy_basket_rolls"} <= tables
+
+    # A second startup must not attempt to reapply 0013.
+    second_run = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
+    assert second_run == []
+
+
+def test_strategy_basket_roll_anchor_is_one_row_per_basket(tmp_path: Path):
+    from common.persistence.migrations import VERSIONS_DIR
+
+    database = Database(tmp_path / "operational" / "intraday_options.db")
+    MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
+
+    with database.transaction() as conn:
+        conn.execute(
+            "INSERT INTO strategy_basket_roll_anchor (runtime_id, strategy_id, "
+            "execution_mode, trading_date, basket_id, reference_price, anchor_candle_ts, "
+            "created_at, updated_at) VALUES ('intraday_options', 'rolling_strangle_otm1', "
+            "'paper', '2026-08-17', 'rolling_strangle_otm1:2026-08-17', 20000.0, "
+            "'2026-08-17T09:45:00+05:30', 'now', 'now')"
+        )
+    with database.transaction() as conn, pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO strategy_basket_roll_anchor (runtime_id, strategy_id, "
+            "execution_mode, trading_date, basket_id, reference_price, anchor_candle_ts, "
+            "created_at, updated_at) VALUES ('intraday_options', 'rolling_strangle_otm1', "
+            "'paper', '2026-08-17', 'rolling_strangle_otm1:2026-08-17', 20070.0, "
+            "'2026-08-17T09:50:00+05:30', 'now', 'now')"
+        )
+
+
+def test_strategy_basket_rolls_enforces_one_row_per_role_and_sequence(tmp_path: Path):
+    """UNIQUE (basket_id, leg_role, roll_sequence) is the real guarantee a
+    post-crash retry cannot reclaim the same role's next roll count twice."""
+    from common.persistence.migrations import VERSIONS_DIR
+
+    database = Database(tmp_path / "operational" / "intraday_options.db")
+    MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
+
+    with database.transaction() as conn:
+        conn.execute(
+            "INSERT INTO strategy_basket_rolls (runtime_id, strategy_id, execution_mode, "
+            "trading_date, basket_id, claim_group_id, leg_role, roll_sequence, "
+            "lifecycle_state, target_leg_id, claim_candle_ts, claimed_at, updated_at) "
+            "VALUES ('intraday_options', 'rolling_strangle_otm1', 'paper', '2026-08-17', "
+            "'rolling_strangle_otm1:2026-08-17', 'grp-1', 'CE', 1, 'CLAIMED', "
+            "'rolling_strangle_otm1:2026-08-17:CE:1', '2026-08-17T09:50:00+05:30', "
+            "'now', 'now')"
+        )
+    # Independent per-role sequencing: PE's roll_sequence=1 is a different
+    # row, not a collision with CE's.
+    with database.transaction() as conn:
+        conn.execute(
+            "INSERT INTO strategy_basket_rolls (runtime_id, strategy_id, execution_mode, "
+            "trading_date, basket_id, claim_group_id, leg_role, roll_sequence, "
+            "lifecycle_state, target_leg_id, claim_candle_ts, claimed_at, updated_at) "
+            "VALUES ('intraday_options', 'rolling_strangle_otm1', 'paper', '2026-08-17', "
+            "'rolling_strangle_otm1:2026-08-17', 'grp-2', 'PE', 1, 'CLAIMED', "
+            "'rolling_strangle_otm1:2026-08-17:PE:1', '2026-08-17T09:50:00+05:30', "
+            "'now', 'now')"
+        )
+    # A retried claim for CE's already-claimed roll_sequence=1 collides.
+    with database.transaction() as conn, pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO strategy_basket_rolls (runtime_id, strategy_id, execution_mode, "
+            "trading_date, basket_id, claim_group_id, leg_role, roll_sequence, "
+            "lifecycle_state, target_leg_id, claim_candle_ts, claimed_at, updated_at) "
+            "VALUES ('intraday_options', 'rolling_strangle_otm1', 'paper', '2026-08-17', "
+            "'rolling_strangle_otm1:2026-08-17', 'grp-1-retry', 'CE', 1, 'CLAIMED', "
+            "'rolling_strangle_otm1:2026-08-17:CE:1', '2026-08-17T09:50:00+05:30', "
+            "'now', 'now')"
         )

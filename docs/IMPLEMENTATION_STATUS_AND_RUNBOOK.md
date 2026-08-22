@@ -10066,3 +10066,152 @@ test guard. No secret was read, printed or altered. No branch was merged.
 `live_execution_allowed`, and every other strategy's `enabled`/`mode`/
 `live_approved` are unchanged. `OPERATIONAL LIVE ACTIVATION ELIGIBLE` remains
 **NO — BLOCKED**, unaffected by this branch.
+
+### `strategy-rolling-strangle-otm1` branch addendum — 22 August 2026 (unmerged, Phase 0/1 only)
+
+Cut from `feature-paper-auto-start` at `43ddd88` onto a dedicated feature
+branch/isolated worktree (`/Volumes/Trading/algo_trading_rolling_strangle_otm1`),
+porting the legacy `points_rolling_strangle` strategy as `rolling_strangle_otm1`
+— a short OTM-1 NIFTY strangle that rolls a threatened leg repeatedly (up to 2
+CE rolls and 2 PE rolls per day, independently counted), per the approved
+`ROLLING_STRANGLE_OTM1_ALGO_TRADING_SPEC.md`. **This branch is not complete.**
+Only Phase 0 (inspection) and Phase 1 (generic durable roll data model,
+repository API, migration) are done; strategy behavior, engine wiring,
+runtime/config and dashboard support remain outstanding.
+
+#### Phase 0 finding: the existing generic multi-leg model cannot represent repeated rolls
+
+The multi-leg machinery (`common/engine/multi_leg_*`, migration `0009`) was
+built for `straddle_920`'s single sole-adjustment-per-day lifecycle: one
+scalar `adjustment_count`, one `pending_replacement_role`/`_state` slot, no
+reference-spot column anywhere in the schema, and `BasketSignal` has no
+command capable of expressing an atomic multi-leg roll. `exit_state_snapshot()`
+is disqualified by proof, not preference — it is never persisted at all on
+the multi-leg path (`MultiLegEngine.__init__` has no
+`persist_exit_state`/`recover_exit_state` parameters, unlike single-leg
+`TradingEngine`), and even on the single-leg path it is a per-candle
+best-effort observability write, never a checkpoint. Two further review
+rounds surfaced that a naive design would misclassify "position still open"
+as "close never submitted" (it can mean genuinely pending/ambiguous instead),
+and that a leg can legitimately carry more than one exit-side order intent
+(a rejected roll close followed, later, by hard square-off closing the same
+leg) — which the existing `_reconcile_leg`'s `len(exit_rows) > 1` check
+cannot tolerate. The full design, with file:line citations for every claim,
+is recorded in the branch's own Phase 0 report (not duplicated here); the
+short version is: additive migration `0013`, a per-role append-only roll
+ledger whose row is genuinely mutable through its own lifecycle, a typed
+command surface so the strategy never mutates `Basket` directly, and roll
+recovery keyed by a target's own reserved close-intent identity rather than
+by scanning every exit attempt for its leg.
+
+#### Phase 1 delivered: the generic durable roll data model, repository API and migration
+
+No strategy code, no config, no engine wiring, no enablement — only the data
+layer, reusable by any future rolling multi-leg strategy (nothing here names
+`rolling_strangle_otm1`):
+
+* **Migration `0013_basket_roll_state.sql`** — two additive side tables, no
+  `ALTER TABLE` on `strategy_baskets`: `strategy_basket_roll_anchor` (mutable,
+  one row per basket, the shared re-anchored reference spot) and
+  `strategy_basket_rolls` (one row per `(basket_id, leg_role, roll_sequence)`,
+  a deliberate hybrid of migration `0010`'s `strategy_cycle_adjustments`
+  append-only-identity pattern and `0012`'s `strategy_cycle_entry_stage`
+  mutable-row pattern — needed because this table's own row *is* the mutable
+  in-flight claim, which is what makes two independent, concurrent in-flight
+  claims representable for the both-leg recentre mode, the one thing a
+  single mutable slot on the parent basket cannot do). `leg_role` is `TEXT`
+  with no `CHECK` constraint, validated on load through the full `LegRole`
+  enum (all seven current members, any future one, no further migration
+  needed) — the same pattern `strategy_baskets.pending_replacement_role`
+  already uses. `close_correlation_id`/`close_intent_id` are nullable,
+  populated atomically only with the transition off `CLAIMED`. Applies
+  cleanly to a fresh database and replays cleanly upgrading a database
+  seeded through `0012` only, proven by
+  `test_migration_0013_upgrades_a_database_created_by_0012_with_real_rows`
+  (mirroring the existing `0010`-over-`0009` template) plus two dedicated
+  constraint tests. `test_shipped_migrations_start_at_the_walking_skeleton`
+  and the two other tests that hardcode the full migration-version list
+  were updated to include `"0013"`.
+* **`common/engine/multi_leg_models.py`** — `AnchorUpdate`, `AdjustmentTarget`,
+  `AdjustmentRequest`, `BasketStateCommit` (the typed command surface a
+  strategy uses instead of mutating `Basket` directly — restores the
+  invariant `BaseMultiLegStrategy`'s own docstring already states),
+  `BasketAction.ADJUST_LEGS` and `BasketSignal.adjustment`/`.state_commit`
+  (both default `None`, so every existing construction site and
+  `straddle_920`'s emitted surface are byte-identical), `RollClaim` and
+  `BasketRollState` (the read-only, hydrated durable roll state a strategy
+  is handed alongside `Basket`, exposing `roll_count(role)` and
+  `active_claim(role)`), and `AdjustmentLifecycle.FAILED` (a new terminal
+  outcome for a definitively rejected/cancelled roll close, additive to the
+  existing vocabulary the positional engine already reuses).
+* **`common/engine/multi_leg_state.py`** — `load_basket_roll_state` hydrates
+  `BasketRollState`/`RollClaim` from the new tables, fail-closed
+  (`BasketRowInconsistent`) on an unrecognised `leg_role`, deliberately
+  *not* fail-closed on an unrecognised `lifecycle_state` (kept as `str` so a
+  future vocabulary extension is representable rather than rejected — proven
+  by a dedicated test). `load_basket` now always populates
+  `Basket.roll_state` — a real (possibly empty) `BasketRollState` for every
+  basket, including every existing `straddle_920` basket, never left unset.
+* **`common/execution/repository.py`** — `upsert_basket_roll_anchor`/
+  `load_basket_roll_anchor`, `upsert_basket_roll`/`load_basket_rolls`,
+  `commit_basket_state` (writes the basket projection, an optional anchor
+  re-anchor, and zero or more freshly-`CLAIMED` roll rows in **one**
+  transaction — proven atomic under an injected mid-transaction failure: the
+  basket row and anchor row, both written earlier in the same transaction,
+  do not survive either), `reserve_roll_close_intent` (the smallest generic
+  extension of the existing `reserve_intent` — reuses its exact `order_intents`
+  insert, extended in the *same* transaction to atomically associate the
+  reserved intent's identity onto its `strategy_basket_rolls` row and
+  transition it to `EXIT_SUBMISSION_PENDING`; refuses, rather than silently
+  creating or overwriting anything, when there is no `CLAIMED` row to
+  associate with), and `order_intent_by_id` (a single-intent lookup, the
+  same column shape as `leg_order_history` but scoped to one stable identity
+  — because a roll claim's own recovery must never scan every exit attempt
+  for its leg, since a later, unrelated square-off attempt on the same leg
+  is legitimate). `upsert_strategy_basket`'s existing SQL was extracted into
+  a private `_write_strategy_basket_row` helper (called by both it and
+  `commit_basket_state`) with no change to its own public behavior —
+  proven by the full existing `straddle_920`/repository suite passing
+  unchanged after the extraction, before any new method was added.
+
+#### Files
+
+New: `common/persistence/migrations/versions/0013_basket_roll_state.sql`,
+`tests/unit/test_basket_roll_state.py` (18 tests). Modified:
+`common/engine/multi_leg_models.py`, `common/engine/multi_leg_state.py`,
+`common/execution/repository.py`, `tests/unit/test_migrations.py` (one new
+migration-version entry, one new replay test, two new constraint tests, three
+existing hardcoded migration-list assertions extended with `"0013"`).
+`strategies/intraday_options/rolling_strangle_otm1/ROLLING_STRANGLE_OTM1_ALGO_TRADING_SPEC.md`
+committed as the specification (commit `d2986ba`) — no strategy code yet.
+
+#### Verification
+
+Full suite: exit code 0, no failures (a handful of pre-existing environmental
+skips only). `common/engine/multi_leg_models.py`, `common/engine/
+multi_leg_state.py` and `common/execution/repository.py` clean under
+`ruff check` and `mypy --strict`. `mypy common strategies runtimes dashboards
+scripts --strict` clean over 236 source files. Every existing `straddle_920`
+durability/reconciliation/restart/correlation/acceptance test, and
+`test_no_straddle_920_branches.py`, `test_leg_role_extension_is_additive.py`,
+re-run and pass unchanged — this phase's schema and repository additions are
+purely additive and are not yet wired into any engine or strategy code path,
+so nothing existing could regress from them being exercised at runtime.
+
+#### Safety
+
+Development happened entirely in an isolated `git worktree`
+(`/Volumes/Trading/algo_trading_rolling_strangle_otm1`); the running PAPER
+supervisor, its LaunchAgents and the Streamlit dashboard in the primary
+checkout were never touched. No runtime, dashboard or LaunchAgent was
+started, stopped or modified. No Dhan or order-capable endpoint, and no
+Telegram endpoint, was called. No secret was read, printed or altered. No
+branch was merged. No config file exists yet for this strategy — nothing
+under `config/` was added or changed, so `scripts.assert_no_live_config_committed`
+has nothing new to check. `auto_start.enabled`, `global.live_trading_enabled`,
+every runtime's `live_execution_allowed`, and every other strategy's
+`enabled`/`mode`/`live_approved` are unchanged.
+`OPERATIONAL LIVE ACTIVATION ELIGIBLE` remains **NO — BLOCKED**, unaffected
+by this branch. Implementation completion of this phase does not authorise
+PAPER enablement or any further phase — Phase 2 (generic engine lifecycle and
+reconciliation) is next, stopping for review before it begins.
