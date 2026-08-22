@@ -276,7 +276,33 @@ def _reconcile_basket(
     # replacement itself. Covers a basket whose pending_replacement_role
     # was written before migration 0013 existed and so has no
     # strategy_basket_rolls row for the check above to find.
-    if basket.pending_replacement_role is not None:
+    #
+    # Phase 5 fix (found while proving rolling_strangle_otm1's own restart
+    # matrix; generic, shared with straddle_920 since both drive the same
+    # _close_adjusted_legs_with_ledger machinery): this must fire only for
+    # the two states the comment above actually names.
+    # pending_replacement_role/_state are a speculative "compatibility
+    # projection" written at *claim* time (_close_adjusted_legs_with_ledger
+    # sets pending_replacement_state = EXIT_SUBMISSION_PENDING before the
+    # close is even attempted) and are never reset on a terminal FAILED/
+    # EXIT_UNKNOWN outcome — only the roll ledger's own precise per-claim
+    # row is. Firing unconditionally on "role is set" therefore produced a
+    # false-positive UnmanageableBasketState for the spec-required,
+    # already-correctly-resolved case of a definitively rejected roll close
+    # (leg correctly reconstructed OPEN, roll_sequence not refunded, no
+    # replacement) — exactly the state the precise, roll_state-based check
+    # above already proves is *not* a contradiction. Restricting the scalar
+    # fallback to the two states that actually mean "a replacement is
+    # pending" leaves its original legacy (pre-0013) coverage unchanged and
+    # only removes this false positive.
+    _replacement_pending_states = {
+        AdjustmentLifecycle.AWAITING_NEXT_CANDLE.value,
+        AdjustmentLifecycle.REPLACEMENT_PENDING.value,
+    }
+    if (
+        basket.pending_replacement_role is not None
+        and basket.pending_replacement_state in _replacement_pending_states
+    ):
         role = basket.pending_replacement_role
         stale_open = [
             leg

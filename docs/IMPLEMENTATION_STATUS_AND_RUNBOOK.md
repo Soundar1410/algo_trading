@@ -10711,3 +10711,184 @@ flags changed; every live gate
 remains **NO — BLOCKED**. Phase 5 (end-to-end acceptance, dashboard,
 restart matrix, consolidated verification) is next, stopping for review
 before it begins.
+
+### `strategy-rolling-strangle-otm1` Phase 5 addendum — 22 August 2026 (unmerged, final)
+
+The full spec §17.6 restart/reconciliation matrix, read-only dashboard
+integration, end-to-end/no-network proofs, and consolidated final
+verification. Implementation-complete for this branch; still disabled,
+PAPER-only, not live-approved, and not merged.
+
+#### 5A. Restart/reconciliation matrix (`tests/integration/
+test_rolling_strangle_otm1_restart.py`, 24 tests)
+
+Every restart is a **second, independently constructed** `MultiLegEngine` (+
+its own `PositionManager`/`LifecycleGateway`/`OrderLifecycle`/`RollLedger`)
+built over the same repository/SQLite file — never the same instance
+reused. Ticks are fed through the real `MultiLegEngine.on_tick` directly
+(after `_start_day()`, the same call `run()` itself makes first) rather than
+through `run()`'s own broad `except Exception: force square-off; raise`
+wrapper, so a genuine crash at an exact tick boundary can be expressed and
+caught with `pytest.raises` at that exact point, without the engine's own
+"still alive enough to clean up" behaviour intervening — the same
+real-methods-directly technique Phase 2's own suite established. One
+sub-row (a claim committed with literally no close attempt dispatched yet)
+has no expressible tick sequence at all, because
+`_close_adjusted_legs_with_ledger` performs claim-then-close as one
+uninterruptible call for a single target; that state is seeded via
+`RollLedger.commit_claims` directly — the same real method the engine
+itself calls, never a hand-typed row — mirroring Phase 2's own precedent
+for this identical state.
+
+Covers, each proven with a real restart: primary entry at every boundary
+(before/during/one-leg/both-legs/rejected/ambiguous/lot-mismatch); the full
+single-leg roll lifecycle across five successive restarts (before claim ->
+seeded CLAIMED-no-intent -> resumed, not re-claimed -> AWAITING_NEXT_CANDLE
+-> replacement pending -> REPLACEMENT_FILLED, with the resume path proven
+never to re-anchor); two-roll budget exhaustion; cutoff expiry; both-leg
+atomic claim/anchor, partial-confirmation blocking the whole group, and
+atomic replacement consumption; the required multiple-exit-attempts
+lifecycle (a rejected roll close followed by a later, unrelated square-off
+of the same leg, reconciling cleanly); an over-close contradiction and an
+unrecognised lifecycle_state both failing closed; durable state
+preservation (no same-day re-entry once blocked, no reset on a same-day
+restart); hard square-off (full and one-sided-partial baskets, and firing
+with no prior underlying candle data at all); and the exact ₹19,999/₹20,000
+combined-stop boundary, each with a restart on both sides.
+
+**Genuine defect found and fixed** (root cause, generic, required to
+complete this matrix — reported per the phase's own defect-handling rule):
+`_reconcile_basket`'s legacy "replacement pending while a leg of that role
+is OPEN" fallback check fired on `basket.pending_replacement_role` alone,
+with no check of `pending_replacement_state`. That scalar "compatibility
+projection" pair is written *speculatively* at claim time
+(`pending_replacement_state = EXIT_SUBMISSION_PENDING`, before the close is
+even attempted) and is **never reset** on a terminal `FAILED`/`EXIT_UNKNOWN`
+outcome — only the roll ledger's own precise per-claim row is. The
+unconditional check therefore raised a false-positive
+`UnmanageableBasketState` on restart for the spec-required, already-
+correctly-resolved case of a definitively rejected roll close (leg
+correctly reconstructed `OPEN`, `roll_sequence` not refunded, no
+replacement) — exactly the state the *precise*, `roll_state`-based check
+immediately above it already proves is not a contradiction. Root cause:
+the fallback's own comment already named its true scope ("AWAITING_NEXT_
+CANDLE/REPLACEMENT_PENDING both mean...") but the code never enforced it.
+Fix: restrict the fallback to fire only when `pending_replacement_state`
+is actually `AWAITING_NEXT_CANDLE` or `REPLACEMENT_PENDING` — its original,
+documented legacy (pre-`0013`) coverage is unchanged; only the false
+positive is removed. Shared, generic code
+(`runtimes/intraday_options/multi_leg_engine_worker.py`) — `straddle_920`
+drives the identical `_close_adjusted_legs_with_ledger` path since Phase 2
+and was exposed to the identical latent risk (a rejected single adjustment,
+restarted) without ever having a test reach that exact restart boundary.
+Regression: every `straddle_920` durability/reconciliation/restart/
+acceptance/correlation suite, `test_rolling_multi_leg_engine.py` (Phase 2's
+own 20-test generic suite), `test_basket_roll_state.py` and
+`test_migrations.py` re-run and pass unchanged after the fix — the change
+can only make the check fire *less* often, never more, so no test relying
+on a genuine `AWAITING_NEXT_CANDLE`/`REPLACEMENT_PENDING` contradiction
+could regress.
+
+#### 5B. Dashboard integration
+
+Extended the existing generic multi-leg read-model
+(`dashboards/data/multi_leg.py`) with `RollRow`/`RollAnchorRow` and
+`load_rolls_for_basket`/`load_roll_anchor`, reading migration `0013`'s
+`strategy_basket_rolls`/`strategy_basket_roll_anchor` — filtered only by
+`basket_id`, exactly like every existing function in that module, so any
+multi-leg strategy that ever claims a roll (`straddle_920`'s own single
+adjustment included, normalised into the same claim machinery since Phase
+2) is covered with zero further changes. `dashboards/intraday_options.py`'s
+generic `_render_baskets` gained an optional roll-history table and
+reference-anchor caption, defaulting to showing nothing when the caller
+passes neither (every existing call site, and every existing test, is
+unaffected — proven by re-running `test_dashboard_apptest.py`/`test_
+dashboard.py` unchanged). No `if strategy_id == "rolling_strangle_otm1"`
+branch anywhere — the strategy selector, basket loader and now the roll
+loader all discover/scope generically by config and by `strategy_id` as an
+ordinary filter parameter.
+
+Proven against **real** data produced through the real `MultiLegEngine`/
+`ExecutorRepository`/`RollLedger` stack (never a hand-typed roll/anchor
+row): roll history reads back correctly through a real `connect_readonly`
+connection (which itself structurally refuses a write — proven directly);
+a role still awaiting replacement renders `None` fields honestly, never
+fabricated; two strategies' baskets in the same database never leak into
+each other's `load_baskets`/`load_rolls_for_basket` results; the real
+Streamlit `AppTest` runtime renders this strategy's own real roll history
+correctly in the Baskets tab with no branch (byte-identical page code to
+`straddle_920`'s own already-exercised path). `discover_strategy_options`
+lists this strategy `Disabled` from the real committed config with no code
+change.
+
+#### 5C. End-to-end and no-network proofs (`tests/end_to_end/
+test_rolling_strangle_otm1_end_to_end.py`, 3 tests)
+
+A complete entry -> roll -> replacement -> restart -> hard-square-off
+lifecycle through the real engine/repository stack, ending flat with
+durable realised P&L and roll history; real `build_supervisor` composition
+against the real committed config alongside `ema_cross_9_21_buy` and
+`straddle_920` (this strategy stays out, per Phase 4's own isolation
+proof, since it ships disabled). Both wrapped in the same outbound-socket
+sentinel technique `tests/end_to_end/test_notification_guard_spawn.py`
+already established for this repository (refuses and logs any non-loopback
+`connect`/`connect_ex`), applied in-process for this strategy's own test
+family rather than across a spawned process boundary — nothing in this
+family spawns a worker or a dashboard. Zero outbound attempts recorded in
+either test. The external-notification guard
+(`ALGO_DISABLE_EXTERNAL_NOTIFICATIONS`) is already enforced repository-wide
+by `tests/conftest.py`'s autouse `isolated_env` fixture for every test in
+this suite, this file included.
+
+#### Mandatory architecture checks
+
+`tests/unit/test_no_rolling_strangle_otm1_branches.py` (Phase 4) re-run
+unchanged and still passes after every Phase 5 file/dashboard change — its
+`GENERIC_TARGETS` already walks `dashboards/` (and `orchestration/`,
+`runtimes/intraday_options/`) recursively, so the dashboard extension above
+was re-scanned automatically, with no update needed to the negative-space
+test itself. `test_no_straddle_920_branches.py`, `test_no_supertrend_buy_
+1_1p2_branches.py`, and `test_no_weekly_delta_neutral_branches.py` all
+re-run and pass unchanged. `roll_ledger=None` fallback: every `straddle_
+920` test (which never wires a roll ledger) passed unchanged both before
+and after the Phase 5A fix, proving that fallback contract untouched.
+Weekly positional (`weekly_delta_neutral`) restart/reconciliation/entry/
+exit/config/selection/risk suites re-run in full and pass — expected, since
+this phase's only production change lives in
+`runtimes/intraday_options/multi_leg_engine_worker.py`, a module the
+positional engine (`common.engine.positional.positional_engine`) never
+imports.
+
+#### Files changed this phase
+
+Modified: `runtimes/intraday_options/multi_leg_engine_worker.py` (the
+`_reconcile_basket` fix above), `dashboards/data/multi_leg.py`,
+`dashboards/intraday_options.py`. New: `tests/integration/
+test_rolling_strangle_otm1_restart.py` (24), `tests/integration/
+test_rolling_strangle_otm1_dashboard.py` (6), `tests/end_to_end/
+test_rolling_strangle_otm1_end_to_end.py` (3).
+
+#### Regression
+
+147 `rolling_strangle_otm1`-scoped tests pass. Full `pytest`: exit 0 (run
+twice). `ruff check .`: clean. `mypy common strategies runtimes dashboards
+scripts --strict`: clean, 238 source files (unchanged — no new production
+`.py` file this phase). `scripts.assert_no_live_config_committed`: OK.
+`orchestration.launchd.generate_plists --check`, read-only from the real
+checkout: 2 plists match, unaffected.
+
+#### Safety
+
+Same isolated worktree; no runtime/dashboard/LaunchAgent
+started/stopped/modified/installed; no Dhan/Telegram endpoint reachable —
+measured, not merely argued, via the network sentinel; every proof used a
+scripted/recorded in-process fake feed and broker; no secret
+read/printed/altered; no branch merged; config unchanged
+(`enabled: false`/`mode: paper`/`live_approved: false`); no existing
+strategy's flags changed; every live gate unchanged.
+`OPERATIONAL LIVE ACTIVATION ELIGIBLE` remains **NO — BLOCKED**: the 30-day
+paper evaluation, a second real paper strategy, EMA-specific minimum-
+quantity approval, static-IP/provider setup, live auth revalidation, and
+separate approval to flip any gate all remain outstanding, unaffected by
+this implementation-complete state. This is the final phase for this
+branch; no further phase is planned unless review requests one.

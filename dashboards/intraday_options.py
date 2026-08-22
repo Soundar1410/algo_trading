@@ -77,8 +77,12 @@ from dashboards.data.intraday_options import (  # noqa: E402
 from dashboards.data.multi_leg import (  # noqa: E402
     BasketRow,
     LegRow,
+    RollAnchorRow,
+    RollRow,
     load_baskets,
     load_legs_for_basket,
+    load_roll_anchor,
+    load_rolls_for_basket,
 )
 from dashboards.data.strategy_scope import (  # noqa: E402
     StrategyOption,
@@ -249,13 +253,23 @@ def _render_live_positions(streamlit: Any, rows: tuple[Any, ...]) -> None:
 
 # =================================================================== Baskets
 def _render_baskets(
-    streamlit: Any, baskets: tuple[BasketRow, ...], legs_by_basket: dict[str, tuple[LegRow, ...]]
+    streamlit: Any,
+    baskets: tuple[BasketRow, ...],
+    legs_by_basket: dict[str, tuple[LegRow, ...]],
+    rolls_by_basket: dict[str, tuple[RollRow, ...]] | None = None,
+    anchor_by_basket: dict[str, RollAnchorRow | None] | None = None,
 ) -> None:
     """Generic multi-leg basket/leg drill-down — reusable by any multi-leg
-    strategy, not specific to straddle_920. Read-only, typed data only."""
+    strategy, not specific to straddle_920 or rolling_strangle_otm1.
+    Read-only, typed data only. ``rolls_by_basket``/``anchor_by_basket``
+    default ``None`` so every existing caller (and every existing test)
+    keeps working unchanged; a caller that does not pass them simply shows
+    no roll history section, exactly as before this was added."""
     if not baskets:
         streamlit.info("No basket for a multi-leg strategy on this date.")
         return
+    rolls_by_basket = rolls_by_basket or {}
+    anchor_by_basket = anchor_by_basket or {}
     for basket in baskets:
         with streamlit.expander(
             f"{basket.basket_id} — {basket.lifecycle_state} "
@@ -279,6 +293,46 @@ def _render_baskets(
                     f"Pending replacement: {basket.pending_replacement_role} "
                     f"({basket.pending_replacement_state or 'unknown state'})"
                 )
+
+            anchor = anchor_by_basket.get(basket.basket_id)
+            rolls = rolls_by_basket.get(basket.basket_id, ())
+            if anchor is not None or rolls:
+                streamlit.caption(
+                    "Reference anchor: "
+                    + (
+                        f"{format_inr(anchor.reference_price)} as of "
+                        f"{anchor.anchor_candle_ts or MISSING}"
+                        if anchor is not None and anchor.reference_price is not None
+                        else MISSING
+                    )
+                )
+            if rolls:
+                rolls_table = [
+                    {
+                        "Role": roll.leg_role,
+                        "Roll #": roll.roll_sequence,
+                        "State": roll.lifecycle_state,
+                        "From leg": roll.target_leg_id,
+                        "From strike": (
+                            roll.target_strike if roll.target_strike is not None else MISSING
+                        ),
+                        "To leg": roll.replacement_leg_id or MISSING,
+                        "To strike": (
+                            roll.replacement_strike
+                            if roll.replacement_strike is not None
+                            else MISSING
+                        ),
+                        "Trigger spot": (
+                            format_inr(roll.reference_price_at_claim)
+                            if roll.reference_price_at_claim is not None
+                            else MISSING
+                        ),
+                        "Claim candle (IST)": roll.claim_candle_ts,
+                        "Close correlation": roll.close_correlation_id or MISSING,
+                    }
+                    for roll in rolls
+                ]
+                streamlit.dataframe(rolls_table, hide_index=True, width="stretch")
 
             legs = legs_by_basket.get(basket.basket_id, ())
             if not legs:
@@ -763,7 +817,27 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
             legs_by_basket: dict[str, tuple[LegRow, ...]] = (
                 {} if isinstance(legs_result, SnapshotUnavailable) else legs_result
             )
-            _render_baskets(st, baskets, legs_by_basket)
+
+            def _load_all_rolls(
+                conn: Any, basket_ids: tuple[str, ...] = tuple(b.basket_id for b in baskets)
+            ) -> dict[str, tuple[RollRow, ...]]:
+                return {bid: load_rolls_for_basket(conn, basket_id=bid) for bid in basket_ids}
+
+            rolls_result = run_bounded(database_path, _load_all_rolls)
+            rolls_by_basket: dict[str, tuple[RollRow, ...]] = (
+                {} if isinstance(rolls_result, SnapshotUnavailable) else rolls_result
+            )
+
+            def _load_all_anchors(
+                conn: Any, basket_ids: tuple[str, ...] = tuple(b.basket_id for b in baskets)
+            ) -> dict[str, RollAnchorRow | None]:
+                return {bid: load_roll_anchor(conn, basket_id=bid) for bid in basket_ids}
+
+            anchor_result = run_bounded(database_path, _load_all_anchors)
+            anchor_by_basket: dict[str, RollAnchorRow | None] = (
+                {} if isinstance(anchor_result, SnapshotUnavailable) else anchor_result
+            )
+            _render_baskets(st, baskets, legs_by_basket, rolls_by_basket, anchor_by_basket)
 
         _baskets()
 

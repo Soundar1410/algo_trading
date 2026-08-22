@@ -8,6 +8,16 @@ directly reusable by the next multi-leg strategy with zero changes here.
 basis figures) are exposed as typed data fields for the page to render —
 never hardcoded SQL or a page branch naming this one strategy.
 
+:class:`RollRow`/:class:`RollAnchorRow` (Phase 5,
+``strategy-rolling-strangle-otm1``) extend this same generic read-model to
+migration ``0013``'s ``strategy_basket_rolls``/``strategy_basket_roll_
+anchor`` — durable repeated-roll history first needed by
+``rolling_strangle_otm1``, but keyed only by ``basket_id`` exactly like
+every other function here, so any multi-leg strategy that ever claims a
+roll (``straddle_920``'s own single adjustment included, since Phase 2
+normalises it into the same claim machinery) is covered with zero further
+changes.
+
 Same convention as :mod:`dashboards.data.intraday_options`: every function
 takes an already-open ``connect_readonly`` connection, so the page owns
 connection lifetime via :func:`dashboards._shared.run_bounded` and every
@@ -192,4 +202,109 @@ def _row_to_leg(conn: sqlite3.Connection, row: sqlite3.Row) -> LegRow:
         unrealised_gross_pnl=None,
         charges=charges,
         net_pnl=net_pnl,
+    )
+
+
+@dataclass(frozen=True)
+class RollRow:
+    """One durable roll claim (migration ``0013``'s ``strategy_basket_
+    rolls``) — generic to any multi-leg strategy's repeated-roll history.
+    ``target_*``/``replacement_*`` are read from ``strategy_legs`` by leg
+    id; a leg id with no matching row (not expected in production, but the
+    read must not raise) comes back ``None``, which the page renders as
+    ``—`` rather than guessing."""
+
+    leg_role: str
+    roll_sequence: int
+    lifecycle_state: str
+    target_leg_id: str
+    target_strike: float | None
+    target_symbol: str | None
+    replacement_leg_id: str | None
+    replacement_strike: float | None
+    replacement_symbol: str | None
+    reference_price_at_claim: float | None
+    claim_candle_ts: str
+    claimed_at: str
+    close_correlation_id: str | None
+    close_intent_id: int | None
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class RollAnchorRow:
+    """The shared reference spot a basket's rolls re-anchor to (migration
+    ``0013``'s ``strategy_basket_roll_anchor``) — one row per basket,
+    generic to any multi-leg strategy."""
+
+    reference_price: float | None
+    anchor_candle_ts: str | None
+    updated_at: str
+
+
+def load_rolls_for_basket(conn: sqlite3.Connection, *, basket_id: str) -> tuple[RollRow, ...]:
+    """Every roll claim for one basket, ordered by role then roll sequence
+    so repeated rolls for one role read in chronological order."""
+    rows = conn.execute(
+        """
+        SELECT * FROM strategy_basket_rolls
+        WHERE basket_id = ?
+        ORDER BY leg_role, roll_sequence
+        """,
+        (basket_id,),
+    ).fetchall()
+    return tuple(_row_to_roll(conn, row) for row in rows)
+
+
+def load_roll_anchor(conn: sqlite3.Connection, *, basket_id: str) -> RollAnchorRow | None:
+    """The basket's current shared reference spot, if it has ever rolled or
+    otherwise durably anchored one — ``None`` for a basket with no anchor
+    row at all (e.g. it never reached primary entry)."""
+    row = conn.execute(
+        "SELECT * FROM strategy_basket_roll_anchor WHERE basket_id = ?",
+        (basket_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return RollAnchorRow(
+        reference_price=row["reference_price"],
+        anchor_candle_ts=row["anchor_candle_ts"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _leg_strike_and_symbol(
+    conn: sqlite3.Connection, leg_id: str | None
+) -> tuple[float | None, str | None]:
+    if leg_id is None:
+        return None, None
+    row = conn.execute(
+        "SELECT strike, symbol FROM strategy_legs WHERE leg_id = ?", (leg_id,)
+    ).fetchone()
+    if row is None:
+        return None, None
+    return row["strike"], row["symbol"]
+
+
+def _row_to_roll(conn: sqlite3.Connection, row: sqlite3.Row) -> RollRow:
+    target_strike, target_symbol = _leg_strike_and_symbol(conn, row["target_leg_id"])
+    replacement_strike, replacement_symbol = _leg_strike_and_symbol(
+        conn, row["replacement_leg_id"]
+    )
+    return RollRow(
+        leg_role=row["leg_role"],
+        roll_sequence=int(row["roll_sequence"]),
+        lifecycle_state=row["lifecycle_state"],
+        target_leg_id=row["target_leg_id"],
+        target_strike=target_strike,
+        target_symbol=target_symbol,
+        replacement_leg_id=row["replacement_leg_id"],
+        replacement_strike=replacement_strike,
+        replacement_symbol=replacement_symbol,
+        reference_price_at_claim=row["reference_price_at_claim"],
+        claim_candle_ts=row["claim_candle_ts"],
+        claimed_at=row["claimed_at"],
+        close_correlation_id=row["close_correlation_id"],
+        close_intent_id=row["close_intent_id"],
+        updated_at=row["updated_at"],
     )
