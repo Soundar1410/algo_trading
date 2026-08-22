@@ -1,0 +1,215 @@
+# rolling_strangle_otm1 — the OTM-1 NIFTY rolling strangle, ported from the
+# legacy points_rolling_strangle strategy. Full spec: strategies/
+# intraday_options/rolling_strangle_otm1/ROLLING_STRANGLE_OTM1_ALGO_TRADING_SPEC.md.
+# Do not copy config/strategies/skeleton_fixture.yaml as a template.
+#
+# PAPER ONLY at delivery, and disabled. Setting mode to `live` would NOT start
+# a live strategy regardless: runtimes/intraday_options/config_adapter.py's
+# _build_multi_leg_engine_worker_config refuses a live mode outright for the
+# multi-leg engine (see that function and multi_leg_engine_worker.py's own
+# docstring — this is a short strangle with theoretically unbounded risk, and
+# any live proposal needs a separate written risk review this repository has
+# not done). The broker factory's own live gate
+# (common.config.models.effective_live_gate) would refuse it a second time
+# regardless. Phase 4 (this file) ships strictly config/runtime wiring —
+# implementation completion does not authorise PAPER enablement or live use
+# (spec section 16).
+
+strategy_id: rolling_strangle_otm1
+runtime_id: intraday_options
+# Shipped disabled. Enabling for the first paper session is a deliberate,
+# explicit operator action, taken only after the 30-day paper evaluation and
+# every other outstanding item CLAUDE.md's project rules record for this
+# repository's overall operational eligibility. Do not flip this to true as
+# part of implementation work.
+enabled: false
+
+mode: paper
+live_approved: false
+
+# Same discriminator straddle_920 uses: EngineKind routes additively, by
+# value, never by a strategy-name branch — see config_adapter.py's own
+# docstring.
+engine: multi_leg_engine
+
+risk:
+  # Spec sections 5/8/9.4/10.2. The strategy's own primary-entry gate fires
+  # at 09:45 (parameters.strategy_kwargs.entry_time below) — entry_start here
+  # is only the engine-level session boundary, deliberately earlier (09:15,
+  # the exchange open), so five-minute underlying candles are already being
+  # built by the time 09:45 arrives; the strategy itself, not this boundary,
+  # is what refuses every candle before then. entry_cutoff mirrors the
+  # strategy's own new-entry/replacement cutoff (strictly before 15:10) so
+  # MarketSession.can_enter and the strategy's own cutoff check agree on the
+  # exact same instant — one configured pair, not two independently
+  # configured times that can drift apart (the same reasoning straddle_920's
+  # and supertrend_buy_1_1p2's own risk blocks record). square_off_at is the
+  # operator-approved 15:15 CAS deviation from the legacy 15:20 (spec section
+  # 3.4) — engine-owned hard square-off, unconditional, independent of
+  # strategy state.
+  entry_start: "09:15"
+  entry_cutoff: "15:10"
+  square_off_at: "15:15"
+
+parameters:
+  # ------------------------------------------------------- required, both paths
+  instrument: NIFTY
+  # NIFTY index security id (common.market_data.scrip_master.INDEX_REGISTRY).
+  security_id: "13"
+
+  # ------------------------------------------------- engine-path discriminator
+  strategy_ref: "strategies.intraday_options.rolling_strangle_otm1.strategy:RollingStrangleOtm1Strategy"
+
+  # RollingStrangleOtm1Strategy's own constructor kwargs (spec sections 4, 6,
+  # 8-10). Travels through config_adapter.py verbatim, then to
+  # runtimes.intraday_options.multi_leg_engine_worker.load_multi_leg_strategy's
+  # factory(**kwargs) call.
+  strategy_kwargs:
+    lots_per_leg: 10
+    entry_time: "09:45"
+    # Strictly-before semantics (spec section 9.4): a candle whose decision
+    # timestamp is exactly this value already refuses a new roll/replacement.
+    # Must equal risk.entry_cutoff above — see that key's own comment for why
+    # they are one configured instant, not two independently drifting ones.
+    stop_new_entries_after: "15:10"
+    # Informational only (RollingStrangleOtm1Strategy.status()) — hard
+    # square-off itself is entirely engine/session-owned (risk.square_off_at
+    # above), never evaluated by the strategy directly. Must equal
+    # risk.square_off_at for the same one-configured-instant reason.
+    square_off_time: "15:15"
+    # strike_step is intentionally configured in TWO places that must agree:
+    # here (the strategy's own otm_steps = max(1, round(otm_distance_points /
+    # strike_step)) computation, spec section 6.4 step 3) and again at
+    # parameters.strike_step below (the engine's OptionSelector construction).
+    # They are two different components reading the same conceptual value
+    # through two different config paths — RollingStrangleOtm1Strategy has no
+    # access to parameters.strike_step directly, since only strategy_kwargs
+    # travels to its constructor. Keep both in sync; a mismatch would not
+    # fail to load, it would silently select the wrong OTM strike.
+    strike_step: 50
+    otm_distance_points: 50
+    roll_trigger_points: 60
+    max_rolls_ce: 2
+    max_rolls_pe: 2
+    # Spec section 9.3: preserve the legacy configurable both-leg recentre
+    # mode in code, but the shipped configuration stays single-leg — do not
+    # flip this without a separate specification/approval (spec section
+    # 9.3's own text).
+    single_leg_roll: true
+    combined_stop_per_lot: 2000.0
+    # Manually configured news-blackout trading dates ("YYYY-MM-DD"), spec
+    # section 8. Empty by default; add real dates here as they are known.
+    blackout_dates: []
+
+  # ------------------------------------------------------------- candle/session
+  timeframe: "5m"
+
+  # --------------------------------------------------------- option resolution
+  # "dhan" resolves real NIFTY weekly CE/PE contracts (strike, expiry AND lot
+  # size) from the exchange's own daily instrument master at runtime — spec
+  # section 6.4. Never hardcode a lot size, expiry or security id. No
+  # lot_size key here, deliberately, matching straddle_920's own P1-4
+  # correction: the "dhan" resolver takes lot size exclusively from the
+  # resolved contract's own metadata, so a value here would never be read for
+  # it and could silently mislead if contract_resolver were ever switched to
+  # "simulated" without also adding an explicit lot_size — which
+  # config_adapter.py refuses to do silently (ConfigError).
+  contract_resolver: dhan
+  strike_step: 50
+  expiry: null
+  index_security_id: ""
+  index_segment: ""
+  fno_segment: ""
+  scrip_master_cache_dir: ""
+
+  # This strategy has no auxiliary market-data instrument (spec section 6.1:
+  # "India VIX ... [is] not [an] input to this strategy") — vix_security_id
+  # is deliberately omitted rather than set, which
+  # _build_multi_leg_engine_worker_config reads as "" (no VIX subscription
+  # requested). RollingStrangleOtm1Strategy.on_candle's own vix parameter is
+  # accepted (BaseMultiLegStrategy's shared call signature) and never read.
+
+  # ----------------------------------------------------- strategy's own risk
+  # rolling_strangle_otm1 computes and durably persists its own gross
+  # combined-stop P&L (spec section 10.1) inside its Basket/BasketRollState —
+  # the generic engine-level daily guard
+  # (common.engine.daily_guard.DailyRiskGuard) stays OFF for this strategy so
+  # there is exactly one daily-loss decider, never a second, differently-
+  # shaped one running alongside it (mirrors straddle_920's own risk-
+  # separation posture; see tests/unit/test_straddle_920_risk_separation.py
+  # for the proof pattern this strategy's own equivalent test follows).
+  # capital_base is inert while daily_max_loss_pct is null
+  # (MultiLegEngine._build_daily_guard short-circuits before ever reading it)
+  # — kept here only for schema consistency with the other multi-leg
+  # strategies, not because any formula in this strategy reads it.
+  capital_base: 2000000
+  daily_max_loss_pct: null
+
+  # --------------------------------------------------------- 2026 holiday calendar
+  # The engine's own MarketSession reads its holidays from HERE, not from
+  # config/global.yaml (whose list feeds only the unattended auto-start
+  # gate) — strategy-scoped ownership, the same convention
+  # supertrend_buy_1_1p2.yaml documents and this list is copied from
+  # (verified 2026-08-20 against NSE's holiday-master endpoint and
+  # cross-checked against three published calendars; weekend dates retained
+  # for an exact audit trail even though MarketSession already rejects
+  # Saturdays/Sundays).
+  #
+  # OWNERSHIP AND MAINTENANCE (operator-approved decision, enforced only
+  # here for this strategy):
+  #
+  #   * STRATEGY-SCOPED. Applies to rolling_strangle_otm1 only. Editing
+  #     config/global.yaml's list does not change it, and editing this one
+  #     does not change any other strategy or the unattended auto-start
+  #     gate. Every strategy's own copy is maintained together, deliberately
+  #     duplicated so they stay line-for-line comparable.
+  #   * ANNUAL. A 2027 list must be committed here before January 2027, or
+  #     every 2027 holiday is treated as an ordinary trading day by this
+  #     strategy's MarketSession — which would incorrectly permit trading
+  #     and distort completed-candle expectations (a roll trigger or
+  #     replacement evaluated against a candle that should never have
+  #     existed). Re-verify against NSE's own circular, never by copying an
+  #     unverified source.
+  #   * Re-verify after any ad-hoc NSE closure circular.
+  holidays:
+    - "2026-01-15"  # Municipal Corporation Election - Maharashtra
+    - "2026-01-26"  # Republic Day
+    - "2026-02-15"  # Mahashivratri (Sunday)
+    - "2026-03-03"  # Holi
+    - "2026-03-21"  # Id-Ul-Fitr / Ramadan Eid (Saturday)
+    - "2026-03-26"  # Shri Ram Navami
+    - "2026-03-31"  # Shri Mahavir Jayanti
+    - "2026-04-03"  # Good Friday
+    - "2026-04-14"  # Dr. Baba Saheb Ambedkar Jayanti
+    - "2026-05-01"  # Maharashtra Day
+    - "2026-05-28"  # Bakri Id
+    - "2026-06-26"  # Muharram
+    - "2026-08-15"  # Independence Day (Saturday)
+    - "2026-09-14"  # Ganesh Chaturthi
+    - "2026-10-02"  # Mahatma Gandhi Jayanti
+    - "2026-10-20"  # Dussehra
+    - "2026-11-08"  # Diwali Laxmi Pujan / Muhurat session (Sunday)
+    - "2026-11-10"  # Diwali-Balipratipada
+    - "2026-11-24"  # Prakash Gurpurb Sri Guru Nanak Dev
+    - "2026-12-25"  # Christmas
+
+  # ------------------------------------------------------------ paper execution
+  # Intentional architecture-level execution-model deviation (spec section
+  # 13): the legacy simulator ran zero slippage and zero latency. This uses
+  # the repository's canonical intraday paper-execution block instead — the
+  # same one ema_cross_9_21_buy and supertrend_buy_1_1p2 use — so results
+  # stay comparable across strategies. This changes only the fill/charge
+  # model, never the strategy's signal or its gross combined-stop formula
+  # (spec section 10.1's stop compares gross P&L, unaffected by charges).
+  paper_execution:
+    slippage:
+      options:
+        mode: ticks
+        market_order_ticks: 1
+    submission_latency_ms: 250
+    tick_size: 0.05
+    allow_ltp_fallback: true
+    ltp_fallback_extra_ticks: 1
+    # Live feed: reject a quote older than 2s rather than fill on stale data
+    # (spec section 6.3's fresh-tick rule).
+    max_quote_age_ms: 2000

@@ -257,6 +257,53 @@ def test_primary_entry_sells_one_step_otm_ce_and_pe(tmp_path) -> None:  # type: 
     assert strikes == {24050.0, 23950.0}  # ATM +/- one 50pt OTM step
 
 
+def test_primary_entry_dynamically_subscribes_both_contracts(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Phase 4 point 10/11: both CE and PE dynamic subscription requests are
+    genuinely routed through the feed, keyed on their exact resolved
+    security IDs — not merely inferred from the fills succeeding."""
+    repository = _repository(tmp_path)
+    engine, _positions, _broker = _build_engine(repository)
+    ticks = [
+        _tick(NIFTY, 24000.0, _ts(9, 41)),
+        _tick(NIFTY, 24000.0, _ts(9, 45, 0)),
+        _tick("SIM:NIFTY:WEEKLY:24050:CE", 100.0, _ts(9, 45, 5)),
+        _tick("SIM:NIFTY:WEEKLY:23950:PE", 95.0, _ts(9, 45, 10)),
+    ]
+    _run(engine, ticks)
+
+    assert {"SIM:NIFTY:WEEKLY:24050:CE", "SIM:NIFTY:WEEKLY:23950:PE"} <= engine.feed.subscriptions
+
+
+def test_a_rolled_replacement_requests_a_fresh_dynamic_subscription(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Phase 4 point 10: a replacement contract gets its own genuinely new
+    dynamic subscription, never a reuse of the adjusted-out leg's security
+    ID. The untouched PE leg's own subscription is undisturbed by the CE
+    roll — one leg's lifecycle never leaks into another's subscription
+    state. (The adjusted-out CE contract is correctly unsubscribed once its
+    leg closes — reducing feed load for a security this basket no longer
+    holds — which is a distinct, intentional behaviour from "leaking into
+    another worker's channel", proven separately by the supervisor
+    composition suite's per-worker queue-isolation tests.)
+    """
+    repository = _repository(tmp_path)
+    engine, _positions, _broker = _build_engine(repository)
+    ticks = [
+        _tick(NIFTY, 24000.0, _ts(9, 41)),
+        _tick(NIFTY, 24000.0, _ts(9, 45, 0)),
+        _tick("SIM:NIFTY:WEEKLY:24050:CE", 100.0, _ts(9, 45, 5)),
+        _tick("SIM:NIFTY:WEEKLY:23950:PE", 95.0, _ts(9, 45, 10)),
+        _tick(NIFTY, 24100.0, _ts(9, 49, 0)),
+        _tick(NIFTY, 24100.0, _ts(9, 50, 0)),
+        _tick(NIFTY, 24100.0, _ts(9, 55, 0)),
+        _tick("SIM:NIFTY:WEEKLY:24150:CE", 105.0, _ts(9, 55, 5)),
+    ]
+    _run(engine, ticks)
+
+    assert "SIM:NIFTY:WEEKLY:23950:PE" in engine.feed.subscriptions  # untouched leg: undisturbed
+    assert "SIM:NIFTY:WEEKLY:24150:CE" in engine.feed.subscriptions  # replacement: newly added
+    assert "SIM:NIFTY:WEEKLY:24050:CE" not in engine.feed.subscriptions  # closed leg: unsubscribed
+
+
 def test_quantity_is_lots_times_resolved_lot_size(tmp_path) -> None:  # type: ignore[no-untyped-def]
     repository = _repository(tmp_path)
     engine, positions, _broker = _build_engine(repository, lot_size=65, lots_per_leg=10)

@@ -50,6 +50,7 @@ _enter_legs`) — matching every other strategy in this repository.
 
 from __future__ import annotations
 
+from datetime import date
 from datetime import time as time_
 from typing import Any
 
@@ -79,6 +80,30 @@ from common.utils.timeutils import parse_hhmm
 #: dict/set iteration order.
 _ROLES: tuple[LegRole, ...] = (LegRole.CE, LegRole.PE)
 
+#: Every constructor parameter this strategy recognises (Phase 4 validation).
+#: A caller-supplied key outside this set is refused at construction — see
+#: __init__'s own check below — rather than silently ignored, which is what
+#: would otherwise happen to e.g. a misspelled ``max_rols_ce`` in
+#: ``config/strategies/rolling_strangle_otm1.yaml``'s ``strategy_kwargs``: it
+#: would never reach ``_pick``'s known-key lookups, the field would silently
+#: keep its default, and a risk-critical typo would ship undetected.
+_KNOWN_KWARGS: frozenset[str] = frozenset(
+    {
+        "lots_per_leg",
+        "entry_time",
+        "stop_new_entries_after",
+        "square_off_time",
+        "strike_step",
+        "otm_distance_points",
+        "roll_trigger_points",
+        "max_rolls_ce",
+        "max_rolls_pe",
+        "single_leg_roll",
+        "combined_stop_per_lot",
+        "blackout_dates",
+    }
+)
+
 
 def _pick(cfg: Any, kwargs: dict[str, Any], key: str, default: Any) -> Any:
     """Read ``key`` from explicit kwargs first, then ``cfg.parameters``, else default.
@@ -103,7 +128,25 @@ class RollingStrangleOtm1Strategy(BaseMultiLegStrategy):
 
     def __init__(self, cfg: Any = None, **kwargs: Any) -> None:
         super().__init__(cfg)
+        # Phase 4 validation: reject an unrecognised parameter rather than
+        # silently defaulting past a typo in a risk-critical field. Checks
+        # both construction paths _pick itself supports — explicit kwargs
+        # (the real runtime's factory(**strategy_kwargs) call) and
+        # cfg.parameters (a future registry-style construction).
+        supplied = set(kwargs) | set(getattr(cfg, "parameters", {}) or {})
+        unknown = supplied - _KNOWN_KWARGS
+        if unknown:
+            raise ValueError(
+                f"RollingStrangleOtm1Strategy received unrecognised parameter(s) "
+                f"{sorted(unknown)!r} — refusing rather than silently ignoring a "
+                f"possible typo in a risk-critical field. Recognised parameters: "
+                f"{sorted(_KNOWN_KWARGS)!r}."
+            )
+
         self._lots_per_leg = int(_pick(cfg, kwargs, "lots_per_leg", 10))
+        if self._lots_per_leg <= 0:
+            raise ValueError(f"lots_per_leg must be > 0 (got {self._lots_per_leg})")
+
         self._entry_time: time_ = parse_hhmm(str(_pick(cfg, kwargs, "entry_time", "09:45")))
         self._new_entry_cutoff: time_ = parse_hhmm(
             str(_pick(cfg, kwargs, "stop_new_entries_after", "15:10"))
@@ -114,21 +157,65 @@ class RollingStrangleOtm1Strategy(BaseMultiLegStrategy):
         self._square_off_time: time_ = parse_hhmm(
             str(_pick(cfg, kwargs, "square_off_time", "15:15"))
         )
+        # Spec section 5/9.4: entry must precede the new-entry cutoff, which
+        # must in turn precede (or coincide with) hard square-off — the same
+        # ordering SquareOffPolicy itself enforces at the engine/session
+        # level, checked again here since this class also carries its own
+        # copy of these three times for its own decisions.
+        if not self._entry_time < self._new_entry_cutoff <= self._square_off_time:
+            raise ValueError(
+                f"entry_time ({self._entry_time}) must be before "
+                f"stop_new_entries_after ({self._new_entry_cutoff}), which must be "
+                f"at or before square_off_time ({self._square_off_time})"
+            )
+
         self._strike_step = int(_pick(cfg, kwargs, "strike_step", 50))
+        if self._strike_step <= 0:
+            raise ValueError(f"strike_step must be > 0 (got {self._strike_step})")
+
         self._otm_distance_points = float(_pick(cfg, kwargs, "otm_distance_points", 50))
+        if self._otm_distance_points <= 0:
+            raise ValueError(
+                f"otm_distance_points must be > 0 (got {self._otm_distance_points})"
+            )
+
         self._roll_trigger_points = float(_pick(cfg, kwargs, "roll_trigger_points", 60))
-        self._max_rolls: dict[LegRole, int] = {
-            LegRole.CE: int(_pick(cfg, kwargs, "max_rolls_ce", 2)),
-            LegRole.PE: int(_pick(cfg, kwargs, "max_rolls_pe", 2)),
-        }
+        if self._roll_trigger_points <= 0:
+            raise ValueError(
+                f"roll_trigger_points must be > 0 (got {self._roll_trigger_points})"
+            )
+
+        max_rolls_ce = int(_pick(cfg, kwargs, "max_rolls_ce", 2))
+        max_rolls_pe = int(_pick(cfg, kwargs, "max_rolls_pe", 2))
+        if max_rolls_ce < 0 or max_rolls_pe < 0:
+            raise ValueError(
+                f"max_rolls_ce/max_rolls_pe must be non-negative integers "
+                f"(got {max_rolls_ce}/{max_rolls_pe})"
+            )
+        self._max_rolls: dict[LegRole, int] = {LegRole.CE: max_rolls_ce, LegRole.PE: max_rolls_pe}
+
         self._single_leg_roll = bool(_pick(cfg, kwargs, "single_leg_roll", True))
+
         self._combined_stop_per_lot = float(_pick(cfg, kwargs, "combined_stop_per_lot", 2000.0))
+        if self._combined_stop_per_lot <= 0:
+            raise ValueError(
+                f"combined_stop_per_lot must be > 0 (got {self._combined_stop_per_lot})"
+            )
         # SL_total (spec section 4) — computed once, config-driven; scales
         # exactly by combined_stop_per_lot per lot (spec section 17.5).
         self._sl_total = self._lots_per_leg * self._combined_stop_per_lot
-        self._blackout_dates: frozenset[str] = frozenset(
-            str(d) for d in _pick(cfg, kwargs, "blackout_dates", ())
-        )
+
+        raw_blackout_dates = tuple(_pick(cfg, kwargs, "blackout_dates", ()))
+        for raw_date in raw_blackout_dates:
+            try:
+                date.fromisoformat(str(raw_date))
+            except ValueError as exc:
+                raise ValueError(
+                    f"blackout_dates entry {raw_date!r} is not a valid ISO 'YYYY-MM-DD' "
+                    "date"
+                ) from exc
+        self._blackout_dates: frozenset[str] = frozenset(str(d) for d in raw_blackout_dates)
+
         # steps = max(1, round(otm_distance / strike_step)) (spec section
         # 6.4 step 3) — constant for this strategy's lifetime given fixed
         # config; recomputing it per selection would be pure waste since

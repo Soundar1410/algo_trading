@@ -10533,3 +10533,181 @@ every existing live gate (`global.live_trading_enabled`,
 `OPERATIONAL LIVE ACTIVATION ELIGIBLE` remains **NO — BLOCKED**. Phase 4
 (runtime/config/composition) is next, stopping for review before it
 begins.
+
+### `strategy-rolling-strangle-otm1` Phase 4 addendum — 22 August 2026 (unmerged)
+
+Disabled PAPER configuration, generic config loading/validation, runtime
+discovery and supervisor composition, worker/tick/control-queue isolation,
+dynamic option subscription wiring, and fresh-tick fill verification — proven
+against the real config loader, the real config adapter, and the real
+``build_supervisor`` composition root. No dashboard changes and no full
+restart acceptance matrix (both remain Phase 5). No shared code changed this
+phase — every proof runs against Phase 3's own three generic engine
+completions and the pre-existing generic composition root, unmodified.
+
+#### Configuration (`config/strategies/rolling_strangle_otm1.yaml`)
+
+Mirrors `straddle_920.yaml`'s real, current schema — not the spec's own
+illustrative YAML, which differs in field placement (`strike_step` inside
+`strategy_kwargs` is a value the spec's illustrative block does not show
+duplicated). `strategy_id`/`runtime_id`/`enabled: false`/`mode: paper`/
+`live_approved: false`/`engine: multi_leg_engine`; `risk.entry_start: "09:15"`
+(engine-level candle-building start, earlier than the strategy's own 09:45
+gate), `risk.entry_cutoff: "15:10"` (must equal `parameters.strategy_kwargs.
+stop_new_entries_after` — one configured instant, not two that can drift),
+`risk.square_off_at: "15:15"`. `parameters.strategy_ref` is the real
+`module:ClassName` the config adapter requires. `contract_resolver: dhan`,
+no `lot_size` key anywhere in the file (grepped, not merely asserted absent
+from one dict) — the dhan resolver takes it from the resolved contract only.
+`parameters.strike_step: 50` (engine's `OptionSelector`) is intentionally
+duplicated at `parameters.strategy_kwargs.strike_step: 50` (the strategy's
+own `otm_steps` formula) — the YAML documents why a mismatch would not fail
+to load, only silently select the wrong strike, and a dedicated test pins
+the two values equal. No `vix_security_id` — spec section 6.1 names no
+auxiliary instrument for this strategy. `daily_max_loss_pct: null` disables
+the generic per-tick `DailyRiskGuard`, mirroring `straddle_920`'s own
+risk-separation posture (this strategy owns the sole ₹20,000 gross combined-
+stop decider). Holiday calendar copied verbatim from `supertrend_buy_1_1p2.
+yaml`'s own verified 2026 NSE calendar (same exchange, same year),
+strategy-scoped per that file's documented ownership convention. Paper
+execution uses the repository's canonical intraday block (`ema_cross_9_21_
+buy`/`supertrend_buy_1_1p2`'s own — 1-tick slippage, 250ms latency, 2s max
+quote age), an intentional deviation from the legacy zero-slippage
+simulator that changes only the fill/charge model, never the gross combined-
+stop formula.
+
+#### Strategy-owned validation (`strategies/intraday_options/
+rolling_strangle_otm1/strategy.py`)
+
+Added to `RollingStrangleOtm1Strategy.__init__` — no adapter branch, matching
+the existing `supertrend_buy_1_1p2`/`ema_cross_9_21_buy` convention of a
+strategy validating its own typed constructor kwargs: an explicit
+`_KNOWN_KWARGS` allow-list rejects any unrecognised `strategy_kwargs` key
+(closing the "misspelled parameter silently keeps its default" gap — no
+generic mechanism for this exists anywhere in the repository today, and
+adding one to the shared adapter would be a broader, out-of-scope change);
+positivity checks on `lots_per_leg`/`strike_step`/`otm_distance_points`/
+`roll_trigger_points`/`combined_stop_per_lot`; non-negative checks on
+`max_rolls_ce`/`max_rolls_pe`; `entry_time < stop_new_entries_after <=
+square_off_time` ordering; ISO-date parsing for every `blackout_dates`
+entry. Every check raises `ValueError` with a specific message, exactly the
+`supertrend_buy_1_1p2` pattern (`raise ValueError(f"... (got {value})")`).
+
+#### Runtime discovery and supervisor composition
+
+Proven against the real `build_supervisor`, never a hand-built `WorkerConfig`
+— the same discipline `test_supervisor_tick_channel_registration.py` and
+`test_supertrend_buy_1_1p2_supervisor_composition.py` established after a
+real production defect (a `multi_leg_engine` worker registered with no tick
+queue killed `straddle_920` at startup) slipped past a hand-built test the
+whole time it was broken. Against the real committed tree: the disabled
+strategy is discovered but registers no worker, no tick queue, no control
+queue, and the two already-enabled `intraday_options` strategies
+(`ema_cross_9_21_buy`, `straddle_920`) are unaffected. Against a config tree
+copied verbatim from the committed one with only this strategy's `enabled:
+false` flipped to `true` (never a hand-invented YAML, so a pass proves the
+*real* committed configuration produces a correctly isolated worker): a
+third, isolated worker is registered with `MultiLegEngineWorkerConfig` (not
+`EngineWorkerConfig`), `requires_tick_channel is True`, its own tick queue
+and control queue (`id()`-distinct from the other two), and the other two
+workers' own registrations are provably unaffected (queue presence,
+execution mode, engine-field type all identical before/after). Execution
+mode stays PAPER and every live gate
+(`global_live_trading_enabled`/`runtime_live_execution_allowed`/
+`strategy_live_approved`) stays refused throughout.
+
+#### Correlation identity
+
+`strategy_token("rolling_strangle_otm1")` resolves to `"roll"` — no adapter
+change or manual mapping needed; `strategy_token` is already a pure,
+generic function of `strategy_id`. Confirmed distinct from every other
+committed `intraday_options` strategy's token (`stra`, `emac`, `supe`,
+`skel`) and proven not to collide in practice by three admitted workers
+coexisting under one `build_supervisor` call (`add_worker` refuses on
+collision).
+
+#### Dynamic subscription and fresh-tick proof
+
+Primary entry genuinely calls `feed.subscribe` for both resolved CE and PE
+security IDs (`engine.feed.subscriptions`, not inferred from the fills
+alone). A roll's replacement contract requests a genuinely new subscription
+distinct from the adjusted-out leg's; the untouched opposite leg's own
+subscription is undisturbed by that roll (one leg's lifecycle does not leak
+into another's); the closed leg's own contract is correctly unsubscribed
+once its leg closes (existing, intentional engine behaviour — feed load
+reduction — not a defect and not "leaking into another worker's channel",
+which is instead proven by the supervisor composition suite's per-worker
+`id()`-distinct queue tests). The underlying subscribes on the authoritative
+index segment (`IDX_I`, via `_resolve_security_segment`/`resolve_index_
+meta`) — proven directly against `worker.security_segment` for the committed
+config. Every fresh-tick/no-fabricated-fill/mismatched-lot-size-blocks-entry
+proof from Phase 3's own `test_rolling_strangle_otm1_engine.py` (production
+`MultiLegEngine` composition, the same class a real worker constructs, not
+a fake) already stands and is re-run unchanged this phase. No Dhan feed
+adapter or network call is reachable from any of this — `SimulatedFeed`/
+`RecordedFeedAdapter` throughout.
+
+#### Files and tests
+
+New: `config/strategies/rolling_strangle_otm1.yaml`; `tests/unit/
+test_rolling_strangle_otm1_config.py` (committed-config proof plus 11
+invalid-`strategy_kwargs` boundary cases, each asserting `ValueError`);
+`tests/unit/test_rolling_strangle_otm1_risk_separation.py` (mirrors
+`test_straddle_920_risk_separation.py`); `tests/unit/
+test_no_rolling_strangle_otm1_branches.py` (mirrors the more thorough,
+later `test_no_supertrend_buy_1_1p2_branches.py` pattern — recursive
+`dashboards`/`orchestration`/`scripts` walk — combined with straddle_920's
+own `multi_leg_*` module list, plus a dedicated check that Phase 3's three
+generic engine completions read as ordinary generic code); `tests/
+integration/test_rolling_strangle_otm1_supervisor_composition.py` (mirrors
+`test_supertrend_buy_1_1p2_supervisor_composition.py`). Extended: `tests/
+integration/test_rolling_strangle_otm1_engine.py` (+3 tests: dynamic
+subscription proof, replacement-subscription proof). Modified (one-line
+wording fix to avoid a test false-positive on the literal substring "mode:
+live" inside a comment): the new YAML's own header comment.
+
+#### Regression
+
+Every explicitly mandated suite re-run individually and passing: Phase 1
+(`test_basket_roll_state.py`, `test_migrations.py`), Phase 2
+(`test_rolling_multi_leg_engine.py`), Phase 3 (`test_rolling_strangle_
+otm1_strategy.py`, `test_rolling_strangle_otm1_engine.py`), every
+`straddle_920` suite, `ema_cross_9_21_buy` and `supertrend_buy_1_1p2`
+strategy/config/warmup/supervisor-composition/negative-space suites,
+`test_supervisor_tick_channel_registration.py`, `test_config_loader.py`/
+`test_config_adapter*.py`/`test_config_auto_start.py`, `test_feed_hub.py`/
+`test_dynamic_subscription_wake.py`, `test_broker_factory.py`/
+`test_paper_broker*.py`, every `test_auto_start_*.py`,
+`test_notification_guard.py`, `test_process_locks.py`, `test_heartbeat.py`
+— all pass. Full `pytest`: exit 0. `ruff check .`: clean. `mypy common
+strategies runtimes dashboards scripts --strict`: clean, 238 source files
+(unchanged from Phase 3 — no new `.py` file in the checked scope this
+phase). `scripts.assert_no_live_config_committed`: OK, now also scanning
+the new YAML. `orchestration.launchd.generate_plists --check`, run
+read-only from the real checkout (`/Volumes/Trading/algo_trading`), not
+regenerated from the worktree: 2 plists match, unaffected (no LaunchAgent
+or plist-generation file touched this phase).
+
+#### Existing strategies unaffected
+
+`ema_cross_9_21_buy` and `straddle_920` (the two other enabled
+`intraday_options` strategies) proven, in the same supervisor-composition
+run that admits the new worker, to keep identical engine-field types,
+execution mode, and tick-queue presence before and after. Every strategy's
+own regression suite (straddle_920, EMA, SuperTrend) passes unchanged. No
+strategy's `enabled`/`mode`/`live_approved` was touched; `config/global.
+yaml` was not modified.
+
+#### Safety
+
+Same isolated worktree; no runtime, dashboard, or LaunchAgent
+started/stopped/modified/installed; no Dhan or Telegram endpoint called;
+every proof used a scripted/recorded in-process fake feed and broker, never
+a real network call; no secret read/printed/altered; no branch merged; the
+new config ships disabled/PAPER/not-live-approved; no existing strategy's
+flags changed; every live gate
+(`global.live_trading_enabled`/`auto_start.enabled`/every runtime's
+`live_execution_allowed`) unchanged. `OPERATIONAL LIVE ACTIVATION ELIGIBLE`
+remains **NO — BLOCKED**. Phase 5 (end-to-end acceptance, dashboard,
+restart matrix, consolidated verification) is next, stopping for review
+before it begins.
