@@ -612,8 +612,16 @@ class IntradayOptionsSupervisor:
             # closes its positions. That path was built in Part 2b-ii-A and was
             # unreachable as deployed until this line, because only the candle queue
             # was ever sentinelled.
+            #
+            # The `receive_candles` guard is a no-op for this runtime — every channel
+            # registered here consumes candles, including the engine workers, whose
+            # `_drain_candle_queue` thread exists precisely to drain them and catch
+            # this sentinel. It is written the same way as the positional supervisor's
+            # so that "the hub never publishes to a `receive_candles=False` queue, and
+            # neither does its supervisor" holds as one invariant, not two conventions.
             for _, channel in self._workers:
-                channel.queue.publish(None)
+                if channel.receive_candles:
+                    channel.queue.publish(None)
                 if channel.tick_queue is not None:
                     channel.tick_queue.publish(None)
 

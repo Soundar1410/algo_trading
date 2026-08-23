@@ -131,6 +131,15 @@ class WorkerChannel:
     #: :meth:`SharedFeedHub._grouped_initial_subscriptions`.
     segment: int | None = None
     mode: int | None = None
+    #: Whether this worker consumes completed candles from :attr:`queue`.
+    #: ``False`` marks a tick-only worker — one whose child process is handed
+    #: only ``tick_queue.raw`` and which reads through
+    #: :class:`~common.engine.hub_feed.HubTickFeed`. The hub then never
+    #: publishes candles to ``queue``, so a queue nobody drains cannot fill,
+    #: drop-oldest, and report an overflow that means nothing for this worker.
+    #: The queue object is still built (it stays non-optional, and the
+    #: supervisors' release path is unchanged); it simply stays empty.
+    receive_candles: bool = True
 
     def wants(self, security_id: str) -> bool:
         return security_id in self.security_ids or security_id in self.dynamic_ids
@@ -535,7 +544,10 @@ class SharedFeedHub:
     def _fan_out(self, candle: Candle) -> None:
         self.candle_count += 1
         for channel in self._channels:
-            if not channel.wants(candle.security_id):
+            # ``receive_candles`` first: a tick-only worker never drains this
+            # queue, so publishing to it would fill it, drop the oldest, and
+            # warn — forever, about a queue that does not exist for its owner.
+            if not channel.receive_candles or not channel.wants(candle.security_id):
                 continue
             if not channel.queue.publish(candle):
                 # Overflow is a health event, never a silent drop.
@@ -553,10 +565,17 @@ class SharedFeedHub:
         The candle queue keeps ``name=strategy_id`` unchanged, so anything already
         reading these stats sees exactly what it saw before; a tick queue is
         suffixed ``:ticks`` so the two are distinguishable in a heartbeat.
+
+        A channel with ``receive_candles=False`` contributes no candle-queue
+        entry at all. The hub never publishes to that queue, so its stats would
+        be a permanent zero row for a queue its worker does not have — and a
+        heartbeat that reports a queue nobody consumes is worse than one that
+        omits it. Its tick queue is reported exactly as any other.
         """
         stats: list[QueueStats] = []
         for channel in self._channels:
-            stats.append(channel.queue.stats())
+            if channel.receive_candles:
+                stats.append(channel.queue.stats())
             if channel.tick_queue is not None:
                 stats.append(channel.tick_queue.stats())
         return tuple(stats)
@@ -572,6 +591,7 @@ def build_channel(
     tick_max_depth: int = DEFAULT_TICK_MAX_DEPTH,
     segment: int | None = None,
     mode: int | None = None,
+    receive_candles: bool = True,
 ) -> WorkerChannel:
     """Create a worker channel with its own bounded queue.
 
@@ -583,6 +603,11 @@ def build_channel(
     :attr:`WorkerChannel.segment` for why an options runtime must set these
     explicitly for its underlying. ``None`` (the default) preserves the
     adapter's own default, unchanged from before this parameter existed.
+
+    ``receive_candles=False`` registers a tick-only worker: the queue is still
+    created (see :attr:`WorkerChannel.queue`) but the hub never publishes to
+    it. The default keeps every caller that predates this parameter exactly as
+    it was.
     """
     q = (
         BoundedWorkerQueue.in_process(strategy_id, max_depth)
@@ -604,4 +629,5 @@ def build_channel(
         tick_queue=tick_q,
         segment=segment,
         mode=mode,
+        receive_candles=receive_candles,
     )

@@ -10892,3 +10892,130 @@ quantity approval, static-IP/provider setup, live auth revalidation, and
 separate approval to flip any gate all remain outstanding, unaffected by
 this implementation-complete state. This is the final phase for this
 branch; no further phase is planned unless review requests one.
+
+## Feed defect: false candle-queue overflow for tick-only workers
+
+**Status:** fixed on `fix/positional-candle-channel-opt-out`, cut from
+`origin/feature-paper-auto-start`. Not a phase — a defect fix, recorded here
+because it changes what the shared feed hub publishes and what a heartbeat
+reports.
+
+### The symptom
+
+Production logged, continuously, once per completed candle:
+
+```
+common.feed.hub worker queue overflow strategy_id=weekly_delta_neutral dropped=N depth=-1
+```
+
+`depth=-1` is not a negative depth: it is `BoundedWorkerQueue.depth()`'s
+documented fallback (`common/feed/queues.py`), because macOS
+`multiprocessing.Queue.qsize()` raises `NotImplementedError`.
+
+### Root cause
+
+`worker queue overflow` is the **candle** queue — a lost tick logs
+`worker tick queue overflow` instead, so the tick path was never involved.
+
+1. `PositionalOptionsSupervisor.add_worker()` called `build_channel(...)`, which
+   unconditionally creates a candle queue — here `DEFAULT_QUEUE_DEPTH = 64`.
+2. The spawn args hand the child **only** `channel.tick_queue.raw`.
+   `run_positional_worker_process` has no candle-queue parameter at all; the
+   worker reads through `HubTickFeed`. Nothing in the runtime ever calls
+   `channel.queue.get()`.
+3. `SharedFeedHub._fan_out()` published every completed candle into that queue
+   anyway, because `channel.wants(...)` was true — and `wants()` includes
+   `dynamic_ids`, so every option contract subscribed at runtime fed it too.
+4. `BoundedWorkerQueue.publish` is drop-oldest. After 64 candles the unread
+   queue was permanently full, so every candle after that was one `dropped`
+   increment plus one WARNING, for the rest of the session.
+
+This was **not** only log noise. Those drops were summed into
+`PositionalSupervisorResult.dropped_events[strategy_id]` and, through
+`queue_stats()`, into every heartbeat's `dropped_events` — so a queue that does
+not exist for its owner was degrading reported health. The intraday runtime had
+already reached this conclusion for its own engine workers and solved it with
+the `_drain_candle_queue` thread (`runtimes/intraday_options/engine_worker.py`),
+whose docstring says the drops "mean nothing for this worker" and that draining
+"keeps `SupervisorResult.dropped_events` honest". The positional supervisor's
+comment instead called the same condition harmless overflow-log chatter. That
+comment was wrong and has been replaced.
+
+### The fix — a capability, not a special case
+
+No strategy id is named anywhere in the change, and no queue depth changed.
+
+- `WorkerChannel.receive_candles: bool = True` — a generic per-channel
+  capability. Appended after `mode`, so every hand-built fixture keeps today's
+  behaviour by default.
+- `SharedFeedHub._fan_out()` skips a channel whose `receive_candles` is false.
+  The gate is inside the per-channel loop, so `candle_count` still counts what
+  the hub aggregated, and it also covers `stop()`'s partial-bar flush, which
+  routes through the same method.
+- `SharedFeedHub.queue_stats()` omits a disabled candle queue entirely, so
+  health cannot report a queue the worker never consumes. Its tick queue is
+  reported as before.
+- `build_channel(..., receive_candles: bool = True)` — backward compatible;
+  every pre-existing caller is untouched.
+- `PositionalOptionsSupervisor.add_worker()` now registers
+  `tick_channel=True, receive_candles=False`.
+- Shutdown: the **candle** sentinel is gated on the same capability in *both*
+  supervisors, so "nothing is ever published to a `receive_candles=False` queue"
+  holds end to end and is assertable. For the intraday supervisor this is a
+  no-op — every channel there consumes candles. The **tick** sentinel is
+  untouched, and remains the path that stops `HubTickFeed.run()` and reaps the
+  positional child.
+- `PositionalSupervisorResult.dropped_events` no longer carries a
+  `strategy_id` key for a channel with no candle stream, mirroring how the
+  intraday result already omits `:ticks` for a channel with no tick queue.
+  Verified by grep that nothing reads positional `dropped_events`.
+
+Deliberately unchanged: `DEFAULT_QUEUE_DEPTH` (64) and `DEFAULT_TICK_MAX_DEPTH`
+(2048); both overflow warnings; `_fan_out_tick`, `_notify_drop`,
+`TickDropNotice`, `broadcast_feed_gap`; intraday `add_worker`, its spawn args
+and its `_drain_candle_queue` thread; every existing `build_channel` caller.
+
+### Regression
+
+Two new files, no existing test modified:
+
+- `tests/integration/test_feed_candle_channel_opt_out.py` (10 tests) — a
+  tick-only channel takes no candles past its depth and logs nothing; its ticks
+  still arrive; `stop()`'s flush skips it too; a default channel is unchanged;
+  a genuinely overflowing **candle** channel still counts and warns; a genuinely
+  overflowing **tick** channel on the same opted-out channel still drops,
+  warns and emits `TickDropNotice`; `queue_stats()` omits the disabled queue.
+- `tests/integration/test_positional_candle_channel_composition.py` (3 tests) —
+  the same guarantees against the **real** `PositionalOptionsSupervisor.
+  add_worker()` composition rather than a hand-built `WorkerChannel`, plus a
+  real spawned child proving clean shutdown through the tick sentinel alone
+  with the candle queue provably never written to.
+
+Both files were confirmed to **fail** against the pre-fix code (5/10 and 3/3
+respectively) before being accepted, so neither passes vacuously.
+
+Full `pytest`: 3145 passed, 18 skipped, exit 0. `ruff check .`: clean. `mypy
+common strategies runtimes dashboards scripts --strict`: clean, 238 source
+files. `scripts.assert_no_live_config_committed`: OK, exit 0.
+`orchestration.launchd.generate_plists --check` reports drift **only** because
+a git worktree has a different repo root, which the generator embeds; proved by
+regenerating in memory, substituting the worktree path for the real checkout
+path, and confirming both plists are then byte-identical to the committed
+files. The plists were **not** regenerated — doing so would have repointed the
+LaunchAgents at the worktree. `tests/unit/test_launchd_plists.py`: 36 passed.
+
+### Safety
+
+All work done in an isolated worktree at
+`/Volumes/Trading/algo_trading_positional_queue_fix`; the active checkout at
+`/Volumes/Trading/algo_trading` stayed on `feature-paper-auto-start`, clean, and
+was never fetched, pulled, switched, modified or restarted. No
+runtime/dashboard/LaunchAgent started, stopped, installed or modified. No
+Dhan/Telegram/broker network call — every test drives an in-process fake
+adapter. No secret read, printed or altered. No branch merged. Config
+unchanged: no strategy rule, `enabled` flag, PAPER/live mode, auto-start gate,
+notification setting or live-safety gate was touched.
+`OPERATIONAL LIVE ACTIVATION ELIGIBLE` remains **NO — BLOCKED**: the 30-day
+paper evaluation, a second real paper strategy, EMA-specific minimum-quantity
+approval, static-IP/provider setup, live auth revalidation, and separate
+approval to flip any gate all remain outstanding, unaffected by this fix.

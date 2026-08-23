@@ -6,10 +6,12 @@ Mirrors ``runtimes.intraday_options.supervisor.IntradayOptionsSupervisor``'s
 own shape directly: one :class:`~common.feed.hub.SharedFeedHub` over one
 shared :class:`~common.market_data.adapter.MarketFeedAdapter`, one
 :class:`~common.feed.hub.WorkerChannel` per enabled strategy
-(:func:`~common.feed.hub.build_channel`, ``tick_channel=True`` always —
-every positional worker is tick-driven, never candle-driven, so unlike the
-intraday supervisor there is no fixture/non-engine path to make this
-conditional on), one ``multiprocessing.get_context("spawn")`` child process
+(:func:`~common.feed.hub.build_channel`, ``tick_channel=True`` and
+``receive_candles=False`` always — every positional worker is tick-driven,
+never candle-driven, so unlike the intraday supervisor there is no
+fixture/non-engine path to make this conditional on, and the hub is told
+not to publish completed candles into a queue this runtime never drains),
+one ``multiprocessing.get_context("spawn")`` child process
 per worker (:func:`~runtimes.positional_options.worker.
 run_positional_worker_process`), one control queue per worker draining
 into ``hub.request_subscription`` on this supervisor's own thread — copied
@@ -97,10 +99,20 @@ log = get_logger(__name__)
 EXIT_OK = 0
 EXIT_FAILED = 1
 
-#: Queue depth per worker's candle channel — never actually consumed by a
-#: positional worker (it is tick-driven), but ``build_channel`` always
-#: creates one; a modest depth just bounds the harmless overflow-log
-#: chatter rather than mattering functionally.
+#: Queue depth per worker's candle channel. A positional worker is
+#: tick-driven and never drains this queue — its child process is handed
+#: only ``tick_queue.raw`` — so every channel registered here declares
+#: ``receive_candles=False`` and the hub publishes nothing into it. The
+#: queue object is still created by ``build_channel``; this depth only
+#: bounds that allocation.
+#:
+#: It used to be published into anyway. Nothing consumed it, so after 64
+#: candles it stayed full and every later candle became one drop-oldest
+#: event plus one ``worker queue overflow`` warning — for the rest of the
+#: session, counted into the heartbeat's ``dropped_events``. That was never
+#: harmless chatter: it was a health signal reporting a queue that does not
+#: exist for its owner. ``receive_candles`` is the fix; do not restore the
+#: publish by raising this number.
 DEFAULT_QUEUE_DEPTH = 64
 
 #: How long to wait for the feed thread to return after a stop is requested.
@@ -173,8 +185,10 @@ class PositionalSupervisorConfig:
     tick_queue_depth: int = DEFAULT_TICK_MAX_DEPTH
     heartbeat_interval_seconds: float = DEFAULT_INTERVAL_SECONDS
     #: ``SharedFeedHub`` always builds a completed-candle aggregator per
-    #: instrument, even though nothing here ever reads it — see the module
-    #: docstring. The value is otherwise inert for this runtime.
+    #: instrument, even though nothing here ever reads it: every channel
+    #: this supervisor registers declares ``receive_candles=False``, so a
+    #: completed candle is aggregated and then goes nowhere. The value is
+    #: inert for this runtime.
     candle_interval_seconds: int = 60
 
 
@@ -185,9 +199,13 @@ class PositionalSupervisorResult:
     workers_started: int = 0
     ticks_received: int = 0
     worker_exit_codes: dict[str, int] = field(default_factory=dict)
-    #: Drops per channel — the candle channel (never consumed, see the
-    #: module docstring) under ``strategy_id``, the tick channel under
-    #: ``f"{strategy_id}:ticks"``.
+    #: Drops per channel, keyed by the channel that actually exists for its
+    #: worker: the tick channel under ``f"{strategy_id}:ticks"``. A channel
+    #: with ``receive_candles=False`` contributes no ``strategy_id`` entry —
+    #: the hub never publishes to that queue, so a key here would be a
+    #: permanent zero for a queue the worker does not have. This mirrors the
+    #: intraday result, which likewise omits ``:ticks`` for a channel with no
+    #: tick queue.
     dropped_events: dict[str, int] = field(default_factory=dict)
     stopped_by_signal: bool = False
     #: False when the feed thread was still blocked after the grace period
@@ -265,6 +283,11 @@ class PositionalOptionsSupervisor:
         fixture/non-engine path here to make this conditional on, unlike
         :meth:`~runtimes.intraday_options.supervisor.
         IntradayOptionsSupervisor.add_worker`.
+
+        And, for the same reason, always opts *out* of completed candles.
+        :meth:`run` hands the child only ``channel.tick_queue.raw``; nothing
+        in this runtime ever calls ``channel.queue.get()``. Declaring that
+        to the hub is what stops it publishing into a queue no one drains.
         """
         underlying_segment = segment_code(worker_config.underlying_segment)
         channel = build_channel(
@@ -272,6 +295,7 @@ class PositionalOptionsSupervisor:
             [worker_config.underlying_security_id],
             max_depth=self._config.queue_depth,
             tick_channel=True,
+            receive_candles=False,
             tick_max_depth=self._config.tick_queue_depth,
             segment=underlying_segment,
             # The underlying stays on the adapter's own default (Ticker)
@@ -383,13 +407,22 @@ class PositionalOptionsSupervisor:
             )
             result.ticks_received = self._hub.tick_count
 
-            # Sentinel per worker, on every channel it has — tells a
-            # blocked consumer to stop waiting. Both channels, even though
-            # a positional worker never drains the candle one: cheap, and
-            # keeps this loop identical in shape to the intraday
-            # supervisor's own.
+            # Sentinel per worker, on every channel its worker actually
+            # drains — tells a blocked consumer to stop waiting rather than
+            # relying on its idle timeout. The tick sentinel is the one that
+            # matters here and the only one a positional worker can ever
+            # see: `HubTickFeed.run` returns on it, which is how a stop
+            # delivered to this process reaches each child.
+            #
+            # The candle sentinel is gated on the same capability the hub
+            # publishes under, so a `receive_candles=False` queue stays
+            # provably untouched end to end — empty, zero-published,
+            # zero-dropped — instead of holding one item nobody will ever
+            # read. For the intraday supervisor, whose channels all consume
+            # candles, the identical gate changes nothing.
             for _, channel in self._workers:
-                channel.queue.publish(None)
+                if channel.receive_candles:
+                    channel.queue.publish(None)
                 if channel.tick_queue is not None:
                     channel.tick_queue.publish(None)
 
@@ -405,7 +438,8 @@ class PositionalOptionsSupervisor:
                     self._report_duplicate_worker(strategy_id, repository)
 
             for _, channel in self._workers:
-                result.dropped_events[channel.strategy_id] = channel.queue.dropped
+                if channel.receive_candles:
+                    result.dropped_events[channel.strategy_id] = channel.queue.dropped
                 if channel.tick_queue is not None:
                     result.dropped_events[f"{channel.strategy_id}:ticks"] = (
                         channel.tick_queue.dropped
