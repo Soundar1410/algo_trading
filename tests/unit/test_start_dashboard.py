@@ -81,6 +81,58 @@ def test_force_bypasses_the_flag_but_never_the_port_check(
     assert _never_exec == [], "--force must not create a duplicate server"
 
 
+def _fake_project_root(tmp_path: Path) -> Path:
+    """A tree with the two files main() insists on before it execs."""
+    streamlit_bin = tmp_path / ".venv" / "bin" / "streamlit"
+    streamlit_bin.parent.mkdir(parents=True, exist_ok=True)
+    streamlit_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+    app = tmp_path / "dashboards" / "app.py"
+    app.parent.mkdir(parents=True, exist_ok=True)
+    app.write_text("", encoding="utf-8")
+    return tmp_path
+
+
+def _launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recorded: list[list[str]],
+    extra: list[str] | None = None,
+) -> list[str]:
+    """Run main() to the exec point and return the argv it would have run."""
+    monkeypatch.setattr(sd, "port_is_serving", lambda port, **kwargs: False)
+    monkeypatch.setattr(sd, "resolve_project_root", lambda: _fake_project_root(tmp_path))
+    config = _config(tmp_path, dashboard_auto_start=True)
+
+    with pytest.raises(SystemExit):
+        sd.main(["--config-root", str(config), *(extra or [])])
+    (argv,) = recorded
+    return argv
+
+
+def test_the_launch_is_headless(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _never_exec):
+    """Its owner is a RunAtLoad LaunchAgent, so a browser auto-open would fire
+    at every login. Streamlit's macOS default is non-headless, so the flag has
+    to be passed explicitly."""
+    argv = _launch(tmp_path, monkeypatch, _never_exec)
+
+    assert "--server.headless" in argv
+    assert argv[argv.index("--server.headless") + 1] == "true"
+
+
+def test_a_passthrough_can_still_override_headless(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _never_exec
+):
+    """An operator who does want the auto-open keeps it. Streamlit's CLI is
+    Click, which takes the last occurrence of a repeated option, so the
+    passthrough copy must come after ours."""
+    argv = _launch(tmp_path, monkeypatch, _never_exec, ["--server.headless", "false"])
+
+    first = argv.index("--server.headless")
+    last = len(argv) - 1 - argv[::-1].index("--server.headless")
+    assert first != last, "both copies must be present for last-wins to apply"
+    assert argv[last + 1] == "false"
+
+
 def test_a_missing_streamlit_binary_is_reported_not_crashed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _never_exec
 ):

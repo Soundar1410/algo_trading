@@ -100,6 +100,15 @@ def main(argv: list[str] | None = None) -> int:
         str(app_path),
         "--server.port",
         str(args.port),
+        # Headless, because the owner is a RunAtLoad LaunchAgent: Streamlit's
+        # macOS default (``headless = false``) opens a browser tab itself, so a
+        # non-headless launch pops one open at every login, whether or not the
+        # operator wants to look at the dashboard. The server still listens on
+        # ``--server.port``; only the auto-open is suppressed. Placed before
+        # ``passthrough`` so an explicit ``--server.headless false`` still wins
+        # — Streamlit's CLI takes the last occurrence of a repeated option.
+        "--server.headless",
+        "true",
         *passthrough,
     ]
     # NoReturn on success: os.execv replaces this process image entirely, so
