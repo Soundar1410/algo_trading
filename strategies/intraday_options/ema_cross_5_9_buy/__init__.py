@@ -1,8 +1,9 @@
-"""``ema_cross_9_21_buy`` — Phase 9's first real intraday-options strategy. See
-``ema_cross_9_21_buy_spec.md`` in this directory for the full functional/design
-spec. A second real strategy, ``ema_cross_5_9_buy`` (a faithful clone with
-EMA periods 5/9 instead of 9/21), lives alongside this one in
-``strategies/intraday_options/ema_cross_5_9_buy/``.
+"""``ema_cross_5_9_buy`` — the second real intraday-options strategy, a faithful
+clone of ``ema_cross_9_21_buy`` (Phase 9's first real strategy) with only the
+EMA periods (5/9 instead of 9/21) and identity changed. See
+``ema_cross_5_9_buy_spec.md`` in this directory for the full functional/design
+spec, and ``ema_cross_9_21_buy_spec.md`` (the sibling strategy's directory)
+for the shared behavioural source of truth this strategy clones.
 
 **Deliberately not imported by** :mod:`strategies.intraday_options` (the
 parent package's ``__init__.py``). This module's :mod:`.strategy` pulls in
