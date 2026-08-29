@@ -8,8 +8,8 @@ the next phase. Updated after every phase.
 | | |
 |---|---|
 | **Current phase** | **Phase 10 — Controlled live readiness: CODE HARDENED, fully disabled.** Production parent/worker preflight wiring, Dhan order/update handling, restart-safe account-loss emergency square-off, account-wide reserve-before-submit risk plus live MTM, shared rate limiting, broker-authoritative startup/mode-transition/session-end reconciliation, strict migration history, and restore validation exist and are tested with mocks/fakes only. `ema_cross_9_21_buy` and its Rev 3.1 matrix are unchanged. **Every committed live gate remains fail-closed** (`global.live_trading_enabled: false`, `live_execution_allowed: false`, `live_approved: false`, no `mode: live` in `config/`), enforced by `scripts.assert_no_live_config_committed`. No real Dhan order/network call was made. |
-| **Next phase** | Operational evidence and explicit human decisions, not more live-enabling code: complete/review the 30-day paper run, run the second real strategy (`ema_cross_5_9_buy`, built — see the 27 August 2026 addendum — but shipped `enabled: false`) through its own paper evaluation period, choose/configure an approved egress-IP provider and static IP, revalidate authentication operationally, then separately decide whether to approve minimum-quantity live activation. |
-| **Last updated** | 27 August 2026 — second real strategy `ema_cross_5_9_buy` added (a faithful EMA 5/9 clone of `ema_cross_9_21_buy`), shipped `enabled: false`; all committed live gates remain disabled |
+| **Next phase** | Operational evidence and explicit human decisions, not more live-enabling code: complete/review the 30-day paper run, run the second and third real strategies (`ema_cross_5_9_buy` and `ema_cross_5_21_buy`, both built — see the 27 and 29 August 2026 addenda — but both shipped `enabled: false`) through their own paper evaluation periods, choose/configure an approved egress-IP provider and static IP, revalidate authentication operationally, then separately decide whether to approve minimum-quantity live activation. |
+| **Last updated** | 29 August 2026 — third real strategy `ema_cross_5_21_buy` added (a faithful EMA 5/21 clone of `ema_cross_9_21_buy`, fast period only), shipped `enabled: false`; all committed live gates remain disabled |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
 | **Live order placement** | Code path exists but is deliberately unreachable from committed configuration. Parent and child preflight both fail closed without approved operational inputs; `OPERATIONAL LIVE ACTIVATION ELIGIBLE: NO — BLOCKED`. |
@@ -58,6 +58,55 @@ readiness gate is now 9 bars (9-EMA ready) instead of 21.
 - CLAUDE.md line 7 ("do not implement real strategies yet") is stale as of
   Phase 9 and was flagged to the operator; not edited here (operator's own
   file, per project rules).
+
+### Third real strategy: `ema_cross_5_21_buy` — 29 August 2026
+
+Added `ema_cross_5_21_buy`, a faithful clone of `ema_cross_9_21_buy` (Phase 9's
+first real strategy) differing only in the fast EMA period (5 instead of 9)
+and identity — the slow period (21) is unchanged. Same ATM-weekly BUY-only
+single-position design, same `momentum_low_or_highest_close` premium exit (4%
+activation / 8% trail), same 3% daily live-MTM cap on its own independent
+₹10,00,000 capital base, same 09:15/14:45/15:15 timing, same
+`minimum_separation: 0` / `confirmation_candles: 1` (no whipsaw damping —
+operator decision). The one behavioural consequence of the period change:
+none for the cold-start readiness gate — because the slow leg is unchanged
+at 21, the gate stays **21 bars**, unlike the `ema_cross_5_9_buy` clone
+(whose slow leg also changed, dropping its gate to 9 bars).
+
+- **Shipped `enabled: false`** (operator decision) — built, tested and
+  discoverable (`discover_strategies`), but does not run on the shared
+  `intraday_options` feed alongside `ema_cross_9_21_buy` or
+  `ema_cross_5_9_buy` until deliberately enabled. Runnable in isolation via
+  the runtime's `--strategy-id ema_cross_5_21_buy` selector.
+  `discover_enabled_strategies` correctly excludes it while disabled —
+  verified against the real `config/` tree, not assumed.
+- **No shared/combined risk cap.** If ever enabled, `ema_cross_5_21_buy` runs
+  with its own independent ₹10,00,000 capital base and ₹30,000 daily-MTM cap,
+  alongside `ema_cross_9_21_buy`'s and `ema_cross_5_9_buy`'s — no combined cap
+  exists or was built; this is deliberately unbuilt, out of scope for this
+  addition.
+- **Wiring required no code changes** — config discovery
+  (`common.config.loader.discover_enabled_strategies` globs
+  `config/strategies/*.yaml`), the dashboard (renders per discovered
+  `strategy.strategy_id` dynamically), the launchd plist (runs the
+  `intraday_options` runtime, not a specific strategy), and registration
+  (`@register_strategy` + dotted `strategy_ref`) are all already
+  strategy-agnostic.
+- **Files added:** `strategies/intraday_options/ema_cross_5_21_buy/`
+  (`__init__.py`, `strategy.py`, `ema_cross_5_21_buy_spec.md`);
+  `config/strategies/ema_cross_5_21_buy.yaml`;
+  `tests/unit/test_ema_cross_5_21_buy_strategy.py`;
+  `tests/integration/test_ema_cross_5_21_buy_engine.py`.
+- **No change to `ema_cross_9_21_buy`'s or `ema_cross_5_9_buy`'s behaviour,
+  code, or config values.** A repo-wide check for lingering "only real
+  strategy" wording beyond what the 27 August 2026 `ema_cross_5_9_buy` change
+  already softened found none remaining in either sibling strategy's files;
+  no further comment edits were needed there. Full suite, ruff, and mypy all
+  pass.
+- CLAUDE.md's "do not implement real strategies beyond `ema_cross_9_21_buy`"
+  line is stale as of Phase 9 (three real strategies now exist) and was
+  flagged to the operator again; not edited here (operator's own file, per
+  project rules).
 
 ### Phase 10 end-to-end hardening addendum — 13 August 2026
 

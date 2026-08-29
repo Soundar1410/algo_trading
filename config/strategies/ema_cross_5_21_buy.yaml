@@ -1,0 +1,148 @@
+# ema_cross_5_21_buy — the third real strategy, a faithful clone of
+# ema_cross_9_21_buy with only the fast EMA period (5 instead of 9) and
+# identity changed; the slow period (21) is unchanged. A second real
+# strategy, ema_cross_5_9_buy (a faithful clone with EMA periods 5/9 instead
+# of 9/21, currently shipped disabled), also lives alongside this one in
+# config/strategies/ema_cross_5_9_buy.yaml. Full spec:
+# strategies/intraday_options/ema_cross_5_21_buy/ema_cross_5_21_buy_spec.md;
+# ema_cross_9_21_buy_spec.md remains the shared behavioural source of truth
+# for everything not called out as different.
+# Do not copy config/strategies/skeleton_fixture.yaml as a template — that
+# file is explicitly not one (see its own header).
+#
+# Shipped DISABLED (enabled: false, operator decision): built, tested and
+# discoverable, but does not run on the shared intraday_options feed
+# alongside ema_cross_9_21_buy (or ema_cross_5_9_buy) until deliberately
+# enabled. Runnable in isolation via the runtime's
+# --strategy-id ema_cross_5_21_buy selector.
+#
+# PAPER ONLY at delivery. Setting mode to `live` will NOT start a live
+# strategy: the broker factory consults the live gate (common.config.models.
+# effective_live_gate) and refuses. Phase 10's live machinery exists but every
+# committed gate remains disabled; operational activation requires separate
+# evidence and explicit approval.
+
+strategy_id: ema_cross_5_21_buy
+runtime_id: intraday_options
+enabled: false
+
+mode: paper
+live_approved: false
+
+# Labels the single-leg engine family (spec section 1's "preserved custom
+# engine"). parameters.strategy_ref below is what actually tells
+# runtimes/intraday_options/config_adapter.py to drive the ported
+# TradingEngine rather than the Phase 1 fixture path — see that module's
+# docstring for why EngineKind alone cannot be the discriminator.
+engine: trading_engine
+
+risk:
+  # Session entries allowed 09:15 -> 14:45 (spec section 8). entry_start feeds
+  # EngineWorkerConfig.session_start_time; entry_cutoff/square_off_at feed the
+  # SquareOffPolicy that both the entry-cutoff gate and the mandatory 15:15
+  # square-off already derive from (common.engine.config.SessionConfig.
+  # from_square_off_policy) — one configured pair, not two independently
+  # configured times that can drift apart.
+  entry_start: "09:15"
+  entry_cutoff: "14:45"
+  square_off_at: "15:15"
+
+parameters:
+  # ------------------------------------------------------- required, both paths
+  instrument: NIFTY
+  # NIFTY index security id (common.market_data.scrip_master.INDEX_REGISTRY).
+  security_id: "13"
+
+  # ------------------------------------------------- engine-path discriminator
+  strategy_ref: "strategies.intraday_options.ema_cross_5_21_buy.strategy:EmaCross5x21BuyStrategy"
+
+  # EmaCross5x21BuyStrategy's own constructor kwargs (spec sections 4, 6.1, 7,
+  # 12.4, 12.6). Travels through config_adapter.py verbatim -- see its
+  # _build_engine_worker_config docstring.
+  strategy_kwargs:
+    ema_fast: 5
+    ema_slow: 21
+    # Pure closed-candle sign-flip cross, confirmed on the closing candle of
+    # the flip itself (spec 12.6, kept identical to ema_cross_9_21_buy --
+    # operator decision: no whipsaw damping for the 5/21 pair either).
+    minimum_separation: 0
+    confirmation_candles: 1
+    # lots_per_trade is a sizing CHOICE (config); lot_size is NOT configured
+    # anywhere here -- it is resolved from the scrip master at runtime (see
+    # contract_resolver below) and multiplied in by
+    # OpenPosition.quantity = lots * contract.lot_size. Order quantity for
+    # this strategy = 10 * <scrip-master NIFTY weekly lot size>.
+    lots_per_trade: 10
+    # momentum_low_or_highest_close (spec 6.1): 4% activates the best-close
+    # trail only; the momentum-break leg has no activation gate (12.4,
+    # settled: "the momentum structure leg remains active before +4%").
+    trail_percentage: 8.0
+    activation_minimum_favourable_move_percentage: 4.0
+    # Minimal per-position backstop (spec 7 / 12.5). Disabled by default --
+    # the premium-candle combined exit above is the primary exit; see
+    # common.engine.risk_managers.HardStopRiskManager for why this is an
+    # absolute per-lot rupee floor rather than a percentage of premium, and
+    # why that is the honest choice under the existing RiskManager contract.
+    risk_manager_name: hard_stop
+    risk_manager_params:
+      catastrophic_stop_rupees_per_lot: none
+
+  # ------------------------------------------------------------- candle/session
+  timeframe: "5m"
+
+  # --------------------------------------------------------- option resolution
+  # "dhan" resolves real NIFTY weekly contracts (strike, expiry AND lot size)
+  # from the exchange's own daily instrument master at runtime -- spec
+  # section 3 / 12.2. Never hardcode a lot size or a weekly-expiry date.
+  contract_resolver: dhan
+  strike_step: 50
+  # Fallback lot size, used ONLY if contract_resolver is switched to
+  # "simulated" (e.g. an offline/paper-tape run with no scrip master). Ignored
+  # entirely by the "dhan" resolver above, which reads the real one.
+  lot_size: 75
+  expiry: null
+  index_security_id: ""
+  index_segment: ""
+  fno_segment: ""
+  scrip_master_cache_dir: ""
+
+  # ----------------------------------------------------- daily 3% live-MTM cap
+  # capital_base = Rs 10,00,000 (same base as ema_cross_9_21_buy and
+  # ema_cross_5_9_buy -- spec section 12.1/6.3: each strategy carries its own
+  # independent cap, no combined cap across strategies). daily_max_loss_pct
+  # converts to an ABSOLUTE rupee daily_max_loss = 0.03 * capital_base = Rs
+  # 30,000, evaluated every tick on LIVE MTM (realised so far + this
+  # position's open unrealised P&L) -- common.engine.daily_guard.
+  # DailyRiskGuard.check_open_mtm, wired by TradingEngine itself
+  # (common.engine.engine.TradingEngine._build_daily_guard /
+  # _on_option_tick). Latching: halts new entries and squares off for the
+  # rest of the day once tripped.
+  capital_base: 1000000
+  daily_max_loss_pct: 3.0
+
+  # ------------------------------------------------------------------- warm-up
+  # EMA(5)/EMA(21) are SESSION_SPANNING (common.warmup.requirements): prior-
+  # session history is valid and desirable, so a mid-session start behaves
+  # like a bot that ran since the open. Not continuity_required (unlike
+  # SuperTrend), so this strategy still trades correctly cold -- see
+  # EmaCross5x21BuyStrategy.on_candle's is_ready gate (still 21 bars, the
+  # slow leg is unchanged) -- but "dhan" warm-up is configured here so the
+  # fresh-crossover rule is evaluated against a genuinely warmed indicator in
+  # normal operation.
+  warmup_from_history: true
+  warmup_source: dhan
+  warmup_max_lookback_sessions: 3
+
+  regime_enabled: false
+
+  paper_execution:
+    slippage:
+      options:
+        mode: ticks
+        market_order_ticks: 1
+    submission_latency_ms: 250
+    tick_size: 0.05
+    allow_ltp_fallback: true
+    ltp_fallback_extra_ticks: 1
+    # Live feed: reject a quote older than 2s rather than fill on stale data.
+    max_quote_age_ms: 2000
