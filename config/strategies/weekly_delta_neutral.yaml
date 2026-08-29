@@ -25,10 +25,10 @@ engine: positional_multi_leg_engine
 
 parameters:
   underlying: NIFTY
-  lots: 1
+  lots: 20
   # Spec section 6.3: 1% of allocated capital is the maximum-cycle-loss
   # basis every stop multiple in `exits:` below is measured against.
-  allocated_capital: 500000.0
+  allocated_capital: 4000000.0
   risk_free_rate: 0.065
   dividend_yield: 0.0
 
