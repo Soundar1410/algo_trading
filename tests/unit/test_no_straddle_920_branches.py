@@ -142,7 +142,7 @@ def test_the_strategy_package_is_the_only_place_the_id_naturally_appears():
         / "straddle_920"
         / "strategy.py"
     )
-    config_file = REPO_ROOT / "config" / "strategies" / "straddle_920.yaml"
+    config_file = REPO_ROOT / "config" / "strategies" / "intraday_options" / "straddle_920.yaml"
     assert _LITERAL_RE.search(strategy_file.read_text(encoding="utf-8"))
     assert '"straddle_920"' not in config_file.read_text(encoding="utf-8")
     assert "strategy_id: straddle_920" in config_file.read_text(encoding="utf-8")

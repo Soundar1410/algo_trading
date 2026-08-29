@@ -862,21 +862,38 @@ def build_strategy_comparison(
 
 
 def load_strategy_config_raw(config_root: object, strategy_id: str) -> dict[str, object] | None:
-    """The raw, unvalidated ``config/strategies/<id>.yaml`` mapping, or
-    ``None`` if it does not exist or does not parse — a config-only read,
-    same exception class as ``dashboards/app.py``'s live-gate read. Shared
-    by :func:`load_capital_base`, :func:`build_strategy_comparison` (each
-    strategy's own declared mode) and the Overview tab's "Configuration
-    summary" section, so the file is parsed the same way everywhere rather
-    than three slightly different ad-hoc reads.
+    """The raw, unvalidated ``config/strategies/**/<id>.yaml`` mapping, or
+    ``None`` if it does not exist, does not parse, or is ambiguous — a
+    config-only read, same exception class as ``dashboards/app.py``'s
+    live-gate read. Shared by :func:`load_capital_base`,
+    :func:`build_strategy_comparison` (each strategy's own declared mode) and
+    the Overview tab's "Configuration summary" section, so the file is parsed
+    the same way everywhere rather than three slightly different ad-hoc reads.
+
+    Recursive: strategy files live under a per-runtime subfolder
+    (``strategies/<runtime_id>/<strategy_id>.yaml``), mirroring the
+    ``strategies/`` source tree; a flat ``strategies/<strategy_id>.yaml`` is
+    matched too. This function has no ``runtime_id`` of its own to resolve
+    directly with (all three callers only ever have a bare ``strategy_id``),
+    so — like :func:`common.config.loader.load_strategy_config` with
+    ``runtime_id`` omitted — it scans one level rather than guessing a
+    subfolder; more than one match is treated as "not found" (``None``),
+    consistent with this function's existing fail-quiet-to-caller contract
+    for a display-only read (unlike the loader's own strict, raising
+    equivalent, which backs the actual safety-relevant paths).
     """
     from pathlib import Path
 
     import yaml
 
-    path = Path(str(config_root)) / "strategies" / f"{strategy_id}.yaml"
-    if not path.is_file():
+    strategies_dir = Path(str(config_root)) / "strategies"
+    candidates = sorted(strategies_dir.glob(f"*/{strategy_id}.yaml"))
+    flat = strategies_dir / f"{strategy_id}.yaml"
+    if flat.is_file():
+        candidates.append(flat)
+    if len(candidates) != 1:
         return None
+    path = candidates[0]
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except (yaml.YAMLError, OSError):

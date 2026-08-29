@@ -606,3 +606,98 @@ def test_discover_strategies_fails_closed_on_any_file_with_an_unknown_runtime(
     )
     with pytest.raises(ConfigError, match="no_such_runtime"):
         discover_strategies(populated_config, "intraday_options", settings=Settings())
+
+
+# --------------------------------------------- nested per-runtime subfolders
+#
+# config/strategies/ is laid out as strategies/<runtime_id>/<strategy_id>.yaml
+# on disk (mirroring the strategies/ source tree). Two independent code paths
+# resolve a strategy file — discover_strategies()'s directory walk and
+# load_strategy_config()'s direct-by-id lookup — and a change that fixes only
+# one of them (e.g. making the glob recursive but leaving the direct lookup
+# flat, or vice versa) must be caught here, not by a green run that happens
+# to exercise only one path.
+def test_a_nested_strategy_is_found_by_both_discovery_and_direct_by_id(populated_config: Path):
+    """The specific failure mode being guarded against: fixing only the glob
+    or only the direct lookup passes exactly one of these two assertions,
+    never both. The direct-by-id call deliberately does not go through
+    discovery first, so it cannot pass merely because discovery already
+    found the file."""
+    _write(
+        populated_config / "strategies" / "intraday_options" / "nested_v1.yaml",
+        "strategy_id: nested_v1\nruntime_id: intraday_options\nenabled: true\n",
+    )
+
+    resolved = discover_enabled_strategies(
+        populated_config, "intraday_options", settings=Settings()
+    )
+    assert "nested_v1" in [cfg.strategy.strategy_id for cfg in resolved]
+
+    direct = load_strategy_config(
+        populated_config, "nested_v1", runtime_id="intraday_options"
+    )
+    assert direct.strategy_id == "nested_v1"
+
+
+def test_direct_by_id_resolves_a_nested_strategy_without_a_runtime_id_hint(
+    populated_config: Path,
+):
+    """runtime_id omitted falls back to a one-level scan across every runtime
+    subfolder (plus the flat location) rather than requiring the caller to
+    already know where the file lives."""
+    _write(
+        populated_config / "strategies" / "intraday_options" / "nested_v2.yaml",
+        "strategy_id: nested_v2\nruntime_id: intraday_options\nenabled: true\n",
+    )
+    strategy = load_strategy_config(populated_config, "nested_v2")
+    assert strategy.strategy_id == "nested_v2"
+
+
+def test_direct_by_id_still_resolves_a_strategy_left_flat(populated_config: Path):
+    """Backward compatibility: a file not (yet) sorted into a runtime
+    subfolder still resolves via both the runtime_id-given and
+    runtime_id-omitted paths — the two-tier layout is additive, not a hard
+    requirement."""
+    assert (
+        load_strategy_config(
+            populated_config, "io_fixture_v1", runtime_id="intraday_options"
+        ).strategy_id
+        == "io_fixture_v1"
+    )
+    assert load_strategy_config(populated_config, "io_fixture_v1").strategy_id == "io_fixture_v1"
+
+
+def test_direct_by_id_is_ambiguous_across_two_runtime_subfolders(populated_config: Path):
+    """Two different runtimes each shipping a file with the same bare stem is
+    a new possibility once subfolders exist (the flat layout structurally
+    prevented it via filename collision). Without an explicit runtime_id,
+    this must fail loud — never silently pick one — and the error must name
+    every path found, not just the first."""
+    _write(
+        populated_config / "runtimes" / "positional_options.yaml",
+        "runtime_id: positional_options\nenabled: false\n",
+    )
+    _write(
+        populated_config / "strategies" / "intraday_options" / "dup_id.yaml",
+        "strategy_id: dup_id\nruntime_id: intraday_options\nenabled: true\n",
+    )
+    _write(
+        populated_config / "strategies" / "positional_options" / "dup_id.yaml",
+        "strategy_id: dup_id\nruntime_id: positional_options\nenabled: true\n",
+    )
+    with pytest.raises(ConfigError, match="Ambiguous strategy_id"):
+        load_strategy_config(populated_config, "dup_id")
+
+    # With an explicit runtime_id the direct lookup is unambiguous.
+    assert (
+        load_strategy_config(
+            populated_config, "dup_id", runtime_id="intraday_options"
+        ).runtime_id
+        == "intraday_options"
+    )
+    assert (
+        load_strategy_config(
+            populated_config, "dup_id", runtime_id="positional_options"
+        ).runtime_id
+        == "positional_options"
+    )

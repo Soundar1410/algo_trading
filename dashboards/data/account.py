@@ -344,13 +344,18 @@ class LiveGateMatrix:
 def _raw_strategy_files(
     config_root: Path, *, runtime_id: str | None = None
 ) -> list[dict[str, object]]:
-    """Every ``config/strategies/*.yaml`` file's own ``strategy_id``/
+    """Every ``config/strategies/**/*.yaml`` file's own ``strategy_id``/
     ``runtime_id``/``enabled``/``mode``/``live_approved`` fields, parsed
     directly rather than through :func:`~common.config.discover_enabled_strategies`
     — that function returns only *enabled* strategies (by design; see its own
     docstring), so it cannot answer "how many are disabled" either. A file
     that fails to parse is skipped, not guessed at — this table is a
     completeness view, not a safety gate.
+
+    Recursive: strategy files live under a per-runtime subfolder
+    (``strategies/<runtime_id>/<strategy_id>.yaml``), mirroring the
+    ``strategies/`` source tree; a flat ``strategies/<strategy_id>.yaml`` is
+    matched too.
 
     ``runtime_id``, when given, filters to files declaring exactly that
     ``runtime_id`` — every strategy now carries one, required
@@ -364,7 +369,7 @@ def _raw_strategy_files(
     if not strategies_dir.is_dir():
         return []
     rows: list[dict[str, object]] = []
-    for path in sorted(strategies_dir.glob("*.yaml")):
+    for path in sorted(strategies_dir.rglob("*.yaml")):
         try:
             data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         except (yaml.YAMLError, OSError):

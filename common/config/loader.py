@@ -9,7 +9,14 @@ Layout on disk::
     config/
     ├── global.yaml                       # global: {...}, plus optional *_defaults blocks
     ├── runtimes/<runtime_id>.yaml
-    └── strategies/<strategy_id>.yaml
+    └── strategies/<runtime_id>/<strategy_id>.yaml
+
+``strategies/`` is discovered recursively (``discover_strategies`` /
+``discover_enabled_strategies`` below) and mirrors the ``strategies/`` source
+tree's own per-runtime split — one subfolder per ``runtime_id``. A flat
+``strategies/<strategy_id>.yaml`` still resolves too (both loading paths fall
+back to it), so this is not a hard requirement, just the convention every
+committed strategy file follows.
 
 ``global.yaml`` and a runtime file may carry ``runtime_defaults`` /
 ``strategy_defaults`` blocks; a more specific layer overrides them key by key.
@@ -167,6 +174,51 @@ def load_runtime_config(config_root: Path, runtime_id: str) -> RuntimeConfig:
     return result
 
 
+def _resolve_strategy_path(config_root: Path, strategy_id: str, runtime_id: str | None) -> Path:
+    """Find ``<strategy_id>.yaml`` under ``config_root / "strategies"``.
+
+    Two-tier layout, mirroring the ``strategies/`` source tree
+    (``strategies/<runtime_id>/<strategy_id>.yaml``), with a flat
+    ``strategies/<strategy_id>.yaml`` kept as a fallback so a file that has
+    not (yet) been sorted into a runtime subfolder still resolves.
+
+    ``runtime_id`` given → tries the direct path first, no scanning (same
+    cost as the old always-flat lookup). If that guess misses — e.g. a file
+    physically sits in a different subfolder than the ``runtime_id`` its
+    caller expects — falls back to the same scan the ``runtime_id``-omitted
+    case uses, so a genuinely misplaced-vs-mismatched file still resolves and
+    surfaces the *content* mismatch (a clear "declares runtime_id=X, which
+    does not match Y" from the caller) rather than an opaque "file not
+    found". ``runtime_id`` omitted → scan every runtime subfolder plus the
+    flat location for a matching stem; zero or more than one match is a
+    :class:`ConfigError` (never a silent pick), because bare ``strategy_id``
+    uniqueness is no longer structurally guaranteed by a single flat
+    directory once subfolders exist.
+    """
+    strategies_dir = config_root / "strategies"
+    if runtime_id is not None:
+        direct = strategies_dir / runtime_id / f"{strategy_id}.yaml"
+        if direct.is_file():
+            return direct
+
+    candidates = sorted(strategies_dir.glob(f"*/{strategy_id}.yaml"))
+    flat = strategies_dir / f"{strategy_id}.yaml"
+    if flat.is_file():
+        candidates.append(flat)
+    if not candidates:
+        raise ConfigError(
+            f"Configuration file not found for strategy_id={strategy_id!r} under "
+            f"{strategies_dir} or any of its runtime subfolders."
+        )
+    if len(candidates) > 1:
+        listed = ", ".join(str(c.relative_to(config_root)) for c in candidates)
+        raise ConfigError(
+            f"Ambiguous strategy_id={strategy_id!r}: found in multiple places "
+            f"({listed}). Pass runtime_id explicitly to disambiguate."
+        )
+    return candidates[0]
+
+
 def load_strategy_config(
     config_root: Path,
     strategy_id: str,
@@ -175,37 +227,41 @@ def load_strategy_config(
 ) -> StrategyConfig:
     """Load one strategy's configuration, layered under global/runtime defaults.
 
-    ``runtime_id``, when given, is a caller-side expectation to validate
-    against — it does **not** decide which runtime's ``strategy_defaults`` to
-    layer. That decision belongs entirely to the strategy file's own,
-    undefaulted ``runtime_id:`` key, read directly off ``strategy_raw`` below
-    before any layering happens: a strategy's runtime membership must never
-    be inherited from a defaults block (a global or runtime ``strategy_defaults``
-    setting a ``runtime_id`` would let every strategy silently share one
-    runtime, exactly the failure mode this field exists to close). A strategy
-    file that omits ``runtime_id`` fails pydantic's required-field validation
-    inside :func:`_build`; a blank one fails the model's own validator; one
-    naming a runtime with no ``config/runtimes/<id>.yaml`` on disk fails here.
+    ``runtime_id``, when given, is both a caller-side expectation to validate
+    against and (new) what drives direct, O(1) file resolution instead of a
+    scan — see :func:`_resolve_strategy_path`. It does **not** decide which
+    runtime's ``strategy_defaults`` to layer. That decision belongs entirely
+    to the strategy file's own, undefaulted ``runtime_id:`` key, read directly
+    off ``strategy_raw`` below before any layering happens: a strategy's
+    runtime membership must never be inherited from a defaults block (a
+    global or runtime ``strategy_defaults`` setting a ``runtime_id`` would let
+    every strategy silently share one runtime, exactly the failure mode this
+    field exists to close). A strategy file that omits ``runtime_id`` fails
+    pydantic's required-field validation inside :func:`_build`; a blank one
+    fails the model's own validator; one naming a runtime with no
+    ``config/runtimes/<id>.yaml`` on disk fails here.
     """
     global_raw = _read_yaml(config_root / "global.yaml")
-    strategy_raw = _read_yaml(config_root / "strategies" / f"{strategy_id}.yaml")
+    strategy_path = _resolve_strategy_path(config_root, strategy_id, runtime_id)
+    strategy_raw = _read_yaml(strategy_path)
+    strategy_rel = strategy_path.relative_to(config_root).as_posix()
 
     declared_runtime_id = strategy_raw.get("runtime_id")
     if not isinstance(declared_runtime_id, str) or not declared_runtime_id.strip():
         raise ConfigError(
-            f"strategies/{strategy_id}.yaml is missing a required, non-empty "
+            f"{strategy_rel} is missing a required, non-empty "
             "'runtime_id' — every strategy must declare, in its own file, which "
             "runtime group it belongs to. This is never inherited from "
             "strategy_defaults."
         )
     if runtime_id is not None and declared_runtime_id != runtime_id:
         raise ConfigError(
-            f"strategies/{strategy_id}.yaml declares runtime_id={declared_runtime_id!r}, "
+            f"{strategy_rel} declares runtime_id={declared_runtime_id!r}, "
             f"which does not match the requested runtime_id={runtime_id!r}."
         )
     if not (config_root / "runtimes" / f"{declared_runtime_id}.yaml").is_file():
         raise ConfigError(
-            f"strategies/{strategy_id}.yaml declares runtime_id={declared_runtime_id!r}, "
+            f"{strategy_rel} declares runtime_id={declared_runtime_id!r}, "
             f"but config/runtimes/{declared_runtime_id}.yaml does not exist."
         )
 
@@ -233,10 +289,10 @@ def load_strategy_config(
 
     if merged["strategy_id"] != strategy_id:
         raise ConfigError(
-            f"strategy_id mismatch: file strategies/{strategy_id}.yaml declares "
+            f"strategy_id mismatch: file {strategy_rel} declares "
             f"{merged['strategy_id']!r}. The filename is the identity."
         )
-    result: StrategyConfig = _build(StrategyConfig, merged, f"strategies/{strategy_id}.yaml")
+    result: StrategyConfig = _build(StrategyConfig, merged, strategy_rel)
     return result
 
 
@@ -274,7 +330,7 @@ def discover_enabled_strategies(
     :func:`load_resolved_config` has to be called by hand, one ``strategy_id``
     at a time, which is what every caller before Phase 5 did (only tests).
 
-    Strategy files are visited in sorted filename order, so which strategy a
+    Strategy files are visited in sorted path order, so which strategy a
     supervisor tries to spawn first is deterministic across runs.
 
     Raises:
@@ -324,18 +380,19 @@ def discover_strategies(
         return []
 
     resolved: list[ResolvedConfig] = []
-    for path in sorted(strategies_dir.glob("*.yaml")):
+    for path in sorted(strategies_dir.rglob("*.yaml")):
+        rel = path.relative_to(config_root).as_posix()
         raw = _read_yaml(path)
         declared_runtime_id = raw.get("runtime_id")
         if not isinstance(declared_runtime_id, str) or not declared_runtime_id.strip():
             raise ConfigError(
-                f"strategies/{path.stem}.yaml is missing a required, non-empty "
+                f"{rel} is missing a required, non-empty "
                 "'runtime_id' — every strategy must declare which runtime group "
                 "it belongs to."
             )
         if not (config_root / "runtimes" / f"{declared_runtime_id}.yaml").is_file():
             raise ConfigError(
-                f"strategies/{path.stem}.yaml declares runtime_id="
+                f"{rel} declares runtime_id="
                 f"{declared_runtime_id!r}, but config/runtimes/{declared_runtime_id}.yaml "
                 "does not exist."
             )

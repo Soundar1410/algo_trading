@@ -82,7 +82,9 @@ def enabled_config_root(config_root: Path) -> Path:
         encoding="utf-8",
     )
     for name in ("ema_cross_9_21_buy", "straddle_920", STRATEGY_ID):
-        text = (REPO_CONFIG / "strategies" / f"{name}.yaml").read_text(encoding="utf-8")
+        text = (REPO_CONFIG / "strategies" / RUNTIME_ID / f"{name}.yaml").read_text(
+            encoding="utf-8"
+        )
         if name == STRATEGY_ID:
             assert "\nenabled: false\n" in text, "the committed config is no longer disabled"
             text = text.replace("\nenabled: false\n", "\nenabled: true\n", 1)

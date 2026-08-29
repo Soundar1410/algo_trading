@@ -37,7 +37,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_ROOT = REPO_ROOT / "config"
 STRATEGY_ID = "rolling_strangle_otm1"
 RUNTIME_ID = "intraday_options"
-CONFIG_FILE = CONFIG_ROOT / "strategies" / f"{STRATEGY_ID}.yaml"
+CONFIG_FILE = CONFIG_ROOT / "strategies" / RUNTIME_ID / f"{STRATEGY_ID}.yaml"
 IST = ZoneInfo("Asia/Kolkata")
 
 

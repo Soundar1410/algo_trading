@@ -168,7 +168,9 @@ def test_the_strategy_package_is_the_only_place_the_id_naturally_appears():
     strategy_file = (
         REPO_ROOT / "strategies" / "intraday_options" / "rolling_strangle_otm1" / "strategy.py"
     )
-    config_file = REPO_ROOT / "config" / "strategies" / "rolling_strangle_otm1.yaml"
+    config_file = (
+        REPO_ROOT / "config" / "strategies" / "intraday_options" / "rolling_strangle_otm1.yaml"
+    )
     assert _LITERAL_RE.search(strategy_file.read_text(encoding="utf-8"))
     assert '"rolling_strangle_otm1"' not in config_file.read_text(encoding="utf-8")
     assert "strategy_id: rolling_strangle_otm1" in config_file.read_text(encoding="utf-8")

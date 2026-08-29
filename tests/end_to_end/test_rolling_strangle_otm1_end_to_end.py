@@ -340,7 +340,9 @@ def test_the_committed_configuration_stays_paper_disabled_and_not_live_approved(
     """A final, cheap belt-and-suspenders safety check for this consolidated
     verification phase — the exact three flags CLAUDE.md requires never to
     move as part of implementation work."""
-    text = (REPO_CONFIG / "strategies" / f"{STRATEGY_ID}.yaml").read_text(encoding="utf-8")
+    text = (
+        REPO_CONFIG / "strategies" / RUNTIME_ID / f"{STRATEGY_ID}.yaml"
+    ).read_text(encoding="utf-8")
     assert "enabled: false" in text
     assert "mode: paper" in text
     assert "live_approved: false" in text

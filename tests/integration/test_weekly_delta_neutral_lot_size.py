@@ -72,7 +72,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _PRODUCTION_TARGETS: tuple[Path, ...] = (
     _REPO_ROOT / "strategies" / "positional_options" / "weekly_delta_neutral",
     _REPO_ROOT / "runtimes" / "positional_options",
-    _REPO_ROOT / "config" / "strategies" / "weekly_delta_neutral.yaml",
+    _REPO_ROOT / "config" / "strategies" / "positional_options" / "weekly_delta_neutral.yaml",
 )
 _LITERAL_65_RE = re.compile(r"(?<![0-9.])65(?![0-9.])")
 

@@ -114,7 +114,9 @@ def test_the_strategy_package_is_the_only_place_the_id_naturally_appears() -> No
         / "weekly_delta_neutral"
         / "strategy.py"
     )
-    config_file = REPO_ROOT / "config" / "strategies" / "weekly_delta_neutral.yaml"
+    config_file = (
+        REPO_ROOT / "config" / "strategies" / "positional_options" / "weekly_delta_neutral.yaml"
+    )
     assert _LITERAL_RE.search(strategy_file.read_text(encoding="utf-8"))
     assert '"weekly_delta_neutral"' not in config_file.read_text(encoding="utf-8")
     assert "strategy_id: weekly_delta_neutral" in config_file.read_text(encoding="utf-8")

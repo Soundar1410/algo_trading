@@ -94,7 +94,7 @@ def test_every_committed_strategy_file_is_paper_including_the_disabled_ones():
     this covers the rest, so a live-designated strategy cannot sit dormant in
     the tree waiting for someone to flip a single unrelated flag.
     """
-    strategy_files = sorted((REPO_CONFIG / "strategies").glob("*.yaml"))
+    strategy_files = sorted((REPO_CONFIG / "strategies").rglob("*.yaml"))
     assert strategy_files, "no strategy configs found — this test would prove nothing"
 
     for path in strategy_files:

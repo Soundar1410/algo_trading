@@ -102,7 +102,12 @@ def _check_strategies(config_root: Path) -> list[str]:
     if not strategies_dir.is_dir():
         return []
     problems: list[str] = []
-    for path in sorted(strategies_dir.glob("*.yaml")):
+    # Recursive: strategy files live under a per-runtime subfolder
+    # (strategies/<runtime_id>/<strategy_id>.yaml), mirroring the strategies/
+    # source tree. A non-recursive glob here would silently stop checking
+    # every nested file — a live-enabling value in one would go undetected,
+    # not just under-tested, since this script is the CI-enforced guard.
+    for path in sorted(strategies_dir.rglob("*.yaml")):
         try:
             raw = _read_yaml(path)
         except Exception as exc:
