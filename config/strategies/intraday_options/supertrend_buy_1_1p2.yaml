@@ -20,7 +20,7 @@
 
 strategy_id: supertrend_buy_1_1p2
 runtime_id: intraday_options
-enabled: false
+enabled: true
 
 mode: paper
 live_approved: false
@@ -109,7 +109,7 @@ parameters:
   # from the exchange's own daily instrument master at runtime -- spec section
   # 8. Never hardcode a lot size or a weekly-expiry date, so there is
   # deliberately NO `lot_size:` key here (straddle_920's pattern, not
-  # ema_cross_9_21_buy's documented-but-ignored `lot_size: 75`). The legacy
+  # c921_ema_cross_buy's documented-but-ignored `lot_size: 75`). The legacy
   # config's `lot_size: 65` cross-check is not carried over.
   #
   # Known asymmetry, stated rather than assumed away: the MULTI-LEG branch of
@@ -224,13 +224,13 @@ parameters:
   # ------------------------------------------------------------ paper execution
   # Spec section 13, and the one intentional architecture-level deviation from
   # the legacy simulator: the legacy config ran `slippage_points: 0.0` and no
-  # latency at all. That is not reproduced. This block is ema_cross_9_21_buy's
+  # latency at all. That is not reproduced. This block is c921_ema_cross_buy's
   # canonical intraday paper block, so the two single-leg intraday strategies
   # are filled by the same model and their results stay comparable.
   #
   # Charges are deliberately NOT overridden here: no strategy YAML sets
   # `cost_rates`, so this inherits common.broker.costs.CostRates' defaults, the
-  # same rates ema_cross_9_21_buy and straddle_920 book against.
+  # same rates c921_ema_cross_buy and straddle_920 book against.
   paper_execution:
     slippage:
       options:

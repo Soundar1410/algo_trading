@@ -46,7 +46,7 @@ from dashboards.data.multi_leg import (
     load_roll_anchor,
     load_rolls_for_basket,
 )
-from dashboards.data.strategy_scope import DISABLED, discover_strategy_options
+from dashboards.data.strategy_scope import STOPPED, discover_strategy_options
 from runtimes.intraday_options.multi_leg_engine_worker import recover_basket
 from strategies.intraday_options.rolling_strangle_otm1.strategy import RollingStrangleOtm1Strategy
 
@@ -240,13 +240,17 @@ def rolling_strangle_otm1_db(tmp_path: Path) -> Path:
 
 
 # ============================================================= read models
-def test_committed_config_lists_rolling_strangle_otm1_as_disabled() -> None:
+def test_committed_config_lists_rolling_strangle_otm1_as_stopped() -> None:
     """Generic discovery — no code change needed for a new strategy to
-    appear here, since Phase 4's YAML alone is what this reads."""
+    appear here, since Phase 4's YAML alone is what this reads. Shipped
+    disabled at delivery; the operator enabled it for real, paper-only
+    trading on 31 August 2026 (see docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md),
+    so it now shows STOPPED (enabled, no live heartbeat visible with no
+    database connection) rather than DISABLED."""
     options = discover_strategy_options(None, REPO_CONFIG, RUNTIME_ID)
     by_id = {o.strategy_id: o for o in options}
     assert STRATEGY_ID in by_id
-    assert by_id[STRATEGY_ID].status_label == DISABLED
+    assert by_id[STRATEGY_ID].status_label == STOPPED
 
 
 def test_roll_history_reads_back_correctly_from_a_read_only_connection(

@@ -1,7 +1,7 @@
 """Phase 5C: end-to-end and no-network proofs for ``rolling_strangle_otm1``.
 
 Real config loading, real ``discover_strategies``/``build_supervisor``
-composition (alongside ``ema_cross_9_21_buy`` and ``straddle_920``, never in
+composition (alongside ``c921_ema_cross_buy`` and ``straddle_920``, never in
 isolation), real repository migrations through ``0013``, a real temporary
 SQLite database, and a complete entry -> roll -> replacement -> restart ->
 exit lifecycle through the real ``MultiLegEngine`` — scripted/in-process feed
@@ -308,10 +308,12 @@ def test_full_lifecycle_with_a_mid_flight_restart_makes_no_network_call(
 def test_strategy_composes_alongside_ema_and_straddle_920_with_no_network_call(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, network_sentinel: list[object]
 ) -> None:
-    """Real build_supervisor, real committed config, all three intraday_
-    options strategies discovered together — this strategy stays isolated
-    (Phase 4's own proof) and, separately, produces no network traffic
-    while doing so."""
+    """Real build_supervisor, real committed config, this strategy discovered
+    and registered alongside the other real committed intraday_options
+    strategies — the operator enabled it for real, paper-only trading on
+    31 August 2026 (see docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md), so it now
+    composes rather than stays out — isolated from its siblings (Phase 4's
+    own proof) and, separately, produces no network traffic while doing so."""
     monkeypatch.setattr(
         runtime_main, "legacy_system_status",
         lambda: LegacySystemStatus(
@@ -320,9 +322,9 @@ def test_strategy_composes_alongside_ema_and_straddle_920_with_no_network_call(
         ),
     )
     discovered = {c.strategy.strategy_id for c in discover_strategies(REPO_CONFIG, RUNTIME_ID)}
-    assert {STRATEGY_ID, "ema_cross_9_21_buy", "straddle_920"} <= discovered
+    assert {STRATEGY_ID, "c921_ema_cross_buy", "straddle_920"} <= discovered
     enabled = {c.strategy.strategy_id for c in discover_enabled_strategies(REPO_CONFIG, RUNTIME_ID)}
-    assert STRATEGY_ID not in enabled  # ships disabled
+    assert STRATEGY_ID in enabled
 
     tape = REPO_ROOT / "tests" / "fixtures" / "nifty_tick_tape.json"
     adapter = RecordedFeedAdapter(load_tick_tape(tape))
@@ -331,18 +333,22 @@ def test_strategy_composes_alongside_ema_and_straddle_920_with_no_network_call(
         adapter=adapter,
     )
     registrations = {config.strategy_id for config, _channel in supervisor._workers}
-    assert registrations == {"ema_cross_9_21_buy", "straddle_920"}  # this strategy stays out
+    assert {STRATEGY_ID, "c921_ema_cross_buy", "straddle_920"} <= registrations
 
     assert network_sentinel == [], f"unexpected outbound connect attempt(s): {network_sentinel}"
 
 
-def test_the_committed_configuration_stays_paper_disabled_and_not_live_approved() -> None:
+def test_the_committed_configuration_stays_paper_and_not_live_approved() -> None:
     """A final, cheap belt-and-suspenders safety check for this consolidated
-    verification phase — the exact three flags CLAUDE.md requires never to
-    move as part of implementation work."""
+    verification phase — the two flags CLAUDE.md requires never to move
+    without separate live-activation approval. ``enabled`` is not one of
+    them: paper enablement is documented (this file's own header) as a
+    deliberate, separate operator decision, distinct from a live gate, and
+    the operator made that decision on 31 August 2026 — see
+    docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md."""
     text = (
         REPO_CONFIG / "strategies" / RUNTIME_ID / f"{STRATEGY_ID}.yaml"
     ).read_text(encoding="utf-8")
-    assert "enabled: false" in text
     assert "mode: paper" in text
     assert "live_approved: false" in text
+    assert "mode: live" not in text

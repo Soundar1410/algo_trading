@@ -17,12 +17,18 @@
 
 strategy_id: rolling_strangle_otm1
 runtime_id: intraday_options
-# Shipped disabled. Enabling for the first paper session is a deliberate,
-# explicit operator action, taken only after the 30-day paper evaluation and
-# every other outstanding item CLAUDE.md's project rules record for this
-# repository's overall operational eligibility. Do not flip this to true as
-# part of implementation work.
-enabled: false
+# Shipped disabled, with a documented precondition: enabling for the first
+# paper session was meant to wait for the 30-day paper evaluation and every
+# other outstanding item CLAUDE.md's project rules record for this
+# repository's overall operational eligibility.
+#
+# Enabled 31 August 2026 — explicit operator decision, made after being
+# shown this precondition and the unbounded-risk short-strangle warning
+# above, ahead of the 30-day evaluation completing. PAPER ONLY: live stays
+# fail-closed regardless (config_adapter.py's multi-leg engine refuses live
+# outright, and the broker factory's live gate would refuse it again even
+# if that didn't).
+enabled: true
 
 mode: paper
 live_approved: false
@@ -197,7 +203,7 @@ parameters:
   # Intentional architecture-level execution-model deviation (spec section
   # 13): the legacy simulator ran zero slippage and zero latency. This uses
   # the repository's canonical intraday paper-execution block instead — the
-  # same one ema_cross_9_21_buy and supertrend_buy_1_1p2 use — so results
+  # same one c921_ema_cross_buy and supertrend_buy_1_1p2 use — so results
   # stay comparable across strategies. This changes only the fill/charge
   # model, never the strategy's signal or its gross combined-stop formula
   # (spec section 10.1's stop compares gross P&L, unaffected by charges).

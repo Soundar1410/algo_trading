@@ -4,12 +4,19 @@ production-written database, never a hand-typed row.
 
 Two things are proven here that the generic dashboard test suites (which use
 synthetic strategy ids to prove the *mechanism* is data-driven) do not: that this
-specific strategy id, in the real committed configuration, is actually labelled
-``DISABLED``, appears in the real intraday_options selector alongside the two
-enabled strategies, and — once real persisted rows exist for it (written through
-the same ``TradingEngine`` / ``ExecutionRepository`` stack Phase 3 uses) — is
-correctly isolated from another strategy's data by every read model's
-``strategy_id`` filter.
+specific strategy id, in the real committed configuration, is correctly labelled
+by its own ``enabled`` flag, appears in the real intraday_options selector
+alongside the other enabled strategies, and — once real persisted rows exist for
+it (written through the same ``TradingEngine`` / ``ExecutionRepository`` stack
+Phase 3 uses) — is correctly isolated from another strategy's data by every read
+model's ``strategy_id`` filter.
+
+Was ``DISABLED`` at delivery (Phase 4); the operator enabled it for real,
+committed paper trading on 31 August 2026 (see
+docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md), so the discovery/labelling tests
+below now assert ``STOPPED`` (configured and enabled, no live heartbeat visible
+with no database connection) — the committed flag changed, not the mechanism
+these tests exist to prove.
 
 No dashboard file is touched by this port; this file exists to demonstrate that
 fact against real data, not to add one.
@@ -33,7 +40,6 @@ from _supertrend_buy_1_1p2_fixtures import (
 from common.persistence import connect_readonly
 from dashboards.data.intraday_options import load_closed_trades, load_orders
 from dashboards.data.strategy_scope import (
-    DISABLED,
     RUNNING,
     STOPPED,
     discover_strategy_options,
@@ -67,29 +73,32 @@ def _closed_trade_stack(tmp_path: Path) -> Stack:
 
 
 # ------------------------------------------------- discovery and labelling
-def test_the_committed_strategy_is_discovered_and_labelled_disabled():
-    """Spec 18.7: "Disabled strategy is discovered but not spawned" — the dashboard
-    half. Against the real committed config with no database at all (a fresh
-    install), the strategy still appears, because config-based discovery does not
-    require a database."""
+def test_the_committed_strategy_is_discovered_and_labelled_stopped():
+    """Spec 18.7's discovery half, updated for the 31 August 2026 enable
+    decision: against the real committed config with no database at all (a
+    fresh install), the strategy still appears, because config-based
+    discovery does not require a database — now labelled STOPPED (enabled,
+    no live heartbeat visible) rather than DISABLED."""
     options = discover_strategy_options(None, REPO_CONFIG, RUNTIME_ID)
     ours = {o.strategy_id: o for o in options}[STRATEGY_ID]
-    assert ours.status_label == DISABLED
+    assert ours.status_label == STOPPED
     assert ours.execution_mode is None
 
 
-def test_it_appears_alongside_both_enabled_strategies_in_the_same_scope():
-    """The real intraday_options selector, unfiltered by any database: all three
-    strategies configured for this runtime appear together, each labelled by its
-    own committed ``enabled`` flag — nothing here singles any one of them out."""
+def test_it_appears_alongside_the_other_enabled_strategies_in_the_same_scope():
+    """The real intraday_options selector, unfiltered by any database: every
+    strategy configured for this runtime appears together, each labelled by
+    its own committed ``enabled`` flag — nothing here singles any one of
+    them out."""
     options = discover_strategy_options(None, REPO_CONFIG, RUNTIME_ID)
     labels = {o.strategy_id: o.status_label for o in options}
-    assert labels[STRATEGY_ID] == DISABLED
-    # The two enabled strategies show as STOPPED (configured, no live heartbeat) —
-    # the same status a freshly-installed, not-yet-started worker would show.
-    assert labels["ema_cross_9_21_buy"] == STOPPED
+    # All committed-enabled here show as STOPPED (configured, no live
+    # heartbeat) — the same status a freshly-installed, not-yet-started
+    # worker would show.
+    assert labels[STRATEGY_ID] == STOPPED
+    assert labels["c921_ema_cross_buy"] == STOPPED
     assert labels["straddle_920"] == STOPPED
-    assert set(labels) >= {STRATEGY_ID, "ema_cross_9_21_buy", "straddle_920"}
+    assert set(labels) >= {STRATEGY_ID, "c921_ema_cross_buy", "straddle_920"}
 
 
 def test_enabling_it_in_a_fixture_config_would_show_running_generically(

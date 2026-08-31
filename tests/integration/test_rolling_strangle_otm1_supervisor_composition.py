@@ -1,8 +1,15 @@
 """``rolling_strangle_otm1`` through the **real** intraday composition root.
 
 Spec section 18.7-equivalent (Phase 4): "Disabled strategy is discovered but
-not spawned" and "Enabling it in a test fixture adds an isolated intraday
-worker with the correct tick/control channels." Mirrors ``tests/integration/
+not spawned" and "Enabling it adds an isolated intraday worker with the
+correct tick/control channels." Shipped disabled at delivery; the operator
+enabled it for real, paper-only trading on 31 August 2026 (see
+docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md) — so this file now asserts the
+*real* committed ``config/`` tree directly registers this strategy
+correctly, rather than proving it via a synthetic enabled-copy fixture. The
+"not spawned while disabled" property is still proven, just against a
+synthetic *disabled* copy now (the fixture's role is inverted from this
+file's original form, not dropped). Mirrors ``tests/integration/
 test_supertrend_buy_1_1p2_supervisor_composition.py``'s structure exactly —
 see that file's own docstring for why this goes through the real
 ``build_supervisor`` rather than a hand-built ``WorkerConfig``: the defect
@@ -33,9 +40,6 @@ RUNTIME_ID = "intraday_options"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 REPO_CONFIG = REPO_ROOT / "config"
 STRATEGY_ID = "rolling_strangle_otm1"
-#: Every strategy expected enabled in the committed intraday_options tree,
-#: independent of this one — the baseline this file must never disturb.
-_OTHER_ENABLED = ("ema_cross_9_21_buy", "straddle_920")
 
 
 @pytest.fixture(autouse=True)
@@ -67,16 +71,12 @@ def _registrations(supervisor) -> dict[str, tuple[object, object]]:
 
 
 @pytest.fixture
-def enabled_config_root(config_root: Path) -> Path:
+def disabled_config_root(config_root: Path) -> Path:
     """The **committed** config tree, copied verbatim except that this
-    strategy's ``enabled: false`` becomes ``enabled: true``.
-
-    Copied rather than rewritten by hand, and only this one line changed —
-    per the user's own Phase 4 instruction — so a passing test proves *this*
-    committed configuration produces a correctly isolated worker, not merely
-    that some invented YAML does; and the single-line substitution is what
-    makes the "not spawned" test above meaningful, since that is the only
-    difference between the two states.
+    strategy's own ``enabled: true`` becomes ``enabled: false`` — the
+    baseline "as if this strategy had never been enabled" the tests below
+    compare the real committed tree against, to prove enabling it changed
+    nothing about its siblings' wiring.
     """
     (config_root / "global.yaml").write_text(
         (REPO_CONFIG / "global.yaml").read_text(encoding="utf-8"), encoding="utf-8"
@@ -85,65 +85,32 @@ def enabled_config_root(config_root: Path) -> Path:
         (REPO_CONFIG / "runtimes" / f"{RUNTIME_ID}.yaml").read_text(encoding="utf-8"),
         encoding="utf-8",
     )
-    for name in (*_OTHER_ENABLED, STRATEGY_ID):
-        text = (REPO_CONFIG / "strategies" / RUNTIME_ID / f"{name}.yaml").read_text(
-            encoding="utf-8"
-        )
-        if name == STRATEGY_ID:
-            assert "\nenabled: false\n" in text, "the committed config is no longer disabled"
-            text = text.replace("\nenabled: false\n", "\nenabled: true\n", 1)
-        (config_root / "strategies" / f"{name}.yaml").write_text(text, encoding="utf-8")
+    strategies_dir = REPO_CONFIG / "strategies" / RUNTIME_ID
+    for source in strategies_dir.glob("*.yaml"):
+        text = source.read_text(encoding="utf-8")
+        if source.stem == STRATEGY_ID:
+            assert "\nenabled: true\n" in text, "the committed config is no longer enabled"
+            text = text.replace("\nenabled: true\n", "\nenabled: false\n", 1)
+        (config_root / "strategies" / source.name).write_text(text, encoding="utf-8")
     return config_root
 
 
-# ------------------------------------------- committed config: not spawned
-def test_the_committed_disabled_strategy_registers_no_worker(adapter, tmp_path: Path):
-    """Against the real committed ``config/`` tree: discovered (the
-    supervisor's mode-transition exposure check still runs over it — disabling
-    must not bypass that), but no worker, tick queue or control queue."""
-    supervisor = build_supervisor(
-        runtime_id=RUNTIME_ID,
-        config_root=REPO_CONFIG,
-        paths=load_paths(tmp_path),
-        adapter=adapter,
-    )
-
-    registrations = _registrations(supervisor)
-    assert STRATEGY_ID not in registrations
-    assert supervisor.control_queue(STRATEGY_ID) is None
-
-
-def test_the_committed_config_still_registers_only_the_existing_enabled_strategies(
+# --------------------------------------------- committed config: registered
+def test_the_committed_enabled_strategy_registers_an_isolated_worker_with_tick_and_control_channels(
     adapter, tmp_path: Path
 ):
-    """Adding a disabled strategy file must change nothing about what
-    production starts today."""
-    supervisor = build_supervisor(
-        runtime_id=RUNTIME_ID,
-        config_root=REPO_CONFIG,
-        paths=load_paths(tmp_path),
-        adapter=adapter,
-    )
-
-    assert set(_registrations(supervisor)) == set(_OTHER_ENABLED)
-
-
-# ------------------------------------------------ enabled: an isolated worker
-def test_enabling_it_adds_an_isolated_worker_with_tick_and_control_channels(
-    enabled_config_root: Path, adapter, tmp_path: Path
-):
-    """The one thing this port must prove about the runtime seam: a
+    """Against the real committed ``config/`` tree, directly: a
     multi-leg-engine strategy is given both queues by the generic
     registration path, with no supervisor branch naming it."""
     supervisor = build_supervisor(
         runtime_id=RUNTIME_ID,
-        config_root=enabled_config_root,
+        config_root=REPO_CONFIG,
         paths=load_paths(tmp_path),
         adapter=adapter,
     )
 
     registrations = _registrations(supervisor)
-    assert set(registrations) == {*_OTHER_ENABLED, STRATEGY_ID}
+    assert STRATEGY_ID in registrations
 
     config, channel = registrations[STRATEGY_ID]
     assert isinstance(config.multi_leg_engine, MultiLegEngineWorkerConfig)
@@ -153,48 +120,51 @@ def test_enabling_it_adds_an_isolated_worker_with_tick_and_control_channels(
     assert supervisor.control_queue(STRATEGY_ID) is not None
 
 
-def test_the_new_worker_is_isolated_from_the_others(
-    enabled_config_root: Path, adapter, tmp_path: Path
-):
+def test_the_worker_is_isolated_from_every_sibling(adapter, tmp_path: Path):
     """Independent identity, independent queues, independent correlation
-    namespace — architecture spec's strategy-isolation rules."""
+    namespace — architecture spec's strategy-isolation rules. Deliberately
+    checks uniqueness across however many strategies are actually enabled,
+    rather than hardcoding a count — that count grows as more strategies are
+    enabled, which is exactly what made this test brittle the last time it
+    happened."""
     supervisor = build_supervisor(
         runtime_id=RUNTIME_ID,
-        config_root=enabled_config_root,
+        config_root=REPO_CONFIG,
         paths=load_paths(tmp_path),
         adapter=adapter,
     )
 
     registrations = _registrations(supervisor)
-    assert len(registrations) == 3
+    assert STRATEGY_ID in registrations
+    assert len(registrations) > 1, "nothing to prove isolation from"
 
     channels = {sid: channel for sid, (_, channel) in registrations.items()}
     queues = [id(c.tick_queue) for c in channels.values() if c.tick_queue is not None]
-    assert len(queues) == len(set(queues)) == 3
+    assert len(queues) == len(set(queues))
 
     control_queues = [id(supervisor.control_queue(sid)) for sid in registrations]
-    assert len(control_queues) == len(set(control_queues)) == 3
+    assert len(control_queues) == len(set(control_queues))
 
     # add_worker refuses a strategy whose correlation token collides with an
-    # already-admitted one; three admitted workers is itself proof it did
-    # not, for this exact committed strategy_id set.
+    # already-admitted one; every registration coexisting is itself proof it
+    # did not, for the real committed strategy_id set.
     tokens = {strategy_token(sid) for sid in registrations}
-    assert len(tokens) == 3
+    assert len(tokens) == len(registrations)
 
 
-def test_the_correlation_token_is_deterministic_and_generic(enabled_config_root: Path) -> None:
+def test_the_correlation_token_is_deterministic_and_generic() -> None:
     """No manual token mapping exists or is needed: strategy_token is a pure
     function of strategy_id, generic to every caller, unrelated to this
     strategy's own name in any special way."""
     assert strategy_token(STRATEGY_ID) == "roll"
     assert strategy_token(STRATEGY_ID) == strategy_token(STRATEGY_ID)
     assert len(strategy_token(STRATEGY_ID)) <= 4  # STRATEGY_TOKEN_LENGTH
-    for other in (*_OTHER_ENABLED, "supertrend_buy_1_1p2", "skeleton_fixture"):
+    for other in ("c921_ema_cross_buy", "straddle_920", "supertrend_buy_1_1p2", "skeleton_fixture"):
         assert strategy_token(other) != strategy_token(STRATEGY_ID)
 
 
 def test_the_enabled_worker_carries_the_committed_trading_parameters_and_stays_paper(
-    enabled_config_root: Path, adapter, tmp_path: Path
+    adapter, tmp_path: Path
 ):
     """The registration is not merely present, it carries the real
     configuration: strategy_ref, ten lots, the dhan resolver, the
@@ -202,7 +172,7 @@ def test_the_enabled_worker_carries_the_committed_trading_parameters_and_stays_p
     execution (spec section 16)."""
     supervisor = build_supervisor(
         runtime_id=RUNTIME_ID,
-        config_root=enabled_config_root,
+        config_root=REPO_CONFIG,
         paths=load_paths(tmp_path),
         adapter=adapter,
     )
@@ -230,35 +200,57 @@ def test_the_enabled_worker_carries_the_committed_trading_parameters_and_stays_p
     assert config.runtime_live_execution_allowed is False
 
 
-def test_the_other_two_enabled_workers_are_unaffected_by_enabling_this_one(
-    enabled_config_root: Path, adapter, tmp_path: Path
+# ------------------------------------------------ disabled: not registered
+def test_a_disabled_copy_registers_no_worker(disabled_config_root: Path, adapter, tmp_path: Path):
+    """The other half of Spec 18.7-equivalent, proven against a synthetic
+    disabled copy now that the real committed file is enabled: discovered —
+    the supervisor still runs its mode-transition exposure check over it,
+    disabling must not bypass that — but no worker, tick queue or control
+    queue."""
+    supervisor = build_supervisor(
+        runtime_id=RUNTIME_ID,
+        config_root=disabled_config_root,
+        paths=load_paths(tmp_path),
+        adapter=adapter,
+    )
+
+    registrations = _registrations(supervisor)
+    assert STRATEGY_ID not in registrations
+    assert supervisor.control_queue(STRATEGY_ID) is None
+
+
+def test_disabling_it_does_not_change_the_other_enabled_workers(
+    disabled_config_root: Path, adapter, tmp_path: Path
 ):
     """Flipping only this strategy's own flag must not reroute, resize or
-    otherwise change the workers that were already enabled."""
-    baseline_root = tmp_path / "baseline"
-    with_new_strategy_root = tmp_path / "with_new_strategy"
-    baseline_root.mkdir()
-    with_new_strategy_root.mkdir()
+    otherwise change the workers that are enabled independent of it —
+    proven by comparing the real committed tree against the synthetic copy
+    with only this one strategy turned off."""
+    enabled_root = tmp_path / "enabled"
+    disabled_root = tmp_path / "disabled"
+    enabled_root.mkdir()
+    disabled_root.mkdir()
 
-    baseline_supervisor = build_supervisor(
+    enabled_supervisor = build_supervisor(
         runtime_id=RUNTIME_ID,
         config_root=REPO_CONFIG,
-        paths=load_paths(baseline_root),
+        paths=load_paths(enabled_root),
         adapter=adapter,
     )
-    baseline = _registrations(baseline_supervisor)
-
-    with_new_strategy = build_supervisor(
+    without = build_supervisor(
         runtime_id=RUNTIME_ID,
-        config_root=enabled_config_root,
-        paths=load_paths(with_new_strategy_root),
+        config_root=disabled_config_root,
+        paths=load_paths(disabled_root),
         adapter=adapter,
     )
-    after = _registrations(with_new_strategy)
 
-    for strategy_id in _OTHER_ENABLED:
-        before_config, before_channel = baseline[strategy_id]
-        after_config, after_channel = after[strategy_id]
+    with_this = _registrations(enabled_supervisor)
+    without_this = _registrations(without)
+
+    assert set(without_this) == set(with_this) - {STRATEGY_ID}
+    for strategy_id in without_this:
+        before_config, before_channel = without_this[strategy_id]
+        after_config, after_channel = with_this[strategy_id]
         assert type(before_config.engine) is type(after_config.engine)
         assert type(before_config.multi_leg_engine) is type(after_config.multi_leg_engine)
         assert before_config.execution_mode == after_config.execution_mode

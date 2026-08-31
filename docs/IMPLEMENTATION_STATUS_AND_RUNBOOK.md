@@ -8,8 +8,8 @@ the next phase. Updated after every phase.
 | | |
 |---|---|
 | **Current phase** | **Phase 10 — Controlled live readiness: CODE HARDENED, fully disabled.** Production parent/worker preflight wiring, Dhan order/update handling, restart-safe account-loss emergency square-off, account-wide reserve-before-submit risk plus live MTM, shared rate limiting, broker-authoritative startup/mode-transition/session-end reconciliation, strict migration history, and restore validation exist and are tested with mocks/fakes only. `c921_ema_cross_buy` (renamed from `ema_cross_9_21_buy` 31 August 2026 — see addendum) and its Rev 3.1 matrix are unchanged. **Every committed live gate remains fail-closed** (`global.live_trading_enabled: false`, `live_execution_allowed: false`, `live_approved: false`, no `mode: live` in `config/`), enforced by `scripts.assert_no_live_config_committed`. No real Dhan order/network call was made. |
-| **Next phase** | Operational evidence and explicit human decisions, not more live-enabling code: complete/review the 30-day paper run, run the second and third real strategies (`c509_ema_cross_buy` and `c521_ema_cross_buy`, both built — see the 27 and 29 August 2026 addenda for their original build record under their pre-rename ids — but both shipped `enabled: false`) through their own paper evaluation periods, choose/configure an approved egress-IP provider and static IP, revalidate authentication operationally, then separately decide whether to approve minimum-quantity live activation. |
-| **Last updated** | 31 August 2026 — all three real EMA-cross strategies renamed to fix a correlation-ID token collision: `ema_cross_5_9_buy`/`ema_cross_5_21_buy`/`ema_cross_9_21_buy` → `c509_ema_cross_buy`/`c521_ema_cross_buy`/`c921_ema_cross_buy` (see addendum below for root cause and sequencing); the dashboard strategy picker also stopped listing renamed/retired strategy ids forever. All committed live gates remain disabled |
+| **Next phase** | Operational evidence and explicit human decisions, not more live-enabling code: complete/review the 30-day paper run for every now-enabled real strategy (`c509_ema_cross_buy`, `c521_ema_cross_buy`, `c921_ema_cross_buy`, `supertrend_buy_1_1p2`, `rolling_strangle_otm1` — see the dated addenda for each one's enable decision), choose/configure an approved egress-IP provider and static IP, revalidate authentication operationally, then separately decide whether to approve minimum-quantity live activation. |
+| **Last updated** | 31 August 2026 — `supertrend_buy_1_1p2` and `rolling_strangle_otm1` enabled for paper trading, a per-strategy operator decision (see addendum). Earlier the same day: all three real EMA-cross strategies renamed to fix a correlation-ID token collision (see the earlier addendum), and the dashboard strategy picker stopped listing renamed/retired strategy ids forever. All committed live gates remain disabled |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
 | **Live order placement** | Code path exists but is deliberately unreachable from committed configuration. Parent and child preflight both fail closed without approved operational inputs; `OPERATIONAL LIVE ACTIVATION ELIGIBLE: NO — BLOCKED`. |
@@ -11311,3 +11311,49 @@ assert the new contract, not skipped or weakened. `ruff`/`mypy` clean;
 `test_dashboard_strategy_scope.py` (15), `test_dashboard_apptest.py`,
 `test_dashboard_home.py`, `test_supertrend_buy_1_1p2_dashboard.py` all
 pass.
+
+### Second and third real strategies enabled for paper trading — 31 August 2026
+
+**Operator decision, per strategy, per CLAUDE.md's "additional real
+strategies require separate approval per strategy" rule.**
+`supertrend_buy_1_1p2` — shipped `enabled: false` at delivery, gated only
+on "a separate, deliberate operator decision after review" — was enabled
+on direct instruction. `rolling_strangle_otm1` carried a stronger written
+precondition (its own config: "Enabling for the first paper session is a
+deliberate, explicit operator action, taken only after the 30-day paper
+evaluation... Do not flip this to true as part of implementation work"),
+which was shown to the operator explicitly before proceeding; the operator
+chose to enable it anyway, in paper mode, ahead of that evaluation
+completing. Both remain `mode: paper`, `live_approved: false` — live stays
+fail-closed regardless (the multi-leg engine refuses live outright for
+`rolling_strangle_otm1`, and the broker factory's live gate would refuse
+either a second time). Both config files carry a dated comment recording
+the decision and its reasoning, matching the convention the `ema_cross_*`
+rename addendum above already established.
+
+Correlation-token collision checked before enabling (`strategy_token()`:
+`supertrend_buy_1_1p2` → `supe`, `rolling_strangle_otm1` → `roll`, neither
+colliding with any other admitted strategy). Restarted `intraday_options`
+with all six now-enabled strategies (`c509_ema_cross_buy`,
+`c521_ema_cross_buy`, `c921_ema_cross_buy`, `straddle_920`,
+`supertrend_buy_1_1p2`, `rolling_strangle_otm1`) admitted with no
+correlation-ID refusal in the supervisor log.
+
+**Fallout, found later the same day and fixed properly, not skipped.**
+Several tests asserted the real committed config's `enabled` flag as a
+permanent fact — one with a literal `assert "enabled: false" in text` that
+could no longer be true. `tests/unit/test_rolling_strangle_otm1_config.py`,
+`test_supertrend_buy_1_1p2_config.py` updated to assert `enabled is True`.
+`tests/integration/test_{rolling_strangle_otm1,supertrend_buy_1_1p2}_
+supervisor_composition.py` rewritten to test the real committed tree
+directly rather than a synthetic "pretend it's enabled" copy (it already
+is), with the fixture inverted to a synthetic *disabled* copy for the
+"does disabling still work" half; hardcoded worker counts (`== 3`) replaced
+with relative uniqueness checks so the count no longer needs updating every
+time another strategy is enabled. `tests/end_to_end/
+test_rolling_strangle_otm1_end_to_end.py`,
+`tests/integration/test_supertrend_buy_1_1p2_dashboard.py`,
+`tests/integration/test_rolling_strangle_otm1_dashboard.py` updated the
+same way (`DISABLED` → `STOPPED`/`enabled is True`). `ruff`/`mypy` clean;
+full suite confirmed at the same pre-existing failure baseline as before
+(unrelated stale scrip-master fixture data), nothing new.

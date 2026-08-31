@@ -65,29 +65,34 @@ def multi_leg(worker) -> MultiLegEngineWorkerConfig:
 
 
 # ------------------------------------------------------------- 16. fail-closed
-def test_the_committed_config_is_disabled_paper_and_not_live_approved(resolved):
-    """The three flags that keep this strategy inert."""
+def test_the_committed_config_is_enabled_paper_and_not_live_approved(resolved):
+    """Shipped disabled at delivery; the operator enabled it for real, paper-only
+    trading on 31 August 2026 (see docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md).
+    The two flags that still keep live execution unreachable, regardless."""
     assert resolved.strategy.strategy_id == STRATEGY_ID
     assert resolved.strategy.runtime_id == RUNTIME_ID
-    assert resolved.strategy.enabled is False
+    assert resolved.strategy.enabled is True
     assert resolved.strategy.mode is ExecutionMode.PAPER
     assert resolved.strategy.live_approved is False
 
 
-def test_the_disabled_strategy_is_discovered_but_never_enabled():
+def test_the_enabled_strategy_is_discovered_and_enabled():
     discovered = [c.strategy.strategy_id for c in discover_strategies(CONFIG_ROOT, RUNTIME_ID)]
     enabled = [c.strategy.strategy_id for c in discover_enabled_strategies(CONFIG_ROOT, RUNTIME_ID)]
     assert STRATEGY_ID in discovered
-    assert STRATEGY_ID not in enabled
+    assert STRATEGY_ID in enabled
 
 
-def test_adding_this_config_did_not_change_which_other_strategies_are_enabled():
-    """The other half of "not spawned": strategies that were already enabled
-    still are, and no other strategy's flags moved."""
+def test_enabling_this_strategy_did_not_change_other_strategies_flags():
+    """No other strategy's committed flags moved as a side effect of this one's
+    enable decision. Deliberately membership checks, not an exhaustive equality
+    against the full enabled set — that set is this file's business only for
+    STRATEGY_ID, and hardcoding every other strategy's name here is exactly the
+    coupling that made this test brittle the last time the committed set grew."""
     enabled = {c.strategy.strategy_id for c in discover_enabled_strategies(CONFIG_ROOT, RUNTIME_ID)}
-    assert STRATEGY_ID not in enabled
-    assert enabled == {"ema_cross_9_21_buy", "straddle_920"}
-    for other in ("ema_cross_9_21_buy", "straddle_920"):
+    assert STRATEGY_ID in enabled
+    assert {"c921_ema_cross_buy", "straddle_920"} <= enabled
+    for other in ("c921_ema_cross_buy", "straddle_920"):
         cfg = load_resolved_config(CONFIG_ROOT, RUNTIME_ID, other)
         assert cfg.strategy.enabled is True
         assert cfg.strategy.mode is ExecutionMode.PAPER
@@ -104,7 +109,6 @@ def test_the_committed_file_names_no_live_enabling_value():
     text = CONFIG_FILE.read_text(encoding="utf-8")
     assert "mode: paper" in text
     assert "live_approved: false" in text
-    assert "enabled: false" in text
     assert "mode: live" not in text
 
 
@@ -275,7 +279,7 @@ def test_a_holiday_and_a_weekend_are_both_closed_to_this_strategy(worker, multi_
 def test_paper_execution_uses_the_current_model_not_the_legacy_zero_slippage(worker):
     """Spec section 13's intentional architecture-level deviation: the legacy
     simulator ran zero slippage and no latency. This uses the same canonical
-    intraday paper block ema_cross_9_21_buy/supertrend_buy_1_1p2 use."""
+    intraday paper block c921_ema_cross_buy/supertrend_buy_1_1p2 use."""
     paper = worker.paper_execution
     assert paper["slippage"] == {"options": {"mode": "ticks", "market_order_ticks": 1}}
     assert paper["submission_latency_ms"] == 250
@@ -285,7 +289,7 @@ def test_paper_execution_uses_the_current_model_not_the_legacy_zero_slippage(wor
     assert paper["max_quote_age_ms"] == 2000
 
     ema = build_worker_config(
-        load_resolved_config(CONFIG_ROOT, RUNTIME_ID, "ema_cross_9_21_buy"),
+        load_resolved_config(CONFIG_ROOT, RUNTIME_ID, "c921_ema_cross_buy"),
         database_path=Path("/tmp/unused.db"),
         lock_dir=Path("/tmp"),
         pid_dir=Path("/tmp"),
