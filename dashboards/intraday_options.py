@@ -776,13 +776,21 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
         _overview()
 
     with tabs[1]:
+        positions_mode = _resolve_mode(st, "io_positions_mode")
 
         @st.fragment(run_every=5)
-        def _positions(strategy_id: str | None = selected_strategy) -> None:
+        def _positions(
+            strategy_id: str | None = selected_strategy,
+            execution_mode: str | None = positions_mode,
+        ) -> None:
             positions = run_bounded(
                 database_path,
                 lambda conn: load_live_positions(
-                    conn, runtime_id, trading_date, strategy_id=strategy_id
+                    conn,
+                    runtime_id,
+                    trading_date,
+                    strategy_id=strategy_id,
+                    execution_mode=execution_mode,
                 ),
             )
             rows = () if isinstance(positions, SnapshotUnavailable) else positions

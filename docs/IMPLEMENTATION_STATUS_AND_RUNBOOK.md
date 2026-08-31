@@ -9,7 +9,7 @@ the next phase. Updated after every phase.
 |---|---|
 | **Current phase** | **Phase 10 — Controlled live readiness: CODE HARDENED, fully disabled.** Production parent/worker preflight wiring, Dhan order/update handling, restart-safe account-loss emergency square-off, account-wide reserve-before-submit risk plus live MTM, shared rate limiting, broker-authoritative startup/mode-transition/session-end reconciliation, strict migration history, and restore validation exist and are tested with mocks/fakes only. `c921_ema_cross_buy` (renamed from `ema_cross_9_21_buy` 31 August 2026 — see addendum) and its Rev 3.1 matrix are unchanged. **Every committed live gate remains fail-closed** (`global.live_trading_enabled: false`, `live_execution_allowed: false`, `live_approved: false`, no `mode: live` in `config/`), enforced by `scripts.assert_no_live_config_committed`. No real Dhan order/network call was made. |
 | **Next phase** | Operational evidence and explicit human decisions, not more live-enabling code: complete/review the 30-day paper run for every now-enabled real strategy (`c509_ema_cross_buy`, `c521_ema_cross_buy`, `c921_ema_cross_buy`, `supertrend_buy_1_1p2`, `rolling_strangle_otm1` — see the dated addenda for each one's enable decision), choose/configure an approved egress-IP provider and static IP, revalidate authentication operationally, then separately decide whether to approve minimum-quantity live activation. |
-| **Last updated** | 31 August 2026 — `supertrend_buy_1_1p2` and `rolling_strangle_otm1` enabled for paper trading, a per-strategy operator decision (see addendum). Earlier the same day: all three real EMA-cross strategies renamed to fix a correlation-ID token collision (see the earlier addendum), and the dashboard strategy picker stopped listing renamed/retired strategy ids forever. All committed live gates remain disabled |
+| **Last updated** | 31 August 2026 — the Intraday Options Live Positions tab gained a Paper/Live Mode filter (see addendum). Earlier the same day: `supertrend_buy_1_1p2`/`rolling_strangle_otm1` enabled for paper trading, all three EMA-cross strategies renamed to fix a correlation-ID token collision, and the dashboard strategy picker stopped listing renamed/retired strategy ids forever. All committed live gates remain disabled |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
 | **Live order placement** | Code path exists but is deliberately unreachable from committed configuration. Parent and child preflight both fail closed without approved operational inputs; `OPERATIONAL LIVE ACTIVATION ELIGIBLE: NO — BLOCKED`. |
@@ -11357,3 +11357,20 @@ test_rolling_strangle_otm1_end_to_end.py`,
 same way (`DISABLED` → `STOPPED`/`enabled is True`). `ruff`/`mypy` clean;
 full suite confirmed at the same pre-existing failure baseline as before
 (unrelated stale scrip-master fixture data), nothing new.
+
+### Live Positions tab: Mode filter added — 31 August 2026
+
+The Intraday Options "Live Positions" tab had no Paper/Live filter, unlike
+Orders & Fills and Closed Trades, which already share the same `_resolve_
+mode`/`_MODE_VALUES` selector (`dashboards/intraday_options.py`).
+`dashboards/data/intraday_options.py`'s `load_live_positions` gained an
+`execution_mode` keyword, filtering the same way `load_orders`/
+`load_closed_trades` already do; the tab wires `_resolve_mode(st,
+"io_positions_mode")` in, identical to the other two tabs. New test
+(`tests/unit/test_dashboard_intraday_options_data.py`) proves the filter
+actually separates a real paper position from a real live one, not merely
+that asking for "live" returns empty because nothing live exists — the
+live half is a direct `positions` row insert rather than a full
+`OrderLifecycle` run, since a live-mode lifecycle refuses to fill at all
+without the Phase 10 account-reservation gate wired (deliberately absent
+in a paper-only test). `ruff`/`mypy` clean.

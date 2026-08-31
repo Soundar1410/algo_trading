@@ -218,6 +218,43 @@ def test_an_open_position_shows_up_in_live_positions_until_closed(
     assert open_after_exit == ()
 
 
+def test_live_positions_mode_filter_separates_paper_from_live(
+    repository: ExecutionRepository, session, database_path: Path
+):
+    """The Live Positions tab's Mode dropdown (All/Paper/Live), same filter
+    shape Orders & Fills and Closed Trades already have.
+
+    The live half is a direct row insert, not a real ``OrderLifecycle`` run:
+    a live-mode lifecycle refuses to fill at all without an account
+    reservation gate wired (Phase 10 safety machinery, deliberately absent
+    here) — this test only needs a genuine ``positions`` row with
+    ``execution_mode='live'`` to prove the read-model's filter, not a full
+    live order round trip."""
+    paper_lifecycle = _lifecycle(repository, session)
+    paper_lifecycle.handle_signal(
+        _signal(Side.BUY, minute=15, close=100.0), trading_date=TRADING_DATE
+    )
+
+    now = datetime.now(IST).isoformat()
+    with repository.database.transaction() as conn:
+        conn.execute(
+            "INSERT INTO positions (runtime_id, strategy_id, execution_mode, trading_date, "
+            "instrument, security_id, quantity, average_price, status, opened_at, updated_at) "
+            "VALUES (?, ?, 'live', ?, 'NIFTY', '21', 75, 200.0, 'OPEN', ?, ?)",
+            (RUNTIME_ID, STRATEGY_ID, TRADING_DATE, now, now),
+        )
+
+    conn = _ro(database_path)
+    everyone = load_live_positions(conn, RUNTIME_ID, TRADING_DATE)
+    paper_only = load_live_positions(conn, RUNTIME_ID, TRADING_DATE, execution_mode="paper")
+    live_only = load_live_positions(conn, RUNTIME_ID, TRADING_DATE, execution_mode="live")
+    conn.close()
+
+    assert {p.security_id for p in everyone} == {"13", "21"}
+    assert {p.security_id for p in paper_only} == {"13"}
+    assert {p.security_id for p in live_only} == {"21"}
+
+
 # =================================================================== overview
 def test_overview_reflects_open_position_and_todays_closed_pnl(
     repository: ExecutionRepository, session, database_path: Path

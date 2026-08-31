@@ -196,6 +196,7 @@ def load_live_positions(
     trading_date: str,
     *,
     strategy_id: str | None = None,
+    execution_mode: str | None = None,
 ) -> tuple[LivePositionRow, ...]:
     query = (
         "SELECT strategy_id, execution_mode, instrument, security_id, quantity, "
@@ -209,6 +210,9 @@ def load_live_positions(
     if strategy_id is not None:
         query += " AND strategy_id = ?"
         params.append(strategy_id)
+    if execution_mode is not None:
+        query += " AND execution_mode = ?"
+        params.append(execution_mode)
     query += " ORDER BY opened_at DESC"
     rows = conn.execute(query, params).fetchall()
     return tuple(
