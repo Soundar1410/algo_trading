@@ -54,9 +54,11 @@ import multiprocessing as mp
 import os
 import queue as queue_module
 import threading
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -65,13 +67,14 @@ from common.execution import ExecutionRepository, strategy_token
 from common.execution.health_events import auth_event_for_source
 from common.feed import DEFAULT_TICK_MAX_DEPTH, SharedFeedHub
 from common.feed.hub import WorkerChannel, build_channel
-from common.feed.reconnect import FeedHealthEvent, ReconnectingFeed
+from common.feed.reconnect import FeedHealthEvent, ReconnectingFeed, ReconnectPolicy
 from common.health import DEFAULT_INTERVAL_SECONDS, HealthState, HeartbeatWriter
 from common.logging import get_logger
 from common.market_data.adapter import MarketFeedAdapter
 from common.notifications import NotificationEvent, Notifier, NullNotifier, SafeNotifier
 from common.persistence import Database, MigrationRunner
 from common.process import DuplicateProcessError, shutdown_signals, supervisor_lock
+from common.utils.timeutils import combine, local_date_in, now_ist
 
 from .worker import EXIT_DUPLICATE, NOTIFIER_FROM_SETTINGS, WorkerConfig, run_worker_process
 
@@ -103,6 +106,39 @@ SUPERVISOR_ROLE = "supervisor"
 #: arrive continuously, so reaching this means the group has received **no**
 #: tick at all for that long — which is already an incident by itself.
 STUCK_SUBSCRIPTION_SECONDS = 30.0
+
+#: How many times a worker that has died is respawned before its strategy is
+#: suspended (contained) for the rest of the session. Mirrors
+#: ``orchestration.process_control.supervised_launch``'s own whole-group
+#: budget (``DEFAULT_MAX_ATTEMPTS = 3``) — one worker crashing is a smaller
+#: blast radius than the whole runtime group failing to start, not a reason
+#: for a larger budget.
+WORKER_RESTART_MAX_ATTEMPTS = 3
+
+#: Backoff between a worker's own restart attempts, reusing
+#: :class:`~common.feed.reconnect.ReconnectPolicy` rather than inventing a
+#: second backoff implementation. Shorter than the feed's own reconnect
+#: backoff (1s/60s): a crashed process is not a network condition that needs
+#: patience, and the strategy is not trading at all while it waits.
+WORKER_RESTART_INITIAL_BACKOFF_SECONDS = 5.0
+WORKER_RESTART_MAX_BACKOFF_SECONDS = 60.0
+
+#: Grace past the latest configured square-off time across every admitted
+#: worker before the supervisor forces its own session to end, regardless of
+#: whether the feed is still delivering.
+#:
+#: Exists because nothing else bounds this process's runtime: the feed
+#: thread only returns when the adapter's own stream ends or a shutdown
+#: signal arrives, and Dhan is observed to keep delivering ticks for hours
+#: past market close (31 August 2026 incident — see the runbook addendum).
+#: Without this, a supervisor with every strategy already squared off still
+#: lingers indefinitely holding its lock file, which silently cancels the
+#: *next* trading day's auto-start: ``RuntimeLauncher``'s "already running"
+#: check sees the stale-but-live process and never spawns a fresh one.
+#: Generous — 15 minutes past the latest square-off is comfortably past any
+#: ordinary end-of-day cleanup, so this is a backstop, not a normal exit
+#: path.
+SESSION_DEADLINE_GRACE_SECONDS = 15 * 60
 
 #: feed_events whose occurrence is itself worth telling a human about, as
 #: opposed to the other five (connected, reconnect_attempted, resubscribed,
@@ -207,6 +243,75 @@ class SupervisorResult:
     #: refused to keep presenting an ambiguously running group once it could no
     #: longer apply what a worker asked for.
     stopped_by_stuck_subscription: bool = False
+    #: True when ``SESSION_DEADLINE_GRACE_SECONDS`` past the latest configured
+    #: square-off time was reached — see :meth:`IntradayOptionsSupervisor.
+    #: _compute_session_deadline`. The backstop against a feed that keeps
+    #: delivering long after every strategy has squared off.
+    stopped_by_session_deadline: bool = False
+    #: True when every admitted worker had exhausted its restart budget
+    #: (:attr:`contained_workers` covers all of them) and nothing remained
+    #: to feed.
+    stopped_by_no_live_workers: bool = False
+    #: How many times any worker was observed to have died this run —
+    #: incremented once per death, not once per poll. See
+    #: :meth:`IntradayOptionsSupervisor._check_worker_liveness`.
+    worker_deaths: int = 0
+    #: How many respawn attempts were made across every worker this run.
+    worker_restarts: int = 0
+    #: strategy_ids that exhausted ``WORKER_RESTART_MAX_ATTEMPTS`` and were
+    #: suspended for the rest of this session. Every strategy *not* in this
+    #: list that was admitted kept trading normally, whether or not it ever
+    #: died and was successfully restarted.
+    contained_workers: list[str] = field(default_factory=list)
+    #: strategy_ids whose worker exited with code ``0`` — a clean,
+    #: deliberate completion (its own square-off, or a fixture's scripted
+    #: end) while the session continued for its siblings. Never a problem;
+    #: kept apart from :attr:`contained_workers` so a reader never confuses
+    #: "finished on its own" with "crashed and gave up".
+    finished_workers: list[str] = field(default_factory=list)
+
+
+@dataclass
+class _WorkerState:
+    """Per-worker liveness/restart bookkeeping, keyed by ``strategy_id``.
+
+    Before this existed, one strategy's state was scattered across four
+    independent structures (``_workers``, ``_processes``, ``_control_queues``,
+    ``hub._channels``), none of which recorded whether a worker had died, how
+    many times it had been restarted, or when it was next allowed to restart
+    — which is exactly why a dead worker went unnoticed for six hours in the
+    incident this class exists to prevent a repeat of.
+    """
+
+    worker_config: WorkerConfig
+    channel: WorkerChannel
+    restarts: int = 0
+    #: A ``time.monotonic()`` reading before which no restart attempt is
+    #: made. Set after each restart, from the backoff policy — never a
+    #: ``sleep()`` in the poll loop, which would stall every worker's
+    #: heartbeat for the wait. Re-checked on later polls instead, the same
+    #: non-blocking-deadline shape ``SharedFeedHub._pending_since`` already
+    #: uses.
+    restart_not_before: float = 0.0
+    #: True once this strategy has exhausted ``WORKER_RESTART_MAX_ATTEMPTS``
+    #: and stays suspended for the rest of the session.
+    contained: bool = False
+    #: True once this worker's process exited with code ``0`` — a clean,
+    #: deliberate completion (it reached its own configured square-off, or
+    #: a fixture strategy finished its scripted sequence) while the shared
+    #: session continues for its siblings, never a crash. Distinct from
+    #: :attr:`contained`: different strategies can carry different
+    #: ``square_off_at`` times, so one legitimately finishing before
+    #: another — or before the session deadline — is an ordinary event,
+    #: not an incident. No alarm, no restart, no ``worker_deaths`` count;
+    #: only its queue is suspended, the same as a contained worker's,
+    #: because nothing is left to read it either way.
+    finished: bool = False
+    #: Latched once the "worker died" alarm has fired for the *current*
+    #: death, so one death produces one alarm rather than one per poll while
+    #: its backoff is waited out. Reset to ``False`` on every successful
+    #: restart, so a worker that dies again gets its own fresh alarm.
+    death_alarmed: bool = False
 
 
 class IntradayOptionsSupervisor:
@@ -217,8 +322,19 @@ class IntradayOptionsSupervisor:
         config: SupervisorConfig,
         adapter: MarketFeedAdapter,
         notifier: Notifier | None = None,
+        clock: Callable[[], datetime] = now_ist,
     ) -> None:
         self._config = config
+        #: Defaults to the real wall clock — production never overrides
+        #: this. Exists so :meth:`_compute_session_deadline` (and any test
+        #: exercising it) is not at the mercy of what time of day the test
+        #: happens to run: without an injectable clock, a test run any time
+        #: after the default square-off time would compute a deadline
+        #: already in the past and the session would end on its very first
+        #: poll. Mirrors ``PositionalOptionsSupervisor``'s own ``clock``
+        #: parameter (``runtimes/positional_options/supervisor.py``),
+        #: brought to parity here for the same reason it exists there.
+        self._clock = clock
         # The adapter is wrapped rather than used bare, and Phase 4 Part 3 is when
         # that started being true. `ReconnectingFeed` had **no constructor call
         # anywhere outside tests**, so everything Phase 2 built — bounded backoff
@@ -282,6 +398,25 @@ class IntradayOptionsSupervisor:
         #: state-transition events, not tick-rate ones (migration 0002's own
         #: rule), so there is no load pattern here to bound against.
         self._feed_health_events: queue_module.Queue[FeedHealthEvent] = queue_module.Queue()
+        #: strategy_id -> liveness/restart bookkeeping, populated at spawn
+        #: (initial and respawn alike) and consulted every poll by
+        #: :meth:`_check_worker_liveness`. See :class:`_WorkerState`.
+        self._worker_state: dict[str, _WorkerState] = {}
+        #: Backoff policy shared by every worker's restart, not one per
+        #: strategy — the budget and timing are a group-wide operational
+        #: decision, not a per-strategy tunable.
+        self._restart_policy = ReconnectPolicy(
+            max_attempts=WORKER_RESTART_MAX_ATTEMPTS,
+            initial_backoff=WORKER_RESTART_INITIAL_BACKOFF_SECONDS,
+            max_backoff=WORKER_RESTART_MAX_BACKOFF_SECONDS,
+        )
+        #: Cumulative counters copied into the returned ``SupervisorResult``
+        #: once the run ends — see :meth:`run`. Kept on ``self`` rather than
+        #: threaded through every check method, the same way ``self._hub``'s
+        #: own ``tick_count``/``candle_count`` already accumulate and are
+        #: copied out after ``_run_feed`` returns.
+        self._worker_deaths_total = 0
+        self._worker_restarts_total = 0
 
     @property
     def hub(self) -> SharedFeedHub:
@@ -412,6 +547,86 @@ class IntradayOptionsSupervisor:
     def control_queue(self, strategy_id: str) -> Any | None:
         """The upstream subscription-request queue for one worker, if it has one."""
         return self._control_queues.get(strategy_id)
+
+    def _spawn_worker(
+        self, worker_config: WorkerConfig, channel: WorkerChannel
+    ) -> mp.process.BaseProcess:
+        """Start one worker child and record it in ``self._processes``.
+
+        Used both for a strategy's initial spawn (in :meth:`run`) and to
+        respawn one whose process died (:meth:`_restart_worker`) — identical
+        wiring by construction. That is what makes restart work uniformly
+        for every strategy in the group, with no per-strategy branching: this
+        method has no idea whether it is being called for the first time or
+        the fourth.
+        """
+        context = mp.get_context("spawn")
+        process = context.Process(
+            # run_worker_process, not run_worker: multiprocessing discards a
+            # target's return value, so only this sys.exit()-translating
+            # wrapper makes worker_exitcode (and worker_exit_codes below)
+            # reflect what actually happened — see run_worker_process's own
+            # docstring (D77).
+            target=run_worker_process,
+            # Both extra channels travel to the child from here. A worker
+            # that did not opt into a tick channel gets ``None`` for both and
+            # is completely unaffected.
+            args=(
+                worker_config,
+                channel.queue.raw,
+                # Not this supervisor's own notifier object — spawn starts a
+                # fresh interpreter, so there is no object to hand across.
+                # This sentinel tells the child to build its own from its own
+                # environment. See NOTIFIER_FROM_SETTINGS's docstring in
+                # worker.py.
+                NOTIFIER_FROM_SETTINGS,
+                channel.tick_queue.raw if channel.tick_queue is not None else None,
+                self._control_queues.get(worker_config.strategy_id),
+            ),
+            name=f"{self._config.runtime_id}:{worker_config.strategy_id}",
+            daemon=False,
+        )
+        process.start()
+        self._processes[worker_config.strategy_id] = process
+        return process
+
+    def _compute_session_deadline(self) -> datetime | None:
+        """The wall-clock instant past which this run forces itself to end.
+
+        Derived from the latest ``square_off_at`` across every admitted
+        worker plus :data:`SESSION_DEADLINE_GRACE_SECONDS` — not a
+        separately maintained config value, so it is automatically correct
+        for whatever strategies happen to be enabled, the same way every
+        other cross-strategy figure in this class (the correlation-token
+        admission set, the live-gate refusals) is derived rather than
+        configured twice.
+
+        ``None`` in two cases: nothing was admitted at all (nothing to
+        derive a deadline from, and ``_run_feed`` has nothing to feed
+        either way), or the computed instant is **already in the past at
+        the moment this is called**. The second case is deliberate, not an
+        edge case being tolerated: a deadline that has already passed
+        before the run even starts protects nothing — the incident this
+        exists to prevent is a session that starts normally, runs the whole
+        day, and then a feed that keeps delivering outlives its own
+        square-off; real ``orchestration.auto_start`` always launches
+        around 09:00, hours before any configured square-off, so this
+        condition should not occur in genuine production use. Enforcing it
+        anyway would instead make every existing caller's ``run()`` —
+        including every test that does not inject :attr:`_clock` — end
+        almost immediately whenever run outside market hours, which is
+        pure regression with no corresponding safety benefit.
+        """
+        if not self._workers:
+            return None
+        latest = max(
+            worker_config.square_off_policy.square_off_at for worker_config, _ in self._workers
+        )
+        today = local_date_in(self._clock())
+        deadline = combine(today, latest) + timedelta(seconds=SESSION_DEADLINE_GRACE_SECONDS)
+        if deadline <= self._clock():
+            return None
+        return deadline
 
     def run(
         self,
@@ -555,37 +770,11 @@ class IntradayOptionsSupervisor:
             )
 
         try:
-            context = mp.get_context("spawn")
             for worker_config, channel in self._workers:
-                process = context.Process(
-                    # run_worker_process, not run_worker: multiprocessing
-                    # discards a target's return value, so only this
-                    # sys.exit()-translating wrapper makes worker_exitcode
-                    # (and worker_exit_codes below) reflect what actually
-                    # happened — see run_worker_process's own docstring (D77).
-                    target=run_worker_process,
-                    # Both extra channels travel to the child from here. Until Part
-                    # 2b-ii-B-2 they were created and never handed over, which left
-                    # the ported engine with no way to receive a tick and no way to
-                    # ask for a subscription. A worker that did not opt in gets
-                    # ``None`` for both and is completely unaffected.
-                    args=(
-                        worker_config,
-                        channel.queue.raw,
-                        # Not this supervisor's own notifier object — spawn
-                        # starts a fresh interpreter, so there is no object to
-                        # hand across. This sentinel tells the child to build
-                        # its own from its own environment. See
-                        # NOTIFIER_FROM_SETTINGS's docstring in worker.py.
-                        NOTIFIER_FROM_SETTINGS,
-                        channel.tick_queue.raw if channel.tick_queue is not None else None,
-                        self._control_queues.get(worker_config.strategy_id),
-                    ),
-                    name=f"{self._config.runtime_id}:{worker_config.strategy_id}",
-                    daemon=False,
+                process = self._spawn_worker(worker_config, channel)
+                self._worker_state[worker_config.strategy_id] = _WorkerState(
+                    worker_config=worker_config, channel=channel
                 )
-                process.start()
-                self._processes[worker_config.strategy_id] = process
                 result.workers_started += 1
                 _log.info(
                     "spawned worker strategy_id=%s pid=%s",
@@ -598,6 +787,16 @@ class IntradayOptionsSupervisor:
                 heartbeat=heartbeat,
                 repository=repository,
                 shutdown_grace=shutdown_grace,
+                session_deadline=self._compute_session_deadline(),
+            )
+
+            result.worker_deaths = self._worker_deaths_total
+            result.worker_restarts = self._worker_restarts_total
+            result.contained_workers = sorted(
+                sid for sid, state in self._worker_state.items() if state.contained
+            )
+            result.finished_workers = sorted(
+                sid for sid, state in self._worker_state.items() if state.finished
             )
 
             result.ticks_received = self._hub.tick_count
@@ -747,6 +946,10 @@ class IntradayOptionsSupervisor:
                 reason = "signal"
             elif result.stopped_by_stuck_subscription:
                 reason = "stuck_subscription"
+            elif result.stopped_by_no_live_workers:
+                reason = "no_live_workers"
+            elif result.stopped_by_session_deadline:
+                reason = "session_deadline"
             else:
                 reason = "clean_shutdown"
             # The group-level counterpart to "runtime_started" above. The
@@ -776,8 +979,14 @@ class IntradayOptionsSupervisor:
         heartbeat: HeartbeatWriter,
         repository: ExecutionRepository,
         shutdown_grace: float,
+        session_deadline: datetime | None = None,
     ) -> None:
-        """Drive the feed on its own thread until it finishes or is signalled."""
+        """Drive the feed on its own thread until it finishes or is signalled.
+
+        ``session_deadline=None`` — the default, kept so every existing
+        direct construction of this call (every test that does not pass it)
+        keeps working unchanged — means no deadline is enforced here.
+        """
         #: Why a signal gets its own flag rather than being inferred from the feed
         #: thread still being alive: a thread that has just finished its work is
         #: briefly still alive while it unwinds, so inferring would report an
@@ -830,6 +1039,36 @@ class IntradayOptionsSupervisor:
                     self._hub.request_stop()
                     break
                 self._check_stale_instruments(repository)
+                self._check_worker_liveness(heartbeat, repository)
+                if self._no_live_workers_remain():
+                    # Every admitted worker crashed and exhausted its
+                    # restart budget. Nothing is left to feed, and sitting
+                    # RUNNING_PAPER with a fully contained group would
+                    # misrepresent it as healthy — see
+                    # stopped_by_no_live_workers. (A group that finished
+                    # cleanly instead does *not* reach here — see
+                    # _no_live_workers_remain's own docstring for why that
+                    # case is deliberately left to the session deadline.)
+                    result.stopped_by_no_live_workers = True
+                    _log.error(
+                        "every worker has crashed and exhausted its restart budget; "
+                        "nothing left to feed, asking the feed to finish"
+                    )
+                    self._hub.request_stop()
+                    break
+                if session_deadline is not None and self._clock() >= session_deadline:
+                    # The backstop against the incident this class's
+                    # crash-awareness design exists to prevent: a feed still
+                    # delivering ticks long after every strategy's own
+                    # square-off, which otherwise leaves this process (and
+                    # its lock file) alive indefinitely.
+                    result.stopped_by_session_deadline = True
+                    _log.warning(
+                        "session deadline %s reached; asking the feed to finish",
+                        session_deadline.isoformat(),
+                    )
+                    self._hub.request_stop()
+                    break
                 self._beat_running(heartbeat)
             # Once more after the wake: a request — or a health event — that
             # arrived in the same instant the feed finished is still worth
@@ -913,15 +1152,293 @@ class IntradayOptionsSupervisor:
                 )
 
     def _beat_running(self, heartbeat: HeartbeatWriter) -> None:
-        """One rate-limited liveness beat, carrying the group's queue picture."""
+        """One rate-limited liveness beat, carrying the group's queue picture.
+
+        Reports ``DEGRADED`` rather than the ordinary running state for as
+        long as any worker stays contained after exhausting its restart
+        budget — the group genuinely is not fully healthy while that holds,
+        the same "stays DEGRADED for as long as it holds" rule
+        :meth:`_check_stuck_subscription` already uses. A worker that is
+        merely dead-and-about-to-be-retried does not hold this beat back:
+        :meth:`_alarm_worker_died` already forced a ``DEGRADED`` beat for
+        that death, and this one reverts to running once the retry succeeds,
+        the same way an ordinary transient condition would.
+        """
         stats = self._hub.queue_stats()
+        state = (
+            HealthState.DEGRADED
+            if any(worker.contained for worker in self._worker_state.values())
+            else HealthState.running_for(ExecutionMode.PAPER)
+        )
         heartbeat.beat(
-            HealthState.running_for(ExecutionMode.PAPER),
+            state,
             last_tick_at=self._hub.last_tick_at,
             # The worst queue in the group, not the sum: one wedged worker is the
             # thing worth seeing, and summing would let three healthy queues hide it.
             queue_depth=max((s.depth for s in stats), default=0),
             dropped_events=sum(s.dropped for s in stats),
+        )
+
+    def _no_live_workers_remain(self) -> bool:
+        """True once every admitted worker has been permanently contained
+        (crashed and exhausted its restart budget) — the abnormal case
+        worth proactively ending the run over.
+
+        Deliberately **not** triggered by every worker having merely
+        :attr:`_WorkerState.finished` cleanly. A group finishing early is
+        ordinary — different strategies carry different ``square_off_at``
+        times — and letting it idle, fully suspended, until the session
+        deadline is a wasted few minutes, not a danger: the deadline is
+        already the backstop against genuinely unbounded lingering. Ending
+        the feed the instant the *last* worker finishes was tried and
+        reverted: it can race a control-queue request drained in that same
+        poll tick — enqueued into the hub's pending-subscription queue but
+        never applied, because nothing but a live feed tick ever calls
+        ``_apply_pending_subscriptions`` and this would have just silenced
+        it — caught by ``test_a_subscription_request_on_the_control_queue_
+        reaches_the_hub`` after the ``finished`` state was added.
+
+        Also **not** true for a worker that is merely dead and waiting out
+        its restart backoff — it may still come back, and ending the whole
+        run over a few seconds' backoff would throw away every other
+        strategy's session for no reason. ``False`` when nothing was ever
+        admitted: that is a different, pre-existing situation
+        (``SharedFeedHub.start`` itself refuses to run with no registered
+        workers), not this check's business.
+        """
+        if not self._worker_state:
+            return False
+        return all(worker.contained for worker in self._worker_state.values())
+
+    def _check_worker_liveness(
+        self, heartbeat: HeartbeatWriter, repository: ExecutionRepository
+    ) -> None:
+        """Notice a dead worker within one poll tick, contain its queue at
+        once, and either respawn it (bounded) or leave it suspended for the
+        rest of the session.
+
+        This is the fix for the crash-awareness gap the 31 August 2026
+        incident exposed: before it, nothing in this poll loop ever looked
+        at ``self._processes``, so a worker that died mid-session was
+        invisible until the whole run ended. Deliberately generic — it
+        reacts only to ``process.is_alive()`` going ``False``, never to
+        *why* a non-zero exit happened: an unhandled exception in a
+        strategy's ``on_candle``, a bad broker response, a poisoned tick, a
+        database lock, an OOM kill are all the identical event from here,
+        and none of them gets its own branch.
+
+        A **zero** exit code is not "why" at all — it is the one outcome
+        that must never be treated as a death. A worker reaching its own
+        configured square-off (different strategies can carry different
+        ``square_off_at`` times) exits cleanly while the shared session
+        keeps running for its siblings; restarting it would re-run its
+        trading day from a blank state, right as the market is closing.
+        Found by the real-process end-to-end test in
+        ``tests/end_to_end/test_supervisor.py``: a fixture worker finishing
+        its own scripted sequence early hit exactly this path before the
+        distinction existed, and got spuriously "restarted".
+        """
+        for strategy_id, state in self._worker_state.items():
+            if state.contained or state.finished:
+                continue
+            process = self._processes.get(strategy_id)
+            if process is None or process.is_alive():
+                continue
+
+            if process.exitcode == 0:
+                state.finished = True
+                self._hub.suspend_channel(strategy_id)
+                _log.info(
+                    "worker %r finished cleanly (exit code 0) while the "
+                    "session continues for its siblings; not restarting — "
+                    "an ordinary early completion, not a crash",
+                    strategy_id,
+                )
+                continue
+
+            # Contain first, before anything else: stop the flood immediately
+            # rather than after logging/alarming/restarting decide what to do
+            # about it. Idempotent — safe to call again on every poll this
+            # worker stays dead.
+            self._hub.suspend_channel(strategy_id)
+
+            if not state.death_alarmed:
+                self._worker_deaths_total += 1
+                self._alarm_worker_died(
+                    heartbeat,
+                    repository,
+                    strategy_id=strategy_id,
+                    exit_code=process.exitcode,
+                    restarts_so_far=state.restarts,
+                    will_retry=state.restarts < WORKER_RESTART_MAX_ATTEMPTS,
+                )
+                state.death_alarmed = True
+
+            if time.monotonic() < state.restart_not_before:
+                continue  # backing off; try again on a later poll
+
+            if state.restarts >= WORKER_RESTART_MAX_ATTEMPTS:
+                self._contain_worker(heartbeat, repository, strategy_id=strategy_id)
+                continue
+
+            self._restart_worker(repository, strategy_id=strategy_id, state=state)
+
+    def _alarm_worker_died(
+        self,
+        heartbeat: HeartbeatWriter,
+        repository: ExecutionRepository,
+        *,
+        strategy_id: str,
+        exit_code: int | None,
+        restarts_so_far: int,
+        will_retry: bool,
+    ) -> None:
+        """Make a dead worker impossible to miss. Same three-channel shape as
+        :meth:`_check_stuck_subscription`/:meth:`_raise_silent_feed_alarm`:
+        a log line is not an alarm, nobody is tailing the file at 15:31.
+
+        ``will_retry`` decides the outlook sentence rather than always
+        naming a restart attempt: the death that exhausts the budget must
+        not claim one is coming when :meth:`_check_worker_liveness` is about
+        to contain the strategy instead — :meth:`_contain_worker` raises its
+        own, separate alarm for that.
+        """
+        outlook = (
+            f"restart attempt {restarts_so_far + 1}/{WORKER_RESTART_MAX_ATTEMPTS} will "
+            "be made"
+            if will_retry
+            else (
+                f"its restart budget ({WORKER_RESTART_MAX_ATTEMPTS} attempts) is "
+                "already exhausted; it will be suspended for the rest of this session"
+            )
+        )
+        message = (
+            f"worker {strategy_id!r} died (exit code {exit_code!r}); its queue "
+            f"has been suspended immediately so it cannot overflow silently. {outlook}."
+        )
+        _log.error("%s", message)
+        heartbeat.beat(HealthState.DEGRADED, force=True)
+        repository.record_error(
+            runtime_id=self._config.runtime_id,
+            strategy_id=strategy_id,
+            execution_mode=ExecutionMode.PAPER,
+            severity="CRITICAL",
+            component="supervisor.worker_died",
+            message=message,
+        )
+        self._notifier.send(
+            NotificationEvent(
+                event_type="worker_died",
+                message=message,
+                runtime_id=self._config.runtime_id,
+                strategy_id=strategy_id,
+                execution_mode=ExecutionMode.PAPER,
+                required_action=(
+                    "Check this worker's own log for the crash cause. It is "
+                    "being restarted automatically; if restarts are exhausted "
+                    "this strategy will stop trading for the rest of the "
+                    "session and needs a look before the next one."
+                ),
+            )
+        )
+
+    def _restart_worker(
+        self,
+        repository: ExecutionRepository,
+        *,
+        strategy_id: str,
+        state: _WorkerState,
+    ) -> None:
+        """Reap, drain, respawn, resume — in that order, and the order is
+        not optional.
+
+        Reap first: workers run ``daemon=False``, so a dead child is a
+        zombie until joined, and respawning before that would have the new
+        process collide with the old one's still-held worker lock and exit
+        ``EXIT_DUPLICATE``. Drain before respawn: whatever is still queued
+        for this worker is now hours-stale by the time anyone could consume
+        it, and a fresh engine must not build a candle or fill a pending
+        entry from it (see ``BoundedWorkerQueue.drain``). Resume last: only
+        once a live process exists to receive what the hub publishes next.
+        """
+        old_process = self._processes.get(strategy_id)
+        if old_process is not None:
+            old_process.join(timeout=5.0)
+
+        state.channel.queue.drain()
+        if state.channel.tick_queue is not None:
+            state.channel.tick_queue.drain()
+
+        state.restarts += 1
+        self._worker_restarts_total += 1
+        process = self._spawn_worker(state.worker_config, state.channel)
+        self._hub.resume_channel(strategy_id)
+        state.death_alarmed = False
+        state.restart_not_before = time.monotonic() + self._restart_policy.delay_for(
+            state.restarts
+        )
+
+        message = (
+            f"worker {strategy_id!r} restarted (attempt {state.restarts}/"
+            f"{WORKER_RESTART_MAX_ATTEMPTS}), pid={process.pid}"
+        )
+        _log.warning("%s", message)
+        repository.record_error(
+            runtime_id=self._config.runtime_id,
+            strategy_id=strategy_id,
+            execution_mode=ExecutionMode.PAPER,
+            severity="WARNING",
+            component="supervisor.worker_restarted",
+            message=message,
+        )
+
+    def _contain_worker(
+        self,
+        heartbeat: HeartbeatWriter,
+        repository: ExecutionRepository,
+        *,
+        strategy_id: str,
+    ) -> None:
+        """Give up on this one strategy for the rest of the session.
+
+        Its queue stays suspended (already done by :meth:`_check_worker_
+        liveness` before this is ever called) and its process stays dead —
+        every *other* strategy in the group keeps running, unaffected. This
+        is the deliberate trade-off over ending the whole group's session:
+        see the runbook addendum for why a group-wide shutdown would instead
+        permanently day-block every multi-leg strategy for the rest of the
+        trading day.
+        """
+        state = self._worker_state[strategy_id]
+        state.contained = True
+        message = (
+            f"worker {strategy_id!r} exhausted its restart budget "
+            f"({WORKER_RESTART_MAX_ATTEMPTS} attempts) and is now suspended for "
+            "the rest of this session. Every other strategy in this group keeps "
+            "running unaffected."
+        )
+        _log.error("%s", message)
+        heartbeat.beat(HealthState.DEGRADED, force=True)
+        repository.record_error(
+            runtime_id=self._config.runtime_id,
+            strategy_id=strategy_id,
+            execution_mode=ExecutionMode.PAPER,
+            severity="CRITICAL",
+            component="supervisor.worker_restart_exhausted",
+            message=message,
+        )
+        self._notifier.send(
+            NotificationEvent(
+                event_type="worker_restart_exhausted",
+                message=message,
+                runtime_id=self._config.runtime_id,
+                strategy_id=strategy_id,
+                execution_mode=ExecutionMode.PAPER,
+                required_action=(
+                    f"{strategy_id} is not trading for the rest of this session. "
+                    "Investigate the crash cause before the next session."
+                ),
+            )
         )
 
     def _check_stuck_subscription(

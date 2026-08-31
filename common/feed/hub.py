@@ -174,6 +174,14 @@ class SharedFeedHub:
         self._pending_since: float | None = None
         #: strategy_id -> the drop total at which that worker was last notified.
         self._last_drop_notice: dict[str, int] = {}
+        #: strategy_ids currently suspended — see :meth:`suspend_channel`.
+        #: Written from the supervisor's poll loop (main thread) the instant
+        #: it observes a worker has died; read from the feed thread inside
+        #: :meth:`_fan_out_tick`/:meth:`_fan_out`. A plain ``set``
+        #: add/discard/``in`` is safe across that boundary under the GIL —
+        #: the same reasoning :attr:`_pending_since` already relies on for
+        #: its own any-thread reads of feed-thread-written state.
+        self._suspended: set[str] = set()
         self.tick_count = 0
         self.candle_count = 0
         self.ticks_published = 0
@@ -450,6 +458,29 @@ class SharedFeedHub:
         if applied_any:
             self.last_subscription_service_at = time.monotonic()
 
+    def suspend_channel(self, strategy_id: str) -> None:
+        """Stop publishing to one worker's queues immediately. Safe from any
+        thread — see :attr:`_suspended`.
+
+        Exists for a worker whose process has died: without this,
+        :meth:`_fan_out_tick`/:meth:`_fan_out` keep publishing into a queue
+        nobody is draining — drop-oldest, forever, one warning per tick —
+        for however long the supervisor takes to notice and end the whole
+        run (measured against a real incident: ~90,000 warnings over six
+        hours). :attr:`WorkerChannel.receive_candles` is this same idea for
+        one channel, fixed at registration; this is its general, toggleable
+        form on both channels, because a *restarted* worker must be able to
+        :meth:`resume_channel`.
+        """
+        self._suspended.add(strategy_id)
+
+    def resume_channel(self, strategy_id: str) -> None:
+        """Undo :meth:`suspend_channel`, once a worker has been respawned."""
+        self._suspended.discard(strategy_id)
+
+    def is_suspended(self, strategy_id: str) -> bool:
+        return strategy_id in self._suspended
+
     def drop_subscription(self, strategy_id: str, security_id: str) -> None:
         """Stop routing an instrument to one worker. **Feed thread only.**
 
@@ -486,6 +517,8 @@ class SharedFeedHub:
     def _fan_out_tick(self, tick: Tick) -> None:
         """Publish the raw tick to every opted-in worker that wants the instrument."""
         for channel in self._channels:
+            if channel.strategy_id in self._suspended:
+                continue
             if channel.tick_queue is None or not channel.wants(tick.security_id):
                 continue
             self.ticks_published += 1
@@ -544,7 +577,9 @@ class SharedFeedHub:
     def _fan_out(self, candle: Candle) -> None:
         self.candle_count += 1
         for channel in self._channels:
-            # ``receive_candles`` first: a tick-only worker never drains this
+            if channel.strategy_id in self._suspended:
+                continue
+            # ``receive_candles`` next: a tick-only worker never drains this
             # queue, so publishing to it would fill it, drop the oldest, and
             # warn — forever, about a queue that does not exist for its owner.
             if not channel.receive_candles or not channel.wants(candle.security_id):

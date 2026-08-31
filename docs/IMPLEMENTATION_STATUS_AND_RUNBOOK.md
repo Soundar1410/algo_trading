@@ -8,8 +8,8 @@ the next phase. Updated after every phase.
 | | |
 |---|---|
 | **Current phase** | **Phase 10 — Controlled live readiness: CODE HARDENED, fully disabled.** Production parent/worker preflight wiring, Dhan order/update handling, restart-safe account-loss emergency square-off, account-wide reserve-before-submit risk plus live MTM, shared rate limiting, broker-authoritative startup/mode-transition/session-end reconciliation, strict migration history, and restore validation exist and are tested with mocks/fakes only. `c921_ema_cross_buy` (renamed from `ema_cross_9_21_buy` 31 August 2026 — see addendum) and its Rev 3.1 matrix are unchanged. **Every committed live gate remains fail-closed** (`global.live_trading_enabled: false`, `live_execution_allowed: false`, `live_approved: false`, no `mode: live` in `config/`), enforced by `scripts.assert_no_live_config_committed`. No real Dhan order/network call was made. |
-| **Next phase** | Operational evidence and explicit human decisions, not more live-enabling code: complete/review the 30-day paper run for every now-enabled real strategy (`c509_ema_cross_buy`, `c521_ema_cross_buy`, `c921_ema_cross_buy`, `supertrend_buy_1_1p2`, `rolling_strangle_otm1` — see the dated addenda for each one's enable decision), choose/configure an approved egress-IP provider and static IP, revalidate authentication operationally, then separately decide whether to approve minimum-quantity live activation. |
-| **Last updated** | 31 August 2026 — the Intraday Options Live Positions tab gained a Paper/Live Mode filter (see addendum). Earlier the same day: `supertrend_buy_1_1p2`/`rolling_strangle_otm1` enabled for paper trading, all three EMA-cross strategies renamed to fix a correlation-ID token collision, and the dashboard strategy picker stopped listing renamed/retired strategy ids forever. All committed live gates remain disabled |
+| **Next phase** | Operational evidence and explicit human decisions, not more live-enabling code: complete/review the 30-day paper run, run the second and third real strategies (`c509_ema_cross_buy` and `c521_ema_cross_buy`, both built — see the 27 and 29 August 2026 addenda for their original build record under their pre-rename ids — but both shipped `enabled: false`) through their own paper evaluation periods, choose/configure an approved egress-IP provider and static IP, revalidate authentication operationally, then separately decide whether to approve minimum-quantity live activation. |
+| **Last updated** | 31 August 2026 — the `intraday_options` supervisor gained active worker-crash detection, containment and bounded per-worker restart, plus a session-end deadline derived from configured square-off times, closing a real incident (a crashed worker went unnoticed for 6+ hours; see the dated addendum near the end of this file). Earlier the same day: all three real EMA-cross strategies renamed to fix a correlation-ID token collision: `ema_cross_5_9_buy`/`ema_cross_5_21_buy`/`ema_cross_9_21_buy` → `c509_ema_cross_buy`/`c521_ema_cross_buy`/`c921_ema_cross_buy` (see the earlier addendum for root cause and sequencing). All committed live gates remain disabled |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
 | **Live order placement** | Code path exists but is deliberately unreachable from committed configuration. Parent and child preflight both fail closed without approved operational inputs; `OPERATIONAL LIVE ACTIVATION ELIGIBLE: NO — BLOCKED`. |
@@ -6516,7 +6516,14 @@ message this phase adds. Per-worker respawn inside the supervisor — a
 crashed worker is still detected and its exit code still recorded
 (`Result.worker_exit_codes`, unchanged since Phase 3), but nothing restarts
 it mid-session; recovery is the whole-process restart `launchd` (via
-`supervised_launch.py`) already provides. Static public IP validation stays
+`supervised_launch.py`) already provides. **Correction, 31 August 2026: the
+"still detected" half of that sentence was not actually true against the
+code as it stood** — nothing in the poll loop ever checked
+`self._processes` mid-session, so a worker that died was invisible until
+the whole run ended, and only then if its exit code happened to be
+`EXIT_DUPLICATE`. Found via a real incident, not a review; both detection
+and bounded per-worker respawn now exist — see the dated addendum near the
+end of this file. Static public IP validation stays
 Phase 10 (spec's own placement, spec:2954). A tripped kill switch does not
 end the supervisor run — see `EXIT_SAFETY_SHUTDOWN`'s scope note above and
 limitation 33.
@@ -11374,3 +11381,168 @@ live half is a direct `positions` row insert rather than a full
 `OrderLifecycle` run, since a live-mode lifecycle refuses to fill at all
 without the Phase 10 account-reservation gate wired (deliberately absent
 in a paper-only test). `ruff`/`mypy` clean.
+
+### Supervisor crash-awareness: detect, contain and bound any worker death — 31 August 2026
+
+**The incident.** `supertrend_buy_1_1p2`'s worker hit an uncaught
+`sqlite3.OperationalError` while opening a position and its process died.
+Nothing noticed. The `intraday_options` supervisor ran another ~6 hours
+with a dead child, kept publishing ticks into its abandoned queue
+(~90,000 dropped-tick warnings), never alarmed, and never exited — still
+holding the `intraday_options.supervisor` lock at 21:01 IST. Had it still
+been alive at 09:00 the next day, `RuntimeLauncher._launch_one`'s "already
+running" check would have skipped starting fresh and silently cancelled
+the trading day for every strategy in the group.
+
+**Root cause, confirmed by reading the code, not assumed.**
+`_run_feed`'s poll loop (`runtimes/intraday_options/supervisor.py`) ran at
+1 Hz and checked five things; `self._processes` was not one of them.
+Every `is_alive()`/`exitcode` call in the file ran only at teardown, after
+the feed had already ended. The loop had exactly three exit conditions —
+feed thread ended, shutdown signal, stuck subscription — and worker death
+was not among them. Separately, and just as load-bearing: **there was no
+wall-clock session deadline anywhere in the supervisor**. Dhan kept
+delivering ticks past close, so the feed thread never returned and the
+poll loop's own wait was never released — this, not the worker death
+itself, is why the process lingered for six hours holding its lock file.
+Fixing worker detection alone would not have prevented that; both gaps
+needed closing.
+
+**Design, and the trade-off made explicitly rather than guessed.**
+Bounded per-worker restart (up to `WORKER_RESTART_MAX_ATTEMPTS = 3`,
+backoff via the existing `common.feed.reconnect.ReconnectPolicy` — reused
+rather than reinvented), then containment of that one strategy for the
+rest of the session, rather than ending the whole group's run. The
+decisive evidence against a group-wide shutdown:
+`common.engine.multi_leg_engine.py`'s `_handle_square_off` sets
+`day_blocked_reason = "hard square-off"` and `lifecycle_state = CLOSED`
+on **any** shutdown, persisted per trading date and re-adopted on
+restart — so ending the group over one worker's crash would have
+permanently day-blocked `straddle_920` and `rolling_strangle_otm1` for the
+rest of that session even after restarting. `EXIT_SAFETY_SHUTDOWN` is also
+in `scripts/_runtimes.py`'s **terminal** set, so a group shutdown would not
+even have been retried.
+
+**What changed, by file:**
+
+- `common/feed/queues.py` — `BoundedWorkerQueue.drain()`: discard whatever
+  is queued for a worker being restarted, without blocking and without
+  counting it as an overflow drop (a drain is a deliberate decision, not
+  the feed callback path measuring a lagging consumer).
+- `common/feed/hub.py` — `SharedFeedHub.suspend_channel`/`resume_channel`/
+  `is_suspended`, gated in both `_fan_out_tick` and `_fan_out`. The general,
+  toggleable form of the existing `WorkerChannel.receive_candles` gate
+  (fixed at registration, candle-side only) — this is what actually stops
+  the flood the instant a death is observed, on both channels, and lets a
+  restarted worker resume.
+- `runtimes/intraday_options/supervisor.py`:
+  - `_WorkerState` (new) — per-worker restart count, backoff deadline,
+    `contained`/`finished` terminal flags, alarm latch. Previously this
+    state was scattered across four independent structures (`_workers`,
+    `_processes`, `_control_queues`, `hub._channels`), none of which
+    recorded any of it.
+  - `_spawn_worker` — the existing spawn body extracted so both the
+    initial spawn loop and a restart call the identical wiring; this is
+    the entire reason the fix is uniform across every strategy with no
+    per-strategy branching.
+  - `_check_worker_liveness` — added as a sixth check in the existing 1 Hz
+    poll loop: suspend the queue immediately, alarm once per death on all
+    three channels (log + `errors` CRITICAL row + notification, mirroring
+    `_check_stuck_subscription`'s existing pattern), then restart (bounded,
+    non-blocking backoff via a stored `restart_not_before` monotonic
+    deadline, never a `sleep()` in the poll loop) or contain on exhaustion.
+  - `_compute_session_deadline` — derived from `max(square_off_at)` across
+    admitted workers plus `SESSION_DEADLINE_GRACE_SECONDS` (15 minutes),
+    not a separately maintained config value. Guarded against a subtle
+    self-inflicted regression: computed once at spawn time, so if that
+    instant is *already* in the past (true for any test run outside market
+    hours, and observed directly: computing it during ordinary interactive
+    use at 21:34 IST that same evening gave a deadline of 15:30 the same
+    day, already four hours gone) it returns `None` rather than ending the
+    run instantly — a deadline that has already passed before the run even
+    starts protects nothing, since real `orchestration.auto_start` always
+    launches hours before any configured square-off.
+  - `IntradayOptionsSupervisor.__init__` gained a `clock` parameter
+    (defaulting to `common.utils.timeutils.now_ist`), brought to parity
+    with `PositionalOptionsSupervisor`'s existing one, for exactly the
+    reason above.
+  - `_beat_running` now reports `DEGRADED` for as long as any worker stays
+    `contained`, the same "stays DEGRADED for as long as it holds" rule
+    `_check_stuck_subscription` already uses — a `finished` worker does not
+    hold this back; that is not a health problem.
+
+**A worker exiting cleanly (code `0`) is not a death — found only by
+testing against real spawned processes, not a fake double.** The
+deterministic unit suite (`tests/unit/test_supervisor_worker_liveness.py`)
+used a fake process double with fully controlled exit codes and passed
+throughout development. The real-process end-to-end test
+(`tests/end_to_end/test_supervisor.py`) initially failed: a second,
+healthy fixture worker finished its own scripted sequence and exited `0`
+while the shared feed kept running for its sibling, and the liveness check
+— at that point reacting to any `is_alive() is False` — alarmed and
+"restarted" it. This is not a test artifact: different strategies can
+carry different `square_off_at` times, so in real production a worker
+reaching its own square-off while the group's feed keeps running for
+others is an everyday event. Restarting it would have re-run its trading
+day from a blank state at the worst possible moment. Fixed by adding
+`_WorkerState.finished`, checked before any alarm/restart logic: exit code
+`0` suspends the queue (nothing is left to read it) and stops, silently —
+no alarm, no restart, no contribution to `worker_deaths`.
+
+**A second regression, found the same way.** `_no_live_workers_remain()`
+originally also triggered on "every worker finished cleanly", to end the
+session promptly rather than idle to the deadline. This raced a
+control-queue subscription request drained into the hub's pending queue on
+the very same poll tick a lone worker finished: nothing but a live feed
+tick ever calls `_apply_pending_subscriptions`, and asking the feed to
+stop in that same tick silenced the request permanently — caught by
+`test_a_subscription_request_on_the_control_queue_reaches_the_hub`, an
+existing, unrelated test that happened to use a fast-finishing fixture
+worker. Scope narrowed: `_no_live_workers_remain()` now triggers only when
+every admitted worker is `contained` (crashed and exhausted its restart
+budget) — the genuinely abnormal case worth proactively ending the run
+over. A group that finishes cleanly is left to ride out to the natural
+feed end or the session deadline, which already bounds it safely; there is
+no danger in that few extra minutes, only in the six-hour incident this
+whole change exists to prevent.
+
+**Exit code discipline preserved.** A contained worker's group still
+returns a **terminal** exit code from `run()` — never retryable — so
+`orchestration.process_control.supervised_launch` does not restart the
+whole group and re-trigger the multi-leg hard-square-off blast radius this
+design exists to avoid.
+
+**Not touched, deliberately:** `common/persistence/database.py` (WAL,
+`busy_timeout=5000ms`, `synchronous=FULL` all unchanged — this closes the
+detection/containment gap, not the DB-lock frequency that triggered
+today's specific incident; that is a separate, later task) and all of
+`positional_options` (separate process, separate database file,
+`positional_options.db` — it has the identical detection gap, confirmed
+during design, and is out of scope here).
+
+**Verification.** New coverage: `tests/unit/test_supervisor_worker_liveness.py`
+(20 tests, a fake-process double — suspend/reap/drain/respawn/resume,
+budget exhaustion and containment, the death-alarm latch, sibling
+isolation, the clean-exit distinction, `_no_live_workers_remain`'s exact
+scope); `tests/integration/test_feed_channel_suspension.py` (7 tests —
+`suspend_channel`/`resume_channel` actually stop `_fan_out`/`_fan_out_tick`,
+per-channel isolation, an ordinary overflowing channel is unaffected);
+`tests/unit/test_bounded_worker_queue_drain.py` (4 tests); one real-process,
+real-`SIGKILL` end-to-end test added to `tests/end_to_end/test_supervisor.py`
+(stable across repeated runs) proving detection, the three-channel alarm,
+restart, sibling isolation and — the actual regression — that the run
+still terminates rather than lingering. Existing supervisor/feed/dashboard
+suites (`test_supervisor.py`, `test_supervisor_signal.py`,
+`test_mode_separation.py`, `test_mixed_mode_live_readiness.py`,
+`test_rolling_strangle_otm1_end_to_end.py`,
+`test_supervisor_health_wiring.py`,
+`test_supervisor_tick_channel_registration.py`,
+`test_stuck_subscription_alarm.py`, `test_candle_gap_policy_wiring.py`,
+`test_feed_candle_channel_opt_out.py`,
+`test_rolling_strangle_otm1_supervisor_composition.py`,
+`test_supertrend_buy_1_1p2_supervisor_composition.py`) all still pass,
+confirmed across repeated runs given the real-process/real-timing surface
+this change touches. `ruff check .` and `mypy common strategies runtimes
+dashboards scripts` both clean. `common/persistence/database.py`'s pragmas
+confirmed unchanged (`DEFAULT_BUSY_TIMEOUT_MS == 5000`,
+`Database.journal_mode() == "wal"`).

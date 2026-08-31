@@ -219,6 +219,27 @@ class BoundedWorkerQueue:
         """Block for one item. Raises ``queue.Empty`` on timeout."""
         return self._queue.get(timeout=timeout)
 
+    def drain(self) -> int:
+        """Discard every currently-queued item without blocking. Returns how
+        many were discarded.
+
+        For a worker being respawned after a crash: whatever is still queued
+        for it was addressed to a process that no longer exists, and by the
+        time a new one starts it is stale market data — feeding it in would
+        corrupt candle building and could trip an elapsed-time gate meant for
+        real ticks. Deliberately does not touch :attr:`dropped`: a drain is a
+        deliberate discard on the supervisor's own decision, not an overflow
+        the feed callback path measured.
+        """
+        discarded = 0
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+            discarded += 1
+        return discarded
+
     def depth(self) -> int:
         """Approximate depth. ``qsize`` is unavailable on some platforms."""
         try:

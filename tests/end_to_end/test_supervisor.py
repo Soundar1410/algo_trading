@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
+import signal
 import threading
+import time
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
@@ -432,6 +435,81 @@ def test_undelivered_ticks_do_not_wedge_the_supervisors_exit(supervisor_config, 
     # Well past the ~65 KB that wedged it, and none of it was consumed.
     assert channel.tick_queue.published > 400
     assert result.worker_exit_codes["skelfix"] == 0
+
+
+def test_a_hard_killed_worker_is_detected_restarted_and_the_run_still_ends(
+    supervisor_config, tick_tape_path, database_path
+):
+    """The real-process, real-``SIGKILL`` proof for the 31 August 2026
+    incident's fix: ``supertrend_buy_1_1p2``'s worker died mid-session
+    (a ``sqlite3.OperationalError``, in that case — irrelevant here, and
+    deliberately not reproduced: a ``SIGKILL`` is about as generic a cause
+    of death as exists, no exception to catch and no code path to
+    special-case) and nothing noticed for six hours. The supervisor kept
+    running with a dead child, its tick queue draining nowhere (~90,000
+    dropped-tick warnings), and never exited — which would have silently
+    cancelled the next trading day's auto-start had it still been alive at
+    09:00.
+
+    This proves, against real spawned OS processes rather than a fake
+    double (see ``tests/unit/test_supervisor_worker_liveness.py`` for the
+    deterministic, fast-iterating unit coverage of the same state machine):
+    detection within a bounded time, the three-channel alarm, a bounded
+    restart, the healthy sibling left untouched, and — the actual
+    regression — the run still terminates instead of lingering.
+    """
+    from common.notifications import RecordingNotifier
+
+    adapter = _LiveishAdapter(load_tick_tape(tick_tape_path), extra=500, interval=0.01)
+    notifier = RecordingNotifier()
+    supervisor = IntradayOptionsSupervisor(supervisor_config, adapter, notifier=notifier)
+    supervisor.add_worker(_worker(supervisor_config, "alphaskel"))
+    supervisor.add_worker(_worker(supervisor_config, "bravoskel"))
+
+    killed = threading.Event()
+
+    def _kill_alphaskel_once_running() -> None:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            process = supervisor._processes.get("alphaskel")
+            if process is not None and process.pid is not None and process.is_alive():
+                time.sleep(0.1)  # past its own startup, into the tape
+                os.kill(process.pid, signal.SIGKILL)
+                killed.set()
+                return
+            time.sleep(0.01)
+
+    killer = threading.Thread(target=_kill_alphaskel_once_running, daemon=True)
+    killer.start()
+
+    result = supervisor.run()
+    killer.join(timeout=1.0)
+
+    assert killed.is_set(), "the test itself failed to reach and kill the worker in time"
+
+    # Detected and restarted — not merely "eventually noticed at teardown".
+    assert result.worker_deaths >= 1
+    assert result.worker_restarts >= 1
+    assert "alphaskel" not in result.contained_workers
+
+    died_events = [e for e in notifier.events if e.event_type == "worker_died"]
+    assert any(e.strategy_id == "alphaskel" for e in died_events)
+
+    # The healthy sibling was never touched by the other one's death.
+    assert result.worker_exit_codes["bravoskel"] == 0
+
+    conn = Database(database_path).connect()
+    rows = conn.execute(
+        "SELECT severity, component FROM errors WHERE strategy_id = 'alphaskel' "
+        "AND component = 'supervisor.worker_died'"
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["severity"] == "CRITICAL"
+
+    # The regression itself: this line is only reached because run() actually
+    # returned. Pre-fix, a dead worker's queue overflowed silently and the
+    # supervisor never exited at all — there is no assertion that expresses
+    # "did not hang" more directly than reaching here.
 
 
 # ------------------------------------------- delivering the queues (Part 2b-ii-B-2)
