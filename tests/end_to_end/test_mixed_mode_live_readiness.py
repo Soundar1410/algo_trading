@@ -5,7 +5,7 @@
 
 **Not operational live evidence.** These fixture strategies are pure test
 doubles (the ``skeleton_fixture`` walking-skeleton pattern, spec-labelled
-"NOT a trading strategy") — never ``ema_cross_9_21_buy``, never a
+"NOT a trading strategy") — never ``c921_ema_cross_buy``, never a
 placeholder production strategy. Config is written to a scratch
 ``config_root`` per test (the same convention ``test_config_loader.py``/
 ``test_dashboard.py`` use), not a static fixture directory, so nothing here

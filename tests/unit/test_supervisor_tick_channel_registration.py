@@ -4,7 +4,7 @@ The production defect this file exists for: ``build_supervisor`` spelled the
 tick-channel predicate out as ``worker_config.engine is not None``, which
 recognised :class:`~runtimes.intraday_options.worker.EngineWorkerConfig` and
 ignored :class:`~runtimes.intraday_options.worker.
-MultiLegEngineWorkerConfig`. In a real paper session ``ema_cross_9_21_buy``
+MultiLegEngineWorkerConfig`. In a real paper session ``c921_ema_cross_buy``
 started, ``weekly_delta_neutral`` (a different runtime group) started, and
 ``straddle_920`` died at startup with "this worker is configured for the
 multi-leg engine but was given no tick queue; the supervisor must register it
@@ -45,7 +45,7 @@ from runtimes.intraday_options.worker import (
 RUNTIME_ID = "intraday_options"
 REPO_CONFIG = Path(__file__).resolve().parents[2] / "config"
 
-_EMA_REF = "strategies.intraday_options.ema_cross_9_21_buy.strategy:EmaCross9x21BuyStrategy"
+_EMA_REF = "strategies.intraday_options.c921_ema_cross_buy.strategy:EmaCross9x21BuyStrategy"
 _STRADDLE_REF = "strategies.intraday_options.straddle_920.strategy:Straddle920Strategy"
 
 
@@ -263,7 +263,7 @@ def test_a_fixture_worker_still_gets_no_tick_channel(three_kinds_config, adapter
 
 @pytest.mark.parametrize(
     ("strategy_id", "engine_field"),
-    [("straddle_920", "multi_leg_engine"), ("ema_cross_9_21_buy", "engine")],
+    [("straddle_920", "multi_leg_engine"), ("c921_ema_cross_buy", "engine")],
 )
 def test_the_committed_enabled_strategies_are_registered_with_a_tick_channel(
     adapter, tmp_path, strategy_id, engine_field
@@ -272,7 +272,7 @@ def test_the_committed_enabled_strategies_are_registered_with_a_tick_channel(
 
     This is the test that would have caught the defect before the paper
     session did: it registers exactly what production registers.
-    ``ema_cross_9_21_buy`` is parametrised alongside ``straddle_920`` to pin
+    ``c921_ema_cross_buy`` is parametrised alongside ``straddle_920`` to pin
     that the fix widened the predicate without changing the single-leg
     strategy that was already working.
     """

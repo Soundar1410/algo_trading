@@ -15,7 +15,7 @@ def _kwargs() -> dict[str, str]:
     return {
         "account_key": "account-hmac",
         "runtime_id": "intraday_options",
-        "strategy_id": "ema_cross_9_21_buy",
+        "strategy_id": "c921_ema_cross_buy",
         "config_fingerprint": "fingerprint-1",
         "actor": "operator@example",
         "reason": "approved controlled-live rehearsal",
@@ -63,7 +63,7 @@ def test_cli_refuses_without_the_exact_action_phrase(tmp_path: Path) -> None:
                 "--runtime-id",
                 "intraday_options",
                 "--strategy-id",
-                "ema_cross_9_21_buy",
+                "c921_ema_cross_buy",
                 "--config-fingerprint",
                 "fp",
                 "--actor",

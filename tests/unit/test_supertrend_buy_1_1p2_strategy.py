@@ -12,7 +12,7 @@ hand-verified numbers. Timing, reversal, sizing, the daily cap and restart recov
 everything the *engine* owns rather than the strategy — belong to the integration
 suites instead.
 
-Unlike ``ema_cross_9_21_buy``'s tests, the production parameters are used throughout:
+Unlike ``c921_ema_cross_buy``'s tests, the production parameters are used throughout:
 SuperTrend(1, 1.2) flips within two or three candles, so there is no reason to shrink
 them for the tests and every reason not to. Every underlying-candle sequence below was
 walked through the real :class:`~common.indicators.supertrend.SuperTrend` before being
@@ -358,7 +358,7 @@ def test_untrusted_warmup_does_not_reset_the_indicator():
 def test_day_start_reset_clears_indicator_trust_and_exit_state():
     """Spec section 7: "No strategy state or trust leakage across days/runs."
 
-    The SuperTrend *is* cleared here, unlike ``ema_cross_9_21_buy``'s EMAs: a latched
+    The SuperTrend *is* cleared here, unlike ``c921_ema_cross_buy``'s EMAs: a latched
     trend carried into a day whose own warm-up has not run yet is exactly what
     manufactures a false flip. Matches the legacy ``reset()``, which called
     ``self._st.reset()`` too."""

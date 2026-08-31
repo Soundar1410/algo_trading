@@ -58,7 +58,7 @@ algo-dashboard = "scripts.start_dashboard:main"
 # weekly_delta_neutral (strategy-weekly-delta-neutral branch) is the first named
 # strategy that needs Greek estimation between Dhan Option Chain snapshots (spec
 # section 17), so this is no longer speculative — but it stays a genuine "extra"
-# rather than a core dependency: the intraday-only platform (ema_cross_9_21_buy,
+# rather than a core dependency: the intraday-only platform (c921_ema_cross_buy,
 # straddle_920) never needs it. Verified on this Mac (arm64/cp311) to resolve to
 # prebuilt wheels with no compilation via its `vollib` dependency, compatible
 # with the pandas<3.0/numpy<2.4 pins above. Pinned exactly in requirements.lock

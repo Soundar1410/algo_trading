@@ -1,6 +1,6 @@
 """``supertrend_buy_1_1p2`` driven by a real, fully-constructed ``TradingEngine``
 over a simulated tape. No monkeypatching, no ``__new__`` shortcuts — mirrors
-``tests/integration/test_ema_cross_9_21_buy_engine.py``'s discipline.
+``tests/integration/test_c921_ema_cross_buy_engine.py``'s discipline.
 
 These prove what the strategy deliberately does **not** implement itself (spec
 sections 8 and 9): contract and ATM-strike resolution, order quantity from the

@@ -9,7 +9,7 @@ query here is directly unit-testable against a migrated fixture database.
 strike/expiry/option-type: no table in this schema persists a structured
 option contract (see ``dashboards/intraday_options.py``'s own
 ``NOT_YET_AVAILABLE`` note — unchanged) and the one strategy that runs today,
-``ema_cross_9_21_buy``, trades the NIFTY index directly
+``c921_ema_cross_buy``, trades the NIFTY index directly
 (``parameters.security_id: "13"``), not an option contract — so those fields
 are not merely unpersisted, they are not applicable to what actually runs.
 No current price / unrealised MTM is shown for paper positions either: no

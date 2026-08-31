@@ -3,7 +3,7 @@
 :mod:`common.engine.risk` ports the abstract ``RiskManager`` + registry with
 **no** concrete implementation: "they arrive with Phase 9, alongside the
 strategies that select them." This module is that arrival — exactly the
-minimal, generic primitive ``ema_cross_9_21_buy``'s spec (section 7) asks for:
+minimal, generic primitive ``c921_ema_cross_buy``'s spec (section 7) asks for:
 "the risk manager may be minimal... a hard stop backstop... a RiskManager
 **must** be supplied regardless — it is an abstract property — even if every
 threshold is set to the disabled token `none`." Nothing else is ported here

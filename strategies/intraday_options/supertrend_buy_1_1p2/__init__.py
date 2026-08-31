@@ -10,7 +10,7 @@ parent package's ``__init__.py``), and this file deliberately does not import
 :mod:`common.exit` and :mod:`common.indicators` — exactly the graph
 ``tests/unit/test_worker_import_boundary.py`` keeps out of every spawned
 worker's module-level imports. The real engine path reaches this strategy the
-same way it reaches ``ema_cross_9_21_buy``: a dotted ``strategy_ref`` string
+same way it reaches ``c921_ema_cross_buy``: a dotted ``strategy_ref`` string
 resolved by ``runtimes.intraday_options.engine_worker.load_strategy``, from
 inside the deferred engine branch — never a package-level import.
 """

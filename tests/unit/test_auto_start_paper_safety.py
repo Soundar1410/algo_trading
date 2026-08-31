@@ -92,7 +92,7 @@ def test_enabled_runtimes_and_their_strategies_are_discovered(tmp_path: Path):
         tmp_path,
         runtimes={"intraday_options": _INTRADAY, "positional_options": _POSITIONAL},
         strategies={
-            "ema_cross_9_21_buy": _strategy("intraday_options"),
+            "c921_ema_cross_buy": _strategy("intraday_options"),
             "weekly_delta_neutral": _strategy(
                 "positional_options", engine="positional_multi_leg_engine"
             ),
@@ -102,7 +102,7 @@ def test_enabled_runtimes_and_their_strategies_are_discovered(tmp_path: Path):
 
     assert report.safe
     assert set(report.runtime_ids) == {"intraday_options", "positional_options"}
-    assert set(report.strategy_ids) == {"ema_cross_9_21_buy", "weekly_delta_neutral"}
+    assert set(report.strategy_ids) == {"c921_ema_cross_buy", "weekly_delta_neutral"}
 
 
 def test_a_disabled_runtime_is_skipped_entirely(tmp_path: Path):
@@ -113,7 +113,7 @@ def test_a_disabled_runtime_is_skipped_entirely(tmp_path: Path):
             "positional_options": {"enabled": False, "live_execution_allowed": False},
         },
         strategies={
-            "ema_cross_9_21_buy": _strategy("intraday_options"),
+            "c921_ema_cross_buy": _strategy("intraday_options"),
             "weekly_delta_neutral": _strategy(
                 "positional_options", engine="positional_multi_leg_engine"
             ),
@@ -130,13 +130,13 @@ def test_a_disabled_strategy_stays_disabled(tmp_path: Path):
         tmp_path,
         runtimes={"intraday_options": _INTRADAY},
         strategies={
-            "ema_cross_9_21_buy": _strategy("intraday_options"),
+            "c921_ema_cross_buy": _strategy("intraday_options"),
             "skeleton_fixture": _strategy("intraday_options", enabled=False),
         },
     )
     report = _verify(config)
 
-    assert report.strategy_ids == ("ema_cross_9_21_buy",)
+    assert report.strategy_ids == ("c921_ema_cross_buy",)
     assert "skeleton_fixture" not in report.strategy_ids
 
 
@@ -165,7 +165,7 @@ def test_a_global_live_switch_blocks_everything(tmp_path: Path):
         tmp_path,
         live_trading_enabled=True,
         runtimes={"intraday_options": _INTRADAY},
-        strategies={"ema_cross_9_21_buy": _strategy("intraday_options")},
+        strategies={"c921_ema_cross_buy": _strategy("intraday_options")},
     )
     report = _verify(config)
 
@@ -177,7 +177,7 @@ def test_a_runtime_permitting_live_execution_blocks_everything(tmp_path: Path):
     config = _write_config(
         tmp_path,
         runtimes={"intraday_options": {"enabled": True, "live_execution_allowed": True}},
-        strategies={"ema_cross_9_21_buy": _strategy("intraday_options")},
+        strategies={"c921_ema_cross_buy": _strategy("intraday_options")},
     )
     report = _verify(config)
 
@@ -198,7 +198,7 @@ def test_a_live_strategy_blocks_the_start_and_is_never_rerouted_to_paper(tmp_pat
         tmp_path,
         runtimes={"intraday_options": _INTRADAY},
         strategies={
-            "ema_cross_9_21_buy": _strategy(
+            "c921_ema_cross_buy": _strategy(
                 "intraday_options", mode="live", live_quantity_lots=1
             )
         },
@@ -216,7 +216,7 @@ def test_a_strategy_config_that_will_not_load_blocks_rather_than_crashes(tmp_pat
     config = _write_config(
         tmp_path,
         runtimes={"intraday_options": _INTRADAY},
-        strategies={"ema_cross_9_21_buy": _strategy("intraday_options", mode="live")},
+        strategies={"c921_ema_cross_buy": _strategy("intraday_options", mode="live")},
     )
     report = _verify(config)
 
@@ -228,7 +228,7 @@ def test_a_live_approved_strategy_blocks_the_start(tmp_path: Path):
     config = _write_config(
         tmp_path,
         runtimes={"intraday_options": _INTRADAY},
-        strategies={"ema_cross_9_21_buy": _strategy("intraday_options", live_approved=True)},
+        strategies={"c921_ema_cross_buy": _strategy("intraday_options", live_approved=True)},
     )
     report = _verify(config)
 
@@ -243,7 +243,7 @@ def test_a_violation_is_terminal_never_retried(tmp_path: Path):
         tmp_path,
         live_trading_enabled=True,
         runtimes={"intraday_options": _INTRADAY},
-        strategies={"ema_cross_9_21_buy": _strategy("intraday_options")},
+        strategies={"c921_ema_cross_buy": _strategy("intraday_options")},
     )
     try:
         _verify(config).raise_if_unsafe()
@@ -257,7 +257,7 @@ def test_a_safe_report_raises_nothing(tmp_path: Path):
     config = _write_config(
         tmp_path,
         runtimes={"intraday_options": _INTRADAY},
-        strategies={"ema_cross_9_21_buy": _strategy("intraday_options")},
+        strategies={"c921_ema_cross_buy": _strategy("intraday_options")},
     )
     _verify(config).raise_if_unsafe()  # must not raise
 
@@ -277,7 +277,7 @@ def test_an_active_legacy_system_blocks_the_start(
     config = _write_config(
         tmp_path,
         runtimes={"intraday_options": _INTRADAY},
-        strategies={"ema_cross_9_21_buy": _strategy("intraday_options")},
+        strategies={"c921_ema_cross_buy": _strategy("intraday_options")},
     )
     report = ps.verify_paper_only(config, check_legacy=True, check_environment=False)
 
@@ -302,7 +302,7 @@ def test_an_undetermined_legacy_state_also_blocks(
     config = _write_config(
         tmp_path,
         runtimes={"intraday_options": _INTRADAY},
-        strategies={"ema_cross_9_21_buy": _strategy("intraday_options")},
+        strategies={"c921_ema_cross_buy": _strategy("intraday_options")},
     )
     report = ps.verify_paper_only(config, check_legacy=True, check_environment=False)
 
@@ -320,7 +320,7 @@ def test_a_failing_environment_check_blocks_that_runtime(
     config = _write_config(
         tmp_path,
         runtimes={"intraday_options": _INTRADAY},
-        strategies={"ema_cross_9_21_buy": _strategy("intraday_options")},
+        strategies={"c921_ema_cross_buy": _strategy("intraday_options")},
     )
     report = ps.verify_paper_only(config, check_legacy=False, check_environment=True)
 

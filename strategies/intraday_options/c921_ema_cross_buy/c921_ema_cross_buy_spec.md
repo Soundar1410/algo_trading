@@ -1,10 +1,10 @@
-# Strategy Requirement & Design Spec — `ema_cross_9_21_buy`
+# Strategy Requirement & Design Spec — `c921_ema_cross_buy`
 
 **NIFTY 5-minute EMA 9/21 crossover · ATM weekly options · BUY-only · intraday**
 
 | Field | Value |
 |---|---|
-| Strategy id | `ema_cross_9_21_buy` |
+| Strategy id | `c921_ema_cross_buy` |
 | Delivers | Phase 9 — first real strategy, paper mode. Phase 10 (live enablement) is explicitly deferred; this document's design anticipates it (see §10's `live_approved: false`) but does not authorize implementing it. |
 | Engine | `trading_engine` (`common.engine.engine.TradingEngine`) |
 | Strategy contract | `common.engine.strategy.BaseStrategy` |
@@ -449,7 +449,7 @@ the whole session until square-off.
 ## 10. Configuration (proposed)
 
 ```yaml
-strategy_id: ema_cross_9_21_buy
+strategy_id: c921_ema_cross_buy
 enabled: true
 
 # Paper only at delivery. Setting `live` will NOT start live: the broker factory
@@ -477,7 +477,7 @@ option_selection:
 trade_side: BUY
 
 strategy:
-  name: ema_cross_9_21_buy
+  name: c921_ema_cross_buy
   timeframe: 5m
   params:
     ema_fast: 9
@@ -586,7 +586,7 @@ below. The corrected lifecycle is:
 **Contract choice is settled by the spec:** premium candles, option selection, and
 a per-position risk policy exist **only** on `BaseStrategy` (not the lighter
 worker-seam `Strategy` protocol). Implement the strategy as a `BaseStrategy`
-subclass registered via `@register_strategy("ema_cross_9_21_buy")`, with
+subclass registered via `@register_strategy("c921_ema_cross_buy")`, with
 `needs_option_candles = True`.
 
 ---

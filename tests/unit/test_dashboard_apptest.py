@@ -50,8 +50,8 @@ def project_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         "runtime_id: positional_options\nenabled: false\nlive_execution_allowed: false\n",
     )
     _write(
-        tmp_path / "config" / "strategies" / "ema_cross_9_21_buy.yaml",
-        "strategy_id: ema_cross_9_21_buy\nruntime_id: intraday_options\n"
+        tmp_path / "config" / "strategies" / "c921_ema_cross_buy.yaml",
+        "strategy_id: c921_ema_cross_buy\nruntime_id: intraday_options\n"
         "enabled: true\nmode: paper\nlive_approved: false\n",
     )
     database = Database(tmp_path / "data" / "operational" / "intraday_options.db")

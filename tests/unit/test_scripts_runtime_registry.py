@@ -106,13 +106,13 @@ def test_start_strategy_still_uses_the_strategy_id_flag_for_intraday(
         _replacing(runtimes_registry, "intraday_options", _fake_intraday_main),
     )
     exit_code = start_strategy.main(
-        ["ema_cross_9_21_buy", "--runtime-id", "intraday_options", "--config-root", str(tmp_path)]
+        ["c921_ema_cross_buy", "--runtime-id", "intraday_options", "--config-root", str(tmp_path)]
     )
     assert exit_code == 0
     assert calls == [
         [
             "--runtime-id", "intraday_options",
-            "--strategy-id", "ema_cross_9_21_buy",
+            "--strategy-id", "c921_ema_cross_buy",
             "--config-root", str(tmp_path),
         ]
     ]

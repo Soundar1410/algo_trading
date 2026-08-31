@@ -164,7 +164,7 @@ declared one — so every running engine's session relied on the weekday rule al
 
 `config/strategies/supertrend_buy_1_1p2.yaml` therefore carries the verified NSE 2026
 calendar, copied from `config/global.yaml`. **This is strategy-scoped**: it applies to
-`supertrend_buy_1_1p2` only, changes nothing for `ema_cross_9_21_buy` or
+`supertrend_buy_1_1p2` only, changes nothing for `c921_ema_cross_buy` or
 `straddle_920`, and is not affected by edits to `config/global.yaml`.
 
 It matters twice: no entry on a closed day (acceptance row 18.1 "Holiday/weekend"),

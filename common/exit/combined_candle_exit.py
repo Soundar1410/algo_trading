@@ -64,7 +64,7 @@ class CombinedCandleExit(BaseExit):
         self.trail_fired: bool = False
         self._highest_close: float | None = None
         self._lowest_close: float | None = None
-        # Phase 9 (ema_cross_9_21_buy spec section 6.1, "Premium candle-gap
+        # Phase 9 (c921_ema_cross_buy spec section 6.1, "Premium candle-gap
         # behaviour"). Set by on_gap() when the engine detects a skipped
         # premium-candle bucket; consumed (and cleared) by the very next
         # should_exit() call, which is exactly the one candle whose "previous

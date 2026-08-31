@@ -1,9 +1,9 @@
-"""``ema_cross_5_9_buy`` — NIFTY 5-minute EMA(5)/EMA(9) crossover, ATM weekly
+"""``c509_ema_cross_buy`` — NIFTY 5-minute EMA(5)/EMA(9) crossover, ATM weekly
 options, BUY-only, intraday. The second real strategy, a faithful clone of
-``ema_cross_9_21_buy`` (Phase 9's first real strategy) with only the EMA
+``c921_ema_cross_buy`` (Phase 9's first real strategy) with only the EMA
 periods and identity changed.
 
-Full functional/design spec: ``ema_cross_5_9_buy_spec.md`` in this directory.
+Full functional/design spec: ``c509_ema_cross_buy_spec.md`` in this directory.
 Read that before touching this file — it is the authoritative source of the
 behaviour here, not this docstring.
 
@@ -28,7 +28,8 @@ What this file deliberately does **not** implement, because the engine already d
   ``TradingEngine._build_daily_guard``/``_on_option_tick`` already construct
   and drive ``DailyRiskGuard.check_open_mtm()``/``register_trade()`` from
   ``EngineConfig.starting_capital``/``max_daily_loss_percent`` — configuration
-  (see ``config/strategies/ema_cross_5_9_buy.yaml``), not strategy code.
+  (see ``config/strategies/intraday_options/c509_ema_cross_buy.yaml``), not
+  strategy code.
 * **Lot-size/expiry resolution and order quantity.**
   :class:`~common.engine.selection.OptionSelector` plus
   :mod:`common.market_data.scrip_master` already resolve the ATM weekly
@@ -76,11 +77,11 @@ def _pick(explicit: Any, params: dict[str, Any], key: str, default: Any) -> Any:
     return explicit if explicit is not None else params.get(key, default)
 
 
-@register_strategy("ema_cross_5_9_buy")
+@register_strategy("c509_ema_cross_buy")
 class EmaCross5x9BuyStrategy(BaseStrategy):
     """NIFTY 5m EMA(5)/EMA(9) crossover -> ATM weekly CE/PE, BUY-only."""
 
-    name = "ema_cross_5_9_buy"
+    name = "c509_ema_cross_buy"
     #: For a UI that wants a human label; not read by the engine.
     display_name = "EMA Cross (5/9) Buy"
 

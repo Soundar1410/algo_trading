@@ -106,7 +106,7 @@ def _pick(explicit: Any, params: dict[str, Any], key: str, default: Any) -> Any:
     (``runtimes.intraday_options.engine_worker.load_strategy``) — or the registry's way
     (``common.engine.strategy.get_strategy(name, cfg)``, reading ``cfg.parameters``) —
     without maintaining two parallel construction paths. Same helper, same reasoning,
-    as ``ema_cross_9_21_buy``.
+    as ``c921_ema_cross_buy``.
     """
     return explicit if explicit is not None else params.get(key, default)
 
@@ -183,7 +183,7 @@ class SupertrendBuy1x1p2Strategy(BaseStrategy):
         # thresholds null — i.e. no per-tick rupee rule at all. This repository ships
         # one risk manager, `hard_stop`, and its own disabled default
         # (catastrophic_stop_rupees_per_lot: none) is behaviourally identical: a
-        # backstop that never fires. Same choice ema_cross_9_21_buy made.
+        # backstop that never fires. Same choice c921_ema_cross_buy made.
         risk_name = str(_pick(risk_manager_name, p, "risk_manager_name", "hard_stop"))
         risk_params = dict(_pick(risk_manager_params, p, "risk_manager_params", {}) or {})
         self._risk_manager: RiskManager = get_risk_manager(risk_name, risk_params)
@@ -205,7 +205,7 @@ class SupertrendBuy1x1p2Strategy(BaseStrategy):
         """Start of each trading day (``TradingEngine._start_day``).
 
         Everything is cleared, **including the SuperTrend itself** — unlike
-        ``ema_cross_9_21_buy``, which keeps its EMAs across the day boundary. The
+        ``c921_ema_cross_buy``, which keeps its EMAs across the day boundary. The
         difference is deliberate and follows from what the two indicators are: an EMA
         converges exponentially, so yesterday's value is a useful head start; a
         SuperTrend's direction is *latched*, so carrying a stale one into a day whose

@@ -41,8 +41,8 @@ def _seed_config(config_root: Path, *, positional_enabled: bool = False) -> None
         "live_execution_allowed: false\n",
     )
     _write(
-        config_root / "strategies" / "ema_cross_9_21_buy.yaml",
-        "strategy_id: ema_cross_9_21_buy\nruntime_id: intraday_options\n"
+        config_root / "strategies" / "c921_ema_cross_buy.yaml",
+        "strategy_id: c921_ema_cross_buy\nruntime_id: intraday_options\n"
         "enabled: true\nmode: paper\nlive_approved: false\n",
     )
     _write(
@@ -82,11 +82,11 @@ def test_load_home_aggregates_configured_and_not_configured_categories(tmp_path:
     _seed_config(config_root, positional_enabled=False)
     repository = _seed_operational_db(operational_root)
     session = repository.open_session(
-        runtime_id="intraday_options", strategy_id="ema_cross_9_21_buy",
+        runtime_id="intraday_options", strategy_id="c921_ema_cross_buy",
         execution_mode=ExecutionMode.PAPER, process_role="worker", pid=1,
     )
     repository.record_heartbeat(
-        session_id=session.id, runtime_id="intraday_options", strategy_id="ema_cross_9_21_buy",
+        session_id=session.id, runtime_id="intraday_options", strategy_id="c921_ema_cross_buy",
         health_state="RUNNING_PAPER",
     )
 
@@ -94,7 +94,7 @@ def test_load_home_aggregates_configured_and_not_configured_categories(tmp_path:
         config_root=config_root, operational_root=operational_root, trading_date=TRADING_DATE
     )
 
-    assert view.total_strategies == 2  # ema_cross_9_21_buy + skeleton_fixture
+    assert view.total_strategies == 2  # c921_ema_cross_buy + skeleton_fixture
     assert view.disabled_count == 1  # skeleton_fixture
     assert view.running_count == 1
 
@@ -140,14 +140,14 @@ def test_paper_and_live_pnl_are_never_combined(tmp_path: Path):
         conn.execute(
             "INSERT INTO positions (runtime_id, strategy_id, execution_mode, trading_date, "
             "instrument, security_id, quantity, average_price, realised_pnl, charges, status, "
-            "opened_at, updated_at) VALUES ('intraday_options', 'ema_cross_9_21_buy', 'paper', "
+            "opened_at, updated_at) VALUES ('intraday_options', 'c921_ema_cross_buy', 'paper', "
             f"'{TRADING_DATE}', 'NIFTY', '13', 0, 100.0, 500.0, 0.0, 'CLOSED', ?, ?)",
             (now, now),
         )
         conn.execute(
             "INSERT INTO positions (runtime_id, strategy_id, execution_mode, trading_date, "
             "instrument, security_id, quantity, average_price, realised_pnl, charges, status, "
-            "opened_at, updated_at) VALUES ('intraday_options', 'ema_cross_9_21_buy', 'live', "
+            "opened_at, updated_at) VALUES ('intraday_options', 'c921_ema_cross_buy', 'live', "
             f"'{TRADING_DATE}', 'NIFTY', '13', 0, 100.0, -200.0, 0.0, 'CLOSED', ?, ?)",
             (now, now),
         )

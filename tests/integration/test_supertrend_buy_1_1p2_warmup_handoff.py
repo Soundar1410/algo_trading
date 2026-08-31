@@ -7,7 +7,7 @@ requirement — a replay places no order however many flips it contains, and the
 live candle enters only on a genuine flip relative to the warmed state.
 
 Fully real engine over a simulated tape, mirroring
-``tests/integration/test_ema_cross_9_21_buy_engine.py`` and
+``tests/integration/test_c921_ema_cross_buy_engine.py`` and
 ``tests/integration/test_engine_warmup_end_to_end.py``: no monkeypatching of engine
 internals, a hand-built ``WarmupManager``/``WarmupSource`` injected directly (a real
 Dhan fetch is :mod:`common.warmup.historical`'s own concern, covered elsewhere).

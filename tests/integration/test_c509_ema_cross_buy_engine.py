@@ -1,19 +1,23 @@
-"""``ema_cross_9_21_buy`` driven by a real, fully-constructed ``TradingEngine``
-over a simulated tape (Phase 9). No monkeypatching, no ``__new__`` shortcuts —
-mirrors ``tests/integration/test_engine_premium_candle_exit.py``'s discipline.
+"""``c509_ema_cross_buy`` driven by a real, fully-constructed ``TradingEngine``
+over a simulated tape — the second real strategy, a faithful clone of
+``c921_ema_cross_buy`` (Phase 9) with only the EMA periods and identity
+changed. No monkeypatching, no ``__new__`` shortcuts — mirrors
+``tests/integration/test_engine_premium_candle_exit.py``'s discipline.
 
 These prove exactly what the strategy does **not** implement itself (spec
 section 9, 8, 3, 6.4): reversal semantics, the entry window/cutoff, the
 mandatory square-off, lot-size-driven order quantity and the daily live-MTM
 loss cap are all engine-owned, and this is where that is demonstrated end to
 end. Everything about the crossover/premium-exit *logic itself* is proven at
-the unit level in ``tests/unit/test_ema_cross_9_21_buy_strategy.py``.
+the unit level in ``tests/unit/test_c509_ema_cross_buy_strategy.py``.
 
-``ema_fast=2, ema_slow=3`` (rather than the production 9/21 defaults) keeps
+``ema_fast=2, ema_slow=3`` (rather than the production 5/9 defaults) keeps
 every tape to a handful of candles; every candle sequence and its resulting
 signal was verified against the real ``EMA``/``ConfirmedCrossover`` classes
-before being hard-coded here (not hand-derived) — see this suite's
-development notes for the verification script.
+before being hard-coded here (not hand-derived). Because that override (not
+the 5/9 production defaults) drives every tape below, the tapes themselves
+are identical to the sibling ``test_c921_ema_cross_buy_engine.py`` suite's —
+only the strategy class/id differs.
 """
 
 from __future__ import annotations
@@ -38,7 +42,7 @@ from common.engine.models import (
 from common.engine.positions import InMemoryGateway, PositionManager
 from common.engine.selection import OptionSelector, SimulatedOptionChainResolver
 from common.models import Candle, Tick
-from strategies.intraday_options.ema_cross_9_21_buy.strategy import EmaCross9x21BuyStrategy
+from strategies.intraday_options.c509_ema_cross_buy.strategy import EmaCross5x9BuyStrategy
 
 IST = ZoneInfo("Asia/Kolkata")
 UNDERLYING = "INDEX"
@@ -105,12 +109,12 @@ def _session(*, start="09:15", end="14:45", square_off="15:15") -> SessionConfig
 def _build_engine(
     ticks: Sequence[Tick],
     *,
-    strategy: EmaCross9x21BuyStrategy | None = None,
+    strategy: EmaCross5x9BuyStrategy | None = None,
     session: SessionConfig | None = None,
     lots: int | None = None,
     **engine_kwargs,
-) -> tuple[TradingEngine, EmaCross9x21BuyStrategy, PositionManager]:
-    strategy = strategy or EmaCross9x21BuyStrategy(ema_fast=2, ema_slow=3, lots_per_trade=1)
+) -> tuple[TradingEngine, EmaCross5x9BuyStrategy, PositionManager]:
+    strategy = strategy or EmaCross5x9BuyStrategy(ema_fast=2, ema_slow=3, lots_per_trade=1)
     # Mirrors the real wiring (runtimes.intraday_options.config_adapter +
     # engine_worker._build): PositionManager's own `lots`, not
     # strategy.quantity_lots, is what actually sizes every order — see
@@ -257,7 +261,7 @@ def test_mandatory_15_15_square_off_still_closes_an_open_position():
 
 # --------------------------------------------------------------- 8. sizing
 def test_order_quantity_is_lots_per_trade_times_scrip_master_lot_size():
-    strategy = EmaCross9x21BuyStrategy(ema_fast=2, ema_slow=3, lots_per_trade=10)
+    strategy = EmaCross5x9BuyStrategy(ema_fast=2, ema_slow=3, lots_per_trade=10)
     ticks = _underlying_ticks([100, 100, 100, 90], start=_dt(9, 15))
     _insert_fill(ticks, 4, PE_CONTRACT, 50.0)
 
@@ -276,7 +280,7 @@ def test_option_selection_carries_no_hardcoded_expiry():
     master (spec section 3/12.2) — OptionSelection has no expiry field for a
     strategy to hardcode into, and this strategy's own selection never
     supplies one."""
-    strategy = EmaCross9x21BuyStrategy()
+    strategy = EmaCross5x9BuyStrategy()
     selection = strategy.option_selection
     assert isinstance(selection, OptionSelection)
     assert not hasattr(selection, "expiry")
@@ -357,7 +361,7 @@ def test_restart_of_the_same_open_trade_restores_persisted_exit_state():
         },
     }
 
-    strategy = EmaCross9x21BuyStrategy(ema_fast=2, ema_slow=3, lots_per_trade=1)
+    strategy = EmaCross5x9BuyStrategy(ema_fast=2, ema_slow=3, lots_per_trade=1)
     positions = PositionManager(InMemoryGateway(slippage_points=0.0), lots=1)
     ticks = [_tick(UNDERLYING, 100.0, _dt(9, 15, 30))]
     engine = TradingEngine(
@@ -394,7 +398,7 @@ def test_restart_restores_daily_risk_state_and_the_cap_trips_from_the_carried_ov
     )
     recovered_risk = DailyRiskRecovery(realised_pnl=-2_000.0, trade_count=1)
 
-    strategy = EmaCross9x21BuyStrategy(ema_fast=2, ema_slow=3, lots_per_trade=1)
+    strategy = EmaCross5x9BuyStrategy(ema_fast=2, ema_slow=3, lots_per_trade=1)
     positions = PositionManager(InMemoryGateway(slippage_points=0.0), lots=1)
     ticks = [
         _tick(UNDERLYING, 100.0, _dt(9, 15, 30)),
@@ -426,15 +430,14 @@ def test_restart_restores_daily_risk_state_and_the_cap_trips_from_the_carried_ov
 
 # ------------------------------------------------ 14b. mid-session restart (real engine)
 #
-# Scenario B, the genuine bug fix, proven end to end through a real
-# TradingEngine (not just the strategy in isolation): the no-warm-up-manager
-# "today's-history" fallback (engine.py's own docstring: "this is the
-# mid-session-restart mechanism") replays today's own candles through
-# ~10:55; a genuine flip on the very first live candle after that must fire
-# immediately. Also proves the new completeness check (spec section 4.4:
-# "verify it actually reached the required candle") is wired correctly at
-# the engine level, both at the exact trust boundary and against a stale
-# reconstruction.
+# Proven end to end through a real TradingEngine (not just the strategy in
+# isolation): the no-warm-up-manager "today's-history" fallback (engine.py's
+# own docstring: "this is the mid-session-restart mechanism") replays today's
+# own candles through ~10:55; a genuine flip on the very first live candle
+# after that must fire immediately. Also proves the completeness check
+# (spec section 4.4: "verify it actually reached the required candle") is
+# wired correctly at the engine level, both at the exact trust boundary and
+# against a stale reconstruction.
 def test_mid_session_restart_preserves_warmed_context_and_flips_on_the_first_live_candle():
     """Boundary-exact positive case: history_provider's last candle ends
     EXACTLY at the trust boundary (10:55, with clock pinned at 10:56 --
@@ -448,7 +451,7 @@ def test_mid_session_restart_preserves_warmed_context_and_flips_on_the_first_liv
     ticks = _underlying_ticks([90.0], start=_dt(10, 55))
     _insert_fill(ticks, 1, CE_CONTRACT, 60.0)  # fills the entry once the candle closes
 
-    strategy = EmaCross9x21BuyStrategy(ema_fast=2, ema_slow=3, lots_per_trade=1)
+    strategy = EmaCross5x9BuyStrategy(ema_fast=2, ema_slow=3, lots_per_trade=1)
     positions = PositionManager(InMemoryGateway(slippage_points=0.0), lots=1)
     engine = TradingEngine(
         EngineConfig(timeframe="5m", session=_session(), warmup_from_history=True),
@@ -482,7 +485,7 @@ def test_mid_session_restart_with_a_stale_history_provider_does_not_trust_the_co
     ticks = _underlying_ticks([90.0], start=_dt(10, 55))
     _insert_fill(ticks, 1, CE_CONTRACT, 60.0)  # would fill IF an entry (wrongly) fired
 
-    strategy = EmaCross9x21BuyStrategy(ema_fast=2, ema_slow=3, lots_per_trade=1)
+    strategy = EmaCross5x9BuyStrategy(ema_fast=2, ema_slow=3, lots_per_trade=1)
     positions = PositionManager(InMemoryGateway(slippage_points=0.0), lots=1)
     engine = TradingEngine(
         EngineConfig(timeframe="5m", session=_session(), warmup_from_history=True),
@@ -532,9 +535,9 @@ def test_paper_mode_config_is_refused_by_the_live_gate():
         global_config=GlobalConfig(live_trading_enabled=False),
         runtime=RuntimeConfig(runtime_id="intraday_options", enabled=True),
         strategy=StrategyConfig(
-            strategy_id="ema_cross_9_21_buy",
+            strategy_id="c509_ema_cross_buy",
             runtime_id="intraday_options",
-            enabled=True,
+            enabled=False,
             mode=ExecutionMode.PAPER,
             live_approved=False,
             parameters={"instrument": "NIFTY", "security_id": "13"},

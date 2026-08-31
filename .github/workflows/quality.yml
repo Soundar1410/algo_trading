@@ -45,7 +45,7 @@ jobs:
               names = set(archive.namelist())
           required = {
               "runtimes/intraday_options/__main__.py",
-              "strategies/intraday_options/ema_cross_9_21_buy/strategy.py",
+              "strategies/intraday_options/c921_ema_cross_buy/strategy.py",
               "scripts/start_dashboard.py",
               "orchestration/process_control/supervised_launch.py",
               "common/persistence/migrations/versions/0001_walking_skeleton.sql",

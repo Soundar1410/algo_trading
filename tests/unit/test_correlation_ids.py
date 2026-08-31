@@ -174,3 +174,37 @@ def test_two_different_strategy_ids_can_produce_the_same_token():
 
 def test_strategy_token_length_matches_the_documented_constant():
     assert len(strategy_token("intraday_options_supertrend")) == STRATEGY_TOKEN_LENGTH
+
+
+def test_the_ema_cross_family_has_pairwise_distinct_tokens():
+    """Regression for a real incident (31 August 2026): under their old
+    names (ema_cross_9_21_buy, ema_cross_5_9_buy, ema_cross_5_21_buy) all
+    three sanitised to the same 'emac' token, so runtimes.intraday_options.
+    supervisor.add_worker's collision guard silently dropped every strategy
+    past the first admitted one out of the intraday_options group —
+    including the already-running, already-approved ema_cross_9_21_buy.
+    Fixed by renaming (to c921/c509/c521_ema_cross_buy) so the
+    distinguishing digits sit first, not by touching STRATEGY_TOKEN_LENGTH
+    (Dhan's 25-character correlation-ID limit leaves no room for that).
+
+    Written generically — any strategy_id list, asserting no two collide —
+    so a hypothetical fourth strategy sharing a prefix with one of these
+    would fail this test too, not just re-prove today's three are fine."""
+    strategy_ids = ["c921_ema_cross_buy", "c509_ema_cross_buy", "c521_ema_cross_buy"]
+    tokens = [strategy_token(sid) for sid in strategy_ids]
+    assert len(tokens) == len(set(tokens)), (
+        f"strategy_token() collision among {strategy_ids!r}: tokens {tokens!r}"
+    )
+
+    # And no collision with any other strategy currently in the repo.
+    other_ids = [
+        "straddle_920",
+        "weekly_delta_neutral",
+        "rolling_strangle_otm1",
+        "skeleton_fixture",
+        "supertrend_buy_1_1p2",
+    ]
+    other_tokens = {strategy_token(sid) for sid in other_ids}
+    assert not (set(tokens) & other_tokens), (
+        f"ema_cross family tokens {tokens!r} collide with {other_tokens!r}"
+    )

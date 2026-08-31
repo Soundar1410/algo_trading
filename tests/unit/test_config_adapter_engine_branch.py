@@ -15,7 +15,7 @@ from common.config.models import GlobalConfig, RuntimeConfig, StrategyConfig
 from runtimes.intraday_options.config_adapter import build_worker_config
 
 _STRATEGY_REF = (
-    "strategies.intraday_options.ema_cross_9_21_buy.strategy:EmaCross9x21BuyStrategy"
+    "strategies.intraday_options.c921_ema_cross_buy.strategy:EmaCross9x21BuyStrategy"
 )
 
 
@@ -31,7 +31,7 @@ def _cfg(**strategy_overrides) -> ResolvedConfig:
     }
     parameters.update(strategy_overrides.pop("parameters", {}))
     strategy_kwargs = {
-        "strategy_id": "ema_cross_9_21_buy",
+        "strategy_id": "c921_ema_cross_buy",
         "runtime_id": "intraday_options",
         "enabled": True,
         "parameters": parameters,
@@ -177,7 +177,7 @@ def test_the_trading_engine_kind_is_the_default_and_unaffected_by_the_new_branch
     tmp_path: Path,
 ):
     """``EngineKind`` defaults to ``TRADING_ENGINE`` on every existing strategy
-    config, ``ema_cross_9_21_buy.yaml`` included — the additive multi-leg
+    config, ``c921_ema_cross_buy.yaml`` included — the additive multi-leg
     routing must not change one byte of what this produces."""
     from common.config import EngineKind
 

@@ -1,13 +1,13 @@
 """Behaviour-level proofs for ``EmaCross9x21BuyStrategy`` (Phase 9).
 
-Full spec: strategies/intraday_options/ema_cross_9_21_buy/ema_cross_9_21_buy_spec.md.
+Full spec: strategies/intraday_options/c921_ema_cross_buy/c921_ema_cross_buy_spec.md.
 
 These exercise the strategy class directly (no ``TradingEngine``) so the
 fresh-crossover invariant, the premium-exit wiring and per-trade state reset
 can be pinned with exact, hand-verified numbers. Timing, reversal, sizing,
 the daily cap and restart recovery — everything the *engine* owns rather than
 the strategy — are proven end to end in
-``tests/integration/test_ema_cross_9_21_buy_engine.py`` instead.
+``tests/integration/test_c921_ema_cross_buy_engine.py`` instead.
 
 Every EMA-dependent test below uses ``ema_fast=2, ema_slow=3`` (an explicit
 constructor override) rather than the production 9/21 defaults, purely so a
@@ -41,7 +41,7 @@ from common.engine.models import (
 from common.engine.strategy import BaseStrategy, available_strategies, get_strategy
 from common.indicators.base import OHLC
 from common.indicators.ema import EMA
-from strategies.intraday_options.ema_cross_9_21_buy.strategy import EmaCross9x21BuyStrategy
+from strategies.intraday_options.c921_ema_cross_buy.strategy import EmaCross9x21BuyStrategy
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -104,9 +104,9 @@ def _close_trade(strategy: EmaCross9x21BuyStrategy, position: OpenPosition, exit
 
 
 # ------------------------------------------------------------- 1. registration
-def test_strategy_registers_as_ema_cross_9_21_buy():
-    assert "ema_cross_9_21_buy" in available_strategies()
-    assert EmaCross9x21BuyStrategy.name == "ema_cross_9_21_buy"
+def test_strategy_registers_as_c921_ema_cross_buy():
+    assert "c921_ema_cross_buy" in available_strategies()
+    assert EmaCross9x21BuyStrategy.name == "c921_ema_cross_buy"
 
 
 def test_get_strategy_by_name_builds_from_cfg_parameters():
@@ -114,7 +114,7 @@ def test_get_strategy_by_name_builds_from_cfg_parameters():
         def __init__(self) -> None:
             self.parameters = {"lots_per_trade": 5}
 
-    strategy = get_strategy("ema_cross_9_21_buy", _Cfg())
+    strategy = get_strategy("c921_ema_cross_buy", _Cfg())
     assert isinstance(strategy, EmaCross9x21BuyStrategy)
     assert strategy.quantity_lots == 5
     # Defaults still apply for everything not in cfg.parameters.

@@ -7,9 +7,9 @@ the next phase. Updated after every phase.
 
 | | |
 |---|---|
-| **Current phase** | **Phase 10 — Controlled live readiness: CODE HARDENED, fully disabled.** Production parent/worker preflight wiring, Dhan order/update handling, restart-safe account-loss emergency square-off, account-wide reserve-before-submit risk plus live MTM, shared rate limiting, broker-authoritative startup/mode-transition/session-end reconciliation, strict migration history, and restore validation exist and are tested with mocks/fakes only. `ema_cross_9_21_buy` and its Rev 3.1 matrix are unchanged. **Every committed live gate remains fail-closed** (`global.live_trading_enabled: false`, `live_execution_allowed: false`, `live_approved: false`, no `mode: live` in `config/`), enforced by `scripts.assert_no_live_config_committed`. No real Dhan order/network call was made. |
-| **Next phase** | Operational evidence and explicit human decisions, not more live-enabling code: complete/review the 30-day paper run, run the second and third real strategies (`ema_cross_5_9_buy` and `ema_cross_5_21_buy`, both built — see the 27 and 29 August 2026 addenda — but both shipped `enabled: false`) through their own paper evaluation periods, choose/configure an approved egress-IP provider and static IP, revalidate authentication operationally, then separately decide whether to approve minimum-quantity live activation. |
-| **Last updated** | 29 August 2026 — third real strategy `ema_cross_5_21_buy` added (a faithful EMA 5/21 clone of `ema_cross_9_21_buy`, fast period only), shipped `enabled: false`; all committed live gates remain disabled |
+| **Current phase** | **Phase 10 — Controlled live readiness: CODE HARDENED, fully disabled.** Production parent/worker preflight wiring, Dhan order/update handling, restart-safe account-loss emergency square-off, account-wide reserve-before-submit risk plus live MTM, shared rate limiting, broker-authoritative startup/mode-transition/session-end reconciliation, strict migration history, and restore validation exist and are tested with mocks/fakes only. `c921_ema_cross_buy` (renamed from `ema_cross_9_21_buy` 31 August 2026 — see addendum) and its Rev 3.1 matrix are unchanged. **Every committed live gate remains fail-closed** (`global.live_trading_enabled: false`, `live_execution_allowed: false`, `live_approved: false`, no `mode: live` in `config/`), enforced by `scripts.assert_no_live_config_committed`. No real Dhan order/network call was made. |
+| **Next phase** | Operational evidence and explicit human decisions, not more live-enabling code: complete/review the 30-day paper run, run the second and third real strategies (`c509_ema_cross_buy` and `c521_ema_cross_buy`, both built — see the 27 and 29 August 2026 addenda for their original build record under their pre-rename ids — but both shipped `enabled: false`) through their own paper evaluation periods, choose/configure an approved egress-IP provider and static IP, revalidate authentication operationally, then separately decide whether to approve minimum-quantity live activation. |
+| **Last updated** | 31 August 2026 — all three real EMA-cross strategies renamed to fix a correlation-ID token collision: `ema_cross_5_9_buy`/`ema_cross_5_21_buy`/`ema_cross_9_21_buy` → `c509_ema_cross_buy`/`c521_ema_cross_buy`/`c921_ema_cross_buy` (see addendum below for root cause and sequencing); the dashboard strategy picker also stopped listing renamed/retired strategy ids forever. All committed live gates remain disabled |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
 | **Live order placement** | Code path exists but is deliberately unreachable from committed configuration. Parent and child preflight both fail closed without approved operational inputs; `OPERATIONAL LIVE ACTIVATION ELIGIBLE: NO — BLOCKED`. |
@@ -11118,3 +11118,196 @@ notification setting or live-safety gate was touched.
 paper evaluation, a second real paper strategy, EMA-specific minimum-quantity
 approval, static-IP/provider setup, live auth revalidation, and separate
 approval to flip any gate all remain outstanding, unaffected by this fix.
+
+### Strategy rename: correlation-ID token collision across the ema_cross_* family — 31 August 2026
+
+**Root cause.** `common/execution/correlation.py`'s `strategy_token()`
+truncates a sanitised `strategy_id` (lowercased, underscores stripped) to its
+first `STRATEGY_TOKEN_LENGTH=4` alphanumeric characters to build Dhan order
+correlation IDs. All three real EMA-cross strategies — `ema_cross_9_21_buy`,
+`ema_cross_5_9_buy`, `ema_cross_5_21_buy` — sanitise to strings starting
+`emacross...`, so all three produced the identical token `"emac"`.
+`runtimes/intraday_options/supervisor.py`'s `add_worker` correctly refuses
+(rather than corrupts `order_intents`' unique constraint on `strategy_id,
+execution_mode, trading_date, sequence_number`) any strategy whose token
+collides with an already-admitted one — so enabling more than one of the
+three at once silently dropped the rest, including the already-running,
+already-approved `ema_cross_9_21_buy`, from the `intraday_options` group.
+
+**Why the token length wasn't just raised.** Dhan's correlation ID has a hard
+25-character limit; the current format
+(`{ns}_{runtime_token}_{strategy_token}_{date:8}_{seq:4}`) leaves only ~2
+spare characters over the existing 4-character token, and the three ids don't
+diverge until character 9-10 of their sanitised form (`emacross9...` vs
+`emacross5...`, and the two `5`-prefixed ones don't diverge until the next
+character after that). No feasible token length within the 25-character
+budget disambiguates them under the old naming. `common/execution/
+correlation.py` and `STRATEGY_TOKEN_LENGTH` were left unchanged.
+
+**Fix.** Renamed the three strategy_ids so the distinguishing digits come
+first, diverging well inside the 4-character token:
+
+| old id | new id | token |
+|---|---|---|
+| `ema_cross_5_9_buy` | `c509_ema_cross_buy` | `c509` |
+| `ema_cross_5_21_buy` | `c521_ema_cross_buy` | `c521` |
+| `ema_cross_9_21_buy` | `c921_ema_cross_buy` | `c921` |
+
+Verified pairwise distinct via `strategy_token()`, and non-colliding with
+every other strategy in the repo (`straddle_920`→`stra`,
+`weekly_delta_neutral`→`week`, `rolling_strangle_otm1`→`roll`,
+`skeleton_fixture`→`skel`, `supertrend_buy_1_1p2`→`supe`). Class names
+(`EmaCross5x9BuyStrategy`, `EmaCross5x21BuyStrategy`, `EmaCross9x21BuyStrategy`)
+already used a `5x9`/`5x21`/`9x21` convention internally and were left
+unchanged — only `strategy_id`, the module path/folder, the spec filename,
+and the config filename/`strategy_id`/`strategy_ref` fields moved.
+
+**Naming false start, corrected in place.** The first naming attempt put the
+distinguishing digits first without a letter prefix (`9x21_ema_cross_buy`,
+`5x9_ema_cross_buy`, `5x21_ema_cross_buy`). `strategy_token()` accepted these
+fine (verified via `importlib.import_module`, which resolves a dotted string
+at runtime and does not require its components to be valid Python
+identifiers), but every test file that reaches the strategy class with a
+literal `from strategies.intraday_options.5x9_ema_cross_buy.strategy import
+...` statement failed to even parse — `SyntaxError: invalid decimal
+literal`, because a digit-leading path segment is not a valid identifier in
+source syntax, only in a dynamically resolved string. Caught immediately by
+running the renamed tests before moving on; renamed again to the
+letter-prefixed `c509`/`c521`/`c921` form used above, which parses correctly
+both ways. No file was left in the broken intermediate state.
+
+**What actually happened today, in order:** enabling `ema_cross_5_9_buy` and
+`ema_cross_5_21_buy` alongside the running `ema_cross_9_21_buy` and
+restarting `intraday_options` surfaced the collision live — the supervisor
+log showed both new strategies refused, and (because the group is
+re-discovered from scratch on every restart) `ema_cross_9_21_buy` was also
+dropped. Reverted immediately (`enabled: false` on both, restart) to restore
+the working state before making any further change.
+
+**Sequencing.** `ema_cross_9_21_buy` had a genuinely **open paper position**
+at the time (qty 650, security_id 46988, opened 2026-08-31T09:20 IST,
+correlation_id `p_io_emac_20260831_0001`) — confirmed by direct query against
+`data/operational/intraday_options.db`. A same-day rename+restart while a
+position is open would have orphaned it: `runtimes/intraday_options/
+engine_worker.py`'s `recover_position()`/`recover_daily_risk()` filter
+strictly by the *current* `strategy_id`, so a worker restarted under a new id
+finds nothing, believes itself flat, and the real open position is left with
+no live process managing its stop/target/square-off. So the rename was
+split, and executed in that order:
+
+1. **Renamed `ema_cross_5_9_buy` → `c509_ema_cross_buy` and
+   `ema_cross_5_21_buy` → `c521_ema_cross_buy` first** — folder, spec file,
+   `strategy.py`'s `@register_strategy`/`.name`, config filename +
+   `strategy_id`/`strategy_ref`, both strategies' own unit/integration test
+   files (renamed, imports/asserts updated), sibling cross-references in
+   `ema_cross_9_21_buy`'s own `__init__.py`/config header. Neither renamed
+   strategy was running, so this carried no runtime risk. Both remain
+   shipped `enabled: false`.
+2. **Waited for `ema_cross_9_21_buy`'s open position to close** — it closed
+   on its own exit logic at 2026-08-31T04:35:01 UTC (10:05 IST), realised
+   P&L +₹6,500 (paper), not a manual intervention. Confirmed zero open
+   positions for the strategy before touching any file. Stopped the
+   `intraday_options` supervisor cleanly (`scripts.stop_runtime`), confirmed
+   orderly shutdown in the log (`workers_started=2`, no square-off needed —
+   already flat), then renamed `ema_cross_9_21_buy` → `c921_ema_cross_buy`
+   the same way as the other two.
+3. Added a regression test to `tests/unit/test_correlation_ids.py` asserting
+   all three new tokens are pairwise distinct and non-colliding with every
+   other strategy's token, parametrised so a future similarly-prefixed
+   strategy would also be caught, not just today's three re-proven safe.
+4. Enabled all three renamed configs and restarted `intraday_options`
+   (11:10:31 IST) to confirm all three admit with no `token collides`
+   refusal in the supervisor log — the actual end-to-end proof the
+   collision is gone, not just the new unit test. Confirmed: `spawned
+   worker strategy_id=c509_ema_cross_buy pid=11848`, `...c521_ema_cross_buy
+   pid=11849`, `...c921_ema_cross_buy pid=11850`, `...straddle_920
+   pid=11851` — all four admitted, zero `token collides` refusals in this
+   run (the two that appear in the log are from the original 09:18
+   discovery of the bug, before any fix). All three then completed
+   indicator warm-up and started running (`mode=paper`).
+
+**Confirmed safe by direct investigation before the `ema_cross_9_21_buy`
+rename** (not assumed): `strategy_id` is a plain `TEXT` column everywhere in
+`common/persistence/migrations/versions/*.sql`, never a foreign key — there
+is no `strategies`/`strategy_registry` table, so old history stays queryable
+under the old id forever and nothing needed migrating. Process locks/PID
+files (`common/process/locks.py`) are named `f"{runtime_id}.{strategy_id}"`
+— the old lock had to be released (worker stopped) before the new-id worker
+started, which step 2 above did explicitly. The dashboard
+(`dashboards/data/intraday_options.py`) filters everything by plain `WHERE
+strategy_id = ?` — the rename shows as two separate entries in the strategy
+picker (old id's history frozen at the rename date, new id's history
+starting fresh), no query errors. Daily-state/position recovery already
+resets at every trading-date boundary regardless of `strategy_id` (proven by
+`tests/integration/test_engine_worker_restart.py`), so this rename — done
+once genuinely flat — carried the same risk profile as an ordinary day
+rollover.
+
+**Unrelated finding surfaced by the full-suite run done as part of this
+verification:** 65 pre-existing failures plus one indefinite hang, entirely
+confined to `positional_options`/`weekly_delta_neutral`/dashboard-positional
+tests — none touch `ema_cross_*`, `intraday_options`, or any file this
+rename changed. All 65 failures share one root cause:
+`common.market_data.scrip_master.ScripMasterError: Every listed NIFTY expiry
+is before 2026-08-31 (newest is 2026-08-26/2026-08-24). The scrip master is
+stale.` — a fixture CSV baked into these tests with a hardcoded expiry list
+that the sandbox's advancing simulated date has now passed. This is the
+deliberate D35 safety behaviour (raise rather than silently resolve a
+contract that can no longer be traded) correctly firing against stale
+*test* data — the real running system is unaffected, since it downloads the
+actual scrip master from Dhan fresh every morning (confirmed in today's own
+log). The hang (`tests/integration/
+test_positional_runtime_weekly_staged_entry.py::
+test_real_weekly_strategy_completes_a_staged_entry_over_the_shared_hub`) is
+a separate, real `multiprocessing` deadlock (confirmed via `lsof`: no
+network activity, blocked on IPC pipes, zero CPU for over an hour) —
+deselected to unblock this verification; not investigated further as part
+of this change, since it is unrelated to it.
+
+**Files touched:**
+`strategies/intraday_options/{c509,c521,c921}_ema_cross_buy/` (renamed from
+`ema_cross_5_9_buy`/`ema_cross_5_21_buy`/`ema_cross_9_21_buy`, contents
+updated); `config/strategies/intraday_options/{c509,c521,c921}_ema_cross_buy.yaml`
+(renamed, `strategy_id`/`strategy_ref` updated, `enabled` unchanged until
+the final end-to-end verification step);
+`tests/unit/test_{c509,c521,c921}_ema_cross_buy_strategy.py`,
+`tests/integration/test_{c509,c521,c921}_ema_cross_buy_engine.py` (renamed,
+updated); `tests/unit/test_correlation_ids.py` (new regression test);
+sibling cross-references in each renamed strategy's own files;
+`config/strategies/intraday_options/{supertrend_buy_1_1p2,straddle_920,
+rolling_strangle_otm1}.yaml`, `strategies/intraday_options/
+supertrend_buy_1_1p2/*`, `strategies/positional_options/
+_fixture_second_strategy/__init__.py`,
+`strategies/positional_options/weekly_delta_neutral/
+WEEKLY_DELTA_NEUTRAL_ALGO_TRADING_SPEC.md`, `runtimes/intraday_options/
+config_adapter.py`, `common/exit/combined_candle_exit.py`,
+`common/engine/risk_managers.py`, `common/engine/strategy.py`,
+`dashboards/data/intraday_options.py`, `.github/workflows/quality.yml`,
+`pyproject.toml`, `README.md` (comment/docstring cross-references updated
+for consistency, no behaviour change); a further ~30 test files with
+literal `strategy_id` references (dashboard, auto-start, supervisor
+composition, config-discovery tests) updated in place; `CLAUDE.md`.
+
+**Follow-up, same day: dashboard picker stopped surfacing "Historical
+only" strategies.** The rename above was the direct trigger — the old
+`ema_cross_9_21_buy`/`ema_cross_5_21_buy` ids stayed selectable in the
+Intraday Options "Strategy:" dropdown indefinitely, labelled "Historical
+only", because `dashboards/data/strategy_scope.py`'s
+`discover_strategy_options` had a third discovery condition ("ever
+produced a `trade_ledger`/`signals`/`order_intents`/`positions` row, no
+matter how long ago") that a rename or removal from config could never
+clear. Operator decision: remove that condition — a strategy now appears
+only while it is configured or currently reporting a healthy heartbeat.
+Old rows are not deleted and remain fully queryable by direct DB access;
+only the picker stops offering them. Shared by every runtime-group page
+(`dashboards/intraday_options.py`, `positional_options.py`,
+`intraday_stocks.py` all build their selector from this one module), so
+the same fix applies the next time any strategy in any runtime group is
+renamed or retired. `tests/unit/test_dashboard_strategy_scope.py`'s
+`test_a_removed_strategy_with_history_remains_selectable` inverted to
+`test_a_removed_strategy_with_history_is_no_longer_selectable` — the old
+assertion no longer matches the wanted behaviour, so it was changed to
+assert the new contract, not skipped or weakened. `ruff`/`mypy` clean;
+`test_dashboard_strategy_scope.py` (15), `test_dashboard_apptest.py`,
+`test_dashboard_home.py`, `test_supertrend_buy_1_1p2_dashboard.py` all
+pass.

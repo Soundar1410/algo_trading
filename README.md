@@ -10,7 +10,7 @@ approved for live.
 
 > **Status: Phase 10 controlled-live code hardened; operational activation
 > blocked.** The shared paper/live architecture, the real
-> `ema_cross_9_21_buy` paper strategy, and generic controlled-live machinery are
+> `c921_ema_cross_buy` paper strategy, and generic controlled-live machinery are
 > implemented, including continuous account-loss emergency control,
 > broker-authoritative startup/mode-transition/session-end reconciliation, and
 > account-wide risk/rate coordination. Every committed live gate remains disabled and tests use

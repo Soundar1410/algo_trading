@@ -1,6 +1,6 @@
-"""``ema_cross_5_21_buy`` driven by a real, fully-constructed ``TradingEngine``
+"""``c521_ema_cross_buy`` driven by a real, fully-constructed ``TradingEngine``
 over a simulated tape — the third real strategy, a faithful clone of
-``ema_cross_9_21_buy`` (Phase 9) with only the fast EMA period (5 instead of
+``c921_ema_cross_buy`` (Phase 9) with only the fast EMA period (5 instead of
 9) and identity changed; the slow period (21) is unchanged. No
 monkeypatching, no ``__new__`` shortcuts — mirrors
 ``tests/integration/test_engine_premium_candle_exit.py``'s discipline.
@@ -10,15 +10,15 @@ section 9, 8, 3, 6.4): reversal semantics, the entry window/cutoff, the
 mandatory square-off, lot-size-driven order quantity and the daily live-MTM
 loss cap are all engine-owned, and this is where that is demonstrated end to
 end. Everything about the crossover/premium-exit *logic itself* is proven at
-the unit level in ``tests/unit/test_ema_cross_5_21_buy_strategy.py``.
+the unit level in ``tests/unit/test_c521_ema_cross_buy_strategy.py``.
 
 ``ema_fast=2, ema_slow=3`` (rather than the production 5/21 defaults) keeps
 every tape to a handful of candles; every candle sequence and its resulting
 signal was verified against the real ``EMA``/``ConfirmedCrossover`` classes
 before being hard-coded here (not hand-derived). Because that override (not
 the 5/21 production defaults) drives every tape below, the tapes themselves
-are identical to the sibling ``test_ema_cross_9_21_buy_engine.py``/
-``test_ema_cross_5_9_buy_engine.py`` suites' — only the strategy class/id
+are identical to the sibling ``test_c921_ema_cross_buy_engine.py``/
+``test_c509_ema_cross_buy_engine.py`` suites' — only the strategy class/id
 differs.
 """
 
@@ -44,7 +44,7 @@ from common.engine.models import (
 from common.engine.positions import InMemoryGateway, PositionManager
 from common.engine.selection import OptionSelector, SimulatedOptionChainResolver
 from common.models import Candle, Tick
-from strategies.intraday_options.ema_cross_5_21_buy.strategy import EmaCross5x21BuyStrategy
+from strategies.intraday_options.c521_ema_cross_buy.strategy import EmaCross5x21BuyStrategy
 
 IST = ZoneInfo("Asia/Kolkata")
 UNDERLYING = "INDEX"
@@ -537,7 +537,7 @@ def test_paper_mode_config_is_refused_by_the_live_gate():
         global_config=GlobalConfig(live_trading_enabled=False),
         runtime=RuntimeConfig(runtime_id="intraday_options", enabled=True),
         strategy=StrategyConfig(
-            strategy_id="ema_cross_5_21_buy",
+            strategy_id="c521_ema_cross_buy",
             runtime_id="intraday_options",
             enabled=False,
             mode=ExecutionMode.PAPER,

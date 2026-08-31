@@ -1,15 +1,28 @@
-# ema_cross_5_9_buy — the second real strategy, a faithful clone of
-# ema_cross_9_21_buy with only the EMA periods (5/9 instead of 9/21) and
-# identity changed. Full spec: strategies/intraday_options/ema_cross_5_9_buy/
-# ema_cross_5_9_buy_spec.md; ema_cross_9_21_buy_spec.md remains the shared
-# behavioural source of truth for everything not called out as different.
+# c521_ema_cross_buy — the third real strategy, a faithful clone of
+# c921_ema_cross_buy with only the fast EMA period (5 instead of 9) and
+# identity changed; the slow period (21) is unchanged. A second real
+# strategy, c509_ema_cross_buy (a faithful clone with EMA periods 5/9 instead
+# of 9/21, currently shipped disabled), also lives alongside this one in
+# config/strategies/intraday_options/c509_ema_cross_buy.yaml. Full spec:
+# strategies/intraday_options/c521_ema_cross_buy/c521_ema_cross_buy_spec.md;
+# c921_ema_cross_buy_spec.md remains the shared behavioural source of truth
+# for everything not called out as different.
 # Do not copy config/strategies/skeleton_fixture.yaml as a template — that
 # file is explicitly not one (see its own header).
 #
+# Renamed from ema_cross_5_21_buy on 31 August 2026: the original id shared
+# its first 4 sanitised characters ("emac") with c921_ema_cross_buy and
+# ema_cross_5_9_buy, so common.execution.correlation.strategy_token()
+# collided across all three and runtimes/intraday_options/supervisor.py's
+# add_worker refused to admit more than one at a time. The distinguishing
+# digits now sit first — see docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md for
+# the full addendum. strategy_id below is otherwise unchanged in meaning.
+#
 # Shipped DISABLED (enabled: false, operator decision): built, tested and
 # discoverable, but does not run on the shared intraday_options feed
-# alongside ema_cross_9_21_buy until deliberately enabled. Runnable in
-# isolation via the runtime's --strategy-id ema_cross_5_9_buy selector.
+# alongside c921_ema_cross_buy (or c509_ema_cross_buy) until deliberately
+# enabled. Runnable in isolation via the runtime's
+# --strategy-id c521_ema_cross_buy selector.
 #
 # PAPER ONLY at delivery. Setting mode to `live` will NOT start a live
 # strategy: the broker factory consults the live gate (common.config.models.
@@ -17,9 +30,9 @@
 # committed gate remains disabled; operational activation requires separate
 # evidence and explicit approval.
 
-strategy_id: ema_cross_5_9_buy
+strategy_id: c521_ema_cross_buy
 runtime_id: intraday_options
-enabled: false
+enabled: true
 
 mode: paper
 live_approved: false
@@ -49,17 +62,17 @@ parameters:
   security_id: "13"
 
   # ------------------------------------------------- engine-path discriminator
-  strategy_ref: "strategies.intraday_options.ema_cross_5_9_buy.strategy:EmaCross5x9BuyStrategy"
+  strategy_ref: "strategies.intraday_options.c521_ema_cross_buy.strategy:EmaCross5x21BuyStrategy"
 
-  # EmaCross5x9BuyStrategy's own constructor kwargs (spec sections 4, 6.1, 7,
+  # EmaCross5x21BuyStrategy's own constructor kwargs (spec sections 4, 6.1, 7,
   # 12.4, 12.6). Travels through config_adapter.py verbatim -- see its
   # _build_engine_worker_config docstring.
   strategy_kwargs:
     ema_fast: 5
-    ema_slow: 9
+    ema_slow: 21
     # Pure closed-candle sign-flip cross, confirmed on the closing candle of
-    # the flip itself (spec 12.6, kept identical to ema_cross_9_21_buy —
-    # operator decision: no whipsaw damping for the faster 5/9 pair).
+    # the flip itself (spec 12.6, kept identical to c921_ema_cross_buy --
+    # operator decision: no whipsaw damping for the 5/21 pair either).
     minimum_separation: 0
     confirmation_candles: 1
     # lots_per_trade is a sizing CHOICE (config); lot_size is NOT configured
@@ -102,26 +115,28 @@ parameters:
   scrip_master_cache_dir: ""
 
   # ----------------------------------------------------- daily 3% live-MTM cap
-  # capital_base = Rs 10,00,000 (same base as ema_cross_9_21_buy -- spec
-  # section 12.1/6.3: each strategy carries its own independent cap, no
-  # combined cap across strategies). daily_max_loss_pct converts to an
-  # ABSOLUTE rupee daily_max_loss = 0.03 * capital_base = Rs 30,000, evaluated
-  # every tick on LIVE MTM (realised so far + this position's open unrealised
-  # P&L) -- common.engine.daily_guard.DailyRiskGuard.check_open_mtm, wired by
-  # TradingEngine itself (common.engine.engine.TradingEngine.
-  # _build_daily_guard / _on_option_tick). Latching: halts new entries and
-  # squares off for the rest of the day once tripped.
+  # capital_base = Rs 10,00,000 (same base as c921_ema_cross_buy and
+  # c509_ema_cross_buy -- spec section 12.1/6.3: each strategy carries its own
+  # independent cap, no combined cap across strategies). daily_max_loss_pct
+  # converts to an ABSOLUTE rupee daily_max_loss = 0.03 * capital_base = Rs
+  # 30,000, evaluated every tick on LIVE MTM (realised so far + this
+  # position's open unrealised P&L) -- common.engine.daily_guard.
+  # DailyRiskGuard.check_open_mtm, wired by TradingEngine itself
+  # (common.engine.engine.TradingEngine._build_daily_guard /
+  # _on_option_tick). Latching: halts new entries and squares off for the
+  # rest of the day once tripped.
   capital_base: 1000000
   daily_max_loss_pct: 3.0
 
   # ------------------------------------------------------------------- warm-up
-  # EMA(5)/EMA(9) are SESSION_SPANNING (common.warmup.requirements): prior-
+  # EMA(5)/EMA(21) are SESSION_SPANNING (common.warmup.requirements): prior-
   # session history is valid and desirable, so a mid-session start behaves
   # like a bot that ran since the open. Not continuity_required (unlike
   # SuperTrend), so this strategy still trades correctly cold -- see
-  # EmaCross5x9BuyStrategy.on_candle's is_ready gate -- but "dhan" warm-up is
-  # configured here so the fresh-crossover rule is evaluated against a
-  # genuinely warmed indicator in normal operation.
+  # EmaCross5x21BuyStrategy.on_candle's is_ready gate (still 21 bars, the
+  # slow leg is unchanged) -- but "dhan" warm-up is configured here so the
+  # fresh-crossover rule is evaluated against a genuinely warmed indicator in
+  # normal operation.
   warmup_from_history: true
   warmup_source: dhan
   warmup_max_lookback_sessions: 3

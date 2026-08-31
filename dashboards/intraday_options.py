@@ -951,7 +951,7 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
             all_strategy_ids,
             default=default_selection,
             key=compare_key,
-            format_func=lambda sid: f"{sid} ({status_by_id.get(sid, 'Historical only')})",
+            format_func=lambda sid: f"{sid} ({status_by_id.get(sid, 'Unknown')})",
         )
         compare_ids = tuple(compare_choice)
 

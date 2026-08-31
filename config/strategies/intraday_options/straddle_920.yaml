@@ -32,7 +32,7 @@ live_approved: false
 
 # The real discriminator (straddle_920 port): config_adapter.py now routes by
 # EngineKind, additively — this strategy is the first (and, at delivery, only)
-# consumer of the multi_leg_engine branch. ema_cross_9_21_buy.yaml's own
+# consumer of the multi_leg_engine branch. c921_ema_cross_buy.yaml's own
 # `engine: trading_engine` line, and that whole routing path, are untouched.
 engine: multi_leg_engine
 

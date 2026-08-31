@@ -117,7 +117,7 @@ class _FakeBootstrap:
 
 _REPORT = PaperSafetyReport(
     plans=(
-        RuntimePlan("intraday_options", ("ema_cross_9_21_buy",)),
+        RuntimePlan("intraday_options", ("c921_ema_cross_buy",)),
         RuntimePlan("positional_options", ("weekly_delta_neutral",)),
     )
 )
@@ -584,7 +584,7 @@ def test_the_success_message_states_the_paper_posture_and_what_will_start(
     assert "PAPER ONLY" in message
     assert "Token source: cache" in message
     assert "intraday_options" in message and "positional_options" in message
-    assert "ema_cross_9_21_buy" in message and "weekly_delta_neutral" in message
+    assert "c921_ema_cross_buy" in message and "weekly_delta_neutral" in message
 
 
 def test_the_give_up_alert_is_sent_once_not_per_retry(

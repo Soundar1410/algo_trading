@@ -1,17 +1,17 @@
-# Strategy Requirement & Design Spec — `ema_cross_5_9_buy`
+# Strategy Requirement & Design Spec — `c509_ema_cross_buy`
 
 **NIFTY 5-minute EMA 5/9 crossover · ATM weekly options · BUY-only · intraday**
 
 | Field | Value |
 |---|---|
-| Strategy id | `ema_cross_5_9_buy` |
-| Delivers | The second real strategy, paper mode. A faithful behavioural clone of `ema_cross_9_21_buy` (Phase 9's first real strategy), differing only in the two EMA periods and identity — see the build spec `ema_cross_5_9_buy_spec.md` (the build order this document supersedes as the delivered design record) for the exhaustive delta. `ema_cross_9_21_buy`'s own spec (`strategies/intraday_options/ema_cross_9_21_buy/ema_cross_9_21_buy_spec.md`) remains the shared behavioural source of truth for everything not called out as different here. Phase 10 (live enablement) is explicitly deferred; this document's design anticipates it (see §10's `live_approved: false`) but does not authorize implementing it. |
+| Strategy id | `c509_ema_cross_buy` |
+| Delivers | The second real strategy, paper mode. A faithful behavioural clone of `c921_ema_cross_buy` (Phase 9's first real strategy), differing only in the two EMA periods and identity — see the build spec `c509_ema_cross_buy_spec.md` (the build order this document supersedes as the delivered design record) for the exhaustive delta. `c921_ema_cross_buy`'s own spec (`strategies/intraday_options/c921_ema_cross_buy/c921_ema_cross_buy_spec.md`) remains the shared behavioural source of truth for everything not called out as different here. Phase 10 (live enablement) is explicitly deferred; this document's design anticipates it (see §10's `live_approved: false`) but does not authorize implementing it. |
 | Engine | `trading_engine` (`common.engine.engine.TradingEngine`) |
 | Strategy contract | `common.engine.strategy.BaseStrategy` |
 | Mode at delivery | `paper` (live gate fail-closed; see §10) |
-| `enabled` at delivery | `false` — operator decision (build spec §6.1): built, tested and discoverable, but dormant on the shared `intraday_options` supervised run until deliberately enabled. Runnable in isolation via the runtime's `--strategy-id ema_cross_5_9_buy` selector. |
+| `enabled` at delivery | `false` — operator decision (build spec §6.1): built, tested and discoverable, but dormant on the shared `intraday_options` supervised run until deliberately enabled. Runnable in isolation via the runtime's `--strategy-id c509_ema_cross_buy` selector. |
 | Status | Delivered — §6.1/§6.2 (formerly open decisions) are resolved; see the table above and §12.6 below. |
-| Revision | Rev 1 — clone of `ema_cross_9_21_buy`'s Rev 3.1 spec, with EMA periods 5/9 replacing 9/21 throughout, the cold-start readiness gate changed from 21 bars to 9 bars (§4.4, §13), and §6.1/§6.2/§12.1/§12.6 recorded as resolved for this strategy's delivery. No other behavioural requirement differs from the source spec's Rev 3.1. |
+| Revision | Rev 1 — clone of `c921_ema_cross_buy`'s Rev 3.1 spec, with EMA periods 5/9 replacing 9/21 throughout, the cold-start readiness gate changed from 21 bars to 9 bars (§4.4, §13), and §6.1/§6.2/§12.1/§12.6 recorded as resolved for this strategy's delivery. No other behavioural requirement differs from the source spec's Rev 3.1. |
 
 > This document is a requirement + design spec, not the code. It records the
 > behaviour the strategy must exhibit and the exact existing modules each
@@ -25,7 +25,7 @@
 
 Build a **second** complete, end-to-end intraday options strategy on the
 preserved engine, implemented and forward-tested in **paper mode**, alongside
-`ema_cross_9_21_buy` — so a second, equally well-understood signal exercises
+`c921_ema_cross_buy` — so a second, equally well-understood signal exercises
 the same pipeline (signal generation, option selection, order submission
 (paper), per-position and day-level risk, square-off) with a faster-reacting
 EMA pair. Phase 10 (live enablement) is a separate, later decision, not part
@@ -118,11 +118,11 @@ confirmed bullish crossover, `-1` only on a newly confirmed bearish crossover, a
 
 - `minimum_separation` — deadband the spread must clear before a flip counts.
   Default **0** (a pure sign-flip cross, matching "closed-candle 5/9 crossover"
-  literally). Kept identical to `ema_cross_9_21_buy` (§12.6 — no whipsaw damping
+  literally). Kept identical to `c921_ema_cross_buy` (§12.6 — no whipsaw damping
   for the faster pair).
 - `confirmation_candles` — consecutive closed candles the new side must hold.
   Default **1** (act on the closing candle of the cross). Kept identical to
-  `ema_cross_9_21_buy` for the same reason.
+  `c921_ema_cross_buy` for the same reason.
 
 ### 4.3 Intraday Fresh-Crossover Rule
 
@@ -305,7 +305,7 @@ exit:
     minimum_favourable_move_percentage: 4.0
 ```
 
-> **Behavioural caveat (settled, same as `ema_cross_9_21_buy`):** the 4% activation
+> **Behavioural caveat (settled, same as `c921_ema_cross_buy`):** the 4% activation
 > gates **only the trailing leg**. The momentum-break leg has **no** activation
 > gate and can fire as early as the *second* premium candle after entry (it needs
 > one prior premium candle for the range comparison), well before +4%. This acts
@@ -329,7 +329,7 @@ exit must:
 This is the premium-side counterpart to the underlying `on_candle_gap` (see §4.1),
 which for this strategy is a no-op (EMAs are `SESSION_SPANNING` and decay a hole
 out; no `SESSION_LOCAL` indicator is used). `CombinedCandleExit`'s gap hook (added
-for `ema_cross_9_21_buy`) is reused verbatim here.
+for `c921_ema_cross_buy`) is reused verbatim here.
 
 **Per-trade state reset (required).** All position-specific premium-exit state must be
 cleared on **every** position close, so nothing leaks into the next trade: the trail
@@ -375,7 +375,7 @@ Two evaluation paths, both required and both latching `halted`:
 > **Important:** `daily_max_loss` is an **absolute rupee** amount ("already scaled
 > for size by the caller"), **not** a percentage. The strategy's config-building
 > code must convert `daily_max_loss = 0.03 × capital_base`, where the capital base
-> is Rs 10,00,000 (§12.1 — same base as `ema_cross_9_21_buy`; each strategy carries
+> is Rs 10,00,000 (§12.1 — same base as `c921_ema_cross_buy`; each strategy carries
 > its own independent cap, no combined cap across strategies, §6.3 of the build
 > spec). Any per-lot amounts must be multiplied by `lots_per_trade × lot_size`
 > before constructing the guard.
@@ -403,7 +403,7 @@ Two independent layers:
   position management is the premium exit (§6.1), so the risk manager is
   minimal: a **catastrophic hard % stop** backstop (`hard_stop`), disabled by
   default (`catastrophic_stop_rupees_per_lot: none`), same as
-  `ema_cross_9_21_buy`. Loss is bounded (always long premium), but a hard
+  `c921_ema_cross_buy`. Loss is bounded (always long premium), but a hard
   floor is cheap insurance if ever enabled.
 - **Day-level `DailyRiskGuard`** (§6.4): 3% loss cap evaluated on **live MTM
   (realised + open unrealised P&L) every tick** via `check_open_mtm`, plus the
@@ -443,7 +443,7 @@ the whole session until square-off.
 ## 10. Configuration (as delivered)
 
 ```yaml
-strategy_id: ema_cross_5_9_buy
+strategy_id: c509_ema_cross_buy
 enabled: false   # operator decision, build spec §6.1 — dormant at delivery
 
 # Paper only at delivery. Setting `live` will NOT start live: the broker factory
@@ -471,7 +471,7 @@ option_selection:
 trade_side: BUY
 
 strategy:
-  name: ema_cross_5_9_buy
+  name: c509_ema_cross_buy
   timeframe: 5m
   params:
     ema_fast: 5
@@ -489,7 +489,7 @@ risk:
   # from a percentage using capital_base (see §12.1). The cap is evaluated on
   # LIVE MTM (realised + open unrealised) every tick, not realised-only (§6.4).
   daily:
-    capital_base: 1000000      # Rs 10,00,000 -- same base as ema_cross_9_21_buy
+    capital_base: 1000000      # Rs 10,00,000 -- same base as c921_ema_cross_buy
     daily_max_loss_pct: 3.0    # -> daily_max_loss = 0.03 * capital_base
     evaluate_on: mtm           # realised + unrealised, per tick (check_open_mtm)
     daily_profit_target: none
@@ -499,7 +499,7 @@ risk:
   # Per-position backstop (see §7). Optional but recommended.
   risk_manager:
     name: hard_stop
-    catastrophic_stop_pct: none   # disabled, same as ema_cross_9_21_buy
+    catastrophic_stop_pct: none   # disabled, same as c921_ema_cross_buy
 
 exit:
   mode: momentum_low_or_highest_close
@@ -527,7 +527,7 @@ paper_execution:
 > Do **not** derive this config by copying `config/strategies/skeleton_fixture.yaml`
 > — that file carries an explicit "do not use as a template" warning. This shape is
 > built from the spec's section 6 and the modules referenced here (and from the
-> already-reviewed `ema_cross_9_21_buy.yaml`, its behavioural template).
+> already-reviewed `c921_ema_cross_buy.yaml`, its behavioural template).
 
 ---
 
@@ -540,10 +540,10 @@ paper_execution:
 | Fresh-crossover detection | `common.indicators.ema.ConfirmedCrossover` | reuse |
 | Premium candle stream | `needs_option_candles=True` → `on_option_candle` | wire (new) |
 | Premium exit | `common.exit.combined_candle_exit` | reuse |
-| Premium candle-gap suppress | `on_option_candle_gap` → exit gap-notify | reuse (added for `ema_cross_9_21_buy`) |
+| Premium candle-gap suppress | `on_option_candle_gap` → exit gap-notify | reuse (added for `c921_ema_cross_buy`) |
 | Per-trade exit reset | `CombinedCandleExit.reset()` via `on_position_closed` | wire (new) |
 | Daily 3% cap (live MTM) | `DailyRiskGuard.check_open_mtm` per tick + `register_trade` on close | wire + %→₹ (new) |
-| Per-position backstop | `common.engine.risk.RiskManager` | reuse (`HardStopRiskManager`, authored for `ema_cross_9_21_buy`) |
+| Per-position backstop | `common.engine.risk.RiskManager` | reuse (`HardStopRiskManager`, authored for `c921_ema_cross_buy`) |
 | Square-off / entry window | `common.engine.square_off`, `risk` config (09:15/14:45/15:15) | reuse |
 | `lot_size` (runtime) | `common.market_data.scrip_master` | wire |
 | `lots_per_trade` (config) × `lot_size` = quantity | strategy sizing | wire (new) |
@@ -567,7 +567,7 @@ below. The lifecycle is:
    **not** a re-replay of history already baked into the existing EMA state.
    No candle is ever fed to an EMA instance twice (double-counting a candle
    would corrupt the average) — this reuses the exact engine `_warm_up()`
-   machinery verified for `ema_cross_9_21_buy`.
+   machinery verified for `c921_ema_cross_buy`.
 3. The reconstructed relationship is **preserved** into live processing as
    context — it is not discarded a second time.
 4. If step 2 produces no usable relationship (no warm-up manager, or a
@@ -577,7 +577,7 @@ below. The lifecycle is:
 **Contract choice is settled by the spec:** premium candles, option selection, and
 a per-position risk policy exist **only** on `BaseStrategy` (not the lighter
 worker-seam `Strategy` protocol). Implement the strategy as a `BaseStrategy`
-subclass registered via `@register_strategy("ema_cross_5_9_buy")`, with
+subclass registered via `@register_strategy("c509_ema_cross_buy")`, with
 `needs_option_candles = True`.
 
 ---
@@ -585,8 +585,8 @@ subclass registered via `@register_strategy("ema_cross_5_9_buy")`, with
 ## 12. Decisions (resolved for this delivery)
 
 **12.1 Capital base for the 3% cap (resolved).** Rs 10,00,000 — same as
-`ema_cross_9_21_buy`. Each strategy carries its own independent cap; there is
-no combined cap across `ema_cross_9_21_buy` and `ema_cross_5_9_buy` (build
+`c921_ema_cross_buy`. Each strategy carries its own independent cap; there is
+no combined cap across `c921_ema_cross_buy` and `c509_ema_cross_buy` (build
 spec §6.3 — deliberately out of scope, unbuilt). The cap is evaluated on
 **live MTM (realised + open unrealised P&L) every tick** (§6.4), so a losing
 open position can trip it before it closes.
@@ -596,18 +596,18 @@ open position can trip it before it closes.
 is hardcoded in config.
 
 **12.3 Premium-candle interval for the exit (settled).** 5m, matching the signal
-timeframe — same as `ema_cross_9_21_buy`.
+timeframe — same as `c921_ema_cross_buy`.
 
 **12.4 Momentum-leg activation (settled).** The un-gated momentum-break leg
 (§6.1 caveat) is the intended fast structural stop — same as
-`ema_cross_9_21_buy`.
+`c921_ema_cross_buy`.
 
 **12.5 Catastrophic backstop stop (settled).** `hard_stop`, disabled by
 default (`catastrophic_stop_rupees_per_lot: none`) — same as
-`ema_cross_9_21_buy`.
+`c921_ema_cross_buy`.
 
 **12.6 Whipsaw guards (resolved, build spec §6.2).** `minimum_separation: 0`,
-`confirmation_candles: 1` — kept identical to `ema_cross_9_21_buy`, no damping
+`confirmation_candles: 1` — kept identical to `c921_ema_cross_buy`, no damping
 for the faster 5/9 pair. Operator decision at delivery.
 
 ---
@@ -621,7 +621,7 @@ for the faster 5/9 pair. Operator decision at delivery.
 - **Cold start:** no entry until the 9-EMA is ready (≥ 9 bars), regardless of
   what §4.3 would otherwise allow — indicator readiness gates entry independently
   of crossover context. (This is the one behavioural consequence of the 5/9
-  period change vs. `ema_cross_9_21_buy`'s 21-bar gate.)
+  period change vs. `c921_ema_cross_buy`'s 21-bar gate.)
 - **Momentum leg needs history:** it cannot fire on the first premium candle after
   entry (no prior premium candle to compare); earliest is the second.
 - **No entry before 09:15 or after 14:45.** The earliest realistic fill is at the
@@ -644,8 +644,8 @@ for the faster 5/9 pair. Operator decision at delivery.
 - **Faster whipsaw exposure:** 5/9 crosses more often and on smaller moves than
   9/21 (build spec §3 note). No damping was applied (§12.6) — this is an
   accepted, deliberate operator choice, not an oversight.
-- **Two strategies, two independent caps:** running `ema_cross_5_9_buy`
-  alongside `ema_cross_9_21_buy` (once/if enabled) means two independent
+- **Two strategies, two independent caps:** running `c509_ema_cross_buy`
+  alongside `c921_ema_cross_buy` (once/if enabled) means two independent
   ₹10,00,000 capital bases and two independent ₹30,000 daily-MTM caps, no
   combined cap, potentially holding opposite legs (one long CE, one long PE)
   at the same time (build spec §0.4).
@@ -684,7 +684,7 @@ for the faster 5/9 pair. Operator decision at delivery.
 - **Default periods:** a dedicated test pins that the constructor defaults really
   are 5 and 9 (not, e.g., accidentally left at 9/21) and that `ema_slow > ema_fast`
   is enforced.
-- **Discovery/enablement:** the real committed `config/strategies/ema_cross_5_9_buy.yaml`
+- **Discovery/enablement:** the real committed `config/strategies/c509_ema_cross_buy.yaml`
   is discovered (`discover_strategies`) but does **not** appear in
   `discover_enabled_strategies` while `enabled: false` (§6.1).
 - Follow the repo's discipline: `ruff check`, `mypy` strict, and behaviour-level
@@ -694,13 +694,13 @@ for the faster 5/9 pair. Operator decision at delivery.
 
 ## 15. Out of Scope
 
-- Any change to `ema_cross_9_21_buy`'s logic.
+- Any change to `c921_ema_cross_buy`'s logic.
 - Option **writing/selling** (this strategy is BUY-only).
 - Multiple simultaneous positions / pyramiding.
 - Non-NIFTY underlyings; non-weekly expiries.
 - Live order placement mechanics beyond wiring the Phase 10 live gate.
-- A shared or combined risk cap across `ema_cross_5_9_buy` and
-  `ema_cross_9_21_buy` (build spec §6.3) — unbuilt, out of scope.
+- A shared or combined risk cap across `c509_ema_cross_buy` and
+  `c921_ema_cross_buy` (build spec §6.3) — unbuilt, out of scope.
 
 ---
 

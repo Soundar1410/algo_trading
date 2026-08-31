@@ -47,7 +47,7 @@ Out of scope:
 - enabling live trading;
 - changing any global or runtime live gate;
 - copying the legacy database, orchestrator, broker, dashboard, scheduler, login, or process layout;
-- changing the rules of `straddle_920` or `ema_cross_9_21_buy`;
+- changing the rules of `straddle_920` or `c921_ema_cross_buy`;
 - weakening intraday square-off or restart behaviour;
 - backtesting parameter optimization;
 - automatic market-order fallback.

@@ -13,7 +13,7 @@ per-strategy engine parameters (``strategy_ref``, ``timeframe``,
 ``strike_step``, ...) that no real strategy existed yet to supply — CLAUDE.md
 was explicit that real strategies are Phase 9's job.
 
-Phase 9 landed the first one (``ema_cross_9_21_buy``) discriminated by
+Phase 9 landed the first one (``c921_ema_cross_buy``) discriminated by
 ``"strategy_ref" in parameters`` rather than by ``EngineKind`` — at that point
 ``StrategyConfig.engine`` defaulted to ``TRADING_ENGINE`` on *every* strategy,
 fixture included, so it could not yet distinguish "wants the ported engine"
@@ -24,7 +24,7 @@ The straddle_920 port makes ``EngineKind`` the real discriminator, **additively*
 
 * ``EngineKind.TRADING_ENGINE`` (the default) + ``"strategy_ref" in
   parameters`` -> the exact Phase 9 path, byte-for-byte unchanged — this
-  branch is untouched by the change below, so ``ema_cross_9_21_buy.yaml`` and
+  branch is untouched by the change below, so ``c921_ema_cross_buy.yaml`` and
   every other ``trading_engine`` config keep behaving exactly as before
   (pinned by ``tests/unit/test_config_adapter_engine_branch.py``'s existing
   assertions plus a new one asserting the produced ``WorkerConfig`` is
@@ -272,7 +272,7 @@ def _build_engine_worker_config(
     use), except ``strategy_ref`` — already guaranteed present by this
     function's only caller — and ``strategy_kwargs``, which travels through
     verbatim: it is the strategy's own constructor's keyword arguments (e.g.
-    ``ema_fast``/``lots_per_trade``/... for ``ema_cross_9_21_buy``), and this
+    ``ema_fast``/``lots_per_trade``/... for ``c921_ema_cross_buy``), and this
     adapter has no business re-deriving or renaming them.
     """
     strategy_id = strategy.strategy_id

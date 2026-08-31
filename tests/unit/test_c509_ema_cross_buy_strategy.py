@@ -2,14 +2,14 @@
 strategy, a faithful clone of ``EmaCross9x21BuyStrategy`` (Phase 9) with only
 the EMA periods (5/9 instead of 9/21) and identity changed.
 
-Full spec: strategies/intraday_options/ema_cross_5_9_buy/ema_cross_5_9_buy_spec.md.
+Full spec: strategies/intraday_options/c509_ema_cross_buy/c509_ema_cross_buy_spec.md.
 
 These exercise the strategy class directly (no ``TradingEngine``) so the
 fresh-crossover invariant, the premium-exit wiring and per-trade state reset
 can be pinned with exact, hand-verified numbers. Timing, reversal, sizing,
 the daily cap and restart recovery — everything the *engine* owns rather than
 the strategy — are proven end to end in
-``tests/integration/test_ema_cross_5_9_buy_engine.py`` instead.
+``tests/integration/test_c509_ema_cross_buy_engine.py`` instead.
 
 Every EMA-dependent test below uses ``ema_fast=2, ema_slow=3`` (an explicit
 constructor override) rather than the production 5/9 defaults, purely so a
@@ -22,7 +22,7 @@ comparison (``close < previous candle's low``) and a best-close retracement
 can be independently controlled in the same walk. Because the ``ema_fast=2,
 ema_slow=3`` override drives every numeric sequence below (not the 5/9
 production defaults), the sequences themselves are identical to the sibling
-``test_ema_cross_9_21_buy_strategy.py`` suite's -- only the class/id and the
+``test_c921_ema_cross_buy_strategy.py`` suite's -- only the class/id and the
 period-specific assertions differ.
 """
 
@@ -47,7 +47,7 @@ from common.engine.models import (
 from common.engine.strategy import BaseStrategy, available_strategies, get_strategy
 from common.indicators.base import OHLC
 from common.indicators.ema import EMA
-from strategies.intraday_options.ema_cross_5_9_buy.strategy import EmaCross5x9BuyStrategy
+from strategies.intraday_options.c509_ema_cross_buy.strategy import EmaCross5x9BuyStrategy
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -110,9 +110,9 @@ def _close_trade(strategy: EmaCross5x9BuyStrategy, position: OpenPosition, exit_
 
 
 # ------------------------------------------------------------- 1. registration
-def test_strategy_registers_as_ema_cross_5_9_buy():
-    assert "ema_cross_5_9_buy" in available_strategies()
-    assert EmaCross5x9BuyStrategy.name == "ema_cross_5_9_buy"
+def test_strategy_registers_as_c509_ema_cross_buy():
+    assert "c509_ema_cross_buy" in available_strategies()
+    assert EmaCross5x9BuyStrategy.name == "c509_ema_cross_buy"
 
 
 def test_get_strategy_by_name_builds_from_cfg_parameters():
@@ -120,7 +120,7 @@ def test_get_strategy_by_name_builds_from_cfg_parameters():
         def __init__(self) -> None:
             self.parameters = {"lots_per_trade": 5}
 
-    strategy = get_strategy("ema_cross_5_9_buy", _Cfg())
+    strategy = get_strategy("c509_ema_cross_buy", _Cfg())
     assert isinstance(strategy, EmaCross5x9BuyStrategy)
     assert strategy.quantity_lots == 5
     # Defaults still apply for everything not in cfg.parameters.

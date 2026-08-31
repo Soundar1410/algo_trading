@@ -2,19 +2,26 @@
 runtime-group page builds its "Strategy:" dropdown from, rather than each
 page/tab re-deriving its own list.
 
-A strategy must appear here the moment any one of three things is true,
-independent of the other two:
+A strategy must appear here the moment either of two things is true,
+independent of the other:
 
 1. it is present in ``config/strategies/*.yaml`` (configured, whether
    enabled or not) — so a newly configured strategy appears before its
    first trade, and a disabled one never disappears;
-2. it has ever reported a ``runtime_heartbeats`` row for this runtime —
-   catches a strategy that is running but was, for whatever reason, never
-   committed to config the normal way;
-3. it has ever produced ``trade_ledger``/``signals``/``order_intents``/
-   ``positions`` rows for this runtime — so a strategy removed from
-   config after running for a while keeps its historical results
-   reachable, rather than vanishing along with the config file.
+2. it currently has a healthy ``runtime_heartbeats`` row for this runtime
+   — catches a strategy that is running but was, for whatever reason,
+   never committed to config the normal way.
+
+Deliberately **not** a third condition for "ever produced a
+``trade_ledger``/``signals``/``order_intents``/``positions`` row, even
+long after it stopped reporting" — that was tried and reverted (31 August
+2026): a strategy renamed or removed from config stayed selectable forever
+under its old id, labelled "Historical only", which is exactly the clutter
+a rename (see docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md's ema_cross_*
+addendum) leaves behind in this dropdown with no way to clear it from the
+UI. That old id's rows are not deleted and remain fully queryable by
+direct DB access or a saved report — only the *picker* stops offering
+them once nothing configured or running still claims that id.
 
 No side effects: every function here takes an already-open
 ``connect_readonly`` connection (or ``None``, when no database exists yet)
@@ -36,7 +43,6 @@ from .account import _raw_strategy_files
 RUNNING = "Running"
 STOPPED = "Stopped"
 DISABLED = "Disabled"
-HISTORICAL_ONLY = "Historical only"
 
 #: The selectbox sentinel for "no strategy filter" — a real value (not
 #: ``None``) so it survives round-tripping through ``st.session_state``
@@ -45,11 +51,6 @@ ALL_STRATEGIES = "ALL"
 
 _HEALTHY_STATES = {"RUNNING_PAPER", "RUNNING_LIVE", "RUNNING"}
 
-#: Every table a strategy_id might appear in purely historically — no
-#: config entry, no current heartbeat, but real past results. Each must
-#: carry a ``strategy_id`` column and a ``runtime_id`` column.
-_HISTORICAL_TABLES = ("trade_ledger", "signals", "order_intents", "positions")
-
 
 @dataclass(frozen=True)
 class StrategyOption:
@@ -57,7 +58,8 @@ class StrategyOption:
     status_label: str
     #: The most recently known execution mode, if any is known at all —
     #: from a current heartbeat's session first, config second. ``None``
-    #: for a historical-only strategy with neither.
+    #: when neither exists (a healthy-but-unconfigured strategy with no
+    #: recorded session yet).
     execution_mode: str | None
 
 
@@ -93,19 +95,6 @@ def _latest_execution_modes(conn: sqlite3.Connection, runtime_id: str) -> dict[s
     return {row["strategy_id"]: row["execution_mode"] for row in rows}
 
 
-def _historical_strategy_ids(conn: sqlite3.Connection, runtime_id: str) -> set[str]:
-    ids: set[str] = set()
-    for table in _HISTORICAL_TABLES:
-        ids.update(
-            row["strategy_id"]
-            for row in conn.execute(
-                f"SELECT DISTINCT strategy_id FROM {table} WHERE runtime_id = ?",
-                (runtime_id,),
-            )
-        )
-    return ids
-
-
 def discover_strategy_options(
     conn: sqlite3.Connection | None,
     config_root: Path | str | None,
@@ -115,7 +104,7 @@ def discover_strategy_options(
     """Every selectable strategy for one runtime group, status-labelled.
 
     ``conn=None`` means no database exists yet for this runtime (skips (2)
-    and (3) above — nothing to read). ``config_root=None`` skips config-based
+    above — nothing to read). ``config_root=None`` skips config-based
     discovery entirely — appropriate only when there genuinely is no
     ``config/`` tree to read (a bare fixture, an early test). Whenever a real
     ``config_root`` is passed, discovery is filtered to files that declare
@@ -139,22 +128,24 @@ def discover_strategy_options(
 
     heartbeat_states: dict[str, str] = {}
     session_modes: dict[str, str] = {}
-    historical_ids: set[str] = set()
     if conn is not None:
         heartbeat_states = _latest_heartbeat_states(conn, runtime_id)
         session_modes = _latest_execution_modes(conn, runtime_id)
-        historical_ids = _historical_strategy_ids(conn, runtime_id)
 
-    all_ids = set(configured) | set(heartbeat_states) | historical_ids
+    # Every id here is either configured right now or currently reporting a
+    # healthy heartbeat — never merely "left a trace once." A strategy_id
+    # whose only trace is an old heartbeat or old trade-table rows, with
+    # neither a config entry nor a healthy heartbeat today, does not qualify
+    # for either branch below and is correctly absent from the picker (see
+    # the module docstring for why that third condition was removed).
+    running_ids = {sid for sid, state in heartbeat_states.items() if state in _HEALTHY_STATES}
+    all_ids = set(configured) | running_ids
     options = []
     for strategy_id in sorted(all_ids):
-        state = heartbeat_states.get(strategy_id)
-        if state in _HEALTHY_STATES:
+        if strategy_id in running_ids:
             status_label = RUNNING
-        elif strategy_id in configured:
-            status_label = STOPPED if configured[strategy_id] else DISABLED
         else:
-            status_label = HISTORICAL_ONLY
+            status_label = STOPPED if configured[strategy_id] else DISABLED
         options.append(
             StrategyOption(
                 strategy_id=strategy_id,

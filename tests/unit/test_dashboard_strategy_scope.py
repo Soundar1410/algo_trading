@@ -17,7 +17,6 @@ from common.persistence import Database, MigrationRunner
 from dashboards.data.intraday_options import load_closed_trades, load_orders
 from dashboards.data.strategy_scope import (
     DISABLED,
-    HISTORICAL_ONLY,
     RUNNING,
     STOPPED,
     StrategyOption,
@@ -112,11 +111,16 @@ def test_a_disabled_strategy_appears_as_disabled(
     )
 
 
-def test_a_removed_strategy_with_history_remains_selectable(
+def test_a_removed_strategy_with_history_is_no_longer_selectable(
     repository: ExecutionRepository, database_path: Path, tmp_path: Path
 ):
-    """No config file at all — the strategy was removed from config, but
-    it produced real signals in the past, so it must not vanish."""
+    """No config file, no current heartbeat — the strategy was removed
+    (or renamed) out of config and its worker is long since stopped, even
+    though it produced real signals in the past. Deliberately absent from
+    the picker (31 August 2026 — see the module docstring): a "Historical
+    only" entry that never went away was exactly the clutter a strategy
+    rename left behind with no way to clear it from the UI. Its old rows
+    are untouched and still reachable by direct DB query."""
     now = datetime.now(UTC).isoformat()
     session = repository.open_session(
         runtime_id=RUNTIME_ID, strategy_id="retired_strategy", execution_mode=ExecutionMode.PAPER,
@@ -138,10 +142,7 @@ def test_a_removed_strategy_with_history_remains_selectable(
     options = discover_strategy_options(conn, config_root, RUNTIME_ID)
     conn.close()
 
-    assert any(
-        o.strategy_id == "retired_strategy" and o.status_label == HISTORICAL_ONLY
-        for o in options
-    )
+    assert not any(o.strategy_id == "retired_strategy" for o in options)
 
 
 def test_no_database_and_no_config_returns_no_strategies(tmp_path: Path):

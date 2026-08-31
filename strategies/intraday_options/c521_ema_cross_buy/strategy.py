@@ -1,9 +1,12 @@
-"""``ema_cross_9_21_buy`` — NIFTY 5-minute EMA(9)/EMA(21) crossover, ATM weekly
-options, BUY-only, intraday. Phase 9's first real strategy.
+"""``c521_ema_cross_buy`` — NIFTY 5-minute EMA(5)/EMA(21) crossover, ATM weekly
+options, BUY-only, intraday. The third real strategy, a faithful clone of
+``c921_ema_cross_buy`` (Phase 9's first real strategy) with only the fast EMA
+period (5 instead of 9) and identity changed; the slow period (21) is
+unchanged.
 
-Full functional/design spec: ``ema_cross_9_21_buy_spec.md`` in this directory.
-Read that before touching this file — it is the authoritative source of the
-behaviour here, not this docstring.
+Full functional/design spec: ``c521_ema_cross_buy_spec.md`` in this
+directory. Read that before touching this file — it is the authoritative
+source of the behaviour here, not this docstring.
 
 What this file deliberately does **not** implement, because the engine already does
 -------------------------------------------------------------------------------------
@@ -26,7 +29,8 @@ What this file deliberately does **not** implement, because the engine already d
   ``TradingEngine._build_daily_guard``/``_on_option_tick`` already construct
   and drive ``DailyRiskGuard.check_open_mtm()``/``register_trade()`` from
   ``EngineConfig.starting_capital``/``max_daily_loss_percent`` — configuration
-  (see ``config/strategies/ema_cross_9_21_buy.yaml``), not strategy code.
+  (see ``config/strategies/intraday_options/c521_ema_cross_buy.yaml``), not
+  strategy code.
 * **Lot-size/expiry resolution and order quantity.**
   :class:`~common.engine.selection.OptionSelector` plus
   :mod:`common.market_data.scrip_master` already resolve the ATM weekly
@@ -74,13 +78,13 @@ def _pick(explicit: Any, params: dict[str, Any], key: str, default: Any) -> Any:
     return explicit if explicit is not None else params.get(key, default)
 
 
-@register_strategy("ema_cross_9_21_buy")
-class EmaCross9x21BuyStrategy(BaseStrategy):
-    """NIFTY 5m EMA(9)/EMA(21) crossover -> ATM weekly CE/PE, BUY-only."""
+@register_strategy("c521_ema_cross_buy")
+class EmaCross5x21BuyStrategy(BaseStrategy):
+    """NIFTY 5m EMA(5)/EMA(21) crossover -> ATM weekly CE/PE, BUY-only."""
 
-    name = "ema_cross_9_21_buy"
+    name = "c521_ema_cross_buy"
     #: For a UI that wants a human label; not read by the engine.
-    display_name = "EMA Cross (9/21) Buy"
+    display_name = "EMA Cross (5/21) Buy"
 
     def __init__(
         self,
@@ -99,7 +103,7 @@ class EmaCross9x21BuyStrategy(BaseStrategy):
         super().__init__(cfg)
         p = self.params
 
-        fast = int(_pick(ema_fast, p, "ema_fast", 9))
+        fast = int(_pick(ema_fast, p, "ema_fast", 5))
         slow = int(_pick(ema_slow, p, "ema_slow", 21))
         if slow <= fast:
             raise ValueError(f"ema_slow ({slow}) must be greater than ema_fast ({fast})")

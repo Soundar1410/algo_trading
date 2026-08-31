@@ -215,7 +215,7 @@ class BaseStrategy(ABC):
         skipped one) clears its detector instead when it is ``False``,
         letting the detector's own "first observation after a reset is
         context-only" behaviour re-establish context safely from the first
-        live candle. See ``ema_cross_9_21_buy_spec.md`` sections 4.3/4.4/11
+        live candle. See ``c921_ema_cross_buy_spec.md`` sections 4.3/4.4/11
         for the concrete rule this default parameter exists to serve.
 
         Called unconditionally — whether warm-up replayed real history, ran

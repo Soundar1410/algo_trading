@@ -1,6 +1,6 @@
 """``straddle_920`` driven through a real :class:`MultiLegEngine` + ``SimulatedFeed``.
 
-Mirrors ``tests/integration/test_ema_cross_9_21_buy_engine.py``'s structure: a
+Mirrors ``tests/integration/test_c921_ema_cross_buy_engine.py``'s structure: a
 real engine, a real (offline) execution path (``InMemoryGateway``), and a
 deterministic tick tape — no monkeypatching, no real broker/network. Covers the
 acceptance-matrix rows that only a real engine run can prove: entry, partial
