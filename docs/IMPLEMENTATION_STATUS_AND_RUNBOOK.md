@@ -9,7 +9,7 @@ the next phase. Updated after every phase.
 |---|---|
 | **Current phase** | **Phase 10 — Controlled live readiness: CODE HARDENED, fully disabled.** Production parent/worker preflight wiring, Dhan order/update handling, restart-safe account-loss emergency square-off, account-wide reserve-before-submit risk plus live MTM, shared rate limiting, broker-authoritative startup/mode-transition/session-end reconciliation, strict migration history, and restore validation exist and are tested with mocks/fakes only. `c921_ema_cross_buy` (renamed from `ema_cross_9_21_buy` 31 August 2026 — see addendum) and its Rev 3.1 matrix are unchanged. **Every committed live gate remains fail-closed** (`global.live_trading_enabled: false`, `live_execution_allowed: false`, `live_approved: false`, no `mode: live` in `config/`), enforced by `scripts.assert_no_live_config_committed`. No real Dhan order/network call was made. |
 | **Next phase** | Operational evidence and explicit human decisions, not more live-enabling code: complete/review the 30-day paper run for every now-enabled real strategy (`c509_ema_cross_buy`, `c521_ema_cross_buy`, `c921_ema_cross_buy`, `supertrend_buy_1_1p2`, `rolling_strangle_otm1`, `straddle_920` — see the dated addenda for each one's enable decision), choose/configure an approved egress-IP provider and static IP, revalidate authentication operationally, then separately decide whether to approve minimum-quantity live activation. |
-| **Last updated** | 1 September 2026 — two Intraday Options dashboard renames: the entry point `dashboards/app.py` → `dashboards/Home.py` (sidebar now reads "Home" instead of the literal filename `app`) and the "Live Positions" tab → "Open Positions" (pairs with the existing "Closed Trades" tab; avoids overloading "Live"/"Running", both already strategy-health vocabulary elsewhere on the page) — see the two dated addenda near the end of this file. The day before: the `intraday_options` supervisor gained active worker-crash detection, containment and bounded per-worker restart, plus a session-end deadline derived from configured square-off times, closing a real incident (a crashed worker went unnoticed for 6+ hours; see the dated addendum near the end of this file). Earlier the same day: all three real EMA-cross strategies renamed to fix a correlation-ID token collision: `ema_cross_5_9_buy`/`ema_cross_5_21_buy`/`ema_cross_9_21_buy` → `c509_ema_cross_buy`/`c521_ema_cross_buy`/`c921_ema_cross_buy` (see the earlier addendum for root cause and sequencing). All committed live gates remain disabled |
+| **Last updated** | 1 September 2026 — a real UTC-vs-IST entry-gate bug found and fixed live in `straddle_920`/`rolling_strangle_otm1` (both strategies were structurally unable to enter near their intended times; fixed, tested, and confirmed with live entries the same session — see the dated addendum near the end of this file, which also covers a same-session operator mistake and its correction). Earlier the same day: two Intraday Options dashboard renames, `dashboards/app.py` → `dashboards/Home.py` and the "Live Positions" tab → "Open Positions" (see the two dated addenda near the end of this file). The day before: the `intraday_options` supervisor gained active worker-crash detection, containment and bounded per-worker restart, plus a session-end deadline derived from configured square-off times, closing a real incident (a crashed worker went unnoticed for 6+ hours; see the dated addendum near the end of this file). Earlier the same day: all three real EMA-cross strategies renamed to fix a correlation-ID token collision: `ema_cross_5_9_buy`/`ema_cross_5_21_buy`/`ema_cross_9_21_buy` → `c509_ema_cross_buy`/`c521_ema_cross_buy`/`c921_ema_cross_buy` (see the earlier addendum for root cause and sequencing). All committed live gates remain disabled |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
 | **Live order placement** | Code path exists but is deliberately unreachable from committed configuration. Parent and child preflight both fail closed without approved operational inputs; `OPERATIONAL LIVE ACTIVATION ELIGIBLE: NO — BLOCKED`. |
@@ -11653,3 +11653,113 @@ The earlier restart was needed specifically because that change moved the
 argv), which a file watcher can't fix regardless of content; an ordinary
 edit to an already-imported page module is exactly what the watcher exists
 to catch.
+
+### straddle_920 / rolling_strangle_otm1: UTC-vs-IST entry-gate bug, found and fixed live — 1 September 2026
+
+**Symptom**: at 09:22 IST, operator asked why `straddle_920` (the "9:20 Morning
+Straddle") had not entered yet. Investigation (logs, `strategy_baskets`,
+`strategy_legs`) found the basket had been persisted at 09:20:00 IST with
+`entries_consumed=0` — the primary-entry gate had not even fired on its
+first eligible candle.
+
+**Root cause**: `Straddle920Strategy.on_candle` (and, identically,
+`RollingStrangleOtm1Strategy.on_candle`) computed `t = timestamp.time()`
+directly off `tick.exchange_time`, which is **UTC-aware**
+(`common.market_data.dhan.reconstruct_exchange_time` — "Rebuild a full UTC
+timestamp"). `.time()` strips the tzinfo, so `t` was the naive UTC
+clock-time, compared against `parse_hhmm("09:20")` — a naive value meant as
+**IST**. The gate `t < entry_evaluation_time` stayed `True` (blocking
+entry) until the UTC clock itself read 09:20, i.e. **14:50 IST** — matching
+exactly what yesterday's log showed (`straddle_920: entry/replacement
+suppressed — day is blocked` at 14:50:00 IST on 31 August). This is the
+identical class of bug `common.utils.timeutils.local_time_in`'s own
+docstring already documents as a real, previously-fixed incident (Phase 4
+Part 3, `MarketSession`/`SessionSquareOffAuthority`/`SquareOffPolicy`) —
+these two strategies were ported later with a hand-rolled `.time()` call
+that never went through the established fix. Invisible to every existing
+test because every fixture in both test files builds timestamps with
+IST tzinfo (`ZoneInfo("Asia/Kolkata")`), which a bare `.time()` also
+happens to get right — `local_time_in`'s docstring predicts this exactly.
+
+**Fix**: both files' `on_candle` now do `t = local_time_in(timestamp)`
+instead of `t = timestamp.time()` — one-line change each, same helper
+Phase 4 Part 3 already established, no new abstraction. Regression tests
+added that a bare `.time()` cannot pass: `tests/integration/
+test_straddle_920_engine.py::test_0920_entry_still_fires_on_genuinely_utc_ticks`
+and `tests/unit/test_rolling_strangle_otm1_strategy.py::
+test_a_genuinely_utc_tick_at_0945_ist_is_also_eligible`, both using a
+genuinely UTC-tzinfo'd timestamp for the same instant an existing
+IST-tzinfo'd test already covers. Verified both fail against the pre-fix
+code and pass against the fix. Full targeted suite (17 files),
+`ruff check .` and `mypy common strategies runtimes dashboards scripts`
+all clean.
+
+**Self-inflicted incident during the fix, corrected same session**: to get
+the fix live today rather than wait for tomorrow's auto-start, the running
+`straddle_920`/`rolling_strangle_otm1` worker processes were sent
+`SIGTERM`. This was a mistake: each worker's own graceful-shutdown handler
+reacted to the signal by running the engine's normal square-off routine
+(`MultiLegEngine._handle_square_off`), which **unconditionally** sets
+`day_blocked_reason = "hard square-off"` and `lifecycle_state = CLOSED` for
+the day — regardless of whether any leg was ever open. Both baskets had
+zero legs and zero risk exposure at the time (confirmed via `strategy_legs`
+before touching anything), but the day-block is scoped per
+`(strategy_id, execution_mode, trading_date)` and durably re-adopted on any
+restart, so a plain restart would have kept both strategies blocked for
+the rest of the day even with the timezone fix applied — a second, worse
+outage than the one being fixed. Caught before compounding it: today's
+newly-shipped worker-crash detection reported both workers as
+"finished cleanly (exit code 0)... not restarting" rather than crashed,
+which is what surfaced the exit-code-0 path was taken (graceful shutdown),
+prompting a check of `strategy_baskets` before any restart was attempted.
+
+**Correction, with explicit operator sign-off at each step**: (1) directly
+reset the two affected `strategy_baskets` rows for trading_date
+`2026-09-01` back to `lifecycle_state='OPEN'`, `day_blocked_reason=NULL`,
+`square_off_state='PENDING'` — verified safe first (zero rows in
+`strategy_legs`/`positions` for either strategy that day, so no residual
+position ambiguity, the actual reason this invariant normally exists); (2)
+because today's supervisor design deliberately never re-examines a
+worker it has already marked "finished" for the run, the only way to get
+new worker processes for these two was a full `intraday_options` group
+restart — but a *graceful* one would have re-triggered the exact same
+unconditional square-off, this time force-closing `c521_ema_cross_buy`'s
+genuinely open paper position (adopted from an earlier same-day recovery)
+mid-session. Used a **hard `SIGKILL`** of the entire group instead (main
+supervisor + resource tracker + all 4 other live workers), which bypasses
+every process's own shutdown code — nothing gets force-squared-off — then
+relaunched fresh via the same command `orchestration.auto_start` used at
+09:00. Every worker's own crash-recovery path (already proven minutes
+earlier by real, unrelated crashes — see below) brought everything back
+correctly: `c521_ema_cross_buy` re-adopted its open PUT position with no
+duplicate order, the other three engine workers resumed normally, and
+`straddle_920`/`rolling_strangle_otm1` came up with the reset, unblocked
+baskets. Both then took their (late, per spec section 9.2's explicit
+"process starts after the evaluation time" allowance) primary entry on the
+first candle evaluated after restart, confirmed live: `straddle_920` sold
+the 24000 CE/PE straddle at 09:55:01 IST, `rolling_strangle_otm1` sold its
+OTM-1 24050 CE / 23950 PE strangle at the same tick. Verified free process
+locks (`fcntl.flock` non-blocking probe) before relaunching; the new
+supervisor also self-logged "removed a stale PID file... pid not
+verified" for each identity, confirming today's `SIGKILL`-survives
+exit-guarantee work (see the "Supervisor crash-awareness" addendum above)
+held up even under an actual hard kill of the process holding the lock,
+not just the crash scenarios that motivated it.
+
+**Unrelated, found live in the same window**: while the above was in
+progress, `c921_ema_cross_buy` and `c521_ema_cross_buy` independently
+crashed for real (`sqlite3.OperationalError: database is locked` on
+`c921` — the same known, separately-tracked DB-lock class from the
+incident that motivated today's earlier supervisor work; and an uncaught
+`common.engine.gateway.GatewayExecutionError: STALE_QUOTE` on `c521`,
+raised out of `_handle_square_off` → `_close` → `gateway.sell` when a
+square-off fill was attempted against a quote already over the broker's
+2000ms staleness limit — worth a closer look separately, not chased
+further here). Both were detected, alarmed and bounded-restarted
+automatically by today's new `_check_worker_liveness` machinery exactly as
+designed, with `c521` correctly re-adopting its open position on restart —
+real, live, unplanned validation of that feature working correctly on its
+first trading day in production.
+
+Neither `positional_options` nor `common/persistence/database.py`'s
+pragmas were touched by any of the above.

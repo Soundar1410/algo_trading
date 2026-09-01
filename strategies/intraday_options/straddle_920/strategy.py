@@ -48,7 +48,7 @@ from common.engine.multi_leg_models import (
 from common.engine.multi_leg_strategy import BaseMultiLegStrategy, register_multi_leg_strategy
 from common.indicators.base import OHLC
 from common.models import ExitReason, OrderSide, Tick
-from common.utils.timeutils import parse_hhmm
+from common.utils.timeutils import local_time_in, parse_hhmm
 
 
 def _pick(cfg: Any, kwargs: dict[str, Any], key: str, default: Any) -> Any:
@@ -128,7 +128,16 @@ class Straddle920Strategy(BaseMultiLegStrategy):
         basket: Basket,
         vix: float | None,
     ) -> BasketSignal | None:
-        t = timestamp.time()
+        # ``timestamp`` (``tick.exchange_time``) is UTC-aware — every entry/
+        # cutoff threshold below is an IST wall-clock time (parse_hhmm has no
+        # timezone of its own), so this must go through local_time_in, not a
+        # bare ``.time()``. A real captured incident found this the hard way:
+        # a bare ``.time()`` compares e.g. 03:50 UTC against a "09:20" meant
+        # as 09:20 IST, so the entry gate below stayed shut for the entire
+        # trading session and only opened at 14:50 IST (see local_time_in's
+        # own docstring — this is exactly the class of bug Phase 4 Part 3
+        # already fixed elsewhere; this strategy just didn't use the fix).
+        t = local_time_in(timestamp)
 
         # --- Replacement handling (spec section 12.3 steps 5-7) -----------
         # Independent of the primary-entry gate below: this fires on the

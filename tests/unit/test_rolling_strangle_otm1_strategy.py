@@ -14,7 +14,7 @@ this file only exercises what the strategy itself decides.
 from __future__ import annotations
 
 import copy
-from datetime import datetime
+from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
 from common.config.models import ExecutionMode
@@ -149,6 +149,24 @@ def test_exactly_0945_is_eligible() -> None:
     strategy = _strategy()
     basket = _basket()
     signal = strategy.on_candle(_candle(24000.0), _ts(9, 45, 0), basket=basket, vix=None)
+    assert signal is not None
+    assert signal.action is BasketAction.ENTER_BASKET
+
+
+def test_a_genuinely_utc_tick_at_0945_ist_is_also_eligible() -> None:
+    """Regression: a real incident (31 August 2026, straddle_920 — same
+    on_candle pattern here) found on_candle comparing a bare
+    ``timestamp.time()`` (UTC clock-time, since ``tick.exchange_time`` is
+    UTC-aware in production) against thresholds meant as IST wall-clock
+    time. Every other fixture in this file uses ``_ts``, which is
+    IST-tzinfo'd — a bare ``.time()`` also happens to get that right, so
+    none of the tests above could have caught this. This one uses a
+    genuinely UTC-tzinfo'd timestamp for the same instant, the way
+    production actually labels it."""
+    strategy = _strategy()
+    basket = _basket()
+    utc_tick = _ts(9, 45, 0).astimezone(UTC)
+    signal = strategy.on_candle(_candle(24000.0), utc_tick, basket=basket, vix=None)
     assert signal is not None
     assert signal.action is BasketAction.ENTER_BASKET
 

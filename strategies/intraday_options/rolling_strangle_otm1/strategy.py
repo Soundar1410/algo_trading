@@ -73,7 +73,7 @@ from common.engine.multi_leg_models import (
 from common.engine.multi_leg_strategy import BaseMultiLegStrategy, register_multi_leg_strategy
 from common.indicators.base import OHLC
 from common.models import ExitReason, OrderSide, Tick
-from common.utils.timeutils import parse_hhmm
+from common.utils.timeutils import local_time_in, parse_hhmm
 
 #: The two roles this strategy ever opens or rolls. Iterated in a fixed order
 #: everywhere a "for each role" loop needs one, so behaviour never depends on
@@ -256,7 +256,12 @@ class RollingStrangleOtm1Strategy(BaseMultiLegStrategy):
         basket: Basket,
         vix: float | None,
     ) -> BasketSignal | None:
-        t = timestamp.time()
+        # ``timestamp`` (``tick.exchange_time``) is UTC-aware — every entry/
+        # cutoff threshold below is an IST wall-clock time (parse_hhmm has no
+        # timezone of its own), so this must go through local_time_in, not a
+        # bare ``.time()`` (see straddle_920/strategy.py's on_candle for the
+        # real incident this exact bug caused there; identical pattern here).
+        t = local_time_in(timestamp)
 
         # The combined stop (on_leg_tick) already durably blocked the day —
         # no new roll, replacement, or entry may follow it (spec section

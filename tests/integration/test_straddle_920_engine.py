@@ -10,7 +10,7 @@ one-adjustment-per-day, exact risk priority, and hard square-off.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
 from common.config.models import ExecutionMode
@@ -30,6 +30,16 @@ VIX = "INDIA_VIX_IDX"
 
 def _ts(hour: int, minute: int, second: int = 0) -> datetime:
     return datetime(2026, 8, 17, hour, minute, second, tzinfo=IST)  # a Monday
+
+
+def _ts_utc(hour: int, minute: int, second: int = 0) -> datetime:
+    """The same instant as :func:`_ts`, but UTC-tzinfo'd rather than
+    IST-tzinfo'd — what ``DhanMarketFeedAdapter`` actually produces in
+    production (``common.market_data.dhan.reconstruct_exchange_time``).
+    Every other helper/fixture in this file is IST-offset, which is exactly
+    why the bare-``.time()`` regression this proves was invisible to the
+    rest of this suite."""
+    return _ts(hour, minute, second).astimezone(UTC)
 
 
 def _tick(security_id: str, price: float, ts: datetime) -> Tick:
@@ -102,6 +112,33 @@ def test_0920_entry_sells_current_atm_ce_and_pe() -> None:
         _tick(NIFTY, 24000.0, _ts(9, 21)),  # closes the 09:15-09:20 candle -> ENTER_BASKET
         _tick("SIM:NIFTY:WEEKLY:24000:CE", 100.0, _ts(9, 21, 5)),
         _tick("SIM:NIFTY:WEEKLY:24000:PE", 95.0, _ts(9, 21, 10)),
+    ]
+    _run(engine, ticks)
+
+    assert positions.has_position()
+    assert len(positions.positions) == 2
+    open_roles = {p.contract.option_type.value for p in positions.positions}
+    assert open_roles == {"CE", "PE"}
+
+
+def test_0920_entry_still_fires_on_genuinely_utc_ticks() -> None:
+    """Regression: a real incident (31 August 2026) found ``on_candle``
+    comparing a bare ``timestamp.time()`` (UTC clock-time, since
+    ``tick.exchange_time`` is UTC-aware in production) against thresholds
+    meant as IST wall-clock time. The entry gate stayed shut for the entire
+    session and only opened at 14:50 IST — 5:30 late. Every other test in
+    this file uses IST-tzinfo'd ticks (:func:`_ts`), which a bare
+    ``.time()`` also happens to get right, so none of them could have
+    caught this; this one uses genuinely UTC-tzinfo'd ticks (:func:`_ts_utc`)
+    — the same instants as the entry test above, just labelled the way
+    production actually labels them."""
+    engine, positions = _build_engine()
+    ticks = [
+        _tick(NIFTY, 24000.0, _ts_utc(9, 16)),
+        _tick(VIX, 12.0, _ts_utc(9, 16)),
+        _tick(NIFTY, 24000.0, _ts_utc(9, 21)),  # closes the 09:15-09:20 candle -> ENTER_BASKET
+        _tick("SIM:NIFTY:WEEKLY:24000:CE", 100.0, _ts_utc(9, 21, 5)),
+        _tick("SIM:NIFTY:WEEKLY:24000:PE", 95.0, _ts_utc(9, 21, 10)),
     ]
     _run(engine, ticks)
 
