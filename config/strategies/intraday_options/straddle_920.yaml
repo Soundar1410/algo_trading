@@ -35,6 +35,10 @@ live_approved: false
 # consumer of the multi_leg_engine branch. c921_ema_cross_buy.yaml's own
 # `engine: trading_engine` line, and that whole routing path, are untouched.
 engine: multi_leg_engine
+# Descriptive only (common.config.models.StrategyStyle) — the dashboard's
+# Style filter. Never read by the engine/risk path. selling: every leg this
+# strategy opens is OrderSide.SELL (see strategy.py's on_candle).
+style: selling
 
 risk:
   # Spec section 5/9.2/12.3/13.1: new entries and adjustment/replacement

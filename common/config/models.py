@@ -44,6 +44,27 @@ class EngineKind(StrEnum):
     POSITIONAL_MULTI_LEG_ENGINE = "positional_multi_leg_engine"
 
 
+class StrategyStyle(StrEnum):
+    """A strategy's directional bias: does it buy options or sell (write)
+    them. Purely descriptive — read by the dashboard for a "Buying"/
+    "Selling" filter (spec: ported from Trading_Automation's Home page
+    style pills), never by any engine or risk code.
+
+    Deliberately not inferred from :class:`EngineKind`: that enum is an
+    *architecture* discriminator (single-leg vs. basket-of-legs vs.
+    fixed-strike), and every ``EngineKind`` docstring/config comment in
+    this codebase already warns against overloading it for an unrelated
+    question — see e.g. ``config/strategies/intraday_options/
+    c509_ema_cross_buy.yaml``'s "EngineKind alone cannot be the
+    discriminator" comment. A future single-leg strategy could just as
+    well sell a single option, so buying/selling stays its own explicit
+    field, set per strategy, not derived.
+    """
+
+    BUYING = "buying"
+    SELLING = "selling"
+
+
 class _StrictModel(BaseModel):
     """Reject unknown keys everywhere.
 
@@ -368,6 +389,11 @@ class StrategyConfig(_StrictModel):
     #: must set this explicitly (validator below) so the existing 10-lot
     #: paper default can never accidentally become the initial live size.
     live_quantity_lots: int | None = Field(default=None, gt=0)
+    #: Optional, purely descriptive (see :class:`StrategyStyle`). ``None``
+    #: for any strategy that hasn't been tagged yet — the dashboard's Style
+    #: filter treats that the same as "no filter applied", never as a third
+    #: category to show/hide.
+    style: StrategyStyle | None = None
 
     @field_validator("strategy_id")
     @classmethod

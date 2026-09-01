@@ -87,7 +87,7 @@ from dashboards.data.multi_leg import (  # noqa: E402
 from dashboards.data.strategy_scope import (  # noqa: E402
     StrategyOption,
     discover_strategy_options,
-    render_strategy_selector,
+    render_strategy_multiselect,
 )
 from dashboards.formatting import (  # noqa: E402
     MISSING,
@@ -112,6 +112,16 @@ _PRESETS = ("Today", "Last 7 trading days", "Last 30 trading days", "Custom")
 _MODES = ("All", "Paper", "Live")
 _MODE_VALUES = {"All": None, "Paper": "paper", "Live": "live"}
 _SECRET_KEY_PATTERN = re.compile(r"secret|token|password|pin|api[_-]?key", re.IGNORECASE)
+
+#: ``StrategyOption.style`` is a bare ``common.config.models.StrategyStyle``
+#: value ("buying"/"selling") — these are the pills labels shown instead,
+#: matching Trading_Automation's own "Options Buying"/"Options Selling"
+#: wording.
+_STYLE_LABELS = ("Options Buying", "Options Selling")
+_STYLE_VALUES = {"Options Buying": "buying", "Options Selling": "selling"}
+
+_OUTCOMES = ("Winning", "Losing")
+_SEVERITIES = ("INFO", "WARNING", "ERROR", "CRITICAL")
 
 
 def _resolve_date_range(streamlit: Any, key: str, today: date) -> tuple[date, date]:
@@ -439,6 +449,24 @@ def _render_orders(streamlit: Any, rows: tuple[OrderRow, ...]) -> None:
 
 
 # ============================================================= Closed trades
+def _filter_by_outcome(
+    trades: tuple[ClosedTradeRow, ...], outcome: tuple[str, ...]
+) -> tuple[ClosedTradeRow, ...]:
+    """Client-side, like the reference dashboard's own Outcome pills —
+    "winning"/"losing" isn't a stored column, it's ``net_pnl``'s sign, so
+    there's no SQL to push this into. Empty ``outcome`` means no filter."""
+    if not outcome:
+        return trades
+    wanted = set(outcome)
+    keep = []
+    for t in trades:
+        winning = t.net_pnl > 0
+        matches = (winning and "Winning" in wanted) or (not winning and "Losing" in wanted)
+        if matches:
+            keep.append(t)
+    return tuple(keep)
+
+
 def _closed_trades_table(trades: tuple[ClosedTradeRow, ...]) -> list[dict[str, object]]:
     table = []
     for t in trades:
@@ -693,23 +721,23 @@ def _render_signals(
         streamlit.caption("No errors recorded.")
 
 
-def _scope_health_view(view: Any, strategy_id: str | None) -> Any:
-    """Filter a runtime-wide ``SystemHealthView`` down to one strategy's
-    PIDs and incidents. Auth/feed/database sections stay runtime-wide —
-    they are not per-strategy facts, so there is nothing honest to filter
-    them to. ``dataclasses.replace`` only; ``system_health.py`` itself is
-    untouched, so the standalone System Health page keeps showing every
-    strategy."""
-    if strategy_id is None:
+def _scope_health_view(view: Any, strategy_ids: tuple[str, ...]) -> Any:
+    """Filter a runtime-wide ``SystemHealthView`` down to the selected
+    strategies' PIDs and incidents. Auth/feed/database sections stay
+    runtime-wide — they are not per-strategy facts, so there is nothing
+    honest to filter them to. ``dataclasses.replace`` only;
+    ``system_health.py`` itself is untouched, so the standalone System
+    Health page keeps showing every strategy."""
+    if not strategy_ids:
         return view
     return replace(
         view,
-        strategy_pids=tuple(p for p in view.strategy_pids if p.strategy_id == strategy_id),
+        strategy_pids=tuple(p for p in view.strategy_pids if p.strategy_id in strategy_ids),
         active_incidents=tuple(
-            i for i in view.active_incidents if i.strategy_id in (strategy_id, None)
+            i for i in view.active_incidents if i.strategy_id in (*strategy_ids, None)
         ),
         resolved_incidents=tuple(
-            i for i in view.resolved_incidents if i.strategy_id in (strategy_id, None)
+            i for i in view.resolved_incidents if i.strategy_id in (*strategy_ids, None)
         ),
     )
 
@@ -738,12 +766,22 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
         database_path,
         lambda conn: discover_strategy_options(conn, paths.config_root, runtime_id),
     )
-    options: tuple[StrategyOption, ...] = (
+    all_options: tuple[StrategyOption, ...] = (
         () if isinstance(options_result, SnapshotUnavailable) else options_result
     )
-    all_strategy_ids = tuple(o.strategy_id for o in options)
+    all_strategy_ids = tuple(o.strategy_id for o in all_options)
 
-    selected_strategy = render_strategy_selector(st, options, key="io_strategy")
+    style_choice = st.pills(
+        "Style", _STYLE_LABELS, selection_mode="multi", key="io_style_filter"
+    )
+    wanted_styles = {_STYLE_VALUES[s] for s in style_choice} if style_choice else None
+    options = (
+        all_options
+        if wanted_styles is None
+        else tuple(o for o in all_options if o.style in wanted_styles)
+    )
+
+    selected_strategies = render_strategy_multiselect(st, options, key="io_strategy")
 
     tabs = st.tabs(
         [
@@ -762,16 +800,16 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
     with tabs[0]:
 
         @st.fragment(run_every=5)
-        def _overview(strategy_id: str | None = selected_strategy) -> None:
+        def _overview(strategy_ids: tuple[str, ...] = selected_strategies) -> None:
             overview = run_bounded(
                 database_path,
                 lambda conn: load_overview(
-                    conn, runtime_id, trading_date, strategy_id=strategy_id
+                    conn, runtime_id, trading_date, strategy_ids=strategy_ids or None
                 ),
             )
             _render_overview(st, () if isinstance(overview, SnapshotUnavailable) else overview)
-            if strategy_id is not None:
-                _render_config_summary(st, paths.config_root, strategy_id)
+            if len(strategy_ids) == 1:
+                _render_config_summary(st, paths.config_root, strategy_ids[0])
 
         _overview()
 
@@ -780,7 +818,7 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
 
         @st.fragment(run_every=5)
         def _positions(
-            strategy_id: str | None = selected_strategy,
+            strategy_ids: tuple[str, ...] = selected_strategies,
             execution_mode: str | None = positions_mode,
         ) -> None:
             positions = run_bounded(
@@ -789,7 +827,7 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
                     conn,
                     runtime_id,
                     trading_date,
-                    strategy_id=strategy_id,
+                    strategy_ids=strategy_ids or None,
                     execution_mode=execution_mode,
                 ),
             )
@@ -801,10 +839,18 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
     with tabs[2]:
 
         @st.fragment(run_every=5)
-        def _baskets(strategy_id: str | None = selected_strategy) -> None:
-            if strategy_id is None:
+        def _baskets(strategy_ids: tuple[str, ...] = selected_strategies) -> None:
+            if not strategy_ids:
                 st.info("Select a strategy to see its baskets.")
                 return
+            if len(strategy_ids) > 1:
+                st.info(
+                    "Select exactly one strategy to see its baskets — this "
+                    "view shows one strategy's legs/rolls in detail, not a "
+                    "multi-strategy summary."
+                )
+                return
+            strategy_id = strategy_ids[0]
             baskets_result = run_bounded(
                 database_path,
                 lambda conn: load_baskets(
@@ -854,7 +900,8 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
 
         @st.fragment(run_every=5)
         def _orders(
-            strategy_id: str | None = selected_strategy, execution_mode: str | None = orders_mode
+            strategy_ids: tuple[str, ...] = selected_strategies,
+            execution_mode: str | None = orders_mode,
         ) -> None:
             orders = run_bounded(
                 database_path,
@@ -862,7 +909,7 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
                     conn,
                     runtime_id,
                     trading_date,
-                    strategy_id=strategy_id,
+                    strategy_ids=strategy_ids or None,
                     execution_mode=execution_mode,
                 ),
             )
@@ -873,26 +920,31 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
     with tabs[4]:
         start, end = _resolve_date_range(st, "closed_trades", today)
         closed_mode = _resolve_mode(st, "io_closed_mode")
+        closed_outcome = st.pills(
+            "Outcome", _OUTCOMES, selection_mode="multi", key="io_closed_outcome"
+        )
 
         @st.fragment(run_every=30)
         def _closed(
             start: date = start,
             end: date = end,
-            strategy_id: str | None = selected_strategy,
+            strategy_ids: tuple[str, ...] = selected_strategies,
             execution_mode: str | None = closed_mode,
+            outcome: tuple[str, ...] = tuple(closed_outcome or ()),
         ) -> None:
             trades = run_bounded(
                 database_path,
                 lambda conn: load_closed_trades(
                     conn,
                     runtime_id,
-                    strategy_id=strategy_id,
+                    strategy_ids=strategy_ids or None,
                     execution_mode=execution_mode,
                     start_date=start.isoformat(),
                     end_date=end.isoformat(),
                 ),
             )
-            _render_closed_trades(st, () if isinstance(trades, SnapshotUnavailable) else trades)
+            rows = () if isinstance(trades, SnapshotUnavailable) else trades
+            _render_closed_trades(st, _filter_by_outcome(rows, outcome))
 
         _closed()
 
@@ -904,7 +956,7 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
         def _performance(
             start: date = start,
             end: date = end,
-            strategy_id: str | None = selected_strategy,
+            strategy_ids: tuple[str, ...] = selected_strategies,
             execution_mode: str | None = performance_mode,
         ) -> None:
             trades = run_bounded(
@@ -912,13 +964,13 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
                 lambda conn: load_closed_trades(
                     conn,
                     runtime_id,
-                    strategy_id=strategy_id,
+                    strategy_ids=strategy_ids or None,
                     execution_mode=execution_mode,
                     start_date=start.isoformat(),
                     end_date=end.isoformat(),
                 ),
             )
-            scope_ids = (strategy_id,) if strategy_id is not None else all_strategy_ids
+            scope_ids = strategy_ids if strategy_ids else all_strategy_ids
             raw_outcomes = run_bounded(
                 database_path,
                 lambda conn: tuple(
@@ -953,7 +1005,7 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
         start, end = _resolve_date_range(st, "comparison", today)
         compare_key = "io_compare_strategies"
         default_selection = list(all_strategy_ids)
-        status_by_id = {o.strategy_id: o.status_label for o in options}
+        status_by_id = {o.strategy_id: o.status_label for o in all_options}
         compare_choice = st.multiselect(
             "Compare strategies",
             all_strategy_ids,
@@ -968,7 +1020,9 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
             start: date = start,
             end: date = end,
             compare_ids: tuple[str, ...] = compare_ids,
-            active_strategy_id: str | None = selected_strategy,
+            active_strategy_id: str | None = (
+                selected_strategies[0] if len(selected_strategies) == 1 else None
+            ),
         ) -> None:
             if not compare_ids:
                 st.info("Select at least one strategy above to compare.")
@@ -989,29 +1043,42 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
                 () if isinstance(rows, SnapshotUnavailable) else rows,
                 active_strategy_id=active_strategy_id,
             )
-            if clicked is not None and clicked != st.session_state.get("io_strategy"):
-                st.session_state["io_strategy"] = clicked
+            if clicked is not None and st.session_state.get("io_strategy") != [clicked]:
+                st.session_state["io_strategy"] = [clicked]
                 st.rerun()
 
         _comparison()
 
     with tabs[7]:
+        signals_severity = st.pills(
+            "Severity", _SEVERITIES, selection_mode="multi", key="io_signals_severity"
+        )
 
         @st.fragment(run_every=30)
-        def _signals(strategy_id: str | None = selected_strategy) -> None:
+        def _signals(
+            strategy_ids: tuple[str, ...] = selected_strategies,
+            severities: tuple[str, ...] = tuple(signals_severity or ()),
+        ) -> None:
             signals = run_bounded(
                 database_path,
                 lambda conn: load_signals(
-                    conn, runtime_id, trading_date, strategy_id=strategy_id
+                    conn, runtime_id, trading_date, strategy_ids=strategy_ids or None
                 ),
             )
             notifications = run_bounded(
                 database_path,
-                lambda conn: load_notifications(conn, runtime_id, strategy_id=strategy_id),
+                lambda conn: load_notifications(
+                    conn, runtime_id, strategy_ids=strategy_ids or None
+                ),
             )
             errors = run_bounded(
                 database_path,
-                lambda conn: load_errors(conn, runtime_id, strategy_id=strategy_id),
+                lambda conn: load_errors(
+                    conn,
+                    runtime_id,
+                    strategy_ids=strategy_ids or None,
+                    severities=severities or None,
+                ),
             )
             _render_signals(
                 st,
@@ -1025,10 +1092,10 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
     with tabs[8]:
 
         @st.fragment(run_every=5)
-        def _health(strategy_id: str | None = selected_strategy) -> None:
+        def _health(strategy_ids: tuple[str, ...] = selected_strategies) -> None:
             view = health_page.load_system_health(database_path, runtime_id, trading_date)
             if not isinstance(view, SnapshotUnavailable):
-                view = _scope_health_view(view, strategy_id)
+                view = _scope_health_view(view, strategy_ids)
             health_page.render(st, view)
 
         _health()

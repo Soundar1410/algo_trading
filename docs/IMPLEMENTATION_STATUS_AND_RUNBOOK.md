@@ -9,7 +9,7 @@ the next phase. Updated after every phase.
 |---|---|
 | **Current phase** | **Phase 10 — Controlled live readiness: CODE HARDENED, fully disabled.** Production parent/worker preflight wiring, Dhan order/update handling, restart-safe account-loss emergency square-off, account-wide reserve-before-submit risk plus live MTM, shared rate limiting, broker-authoritative startup/mode-transition/session-end reconciliation, strict migration history, and restore validation exist and are tested with mocks/fakes only. `c921_ema_cross_buy` (renamed from `ema_cross_9_21_buy` 31 August 2026 — see addendum) and its Rev 3.1 matrix are unchanged. **Every committed live gate remains fail-closed** (`global.live_trading_enabled: false`, `live_execution_allowed: false`, `live_approved: false`, no `mode: live` in `config/`), enforced by `scripts.assert_no_live_config_committed`. No real Dhan order/network call was made. |
 | **Next phase** | Operational evidence and explicit human decisions, not more live-enabling code: complete/review the 30-day paper run for every now-enabled real strategy (`c509_ema_cross_buy`, `c521_ema_cross_buy`, `c921_ema_cross_buy`, `supertrend_buy_1_1p2`, `rolling_strangle_otm1`, `straddle_920` — see the dated addenda for each one's enable decision), choose/configure an approved egress-IP provider and static IP, revalidate authentication operationally, then separately decide whether to approve minimum-quantity live activation. |
-| **Last updated** | 1 September 2026 — a real UTC-vs-IST entry-gate bug found and fixed live in `straddle_920`/`rolling_strangle_otm1` (both strategies were structurally unable to enter near their intended times; fixed, tested, and confirmed with live entries the same session — see the dated addendum near the end of this file, which also covers a same-session operator mistake and its correction). Earlier the same day: two Intraday Options dashboard renames, `dashboards/app.py` → `dashboards/Home.py` and the "Live Positions" tab → "Open Positions" (see the two dated addenda near the end of this file). The day before: the `intraday_options` supervisor gained active worker-crash detection, containment and bounded per-worker restart, plus a session-end deadline derived from configured square-off times, closing a real incident (a crashed worker went unnoticed for 6+ hours; see the dated addendum near the end of this file). Earlier the same day: all three real EMA-cross strategies renamed to fix a correlation-ID token collision: `ema_cross_5_9_buy`/`ema_cross_5_21_buy`/`ema_cross_9_21_buy` → `c509_ema_cross_buy`/`c521_ema_cross_buy`/`c921_ema_cross_buy` (see the earlier addendum for root cause and sequencing). All committed live gates remain disabled |
+| **Last updated** | 1 September 2026 — five dashboard filters ported from Trading_Automation (Outcome, Severity, an adjustable refresh interval, a multi-select Strategy filter replacing the old exclusive one, and a new Options Buying/Selling Style filter backed by a new `StrategyConfig.style` field) — see the dated addendum near the end of this file. Earlier the same day: a real UTC-vs-IST entry-gate bug found and fixed live in `straddle_920`/`rolling_strangle_otm1` (both strategies were structurally unable to enter near their intended times; fixed, tested, and confirmed with live entries the same session — see the dated addendum, which also covers a same-session operator mistake and its correction). Earlier still the same day: two Intraday Options dashboard renames, `dashboards/app.py` → `dashboards/Home.py` and the "Live Positions" tab → "Open Positions" (see the two dated addenda). The day before: the `intraday_options` supervisor gained active worker-crash detection, containment and bounded per-worker restart, plus a session-end deadline derived from configured square-off times, closing a real incident (a crashed worker went unnoticed for 6+ hours; see the dated addendum). Earlier the same day: all three real EMA-cross strategies renamed to fix a correlation-ID token collision: `ema_cross_5_9_buy`/`ema_cross_5_21_buy`/`ema_cross_9_21_buy` → `c509_ema_cross_buy`/`c521_ema_cross_buy`/`c921_ema_cross_buy` (see the earlier addendum for root cause and sequencing). All committed live gates remain disabled |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
 | **Live order placement** | Code path exists but is deliberately unreachable from committed configuration. Parent and child preflight both fail closed without approved operational inputs; `OPERATIONAL LIVE ACTIVATION ELIGIBLE: NO — BLOCKED`. |
@@ -11763,3 +11763,122 @@ first trading day in production.
 
 Neither `positional_options` nor `common/persistence/database.py`'s
 pragmas were touched by any of the above.
+
+### Intraday Options dashboard: five filters ported from Trading_Automation — 1 September 2026
+
+Operator asked for a review of the `Trading_Automation` dashboard
+(`option_strategies/Trading_Strategies_Automation_v2/framework/dashboard/
+app_pages/`, read-only per this project's own reuse rule) for filters worth
+porting. Six were identified; the sixth ("Exit reason") was dropped before
+any code was written — `trade_ledger` (migration `0008`) has no such
+column, `ClosedTradeRow` has no such field, and the page already hardcodes
+`"—"` with a caption admitting it. Fabricating a value, or building a
+filter with nothing real to filter, was explicitly rejected in favour of
+scoping that as a separate future persistence task if ever wanted.
+
+**1. Outcome filter (Winning/Losing), Closed Trades tab.** Client-side —
+"winning" isn't a stored column, it's `net_pnl`'s sign — via a new
+`_filter_by_outcome` helper, following the reference dashboard's own
+`Net Profit > 0`/`<= 0` convention exactly (a trade at exactly zero counts
+as "Losing").
+
+**2. Severity filter (INFO/WARNING/ERROR/CRITICAL), Signals & Events →
+errors table.** SQL-level, not client-side, and deliberately so:
+`load_errors` already caps at `LIMIT 100`; filtering after that cap could
+crowd a CRITICAL row out of a busy low-severity day's view. The new
+`severities` parameter adds `AND severity IN (...)` *before* `ORDER BY id
+DESC LIMIT ?`, so the cap binds on the filtered set. Proven with a test
+that plants an old CRITICAL row buried under 5 newer INFO rows and confirms
+the unfiltered `limit=3` view loses it while the severity-filtered
+`limit=3` view still finds it
+(`test_load_errors_severities_filters_before_the_limit_is_applied`).
+
+**3. Adjustable refresh interval, Home and System Health pages.** Both
+already had an on/off checkbox at a *fixed* interval (30s / 5s); each
+gained an `st.slider` next to the checkbox, stored in a new session-state
+key, feeding `st.fragment(run_every=...)` in place of the old hardcoded
+number. `dashboards/intraday_options.py`'s own 9 tabs (unconditional
+`run_every=5`/`30`, no toggle at all today) were left untouched —
+out of scope for this batch, a candidate follow-up.
+
+**4. Multi-select Strategy filter, every tab.** The page-wide selector
+changed from `render_strategy_selector` (exclusive: "All Strategies" or
+exactly one) to a new `render_strategy_multiselect` (`dashboards/data/
+strategy_scope.py`) — pick any N strategies at once, empty selection means
+no filter, the same convention Trading_Automation itself uses. Every
+`load_*` function in `dashboards/data/intraday_options.py` (`load_overview`,
+`load_live_positions`, `load_orders`, `load_closed_trades`, `load_signals`,
+`load_notifications`, `load_errors`) gained an additive, keyword-only
+`strategy_ids: tuple[str, ...] | None` parameter alongside the pre-existing
+`strategy_id: str | None` (never removed — still used by any direct
+caller/test that passes it, and takes precedence goes to `strategy_ids`
+when both are given) — a new `_in_clause` helper builds the `IN (?,?,...)`
+SQL, the multi-id counterpart of every loader's existing `= ?` single-value
+filter. `_scope_health_view` (pure Python, no SQL) took the same treatment.
+The Baskets tab — inherently a single-strategy detail view (legs/rolls) —
+now shows "select exactly one strategy" when 0 or 2+ are chosen, rather
+than trying to render N strategies' baskets at once. The Overview tab's
+per-strategy Configuration summary expander shows only when exactly one
+strategy is selected, same reasoning. The Strategy Comparison tab's own,
+separate `compare_ids` multiselect (a different concept — which strategies
+to rank against each other in that one tab) is untouched; its
+`status_by_id` lookup was fixed to read from the *unfiltered* discovery
+result rather than the Style-filtered one (a latent bug the Style filter
+below would otherwise have introduced — a strategy filtered out by Style
+would have shown "Unknown" instead of its real status in that tab). The
+row-click-to-drill-in ("click a row in Strategy Comparison to view that
+strategy in the tabs above") now writes `[clicked]` (a list) into
+`st.session_state["io_strategy"]` instead of a bare string, matching
+`st.multiselect`'s session-state shape.
+
+**5. Style filter (Options Buying / Options Selling).** No such
+classification existed anywhere — not in `config/strategies/*.yaml`, not in
+`StrategyConfig`, and deliberately not inferred from `EngineKind`: that
+enum is documented as an *architecture* discriminator (single-leg vs.
+basket-of-legs), and every `EngineKind` config comment in this codebase
+already warns against overloading it for an unrelated question (see e.g.
+`c509_ema_cross_buy.yaml`'s own "EngineKind alone cannot be the
+discriminator" note). Added a new `StrategyStyle` enum
+(`common.config.models`, `BUYING`/`SELLING`, matching the existing
+`EngineKind`/`ExecutionMode` `StrEnum` convention) and a new optional
+`StrategyConfig.style` field, set explicitly per strategy — `style: buying`
+on `c509_ema_cross_buy`/`c521_ema_cross_buy`/`c921_ema_cross_buy`/
+`supertrend_buy_1_1p2` (each verified against its own `trade_side`
+property: `OrderSide.BUY`, never `SELL`), `style: selling` on
+`straddle_920`/`rolling_strangle_otm1` (each verified: every leg
+constructed with `OrderSide.SELL`, never `BUY`, across both strategy
+files). `skeleton_fixture.yaml` (disabled, non-real) left untagged.
+Threaded into `StrategyOption.style` and `discover_strategy_options()`
+(reads the same raw per-file YAML dict the function already loads for
+`enabled`), then a `st.pills("Style", ...)` filter narrows the strategy
+multiselect's own option list — the natural place for a strategy-level
+(not row-level) attribute, composing with item 4 above rather than
+duplicating it.
+
+**Not touched**: `docs/ALGO_TRADING_FORWARD_TESTING_ARCHITECTURE_FINAL.md`
+(single source of truth per CLAUDE.md), `dashboards/positional_options.py`/
+`dashboards/intraday_stocks.py` (kept their existing single-select —
+positional_options has only one real strategy today, multi-select has no
+value yet; intraday_stocks is a deliberate stub), `common/persistence/
+database.py`, and everything in `positional_options`'s own database.
+
+Verified live against the already-running dashboard (a content-only edit —
+Streamlit's own file watcher hot-reloaded it, no restart needed, unlike the
+`Home.py` rename earlier the same day): Style pills correctly narrowed the
+Strategy multiselect to exactly `rolling_strangle_otm1`/`straddle_920` when
+"Options Selling" was chosen; selecting `straddle_920` and toggling
+Outcome correctly split its two closed trades today (one CE leg losing,
+one PE leg winning) between the "Winning"/"Losing" pills; the refresh-
+interval sliders render and default correctly on both Home (30s) and
+System Health (5s). Targeted tests (`test_dashboard_strategy_scope.py`,
+`test_dashboard_intraday_options_data.py`, `test_dashboard_apptest.py`,
+`test_dashboard.py`, `test_dashboard_home.py`,
+`test_dashboard_positional_and_stocks.py`, `test_config_loader.py`,
+`test_config_models.py`, both real-strategy dashboard integration suites,
+`test_start_dashboard.py`, `test_scripts_are_read_only.py`) all pass —
+including two pre-existing AppTest-based tests
+(`test_strategy_selector_filters_overview_and_survives_an_unrelated_rerun`,
+`test_the_baskets_tab_shows_a_basket_and_its_legs`, plus one in
+`test_rolling_strangle_otm1_dashboard.py`) updated for the selectbox →
+multiselect swap, not weakened. `ruff check .` and
+`mypy common strategies runtimes dashboards scripts` both clean.

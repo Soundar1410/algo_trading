@@ -56,7 +56,7 @@ class FakeStreamlit:
         #: and a test needs to distinguish them.
         self.selectbox_returns: dict[str, object] = {}
         self.multiselect_return: list[object] | None = None
-        self.multiselect_calls: list[tuple[str, list[object]]] = []
+        self.multiselect_calls: list[tuple[str, list[object], dict[str, object]]] = []
         self.selectbox_calls: list[tuple[str, list[object], dict[str, object]]] = []
         #: Set before calling render() to simulate a dataframe row click —
         #: consumed by the next dataframe() call made with on_select set.
@@ -154,7 +154,7 @@ class FakeStreamlit:
         self, label: str, options: object, default: object = None, **kwargs: object
     ) -> list[object]:
         values = self.multiselect_return if self.multiselect_return is not None else default or []
-        self.multiselect_calls.append((label, list(values)))
+        self.multiselect_calls.append((label, list(values), dict(kwargs)))
         return list(values)
 
     def set_page_config(self, **kwargs: object) -> None:

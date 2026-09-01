@@ -61,6 +61,12 @@ class StrategyOption:
     #: when neither exists (a healthy-but-unconfigured strategy with no
     #: recorded session yet).
     execution_mode: str | None
+    #: ``common.config.models.StrategyStyle`` value ("buying"/"selling"),
+    #: read straight from config — ``None`` for an untagged or unconfigured
+    #: (heartbeat-only) strategy. Purely descriptive; the dashboard's Style
+    #: filter treats ``None`` the same as "no filter applied", never a third
+    #: category.
+    style: str | None = None
 
 
 def _latest_heartbeat_states(conn: sqlite3.Connection, runtime_id: str) -> dict[str, str]:
@@ -120,11 +126,15 @@ def discover_strategy_options(
     # layering, matching the same forward-compatible shape every other
     # config-reading function in this package already takes.
     configured: dict[str, bool] = {}
+    style_by_id: dict[str, str] = {}
     if config_root is not None:
         for data in _raw_strategy_files(Path(config_root), runtime_id=runtime_id):
             strategy_id = data.get("strategy_id")
             if isinstance(strategy_id, str):
                 configured[strategy_id] = bool(data.get("enabled", False))
+                style = data.get("style")
+                if isinstance(style, str):
+                    style_by_id[strategy_id] = style
 
     heartbeat_states: dict[str, str] = {}
     session_modes: dict[str, str] = {}
@@ -151,6 +161,7 @@ def discover_strategy_options(
                 strategy_id=strategy_id,
                 status_label=status_label,
                 execution_mode=session_modes.get(strategy_id),
+                style=style_by_id.get(strategy_id),
             )
         )
     return tuple(options)
@@ -189,3 +200,37 @@ def render_strategy_selector(
 
     choice = streamlit.selectbox("Strategy", values, format_func=_label, key=key)
     return None if choice == ALL_STRATEGIES else choice
+
+
+def render_strategy_multiselect(
+    streamlit: Any, options: tuple[StrategyOption, ...], *, key: str
+) -> tuple[str, ...]:
+    """A persistent ``st.multiselect`` over raw strategy ids. Returns the
+    strategies chosen, or an empty tuple for "All Strategies" — the same
+    "nothing picked means no filter" convention every filter added
+    alongside this one in the same pass (Outcome, Severity, Style pills)
+    uses, so a caller never has to special-case this widget differently.
+
+    ``st.session_state[key]`` holds exactly what this function returns, as
+    a ``list`` (Streamlit's own shape for ``multiselect``) — the same key
+    the Strategy Comparison tab's row-click writes ``[clicked]`` into to
+    narrow the page down to one strategy.
+    """
+    if not options:
+        streamlit.multiselect(
+            "Strategy",
+            [],
+            key=key,
+            disabled=True,
+            help="No strategies are configured for this runtime group yet.",
+        )
+        return ()
+
+    status_by_id = {o.strategy_id: o.status_label for o in options}
+    values = [o.strategy_id for o in options]
+
+    def _label(strategy_id: str) -> str:
+        return f"{strategy_id} ({status_by_id[strategy_id]})"
+
+    chosen = streamlit.multiselect("Strategy", values, format_func=_label, key=key)
+    return tuple(chosen)

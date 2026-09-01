@@ -25,6 +25,10 @@ live_approved: false
 # TradingEngine rather than the Phase 1 fixture path — see that module's
 # docstring for why EngineKind alone cannot be the discriminator.
 engine: trading_engine
+# Descriptive only (common.config.models.StrategyStyle) — the dashboard's
+# Style filter. Never read by the engine/risk path. buying: this strategy
+# only ever buys options (see strategy.py's trade_side property).
+style: buying
 
 risk:
   # Session entries allowed 09:15 -> 14:45 (spec section 8). entry_start feeds

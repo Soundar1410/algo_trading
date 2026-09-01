@@ -37,6 +37,10 @@ live_approved: false
 # value, never by a strategy-name branch — see config_adapter.py's own
 # docstring.
 engine: multi_leg_engine
+# Descriptive only (common.config.models.StrategyStyle) — the dashboard's
+# Style filter. Never read by the engine/risk path. selling: every leg this
+# strategy opens is OrderSide.SELL (see strategy.py's on_candle).
+style: selling
 
 risk:
   # Spec sections 5/8/9.4/10.2. The strategy's own primary-entry gate fires

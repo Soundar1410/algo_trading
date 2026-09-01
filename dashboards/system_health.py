@@ -251,14 +251,30 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
 
     if "sh_auto_refresh" not in st.session_state:
         st.session_state["sh_auto_refresh"] = True
+    if "sh_auto_refresh_interval" not in st.session_state:
+        st.session_state["sh_auto_refresh_interval"] = 5
     with st.sidebar:
         st.session_state["sh_auto_refresh"] = st.checkbox(
-            "Auto-refresh (5s)", value=st.session_state["sh_auto_refresh"]
+            "Auto-refresh", value=st.session_state["sh_auto_refresh"]
+        )
+        st.session_state["sh_auto_refresh_interval"] = st.slider(
+            "Refresh interval (s)",
+            5,
+            30,
+            st.session_state["sh_auto_refresh_interval"],
+            step=5,
+            disabled=not st.session_state["sh_auto_refresh"],
         )
         if st.button("Refresh now"):
             st.rerun()
 
-    @st.fragment(run_every=5 if st.session_state["sh_auto_refresh"] else None)
+    @st.fragment(
+        run_every=(
+            st.session_state["sh_auto_refresh_interval"]
+            if st.session_state["sh_auto_refresh"]
+            else None
+        )
+    )
     def _body() -> None:
         render(st, load_system_health(database_path, runtime_id, trading_date))
 

@@ -36,6 +36,7 @@ from .models import (
     RetentionConfig,
     RuntimeConfig,
     StrategyConfig,
+    StrategyStyle,
     effective_live_gate,
 )
 from .paths import ProjectPaths, ProjectRootError, load_paths, resolve_project_root
@@ -62,6 +63,7 @@ __all__ = [
     "RuntimeConfig",
     "Settings",
     "StrategyConfig",
+    "StrategyStyle",
     "apply_env_overrides",
     "deep_merge",
     "discover_enabled_strategies",

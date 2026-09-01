@@ -361,6 +361,72 @@ def test_notifications_and_errors_round_trip(
     assert errors[0].component == "engine"
 
 
+def test_load_errors_strategy_ids_filters_to_the_chosen_strategies_plus_runtime_wide(
+    repository: ExecutionRepository, database_path: Path
+):
+    """``strategy_ids`` (the multi-strategy filter) must behave like
+    ``strategy_id`` already did — a runtime-wide row (``strategy_id IS
+    NULL``) still shows up for a scoped view — but across N ids, not one."""
+    repository.record_error(
+        runtime_id=RUNTIME_ID, strategy_id="st01", execution_mode=ExecutionMode.PAPER,
+        severity="ERROR", component="engine", message="st01 broke",
+    )
+    repository.record_error(
+        runtime_id=RUNTIME_ID, strategy_id="st02", execution_mode=ExecutionMode.PAPER,
+        severity="ERROR", component="engine", message="st02 broke",
+    )
+    repository.record_error(
+        runtime_id=RUNTIME_ID, strategy_id="st03", execution_mode=ExecutionMode.PAPER,
+        severity="ERROR", component="engine", message="st03 broke",
+    )
+    repository.record_error(
+        runtime_id=RUNTIME_ID, strategy_id=None, execution_mode=None,
+        severity="CRITICAL", component="feed", message="runtime-wide",
+    )
+
+    conn = _ro(database_path)
+    scoped = load_errors(conn, RUNTIME_ID, strategy_ids=("st01", "st02"))
+    conn.close()
+
+    assert {e.message for e in scoped} == {"st01 broke", "st02 broke", "runtime-wide"}
+
+
+def test_load_errors_severities_filters_before_the_limit_is_applied(
+    repository: ExecutionRepository, database_path: Path
+):
+    """The cap must apply to the *filtered* set, not the unfiltered one —
+    a CRITICAL row must not be crowded out of a Severity-filtered view by
+    ``limit`` lower-severity rows that don't even match the filter."""
+    # The CRITICAL row is inserted first (lowest id) so it is the *oldest*
+    # row — an unfiltered, id-DESC, limit=3 query must crowd it out with
+    # newer INFO noise, proving the cap really binds before this test can
+    # claim the severity filter rescues it from being crowded out.
+    repository.record_error(
+        runtime_id=RUNTIME_ID, strategy_id=STRATEGY_ID, execution_mode=ExecutionMode.PAPER,
+        severity="CRITICAL", component="engine", message="the one that matters",
+    )
+    for i in range(5):
+        repository.record_error(
+            runtime_id=RUNTIME_ID, strategy_id=STRATEGY_ID, execution_mode=ExecutionMode.PAPER,
+            severity="INFO", component="engine", message=f"noise {i}",
+        )
+
+    conn = _ro(database_path)
+    everyone = load_errors(conn, RUNTIME_ID, limit=3)
+    critical_only = load_errors(conn, RUNTIME_ID, severities=("CRITICAL",), limit=3)
+    conn.close()
+
+    # The unfiltered, limited view is dominated by INFO noise (proves the
+    # cap really is 3 and really is size-limiting, not accidentally a
+    # no-op for this fixture).
+    assert len(everyone) == 3
+    assert all(e.severity == "INFO" for e in everyone)
+    # The severity-filtered view still finds the CRITICAL row despite the
+    # same limit=3, because the filter is applied before LIMIT, not after.
+    assert len(critical_only) == 1
+    assert critical_only[0].message == "the one that matters"
+
+
 # ========================================================= strategy comparison
 def test_capital_base_is_read_from_parameters_block(tmp_path: Path):
     strategies_dir = tmp_path / "strategies"

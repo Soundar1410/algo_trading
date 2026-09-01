@@ -23,6 +23,7 @@ from common.config import (
     RuntimeConfig,
     Settings,
     StrategyConfig,
+    StrategyStyle,
     apply_env_overrides,
     deep_merge,
     discover_enabled_strategies,
@@ -215,6 +216,68 @@ def test_resolved_config_carries_all_three_layers(populated_config: Path):
     assert cfg.strategy.strategy_id == "io_fixture_v1"
     assert cfg.strategy.mode is ExecutionMode.PAPER
     assert cfg.strategy.engine is EngineKind.TRADING_ENGINE
+
+
+# ------------------------------------------------------------------- style
+def test_style_defaults_to_none_when_the_yaml_omits_it(populated_config: Path):
+    """``populated_config``'s fixture strategy sets no ``style:`` key —
+    dashboards/data/strategy_scope.py's Style filter treats that the same
+    as "no filter applied", never a third category."""
+    cfg = load_resolved_config(
+        populated_config, "intraday_options", "io_fixture_v1", settings=Settings()
+    )
+    assert cfg.strategy.style is None
+
+
+@pytest.mark.parametrize(
+    ("yaml_value", "expected"),
+    [("buying", StrategyStyle.BUYING), ("selling", StrategyStyle.SELLING)],
+)
+def test_style_is_loaded_from_yaml(
+    populated_config: Path, yaml_value: str, expected: StrategyStyle
+):
+    _write(
+        populated_config / "strategies" / "io_fixture_v1.yaml",
+        "strategy_id: io_fixture_v1\nruntime_id: intraday_options\n"
+        f"enabled: true\nengine: trading_engine\nstyle: {yaml_value}\n",
+    )
+    cfg = load_resolved_config(
+        populated_config, "intraday_options", "io_fixture_v1", settings=Settings()
+    )
+    assert cfg.strategy.style is expected
+
+
+def test_an_invalid_style_value_is_rejected(populated_config: Path):
+    _write(
+        populated_config / "strategies" / "io_fixture_v1.yaml",
+        "strategy_id: io_fixture_v1\nruntime_id: intraday_options\n"
+        "enabled: true\nengine: trading_engine\nstyle: sideways\n",
+    )
+    with pytest.raises(ConfigError):
+        load_resolved_config(
+            populated_config, "intraday_options", "io_fixture_v1", settings=Settings()
+        )
+
+
+def test_every_real_intraday_options_strategy_declares_its_style():
+    """The six real strategies (1 September 2026 addendum) each set
+    ``style:`` explicitly — never inferred from ``EngineKind`` (see
+    ``common.config.models.StrategyStyle``'s own docstring for why).
+    ``skeleton_fixture`` is deliberately excluded: disabled, non-real."""
+    from common.config.paths import resolve_project_root
+
+    config_root = resolve_project_root() / "config"
+    expected = {
+        "c509_ema_cross_buy": StrategyStyle.BUYING,
+        "c521_ema_cross_buy": StrategyStyle.BUYING,
+        "c921_ema_cross_buy": StrategyStyle.BUYING,
+        "supertrend_buy_1_1p2": StrategyStyle.BUYING,
+        "straddle_920": StrategyStyle.SELLING,
+        "rolling_strangle_otm1": StrategyStyle.SELLING,
+    }
+    for strategy_id, style in expected.items():
+        cfg = load_strategy_config(config_root, strategy_id)
+        assert cfg.style is style, f"{strategy_id}: expected style {style!r}, got {cfg.style!r}"
 
 
 # -------------------------------------------------- strict / invalid config

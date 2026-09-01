@@ -431,7 +431,7 @@ def test_the_baskets_tab_renders_this_strategys_real_roll_history(
     at.run()
     assert list(at.exception) == []
 
-    strategy_box = at.selectbox(key="io_strategy")
+    strategy_box = at.multiselect(key="io_strategy")
     label = next(opt for opt in strategy_box.options if STRATEGY_ID in opt)
     assert "Disabled" in label
     strategy_box.select(label).run()

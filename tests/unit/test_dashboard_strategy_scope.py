@@ -21,6 +21,7 @@ from dashboards.data.strategy_scope import (
     STOPPED,
     StrategyOption,
     discover_strategy_options,
+    render_strategy_multiselect,
     render_strategy_selector,
 )
 
@@ -64,6 +65,42 @@ def test_a_configured_strategy_with_no_trades_appears_as_stopped(
     assert options[0] == StrategyOption(
         strategy_id="brand_new", status_label=STOPPED, execution_mode=None
     )
+
+
+def test_style_is_read_from_config_when_present(
+    repository: ExecutionRepository, database_path: Path, tmp_path: Path
+):
+    config_root = tmp_path / "config"
+    _write(
+        config_root / "strategies" / "seller.yaml",
+        "strategy_id: seller\nruntime_id: intraday_options\n"
+        "enabled: true\nmode: paper\nlive_approved: false\nstyle: selling\n",
+    )
+    conn = _ro(database_path)
+    options = discover_strategy_options(conn, config_root, RUNTIME_ID)
+    conn.close()
+
+    assert options == (
+        StrategyOption(
+            strategy_id="seller", status_label=STOPPED, execution_mode=None, style="selling"
+        ),
+    )
+
+
+def test_style_is_none_when_the_yaml_omits_it(
+    repository: ExecutionRepository, database_path: Path, tmp_path: Path
+):
+    config_root = tmp_path / "config"
+    _write(
+        config_root / "strategies" / "untagged.yaml",
+        "strategy_id: untagged\nruntime_id: intraday_options\n"
+        "enabled: true\nmode: paper\nlive_approved: false\n",
+    )
+    conn = _ro(database_path)
+    options = discover_strategy_options(conn, config_root, RUNTIME_ID)
+    conn.close()
+
+    assert options[0].style is None
 
 
 def test_a_running_strategy_appears_as_running(
@@ -206,6 +243,32 @@ def test_selector_return_value_is_deterministic_across_repeated_calls():
     assert first == second == "st01"
 
 
+# =========================================================== multiselect
+def test_render_strategy_multiselect_returns_empty_tuple_for_no_selection():
+    st = FakeStreamlit()
+    options = (StrategyOption("st01", RUNNING, "paper"),)
+    st.multiselect_return = []
+    result = render_strategy_multiselect(st, options, key="io_strategy")
+    assert result == ()
+
+
+def test_render_strategy_multiselect_returns_every_chosen_strategy_id():
+    st = FakeStreamlit()
+    options = (StrategyOption("st01", RUNNING, "paper"), StrategyOption("st02", STOPPED, None))
+    st.multiselect_return = ["st01", "st02"]
+    result = render_strategy_multiselect(st, options, key="io_strategy")
+    assert result == ("st01", "st02")
+
+
+def test_render_strategy_multiselect_is_disabled_when_no_strategies_exist():
+    st = FakeStreamlit()
+    result = render_strategy_multiselect(st, (), key="io_strategy")
+    assert result == ()
+    _label, values, kwargs = st.multiselect_calls[0]
+    assert values == []
+    assert kwargs.get("disabled") is True
+
+
 # ======================================================= filter composition
 def _seed_two_strategies(repository: ExecutionRepository) -> None:
     """st01 trades paper, st02 trades live — both round trips, same date."""
@@ -286,6 +349,42 @@ def test_selecting_one_strategy_excludes_the_other_from_orders(
     only_st01 = load_orders(conn, RUNTIME_ID, TRADING_DATE, strategy_id="st01")
     conn.close()
     assert only_st01 and {o.strategy_id for o in only_st01} == {"st01"}
+
+
+def test_strategy_ids_selects_both_strategies_at_once_for_closed_trades(
+    repository: ExecutionRepository, database_path: Path
+):
+    """The multi-select filter (``strategy_ids``) must reach the same
+    "both, together" result the "All Strategies" no-filter path already
+    gives — proving the IN-clause path actually runs, not silently
+    falling through to unfiltered."""
+    _seed_two_strategies(repository)
+    conn = _ro(database_path)
+    both = load_closed_trades(
+        conn, RUNTIME_ID, strategy_ids=("st01", "st02"),
+        start_date=TRADING_DATE, end_date=TRADING_DATE,
+    )
+    one_via_ids = load_closed_trades(
+        conn, RUNTIME_ID, strategy_ids=("st01",),
+        start_date=TRADING_DATE, end_date=TRADING_DATE,
+    )
+    conn.close()
+    assert {t.strategy_id for t in both} == {"st01", "st02"}
+    assert {t.strategy_id for t in one_via_ids} == {"st01"}
+
+
+def test_strategy_ids_takes_precedence_over_the_singular_strategy_id(
+    repository: ExecutionRepository, database_path: Path
+):
+    """When both are given, ``strategy_ids`` wins — the shape every loader
+    in this batch follows consistently."""
+    _seed_two_strategies(repository)
+    conn = _ro(database_path)
+    rows = load_orders(
+        conn, RUNTIME_ID, TRADING_DATE, strategy_id="st01", strategy_ids=("st02",)
+    )
+    conn.close()
+    assert rows and {o.strategy_id for o in rows} == {"st02"}
 
 
 def test_strategy_and_mode_filters_compose(repository: ExecutionRepository, database_path: Path):

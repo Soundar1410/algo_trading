@@ -37,6 +37,16 @@ from .calendar_stats import DailyOutcome
 MIN_SAMPLE_SIZE = 5
 
 
+def _in_clause(column: str, values: tuple[str, ...]) -> tuple[str, list[object]]:
+    """Build a ``column IN (?,?,...)`` fragment for a non-empty tuple —
+    the multi-strategy counterpart of every loader's existing ``column = ?``
+    single-value filter below. Callers only invoke this when ``values`` is
+    non-empty; an empty tuple means "no filter", handled by the caller
+    before reaching here, exactly like ``strategy_id is not None`` today."""
+    placeholders = ",".join("?" * len(values))
+    return f"{column} IN ({placeholders})", list(values)
+
+
 # ============================================================== Overview
 @dataclass(frozen=True)
 class LatestError:
@@ -71,16 +81,19 @@ def load_overview(
     trading_date: str,
     *,
     strategy_id: str | None = None,
+    strategy_ids: tuple[str, ...] | None = None,
 ) -> tuple[OverviewRow, ...]:
-    if strategy_id is not None:
+    if strategy_ids:
         # A specific strategy must show up here even if it has never
         # heartbeated (spec: a newly configured strategy is selectable
         # before its first trade) — every per-row query below already
         # degrades to defaults (health_state "STOPPED", no PID, etc.) for
         # exactly this case.
-        strategy_ids = [strategy_id]
+        scoped_ids = list(strategy_ids)
+    elif strategy_id is not None:
+        scoped_ids = [strategy_id]
     else:
-        strategy_ids = [
+        scoped_ids = [
             row["strategy_id"]
             for row in conn.execute(
                 "SELECT DISTINCT strategy_id FROM runtime_heartbeats "
@@ -89,7 +102,7 @@ def load_overview(
             )
         ]
     rows: list[OverviewRow] = []
-    for strategy_id in strategy_ids:
+    for strategy_id in scoped_ids:
         heartbeat = conn.execute(
             """
             SELECT health_state,
@@ -196,6 +209,7 @@ def load_live_positions(
     trading_date: str,
     *,
     strategy_id: str | None = None,
+    strategy_ids: tuple[str, ...] | None = None,
     execution_mode: str | None = None,
 ) -> tuple[LivePositionRow, ...]:
     query = (
@@ -207,7 +221,11 @@ def load_live_positions(
         "WHERE runtime_id = ? AND trading_date = ? AND status = 'OPEN' AND quantity != 0"
     )
     params: list[object] = [runtime_id, trading_date]
-    if strategy_id is not None:
+    if strategy_ids:
+        clause, id_params = _in_clause("strategy_id", strategy_ids)
+        query += f" AND {clause}"
+        params.extend(id_params)
+    elif strategy_id is not None:
         query += " AND strategy_id = ?"
         params.append(strategy_id)
     if execution_mode is not None:
@@ -278,6 +296,7 @@ def load_orders(
     trading_date: str,
     *,
     strategy_id: str | None = None,
+    strategy_ids: tuple[str, ...] | None = None,
     execution_mode: str | None = None,
 ) -> tuple[OrderRow, ...]:
     query = (
@@ -290,7 +309,11 @@ def load_orders(
         "WHERE oi.runtime_id = ? AND oi.trading_date = ?"
     )
     params: list[object] = [runtime_id, trading_date]
-    if strategy_id is not None:
+    if strategy_ids:
+        clause, id_params = _in_clause("oi.strategy_id", strategy_ids)
+        query += f" AND {clause}"
+        params.extend(id_params)
+    elif strategy_id is not None:
         query += " AND oi.strategy_id = ?"
         params.append(strategy_id)
     if execution_mode is not None:
@@ -375,6 +398,7 @@ def load_closed_trades(
     runtime_id: str,
     *,
     strategy_id: str | None = None,
+    strategy_ids: tuple[str, ...] | None = None,
     execution_mode: str | None = None,
     start_date: str,
     end_date: str,
@@ -396,7 +420,11 @@ def load_closed_trades(
         "WHERE runtime_id = ? AND trading_date BETWEEN ? AND ?"
     )
     params: list[object] = [runtime_id, start_date, end_date]
-    if strategy_id is not None:
+    if strategy_ids:
+        clause, id_params = _in_clause("strategy_id", strategy_ids)
+        query += f" AND {clause}"
+        params.extend(id_params)
+    elif strategy_id is not None:
         query += " AND strategy_id = ?"
         params.append(strategy_id)
     if execution_mode is not None:
@@ -526,6 +554,7 @@ def load_signals(
     trading_date: str,
     *,
     strategy_id: str | None = None,
+    strategy_ids: tuple[str, ...] | None = None,
     limit: int = 200,
 ) -> tuple[SignalRow, ...]:
     query = (
@@ -538,7 +567,11 @@ def load_signals(
         "WHERE s.runtime_id = ? AND s.trading_date = ?"
     )
     params: list[object] = [runtime_id, trading_date]
-    if strategy_id is not None:
+    if strategy_ids:
+        clause, id_params = _in_clause("s.strategy_id", strategy_ids)
+        query += f" AND {clause}"
+        params.extend(id_params)
+    elif strategy_id is not None:
         query += " AND s.strategy_id = ?"
         params.append(strategy_id)
     query += " ORDER BY s.evaluated_at DESC LIMIT ?"
@@ -582,6 +615,7 @@ def load_notifications(
     runtime_id: str,
     *,
     strategy_id: str | None = None,
+    strategy_ids: tuple[str, ...] | None = None,
     limit: int = 100,
 ) -> tuple[NotificationRow, ...]:
     query = (
@@ -589,9 +623,13 @@ def load_notifications(
         "failure_reason, created_at FROM notifications WHERE runtime_id = ?"
     )
     params: list[object] = [runtime_id]
-    if strategy_id is not None:
+    if strategy_ids:
         # A strategy-scoped view must not hide runtime-wide notifications
         # (strategy_id IS NULL) that affect it too.
+        clause, id_params = _in_clause("strategy_id", strategy_ids)
+        query += f" AND ({clause} OR strategy_id IS NULL)"
+        params.extend(id_params)
+    elif strategy_id is not None:
         query += " AND (strategy_id = ? OR strategy_id IS NULL)"
         params.append(strategy_id)
     query += " ORDER BY id DESC LIMIT ?"
@@ -627,6 +665,8 @@ def load_errors(
     runtime_id: str,
     *,
     strategy_id: str | None = None,
+    strategy_ids: tuple[str, ...] | None = None,
+    severities: tuple[str, ...] | None = None,
     limit: int = 100,
 ) -> tuple[EventErrorRow, ...]:
     query = (
@@ -634,11 +674,23 @@ def load_errors(
         "FROM errors WHERE runtime_id = ?"
     )
     params: list[object] = [runtime_id]
-    if strategy_id is not None:
+    if strategy_ids:
         # Same rule as notifications: a strategy-scoped view still shows
         # runtime-wide errors (feed/database/broker) that affect it.
+        clause, id_params = _in_clause("strategy_id", strategy_ids)
+        query += f" AND ({clause} OR strategy_id IS NULL)"
+        params.extend(id_params)
+    elif strategy_id is not None:
         query += " AND (strategy_id = ? OR strategy_id IS NULL)"
         params.append(strategy_id)
+    if severities:
+        # Filtered before LIMIT (not client-side after) so the cap applies
+        # to the matching set, not to the most recent 100 rows regardless
+        # of severity — a busy low-severity day must not crowd a CRITICAL
+        # row out of a filtered view.
+        clause, sev_params = _in_clause("severity", severities)
+        query += f" AND {clause}"
+        params.extend(sev_params)
     query += " ORDER BY id DESC LIMIT ?"
     params.append(limit)
     rows = conn.execute(query, params).fetchall()

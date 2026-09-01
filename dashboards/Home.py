@@ -557,10 +557,19 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
 
     if "auto_refresh" not in st.session_state:
         st.session_state["auto_refresh"] = True
+    if "auto_refresh_interval" not in st.session_state:
+        st.session_state["auto_refresh_interval"] = 30
 
     with st.sidebar:
         st.session_state["auto_refresh"] = st.checkbox(
-            "Auto-refresh (30s)", value=st.session_state["auto_refresh"]
+            "Auto-refresh", value=st.session_state["auto_refresh"]
+        )
+        st.session_state["auto_refresh_interval"] = st.slider(
+            "Refresh interval (s)",
+            5,
+            60,
+            st.session_state["auto_refresh_interval"],
+            disabled=not st.session_state["auto_refresh"],
         )
         if st.button("Refresh now"):
             st.rerun()
@@ -568,7 +577,11 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
     paths = load_paths()
     trading_date = date.today().isoformat()
 
-    @st.fragment(run_every=30 if st.session_state["auto_refresh"] else None)
+    @st.fragment(
+        run_every=(
+            st.session_state["auto_refresh_interval"] if st.session_state["auto_refresh"] else None
+        )
+    )
     def _body() -> None:
         view = load_home(
             config_root=paths.config_root,

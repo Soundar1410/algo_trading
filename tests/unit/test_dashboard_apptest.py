@@ -152,11 +152,10 @@ def test_strategy_selector_filters_overview_and_survives_an_unrelated_rerun(
     at.run()
     assert list(at.exception) == []
 
-    strategy_box = at.selectbox(key="io_strategy")
+    strategy_box = at.multiselect(key="io_strategy")
     option_labels = list(strategy_box.options)
     assert any("alpha_strategy" in label for label in option_labels)
     assert any("beta_strategy" in label for label in option_labels)
-    assert "All Strategies" in option_labels
 
     # Select one strategy — Overview must now show only that strategy.
     alpha_label = next(label for label in option_labels if "alpha_strategy" in label)
@@ -170,7 +169,7 @@ def test_strategy_selector_filters_overview_and_survives_an_unrelated_rerun(
     # confirm the strategy selection was not reset by it.
     at.selectbox(key="io_orders_mode").select("Paper").run()
     assert list(at.exception) == []
-    assert at.selectbox(key="io_strategy").value == "alpha_strategy"
+    assert at.multiselect(key="io_strategy").value == ["alpha_strategy"]
 
 
 def test_strategy_comparison_multiselect_defaults_to_every_strategy(
@@ -391,7 +390,7 @@ def test_the_baskets_tab_shows_a_basket_and_its_legs(
     at.run()
     assert list(at.exception) == []
 
-    strategy_box = at.selectbox(key="io_strategy")
+    strategy_box = at.multiselect(key="io_strategy")
     label = next(opt for opt in strategy_box.options if "straddle_920" in opt)
     strategy_box.select(label).run()
     assert list(at.exception) == []
@@ -401,3 +400,68 @@ def test_the_baskets_tab_shows_a_basket_and_its_legs(
     assert tables, "the Baskets tab rendered no leg table for a real basket/leg fixture"
     rendered_roles = {row["Role"] for table in tables for row in table.value.to_dict("records")}
     assert rendered_roles == {"CE", "PE"}
+
+
+# ==================================================== pure filter helpers
+# _filter_by_outcome/_scope_health_view are new/changed for the 1 September
+# 2026 filter batch and have no coverage anywhere else (unlike the Mode
+# filter, whose logic is proven at the load_*() level, not as a private
+# helper) — worth a direct, isolated check rather than trusting the wiring
+# alone.
+def test_filter_by_outcome_splits_on_net_pnl_sign():
+    from dashboards.data.intraday_options import ClosedTradeRow
+    from dashboards.intraday_options import _filter_by_outcome
+
+    def _trade(net_pnl: float) -> ClosedTradeRow:
+        return ClosedTradeRow(
+            strategy_id="st01", execution_mode="paper", instrument="NIFTY",
+            security_id="13", trading_date="2026-09-01", side="BUY", quantity=50,
+            entry_price=100.0, exit_price=110.0, points=10.0, gross_pnl=net_pnl,
+            charges=0.0, net_pnl=net_pnl, entry_time="2026-09-01T09:20:00", exit_time=None,
+        )
+
+    winner, loser, breakeven = _trade(500.0), _trade(-500.0), _trade(0.0)
+    trades = (winner, loser, breakeven)
+
+    assert _filter_by_outcome(trades, ()) == trades  # no filter selected
+    assert _filter_by_outcome(trades, ("Winning",)) == (winner,)
+    # exactly 0 counts as "Losing", matching Trading_Automation's own
+    # ``Net Profit <= 0`` convention this filter was ported from.
+    assert _filter_by_outcome(trades, ("Losing",)) == (loser, breakeven)
+    assert _filter_by_outcome(trades, ("Winning", "Losing")) == trades
+
+
+def test_scope_health_view_filters_pids_and_incidents_to_the_given_ids():
+    from dataclasses import dataclass
+
+    from dashboards.intraday_options import _scope_health_view
+
+    @dataclass(frozen=True)
+    class _Pid:
+        strategy_id: str
+
+    @dataclass(frozen=True)
+    class _Incident:
+        strategy_id: str | None
+
+    @dataclass(frozen=True)
+    class _View:
+        strategy_pids: tuple[_Pid, ...]
+        active_incidents: tuple[_Incident, ...]
+        resolved_incidents: tuple[_Incident, ...]
+
+    view = _View(
+        strategy_pids=(_Pid("st01"), _Pid("st02"), _Pid("st03")),
+        active_incidents=(_Incident("st01"), _Incident("st03"), _Incident(None)),
+        resolved_incidents=(_Incident("st02"), _Incident(None)),
+    )
+
+    unscoped = _scope_health_view(view, ())
+    assert unscoped is view  # empty selection = no filter, same object back
+
+    scoped = _scope_health_view(view, ("st01", "st02"))
+    assert {p.strategy_id for p in scoped.strategy_pids} == {"st01", "st02"}
+    # A runtime-wide incident (strategy_id=None) survives scoping to any
+    # selection — same rule the loaders' own "runtime-wide" clauses use.
+    assert {i.strategy_id for i in scoped.active_incidents} == {"st01", None}
+    assert {i.strategy_id for i in scoped.resolved_incidents} == {"st02", None}
