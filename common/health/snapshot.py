@@ -19,7 +19,7 @@ connection and never opens one of its own, so the caller decides whether that
 connection is :func:`common.persistence.connect_readonly` (the dashboard,
 scripts/status) or a write connection already open for another reason (a
 supervisor diagnosing itself). Nothing here hardcodes a database path, for the
-same reason :mod:`dashboards.app` doesn't: the caller owns connection
+same reason :mod:`dashboards.Home` doesn't: the caller owns connection
 lifetime.
 
 **Broker health is derived, not polled.** There is no live broker connection

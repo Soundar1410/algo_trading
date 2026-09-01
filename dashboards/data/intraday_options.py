@@ -868,7 +868,7 @@ def build_strategy_comparison(
 def load_strategy_config_raw(config_root: object, strategy_id: str) -> dict[str, object] | None:
     """The raw, unvalidated ``config/strategies/**/<id>.yaml`` mapping, or
     ``None`` if it does not exist, does not parse, or is ambiguous — a
-    config-only read, same exception class as ``dashboards/app.py``'s
+    config-only read, same exception class as ``dashboards/Home.py``'s
     live-gate read. Shared by :func:`load_capital_base`,
     :func:`build_strategy_comparison` (each strategy's own declared mode) and
     the Overview tab's "Configuration summary" section, so the file is parsed

@@ -22,7 +22,7 @@ supplied (``main()`` always supplies both, from
 this package — no restructuring, only what
 :func:`~dashboards.data.strategy_scope.discover_strategy_options` promised.
 
-Read-only/no-side-effect discipline is identical to ``dashboards/app.py`` —
+Read-only/no-side-effect discipline is identical to ``dashboards/Home.py`` —
 see that module's docstring.
 """
 

@@ -11,7 +11,7 @@ package: every database read goes through
 :func:`~common.persistence.database.connect_readonly`; the one deliberate
 exception is config (``load_global_config``/``load_runtime_config``/
 ``discover_enabled_strategies``/``effective_live_gate``), which opens no
-database, no broker, no feed — see ``dashboards/app.py``'s module docstring
+database, no broker, no feed — see ``dashboards/Home.py``'s module docstring
 for the full argument, unchanged here.
 """
 
@@ -443,7 +443,7 @@ def load_live_gate_matrix(
 
 
 # ==================================================================== render
-#: Shared by ``dashboards/app.py`` and ``dashboards/system_health.py`` so the
+#: Shared by ``dashboards/Home.py`` and ``dashboards/system_health.py`` so the
 #: account-wide section renders identically wherever it appears. Takes the
 #: streamlit module as a duck-typed parameter (no import here) — the same
 #: testability convention every ``render()`` in this package follows.

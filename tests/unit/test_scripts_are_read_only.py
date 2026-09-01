@@ -58,7 +58,7 @@ SCRIPTS = REPO_ROOT / "scripts"
 #: ``__init__.py`` (Phase 10, added only so ``import scripts.auth_bootstrap``
 #: below resolves to one unambiguous module under mypy's ``packages`` config
 #: instead of colliding with the same file's bare-name inference — see
-#: ``dashboards/app.py``'s own ``__init__.py`` for the identical fix) carries
+#: ``dashboards/Home.py``'s own ``__init__.py`` for the identical fix) carries
 #: no script logic of its own and is excluded here the same way
 #: ``dashboards``'s own directory-contents test excludes it.
 SCRIPT_FILES = sorted(p for p in SCRIPTS.glob("*.py") if p.name != "__init__.py")

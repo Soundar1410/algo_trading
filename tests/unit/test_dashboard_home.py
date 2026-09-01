@@ -1,4 +1,4 @@
-"""``dashboards/app.py`` (Home): market status, multi-runtime aggregation,
+"""``dashboards/Home.py``: market status, multi-runtime aggregation,
 category cards, and paper/live P&L separation.
 """
 
@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 from _dashboard_fakes import FakeStreamlit
 
-import dashboards.app as home_page
+import dashboards.Home as home_page
 from common.config.models import ExecutionMode
 from common.execution import ExecutionRepository
 from common.persistence import Database, MigrationRunner

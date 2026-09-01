@@ -86,7 +86,7 @@ def _fake_project_root(tmp_path: Path) -> Path:
     streamlit_bin = tmp_path / ".venv" / "bin" / "streamlit"
     streamlit_bin.parent.mkdir(parents=True, exist_ok=True)
     streamlit_bin.write_text("#!/bin/sh\n", encoding="utf-8")
-    app = tmp_path / "dashboards" / "app.py"
+    app = tmp_path / "dashboards" / "Home.py"
     app.parent.mkdir(parents=True, exist_ok=True)
     app.write_text("", encoding="utf-8")
     return tmp_path

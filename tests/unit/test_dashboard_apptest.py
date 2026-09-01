@@ -200,7 +200,7 @@ def _row_count(database_path: Path, table: str) -> int:
 
 
 def test_home_loads_with_no_exception_and_shows_three_category_links(project_root: Path):
-    at = AppTest.from_file(str(DASHBOARDS_DIR / "app.py"), default_timeout=30)
+    at = AppTest.from_file(str(DASHBOARDS_DIR / "Home.py"), default_timeout=30)
     at.run()
 
     assert list(at.exception) == []
@@ -220,7 +220,7 @@ def test_intraday_options_page_loads_and_every_tab_is_present(project_root: Path
     tab_labels = [t.label for t in at.tabs]
     assert tab_labels == [
         "Overview",
-        "Live Positions",
+        "Open Positions",
         "Baskets",
         "Orders & Fills",
         "Closed Trades",
@@ -248,7 +248,7 @@ def test_not_implemented_pages_load_with_no_exception(project_root: Path, page: 
 @pytest.mark.parametrize(
     "page",
     [
-        "app.py",
+        "Home.py",
         "intraday_options.py",
         "system_health.py",
         "positional_options.py",

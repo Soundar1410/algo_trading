@@ -101,7 +101,7 @@ common/          config, logging, persistence, models, market_data, candles,
                  authentication
 strategies/      intraday_options/  (test-only fixture; real strategies: Phase 9)
 runtimes/        intraday_options/  supervisor + spawn-safe worker
-dashboards/      app.py — one read-only tile
+dashboards/      Home.py — one read-only tile
 scripts/         auth_bootstrap.py, capture_live_tape.py (read-only)
 config/          global.yaml, runtimes/, strategies/
 data/operational/  one SQLite database per runtime group (gitignored)

@@ -15,7 +15,7 @@ this page uses. Whether the matching ``.lock`` file is actually held is
 filesystem state (``common.process.locks``), a different read path this
 page does not open — process/lock reconciliation is a later phase's job.
 
-Read-only/no-side-effect discipline is identical to ``dashboards/app.py`` —
+Read-only/no-side-effect discipline is identical to ``dashboards/Home.py`` —
 see that module's docstring.
 """
 

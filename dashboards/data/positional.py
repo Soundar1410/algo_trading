@@ -23,7 +23,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 
-#: The Home page's category-tile message (``dashboards/app.py``) for when no
+#: The Home page's category-tile message (``dashboards/Home.py``) for when no
 #: strategy is enabled under this runtime group at all — distinct from, but
 #: worded consistently with, ``dashboards.positional_options.NOT_CONFIGURED``
 #: (the page-internal per-tab message), which imports this same string

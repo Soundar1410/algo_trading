@@ -1,6 +1,6 @@
 """Read-only Streamlit dashboard — Home command centre.
 
-``streamlit run dashboards/app.py`` is this platform's one entry point; the
+``streamlit run dashboards/Home.py`` is this platform's one entry point; the
 other four pages (``dashboards/pages/``) are Streamlit's native multipage
 convention, auto-discovered from this script's directory. Home is a compact
 command centre (spec: total strategies, running/stopped/degraded/disabled
@@ -49,7 +49,7 @@ from typing import Any
 from common.config import ConfigError, Settings, load_runtime_config, load_settings
 from common.utils.timeutils import DEFAULT_TZ, get_tz
 
-# ``streamlit run dashboards/app.py`` executes this file directly as
+# ``streamlit run dashboards/Home.py`` executes this file directly as
 # ``__main__`` — see the original module's long-standing note (now here)
 # on why the sys.path fix-up below is required before any ``dashboards.*``
 # import, and is a no-op when this module is imported normally as a package
@@ -96,7 +96,7 @@ _IST = get_tz(DEFAULT_TZ)
 
 #: (category label, runtime_id, page path for st.page_link, not-configured message)
 #: ``st.page_link`` resolves its path relative to the entrypoint script's
-#: own directory (``dashboards/``, since ``streamlit run dashboards/app.py``
+#: own directory (``dashboards/``, since ``streamlit run dashboards/Home.py``
 #: is the entrypoint) — *not* relative to the repository root. Getting this
 #: wrong raises ``StreamlitPageNotFoundError`` at render time; only an
 #: AppTest-driven smoke test catches it, since every other test in this

@@ -8,8 +8,8 @@ the next phase. Updated after every phase.
 | | |
 |---|---|
 | **Current phase** | **Phase 10 — Controlled live readiness: CODE HARDENED, fully disabled.** Production parent/worker preflight wiring, Dhan order/update handling, restart-safe account-loss emergency square-off, account-wide reserve-before-submit risk plus live MTM, shared rate limiting, broker-authoritative startup/mode-transition/session-end reconciliation, strict migration history, and restore validation exist and are tested with mocks/fakes only. `c921_ema_cross_buy` (renamed from `ema_cross_9_21_buy` 31 August 2026 — see addendum) and its Rev 3.1 matrix are unchanged. **Every committed live gate remains fail-closed** (`global.live_trading_enabled: false`, `live_execution_allowed: false`, `live_approved: false`, no `mode: live` in `config/`), enforced by `scripts.assert_no_live_config_committed`. No real Dhan order/network call was made. |
-| **Next phase** | Operational evidence and explicit human decisions, not more live-enabling code: complete/review the 30-day paper run, run the second and third real strategies (`c509_ema_cross_buy` and `c521_ema_cross_buy`, both built — see the 27 and 29 August 2026 addenda for their original build record under their pre-rename ids — but both shipped `enabled: false`) through their own paper evaluation periods, choose/configure an approved egress-IP provider and static IP, revalidate authentication operationally, then separately decide whether to approve minimum-quantity live activation. |
-| **Last updated** | 31 August 2026 — the `intraday_options` supervisor gained active worker-crash detection, containment and bounded per-worker restart, plus a session-end deadline derived from configured square-off times, closing a real incident (a crashed worker went unnoticed for 6+ hours; see the dated addendum near the end of this file). Earlier the same day: all three real EMA-cross strategies renamed to fix a correlation-ID token collision: `ema_cross_5_9_buy`/`ema_cross_5_21_buy`/`ema_cross_9_21_buy` → `c509_ema_cross_buy`/`c521_ema_cross_buy`/`c921_ema_cross_buy` (see the earlier addendum for root cause and sequencing). All committed live gates remain disabled |
+| **Next phase** | Operational evidence and explicit human decisions, not more live-enabling code: complete/review the 30-day paper run for every now-enabled real strategy (`c509_ema_cross_buy`, `c521_ema_cross_buy`, `c921_ema_cross_buy`, `supertrend_buy_1_1p2`, `rolling_strangle_otm1`, `straddle_920` — see the dated addenda for each one's enable decision), choose/configure an approved egress-IP provider and static IP, revalidate authentication operationally, then separately decide whether to approve minimum-quantity live activation. |
+| **Last updated** | 1 September 2026 — two Intraday Options dashboard renames: the entry point `dashboards/app.py` → `dashboards/Home.py` (sidebar now reads "Home" instead of the literal filename `app`) and the "Live Positions" tab → "Open Positions" (pairs with the existing "Closed Trades" tab; avoids overloading "Live"/"Running", both already strategy-health vocabulary elsewhere on the page) — see the two dated addenda near the end of this file. The day before: the `intraday_options` supervisor gained active worker-crash detection, containment and bounded per-worker restart, plus a session-end deadline derived from configured square-off times, closing a real incident (a crashed worker went unnoticed for 6+ hours; see the dated addendum near the end of this file). Earlier the same day: all three real EMA-cross strategies renamed to fix a correlation-ID token collision: `ema_cross_5_9_buy`/`ema_cross_5_21_buy`/`ema_cross_9_21_buy` → `c509_ema_cross_buy`/`c521_ema_cross_buy`/`c921_ema_cross_buy` (see the earlier addendum for root cause and sequencing). All committed live gates remain disabled |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
 | **Live order placement** | Code path exists but is deliberately unreachable from committed configuration. Parent and child preflight both fail closed without approved operational inputs; `OPERATIONAL LIVE ACTIVATION ELIGIBLE: NO — BLOCKED`. |
@@ -11546,3 +11546,110 @@ this change touches. `ruff check .` and `mypy common strategies runtimes
 dashboards scripts` both clean. `common/persistence/database.py`'s pragmas
 confirmed unchanged (`DEFAULT_BUSY_TIMEOUT_MS == 5000`,
 `Database.journal_mode() == "wal"`).
+
+### Dashboard entry point renamed app.py → Home.py — 1 September 2026
+
+Cosmetic-only: the sidebar nav for the dashboard's main page showed the
+literal filename `app` (Streamlit's legacy `pages/`-directory multipage
+convention title-cases and de-numbers every *sub*page's label — hence
+"Intraday Options", "Positional Options", etc. — but leaves the main
+entrypoint script's label as its bare filename stem, unmodified). The page
+itself already called this "Home" throughout its own docstrings and
+comments (`"""Read-only Streamlit dashboard — Home command centre."""`,
+`dashboards/data/positional.py`'s `"The Home page's category-tile
+message"`, `tests/unit/test_dashboard_home.py`'s `home_page` import alias)
+— the display label was the one place that still said `app`.
+
+Renamed via `git mv dashboards/app.py dashboards/Home.py`. Ruff's
+pep8-naming rule (`N`, which would flag a non-lowercase module filename) is
+not in this project's `select` list, so this is not a lint violation.
+
+Updated alongside the rename: `scripts/start_dashboard.py`'s `app_path`
+(the file the `streamlit run` subprocess is pointed at — the dashboard's
+one LaunchAgent-owned entry point, unrelated to `orchestration.auto_start`,
+which deliberately never starts it); every forward-pointing docstring
+cross-reference to `dashboards/app.py` across `dashboards/system_health.py`,
+`dashboards/intraday_options.py`, `dashboards/positional_options.py`,
+`dashboards/data/positional.py`, `dashboards/data/intraday_options.py`,
+`dashboards/data/account.py`, `common/health/snapshot.py`; the functional
+`import dashboards.app as home_page` in `tests/unit/test_dashboard_home.py`
+(now `import dashboards.Home as home_page`); the `AppTest.from_file(...
+"app.py")` call and the `dashboards/`-directory-contents guard set in
+`tests/unit/test_dashboard.py`; and the fixture file name in
+`tests/unit/test_start_dashboard.py` (not load-bearing — `start_dashboard.
+main()` never checks the app path's existence, only the streamlit binary's
+— fixed for consistency with the fixture's own docstring, not correctness).
+
+Left deliberately untouched: **references describing something that
+happened in the past** — `dashboards/data/account.py`'s "Moved out of
+`dashboards/app.py` (Phase 7 Part 3)", `tests/unit/test_dashboard_apptest.
+py`'s "a real bug this suite caught and `dashboards/app.py` was fixed for",
+`common/health/snapshot.py`'s "the Phase 7 audit found... `:mod:
+\`dashboards.app\`` built its own ad-hoc SELECT statements" — all describe
+what was true of the file *at the time*, under the name it had then, the
+same "don't rewrite history" convention this file's own historical sections
+follow. Also untouched: `docs/ALGO_TRADING_FORWARD_TESTING_ARCHITECTURE_
+FINAL.md` (the project's single source of truth per `CLAUDE.md` — its
+`app.py` tree diagrams are original spec content, already diverged from the
+as-built `pages/1_Intraday_Options.py`-style filenames, and not something a
+cosmetic dashboard fix should edit) and the two strategy spec files whose
+`app.py`/`main.py` mentions are unrelated generic strategy-layout
+boilerplate, not this file.
+
+Required a restart of the dashboard's Streamlit process (`launchctl
+kickstart -k gui/<uid>/com.soundarraj.algotrading.dashboard`) to pick up
+the renamed entry script — a plain file rename does not retarget an
+already-running `streamlit run <old-path>` process, and the dashboard was
+live (today's 09:00 auto-start had just come up) at the time of this
+change. The dashboard is read-only and has no bearing on the trading
+processes it displays (`scripts/start_dashboard.py`'s own module docstring:
+"the dashboard has exactly one owner: its own `RunAtLoad` LaunchAgent" —
+`orchestration.auto_start` never starts or depends on it), so the brief
+restart carried no trading risk.
+
+Targeted tests (`test_dashboard.py`, `test_dashboard_home.py`,
+`test_dashboard_apptest.py`, `test_start_dashboard.py`), `ruff check .` and
+`mypy common strategies runtimes dashboards scripts` all clean after the
+rename.
+
+### Intraday Options: "Live Positions" tab renamed to "Open Positions" — 1 September 2026
+
+Cosmetic-only, same day as the `Home.py` rename above. Operator feedback:
+the tab's own Mode filter (added the day before — see the "Live Positions
+tab: Mode filter added" addendum) lets it show *live* positions, so calling
+the tab itself "Live Positions" read as if it only ever showed live-mode
+rows. Considered and rejected: "Running Positions"/"Running Trades" — this
+page already uses "Running" for strategy health state (the Overview tab's
+RUNNING_PAPER/RUNNING_LIVE badges, the Home page's Running/Degraded/
+Stopped/Disabled tile), so reusing it for a position's open/closed state
+would overload the same word with two different meanings on one page.
+"Open Positions" was chosen instead: it pairs with the adjacent "Closed
+Trades" tab (open vs. closed, the standard pairing) and matches the "Open
+positions" metric label already on the Home page — no new vocabulary
+introduced.
+
+Renamed in both `dashboards/intraday_options.py` (the real tab) and
+`dashboards/intraday_stocks.py` (the not-yet-implemented stub page, which
+mirrors the same tab set — kept consistent so it doesn't need a second pass
+once that runtime is built). `dashboards/positional_options.py` has no
+tabbed "Live Positions" concept to rename. Updated every forward-pointing
+docstring/comment cross-reference and the functional tab-label assertions
+in `tests/unit/test_dashboard_apptest.py`,
+`tests/unit/test_dashboard_positional_and_stocks.py` and
+`tests/unit/test_dashboard_intraday_options_data.py`. Left the historical
+runbook line above (`### Live Positions tab: Mode filter added`) and the
+D56/D34-era mention of "Live Positions" in the historical body untouched —
+they describe the tab under the name it had at the time.
+
+No underlying data/query change — `load_live_positions` and its
+`execution_mode` filter keep their existing names; this is a display-label
+change only. Targeted tests, `ruff check .` and `mypy common strategies
+runtimes dashboards scripts` all clean. Unlike the `Home.py` rename above,
+this one did **not** need a dashboard restart: Streamlit's own local-source
+file watcher picked up the edit to `dashboards/intraday_options.py` on the
+next page load with no process kickstart — confirmed live in the browser.
+The earlier restart was needed specifically because that change moved the
+*entrypoint's own path* (the running `streamlit run <old-path>` process's
+argv), which a file watcher can't fix regardless of content; an ordinary
+edit to an already-imported page module is exactly what the watcher exists
+to catch.

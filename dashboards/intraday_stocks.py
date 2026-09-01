@@ -43,7 +43,7 @@ _TABS = (
     ("Overview", "No scanner runtime is configured."),
     ("Scanner & Candidates", "No scanner snapshots exist — there is no scanner running."),
     ("Decisions", "No accept/reject decision data exists yet."),
-    ("Live Positions", "No paper-position data exists for this runtime group."),
+    ("Open Positions", "No paper-position data exists for this runtime group."),
     ("Orders & Fills", "No order flow exists for this runtime group."),
     ("Closed Trades", "No closed-trade data exists yet."),
     ("Performance", "No closed trade exists to compute performance from."),

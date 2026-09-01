@@ -136,7 +136,7 @@ def test_the_dashboards_directory_is_what_we_think_it_is():
     names = {str(p.relative_to(DASHBOARDS_DIR)) for p in PAGE_MODULE_FILES}
     assert names == {
         "_shared.py",
-        "app.py",
+        "Home.py",
         "formatting.py",
         "intraday_options.py",
         "intraday_stocks.py",

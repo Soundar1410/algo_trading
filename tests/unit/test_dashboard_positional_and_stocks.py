@@ -37,7 +37,7 @@ def test_intraday_stocks_renders_eight_tabs_each_with_its_own_message():
             "Overview",
             "Scanner & Candidates",
             "Decisions",
-            "Live Positions",
+            "Open Positions",
             "Orders & Fills",
             "Closed Trades",
             "Performance",

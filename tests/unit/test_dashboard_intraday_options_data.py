@@ -221,7 +221,7 @@ def test_an_open_position_shows_up_in_live_positions_until_closed(
 def test_live_positions_mode_filter_separates_paper_from_live(
     repository: ExecutionRepository, session, database_path: Path
 ):
-    """The Live Positions tab's Mode dropdown (All/Paper/Live), same filter
+    """The Open Positions tab's Mode dropdown (All/Paper/Live), same filter
     shape Orders & Fills and Closed Trades already have.
 
     The live half is a direct row insert, not a real ``OrderLifecycle`` run:

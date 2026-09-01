@@ -4,7 +4,7 @@
     .venv/bin/python -m scripts.start_dashboard [--port 8501] [--force]
 
 ``streamlit run`` is the platform's one real entry point for the dashboard
-(``dashboards/app.py``'s own module docstring), but it is a shell command, not
+(``dashboards/Home.py``'s own module docstring), but it is a shell command, not
 a Python one — nothing to unit-test by importing it. This wrapper exists so
 the LaunchAgent generator (``orchestration/launchd/generate_plists.py``) and
 the ``algo-dashboard`` console script have exactly one place that knows the
@@ -88,7 +88,7 @@ def main(argv: list[str] | None = None) -> int:
 
     root = resolve_project_root()
     streamlit_bin = root / ".venv" / "bin" / "streamlit"
-    app_path = root / "dashboards" / "app.py"
+    app_path = root / "dashboards" / "Home.py"
 
     if not streamlit_bin.is_file():
         print(f"streamlit not found at {streamlit_bin} — is the .venv set up?")

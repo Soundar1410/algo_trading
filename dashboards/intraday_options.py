@@ -1,6 +1,6 @@
 """Read-only Streamlit page — Intraday Options.
 
-Eight tabs (spec): Overview, Live Positions, Orders & Fills, Closed Trades,
+Eight tabs (spec): Overview, Open Positions, Orders & Fills, Closed Trades,
 Performance, Strategy Comparison, Signals & Events, Health — all backed by
 :mod:`dashboards.data.intraday_options`, never by SQL written in this file.
 
@@ -18,13 +18,13 @@ traded.
 selected strikes/expiry, per-leg P&L and roll count are not shown: those
 describe ``MultiLegEngine``/``FixedStrikeEngine``, and per the runbook's
 D56/D34 neither engine is ported into this codebase yet — there is no data
-to read. Current price / points / unrealised MTM on Live Positions are not
+to read. Current price / points / unrealised MTM on Open Positions are not
 shown either: no mark-to-market is persisted for paper positions (see
 ``dashboards/data/intraday_options.py``'s module docstring). Inventing
 either would be exactly the "looks finished but isn't" pattern the runbook
 already declines elsewhere.
 
-Read-only/no-side-effect discipline is identical to ``dashboards/app.py`` —
+Read-only/no-side-effect discipline is identical to ``dashboards/Home.py`` —
 see that module's docstring. Rankings on the Strategy Comparison tab are
 computed read-only, on demand — the reference dashboard's "save today's
 snapshot" write button is deliberately not ported.
@@ -369,7 +369,7 @@ def _render_baskets(
     streamlit.caption(
         "Gross unrealised P&L for a currently OPEN leg is not shown: no live "
         "mark-to-market is persisted for paper positions today, matching the "
-        "same documented gap Live Positions has. Charges/net are read from "
+        "same documented gap Open Positions has. Charges/net are read from "
         "the append-only trade ledger for a CLOSED leg only, for reporting — "
         "never used in the strategy's own gross-P&L risk triggers."
     )
@@ -748,7 +748,7 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
     tabs = st.tabs(
         [
             "Overview",
-            "Live Positions",
+            "Open Positions",
             "Baskets",
             "Orders & Fills",
             "Closed Trades",
