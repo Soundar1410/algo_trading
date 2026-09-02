@@ -170,7 +170,11 @@ def _build_worker_config() -> WorkerConfig:
         max_adjustments_per_cycle=3,
         min_minutes_between_adjustments=90,
         parameters={
-            "underlying": "NIFTY", "index_security_id": NIFTY_SECURITY_ID,
+            "underlying": "NIFTY",
+            # Pinned to the pre-2026-09 legacy path — see
+            # _weekly_delta_neutral_fixtures.py's own comment.
+            "volatility_gate": {"method": "displacement"},
+            "index_security_id": NIFTY_SECURITY_ID,
             "index_segment": "IDX_I", "fno_segment": "NSE_FNO",
         },
     )

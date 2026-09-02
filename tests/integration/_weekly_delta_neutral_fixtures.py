@@ -236,6 +236,16 @@ def build_worker_config(
 ) -> WorkerConfig:
     parameters: dict[str, Any] = {
         "underlying": "NIFTY",
+        # Pinned to the pre-2026-09 legacy path: every test in this family
+        # was written against a handful of scripted ticks, not the new
+        # default's 60-sample rolling realized-volatility window (which
+        # would never fill on this timeline and every entry-dependent test
+        # here would stop entering). This also doubles as end-to-end proof
+        # that method: displacement is still reachable by config alone
+        # (weekly_delta_neutral's volatility-gate rewrite, requirement 3) —
+        # dedicated coverage for method: realized lives in
+        # tests/unit/test_weekly_delta_neutral_entry_gate.py instead.
+        "volatility_gate": {"method": "displacement"},
         "index_security_id": NIFTY_SECURITY_ID,
         "index_segment": "IDX_I",
         "fno_segment": "NSE_FNO",

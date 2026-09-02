@@ -180,6 +180,11 @@ def _build_worker_config() -> WorkerConfig:
         min_minutes_between_adjustments=90,
         parameters={
             "underlying": "NIFTY",
+            # Pinned to the pre-2026-09 legacy path — this test scripts a
+            # handful of ticks, never enough to fill the new default's
+            # 60-sample realized-volatility window. See
+            # _weekly_delta_neutral_fixtures.py's own comment.
+            "volatility_gate": {"method": "displacement"},
             "index_security_id": NIFTY_SECURITY_ID,
             "index_segment": "IDX_I",
             "fno_segment": "NSE_FNO",

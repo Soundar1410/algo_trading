@@ -47,15 +47,21 @@ parameters:
   # extra="forbid" and strategy.py's _WORKER_ONLY_PARAMETER_KEYS).
   evaluation_interval_seconds: 5.0
 
-  # Spec section 3.2/3.3: Wednesday-only, 09:25-09:40 primary window,
-  # opening-stability delay up to 10:15; adjustment window 09:25-14:45 with
-  # the expiry-day cutoff at 14:30; expiry-day phase ladder
-  # 12:00 (tighten) -> 14:30 (no new adjustment) -> 15:05 (planned exit) ->
-  # 15:15 (hard exit, never disabled by market_fallback_enabled below).
+  # Spec section 3.2/3.3: Wednesday-only, entry any time 09:25-12:00 once
+  # the volatility gate below confirms calm (widened from the old
+  # 09:25-09:40 window — decision made, no earliest-entry preference);
+  # adjustment window 09:25-14:45 with the expiry-day cutoff at 14:30;
+  # expiry-day phase ladder 12:00 (tighten) -> 14:30 (no new adjustment) ->
+  # 15:05 (planned exit) -> 15:15 (hard exit, never disabled by
+  # market_fallback_enabled below). entry_window_end (12:00) is a distinct
+  # date from any expiry-day 12:00 tighten — _resolve_actual_expiry always
+  # picks a weekly expiry strictly after entry, so the two 12:00s can never
+  # land on the same trading day (verified, not assumed — see the spec's
+  # own note in section 3.2).
   schedule:
     entry_day: WEDNESDAY
     entry_window_start: "09:25"
-    entry_window_end: "09:40"
+    entry_window_end: "12:00"
     adjustment_start: "09:25"
     adjustment_end: "14:45"
     expiry_tighten_at: "12:00"
@@ -83,13 +89,33 @@ parameters:
     quote_max_age_seconds: 5.0
     minimum_credit_to_width_ratio: 0.18
 
-  # Spec section 3.2/3.3: opening-stability filter — skip today's cycle
-  # (never a Thursday shift) if the underlying has moved more than
-  # maximum_move_percent since the reference tick by skip_after.
+  # Spec section 3.3: legacy opening-stability filter — only read when
+  # volatility_gate.method: displacement below; the shipped default
+  # (method: realized) never reads this block except skip_after, which
+  # both methods share as the give-up cutoff. delay_minutes is retained but
+  # unused by any code (see strategies/.../config.py's own comment).
   opening_filter:
     maximum_move_percent: 0.80
     delay_minutes: 20
-    skip_after: "10:15"
+    skip_after: "12:00"
+
+  # Spec section 3.3 (rewritten): the entry volatility gate. method:
+  # realized is the new default — tick-based realized volatility (no
+  # completed spot candles reach this strategy; see
+  # strategies/.../config.py's VolatilityGateConfig docstring for why ATR
+  # isn't an option). threshold_percent/gap_veto_percent below are
+  # UNPROVEN STARTING POINTS, not tuned values — read
+  # logs/weekly_delta_neutral.log's own realized_vol_percent=... readings
+  # across real paper sessions and adjust before trusting either one.
+  # Flip method to "displacement" to run the old, unchanged opening-move
+  # filter instead, for A/B in paper without a code change.
+  volatility_gate:
+    method: realized
+    threshold_percent: 0.15    # UNPROVEN — starting point only, tune in paper
+    lookback: 60                # ~5 minutes of samples at the 5s evaluation cadence
+    confirmations_required: 3
+    gap_veto_enabled: false     # optional AND-ed veto; off by default (see config.py's own comment)
+    gap_veto_percent: 1.50      # UNPROVEN — only read when gap_veto_enabled: true
 
   # Spec section 7.1/7.2: three consecutive confirmations before rolling,
   # roll only the untested short, at most 1/day and 3/cycle, 90 minutes

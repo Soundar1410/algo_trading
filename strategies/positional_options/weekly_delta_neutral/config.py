@@ -26,7 +26,12 @@ class _Strict(BaseModel):
 class ScheduleConfig(_Strict):
     entry_day: str = "WEDNESDAY"
     entry_window_start: str = "09:25"
-    entry_window_end: str = "09:40"
+    # Widened from "09:40": entry may now fire any time up to 12:00 once
+    # the volatility gate (see VolatilityGateConfig) confirms normal —
+    # decision already made, no earliest-entry preference. Kept in step
+    # with opening_filter.skip_after below by
+    # WeeklyDeltaNeutralParameters._skip_after_not_before_entry_window_end.
+    entry_window_end: str = "12:00"
     adjustment_start: str = "09:25"
     adjustment_end: str = "14:45"
     expiry_tighten_at: str = "12:00"
@@ -123,9 +128,109 @@ class SelectionConfig(_Strict):
 
 
 class OpeningFilterConfig(_Strict):
+    #: Only read by ``volatility_gate.method == "displacement"`` (the
+    #: legacy path — spec section 3.3, pre-rewrite) and by the optional gap
+    #: veto (``volatility_gate.gap_veto_enabled``); the new default
+    #: ``method: realized`` never reads it.
     maximum_move_percent: float = Field(default=0.80, gt=0)
+    #: Retained but unused — never read by any code (verified before this
+    #: change: only ever declared here and set in the shipped YAML). Not
+    #: removed because that would be an unrequested config-contract change;
+    #: left for a future cleanup.
     delay_minutes: int = Field(default=20, gt=0)
-    skip_after: str = "10:15"
+    # Widened from "10:15" alongside schedule.entry_window_end above: the
+    # give-up cutoff for "volatility never confirmed normal this week" is
+    # now 12:00, not the old entry window's own end.
+    skip_after: str = "12:00"
+
+
+class VolatilityGateConfig(_Strict):
+    """Spec section 3.3 (rewritten): what the entry gate treats as "the
+    underlying is calm enough to sell a range around it". ``method``
+    selects the computation:
+
+    - ``"realized"`` (new default): tick-based realized volatility — the
+      1-sigma percentage move implied by the stdev of consecutive spot
+      returns over a rolling ``lookback``-sample window, confirmed
+      ``confirmations_required`` times in a row before entry fires.
+    - ``"displacement"``: the original opening-stability filter (spot's
+      absolute % move from the session's first in-window reference price),
+      preserved unchanged and selectable so a paper session can A/B it
+      against ``"realized"`` without a code change (requirement 3). Reads
+      ``OpeningFilterConfig.maximum_move_percent``/``skip_after`` above,
+      never this class's own ``threshold_percent``/``lookback``/
+      ``confirmations_required``.
+
+    ``method: "atr"`` is deliberately rejected, not silently ignored: this
+    strategy receives spot TICKS only — the positional runtime opts out of
+    the candle channel (``runtimes/positional_options/supervisor.py``'s
+    ``receive_candles=False``, pinned by
+    ``tests/integration/test_positional_candle_channel_composition.py``) —
+    so no completed-candle-based ATR is possible without new engine-level
+    plumbing this change does not add.
+
+    ``threshold_percent`` and ``gap_veto_percent`` below are UNPROVEN
+    STARTING POINTS (requirement 5), not tuned/optimal values — pick a real
+    threshold from ``logs/<runtime>.log``'s own
+    ``realized_vol_percent=...`` readings (see strategy.py's
+    ``_log_volatility_reading``) across real paper sessions before trusting
+    either default.
+    """
+
+    method: str = "realized"
+    #: UNPROVEN starting point — the 1-sigma percentage move of NIFTY spot
+    #: over ``lookback`` samples that counts as "calm" enough to sell a
+    #: range around. Only read when ``method == "realized"``.
+    threshold_percent: float = Field(default=0.15, gt=0)
+    #: Samples in the rolling realized-volatility window — roughly
+    #: ``lookback * evaluation_interval_seconds`` seconds of history (~5
+    #: minutes at the shipped 5s cadence). Coupled to
+    #: ``threshold_percent``: changing one without reconsidering the other
+    #: changes what "calm" means. Only read when ``method == "realized"``.
+    #: Minimum 3, not 2: a window of ``lookback`` samples yields
+    #: ``lookback - 1`` consecutive returns, and a standard deviation needs
+    #: at least 2 data points to be defined — ``lookback: 2`` would yield
+    #: exactly 1 return and could never confirm "normal", ever.
+    lookback: int = Field(default=60, ge=3)
+    #: Consecutive "normal" readings required before entry fires — guards
+    #: against a brief lull inside an otherwise choppy morning. Mirrors
+    #: ``AdjustmentConfig.confirmation_checks``'s own pattern below,
+    #: including resetting to 0 on any not-normal reading. Only read when
+    #: ``method == "realized"``.
+    confirmations_required: int = Field(default=3, gt=0)
+    #: Optional AND-ed veto (requirement 4), OFF by default: "volatility is
+    #: normal now" does not mean "the market didn't gap violently at open
+    #: and then go quiet" — entering right after a large gap means the
+    #: strikes are centered on a level that just repriced. Defaulted off
+    #: because this change's whole purpose is to stop rejecting exactly
+    #: that "gapped then went calm" morning; a veto on by default at
+    #: anything near the old 0.80% threshold would reproduce the rejection
+    #: this change removes. One flag away for A/B in paper.
+    gap_veto_enabled: bool = False
+    #: UNPROVEN starting point, deliberately looser than
+    #: ``OpeningFilterConfig.maximum_move_percent`` (0.80) — this veto is a
+    #: "violent reprice" backstop, not a restatement of the filter this
+    #: change replaces. Only read when ``gap_veto_enabled`` is True.
+    gap_veto_percent: float = Field(default=1.50, gt=0)
+
+    @model_validator(mode="after")
+    def _method_is_supported(self) -> VolatilityGateConfig:
+        if self.method == "atr":
+            raise ValueError(
+                "volatility_gate.method: 'atr' is not implemented — weekly_delta_neutral "
+                "receives spot TICKS only, never completed candles (the positional runtime "
+                "opts out of the candle channel: runtimes/positional_options/supervisor.py "
+                "sets receive_candles=False, pinned by "
+                "tests/integration/test_positional_candle_channel_composition.py). Use "
+                "'realized' (tick-based realized volatility, the default) or 'displacement' "
+                "(the legacy opening-stability filter)."
+            )
+        if self.method not in ("displacement", "realized"):
+            raise ValueError(
+                f"volatility_gate.method must be 'displacement' or 'realized'; got "
+                f"{self.method!r}"
+            )
+        return self
 
 
 class AdjustmentConfig(_Strict):
@@ -194,6 +299,7 @@ class WeeklyDeltaNeutralParameters(_Strict):
     schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)
     selection: SelectionConfig = Field(default_factory=SelectionConfig)
     opening_filter: OpeningFilterConfig = Field(default_factory=OpeningFilterConfig)
+    volatility_gate: VolatilityGateConfig = Field(default_factory=VolatilityGateConfig)
     adjustment: AdjustmentConfig = Field(default_factory=AdjustmentConfig)
     exits: ExitsConfig = Field(default_factory=ExitsConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
@@ -203,3 +309,18 @@ class WeeklyDeltaNeutralParameters(_Strict):
     index_segment: str = ""
     fno_segment: str = ""
     scrip_master_cache_dir: str = ""
+
+    @model_validator(mode="after")
+    def _skip_after_not_before_entry_window_end(self) -> WeeklyDeltaNeutralParameters:
+        # The give-up cutoff can never precede the window it is meant to
+        # extend — otherwise entry_window_end..skip_after would be an empty
+        # (or inverted) evaluation range and the gate could never confirm.
+        if _parse_hhmm(self.opening_filter.skip_after) < _parse_hhmm(
+            self.schedule.entry_window_end
+        ):
+            raise ValueError(
+                "opening_filter.skip_after must not be before schedule.entry_window_end "
+                f"(got skip_after={self.opening_filter.skip_after!r}, "
+                f"entry_window_end={self.schedule.entry_window_end!r})"
+            )
+        return self

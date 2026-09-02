@@ -85,20 +85,31 @@ No short leg may exist without its corresponding protective long hedge.
 ### 3.2 Entry calendar
 
 - Normal entry day: Wednesday.
-- Entry window: 09:25 through 09:40 IST, inclusive at the start and exclusive after the end.
+- Entry window: 09:25 through 12:00 IST, inclusive at the start and exclusive after the end. (Widened 2026-09 from 09:25-09:40 — entry may now fire at any point in this window, the instant the volatility gate in section 3.3 confirms normal; there is deliberately no earliest-entry preference or time-weighting, so the resulting variance in entry time and time-to-expiry is accepted.)
 - At most one primary entry attempt per weekly cycle.
 - If Wednesday is not a trading day, skip that weekly cycle. Do not silently shift entry to Thursday or another day.
-- If the runtime starts after 09:40 on the entry Wednesday, do not enter that cycle.
+- If the runtime starts after 12:00 on the entry Wednesday, do not enter that cycle. (This first-evaluation-too-late rule is independent of the volatility gate's own method.)
 - Do not re-enter an expiry after that expiry's cycle has completed, failed after creating exposure, or begun an exit.
+- The widened window can never collide with the expiry-day phase ladder in section 8 (which starts at 12:00 on a *different* date): section 3.4's nearest-expiry-strictly-after-entry resolution guarantees the entry Wednesday is never itself the resolved expiry date.
 
-### 3.3 Opening-stability filter
+### 3.3 Entry volatility gate
 
-Measure the absolute percentage move from the session's first valid underlying reference price to the current underlying price.
+Replaces the pre-2026-09 "opening-stability filter" (point-to-point displacement from a single reference tick) with a config-selectable gate, `volatility_gate.method`:
 
-- Maximum opening move: 0.80%.
-- If exceeded during the normal entry window, delay entry evaluation by 20 minutes.
-- If conditions remain unstable after 10:15 IST, consume/skip the cycle entry; do not retry later that day.
-- The exact first-price source and its timestamp must be persisted or reconstructable deterministically.
+- **`realized`** (default): tick-based realized volatility — weekly_delta_neutral receives spot *ticks* only (`PositionalContext.spot`), never completed candles (the positional runtime deliberately opts out of the candle channel: `runtimes/positional_options/supervisor.py`'s `receive_candles=False`, pinned by `tests/integration/test_positional_candle_channel_composition.py`), so an ATR gate is not available without new engine-level plumbing. Instead:
+  - Maintain a rolling window of the last `volatility_gate.lookback` spot samples (one per entry evaluation, ~`evaluation_interval_seconds` apart).
+  - Once the window is full, compute the 1-sigma percentage move implied by the standard deviation of consecutive returns across the whole window: `stdev(returns) * sqrt(len(returns)) * 100`.
+  - "Normal" when that value is at most `volatility_gate.threshold_percent`.
+  - Require `volatility_gate.confirmations_required` consecutive normal readings before entry fires (mirrors section 7.1's adjustment-confirmation pattern); any not-normal reading resets the counter to zero.
+  - `threshold_percent`/`gap_veto_percent`'s shipped defaults are explicitly unproven starting points, to be tuned against real paper sessions.
+- **`displacement`** (legacy, still fully supported): the original signal — measure the absolute percentage move from the session's first in-window valid underlying reference price to the current underlying price. Maximum opening move: `opening_filter.maximum_move_percent` (0.80% shipped). No confirmation counter; re-checked every evaluation without ever relaxing the threshold. Selectable by config for A/B against `realized` without a code change; `opening_filter.delay_minutes` remains declared but is not read by any code path (retained for config-contract compatibility only).
+- **`atr`** is not implemented and is explicitly rejected at config load time, for the reason given above (ticks only, no candles).
+
+Both methods share one give-up cutoff, `opening_filter.skip_after` (12:00 IST, widened alongside the entry window and validated to never precede `schedule.entry_window_end`): if the gate has not confirmed normal by then, consume/skip the cycle entry for the week; do not retry later that day. Exactly one pre-entry incident is recorded when a week is skipped this way.
+
+Optional directional-gap veto, `volatility_gate.gap_veto_enabled` (off by default): an AND-ed condition on top of either method, reusing the same displacement computation above rather than a second one — "volatility is normal now" does not by itself rule out "the market gapped violently at open and then went quiet"; entering right after such a gap centers the strikes on a level that just repriced. Off by default because turning it on near the old 0.80% displacement threshold would reproduce exactly the rejection this section's rewrite removes; its own shipped threshold (`gap_veto_percent`, 1.50%) is deliberately looser and, like the other new thresholds, an unproven starting point.
+
+The exact first-price source and its timestamp (used by `displacement` and by the gap veto) must be persisted or reconstructable deterministically, as before.
 
 ### 3.4 Expiry resolution
 
@@ -532,7 +543,7 @@ parameters:
   schedule:
     entry_day: WEDNESDAY
     entry_window_start: "09:25"
-    entry_window_end: "09:40"
+    entry_window_end: "12:00"
     adjustment_start: "09:25"
     adjustment_end: "14:45"
     expiry_adjustment_cutoff: "14:30"
@@ -556,9 +567,17 @@ parameters:
     minimum_credit_to_width_ratio: 0.18
 
   opening_filter:
-    maximum_move_percent: 0.80
-    delay_minutes: 20
-    skip_after: "10:15"
+    maximum_move_percent: 0.80  # only read by volatility_gate.method: displacement, and by the gap veto
+    delay_minutes: 20           # retained but unused by any code
+    skip_after: "12:00"
+
+  volatility_gate:
+    method: realized             # realized | displacement (displacement = the pre-2026-09 behaviour)
+    threshold_percent: 0.15      # UNPROVEN starting point -- tune against paper sessions
+    lookback: 60                 # ~5 minutes of samples at the 5s evaluation cadence
+    confirmations_required: 3
+    gap_veto_enabled: false      # optional AND-ed veto, off by default -- see section 3.3
+    gap_veto_percent: 1.50       # UNPROVEN starting point; only read when gap_veto_enabled: true
 
   adjustment:
     warning_delta_per_lot: 8.0
@@ -596,7 +615,9 @@ Config validation must reject at least:
 - adjustment target not below trigger;
 - soft/hard/emergency loss multiples not strictly increasing;
 - entry or adjustment schedule after the hard exit;
-- any attempt to use an intraday product for an overnight position.
+- any attempt to use an intraday product for an overnight position;
+- `opening_filter.skip_after` before `schedule.entry_window_end`;
+- `volatility_gate.method` outside `realized`/`displacement` (an explicit, informative rejection for `atr` in particular — see section 3.3).
 
 ---
 

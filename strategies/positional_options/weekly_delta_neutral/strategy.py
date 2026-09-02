@@ -12,7 +12,10 @@ BasePositionalMultiLegStrategy` requires.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+import statistics
+from collections import deque
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any
 
@@ -32,6 +35,7 @@ from common.engine.positional.positional_strategy import (
     register_positional_strategy,
 )
 from common.engine.selection import DhanOptionChainResolver
+from common.logging import get_logger
 from common.margin import (
     OVERNIGHT_PRODUCT_TYPE,
     LegMarginRequest,
@@ -56,6 +60,8 @@ from .risk import (
 )
 from .selection import best_hedge, rank_role_candidates, select_iron_condor
 
+_log = get_logger(__name__)
+
 _WEDNESDAY = 2
 
 _ROLE_SIGN = {
@@ -70,6 +76,32 @@ _ROLE_SIGN = {
 class _OpeningFilterState:
     reference_price: float | None = None
     reference_at: datetime | None = None
+
+
+@dataclass
+class _VolatilityGateState:
+    """State for ``volatility_gate.method == "realized"`` (spec section
+    3.3, rewritten) — a bounded rolling window of spot samples plus the
+    confirmation counter, mirroring ``AdjustmentConfig``'s own
+    ``_trigger_confirmations`` pattern. Unused (left at its defaults) when
+    ``method == "displacement"``, which reads only ``_OpeningFilterState``
+    above.
+
+    ``samples`` has no ``maxlen`` set here — a mutable default cannot see
+    the instance's own config, so the strategy sets it in ``__init__``/
+    ``reset_daily`` instead.
+    """
+
+    samples: deque[float] = field(default_factory=deque)
+    confirmations: int = 0
+    #: Recorded once per skipped week (spec 3.2/3.3's "consume/skip the
+    #: cycle entry"), not once per evaluation past ``skip_after`` — an
+    #: evaluation keeps firing every ``evaluation_interval_seconds`` for
+    #: the rest of the day, and record_pre_entry_incident is not itself
+    #: deduplicating.
+    skip_incident_recorded: bool = False
+    last_logged_at: datetime | None = None
+    last_logged_normal: bool | None = None
 
 
 #: Keys ``runtimes.positional_options.config_adapter.build_worker_config``
@@ -100,11 +132,17 @@ class WeeklyDeltaNeutralStrategy(BasePositionalMultiLegStrategy):
         self._scrip_master: ScripMaster = kwargs["scrip_master"]
         self._timezone: str = kwargs.get("timezone", "Asia/Kolkata")
         self._opening = _OpeningFilterState()
+        self._vol_gate = _VolatilityGateState(
+            samples=deque(maxlen=self._params.volatility_gate.lookback)
+        )
         self._trigger_confirmations = 0
 
     # -------------------------------------------------------------- BasePositionalMultiLegStrategy
     def reset_daily(self) -> None:
         self._opening = _OpeningFilterState()
+        self._vol_gate = _VolatilityGateState(
+            samples=deque(maxlen=self._params.volatility_gate.lookback)
+        )
         self._trigger_confirmations = 0
 
     @property
@@ -166,30 +204,28 @@ class WeeklyDeltaNeutralStrategy(BasePositionalMultiLegStrategy):
             return None
         if self._opening.reference_price is None:
             if local_clock >= window_end:
-                # Spec 3.2: "if the runtime starts after 09:40 on the entry
-                # Wednesday, do not enter that cycle" — a first evaluation
-                # this late means the process was never running (or never
-                # observed a spot tick) during the primary window at all.
+                # Spec 3.2: "if the runtime starts after entry_window_end on
+                # the entry Wednesday, do not enter that cycle" — a first
+                # evaluation this late means the process was never running
+                # (or never observed a spot tick) during the primary window
+                # at all. Captured here unconditionally, regardless of
+                # volatility_gate.method: method: displacement uses this
+                # reference price as its own signal below; method: realized
+                # only reads it for the optional gap veto — one computation
+                # (_displacement_percent), never two.
                 return None
             self._opening.reference_price = context.spot
             self._opening.reference_at = context.now
         if local_clock > skip_after:
-            return None  # spec 3.3: unstable past 10:15 -> permanently skip today
+            # Spec 3.3 (rewritten): the volatility gate never confirmed
+            # "normal" by the give-up cutoff -> permanently skip this
+            # week's cycle, no retry later today.
+            self._record_skip_incident_once(context)
+            return None
 
-        move_percent = (
-            abs(context.spot - self._opening.reference_price)
-            / self._opening.reference_price
-            * 100.0
-            if self._opening.reference_price
-            else 0.0
-        )
-        if move_percent > self._params.opening_filter.maximum_move_percent:
-            # Still inside the normal window or the extended (up to
-            # skip_after) delay window: keep waiting, re-checked on the
-            # engine's own evaluation cadence rather than a private timer —
-            # spec section 3.3's "delay entry evaluation by 20 minutes" is
-            # satisfied by this being re-evaluated every cycle without ever
-            # relaxing the threshold, up to the skip_after cutoff above.
+        if not self._volatility_is_normal(context):
+            return None
+        if self._gap_veto_blocks(context):
             return None
 
         resolved_expiry = self._resolve_actual_expiry(local_day)
@@ -258,6 +294,143 @@ class WeeklyDeltaNeutralStrategy(BasePositionalMultiLegStrategy):
             original_wing_width=candidate.wing_width,
             margin_estimate=margin_estimate,
         )
+
+    # --------------------------------------------------- volatility gate (spec 3.3)
+    def _displacement_percent(self, context: PositionalContext) -> float | None:
+        """Absolute percentage move of ``context.spot`` from the session's
+        first in-window reference price (``_OpeningFilterState``, captured
+        once in ``_evaluate_entry``). This is the *entire* legacy spec 3.3
+        signal — ``method: displacement`` uses it directly as the gate;
+        ``method: realized`` never calls this for its own gate, only for
+        the optional gap veto (requirement 4: one computation, two
+        callers, never a second one written for the veto)."""
+        reference = self._opening.reference_price
+        if reference is None or reference == 0 or context.spot is None:
+            return None
+        return abs(context.spot - reference) / reference * 100.0
+
+    def _displacement_is_normal(self, context: PositionalContext) -> bool:
+        """``method: displacement`` — today's original behaviour (spec 3.3,
+        pre-rewrite), preserved unchanged and selectable by config
+        (requirement 3): no confirmation counter, re-checked every
+        evaluation without ever relaxing the threshold, up to the
+        ``skip_after`` cutoff the caller already enforces."""
+        move_percent = self._displacement_percent(context)
+        maximum = self._params.opening_filter.maximum_move_percent
+        return move_percent is not None and move_percent <= maximum
+
+    def _realized_vol_is_normal(self, context: PositionalContext) -> bool:
+        """``method: realized`` (new default) — tick-based realized
+        volatility, standing in for an ATR gate that spot TICKS alone
+        cannot support (see the strategy package's own note on why: the
+        positional runtime opts out of the candle channel —
+        ``runtimes/positional_options/supervisor.py``'s
+        ``receive_candles=False``, pinned by
+        ``tests/integration/test_positional_candle_channel_composition.py``).
+
+        Appends the current spot to a rolling window (``deque(maxlen=
+        volatility_gate.lookback)``, ~5 minutes of samples at the default
+        5s evaluation cadence) and expresses volatility as the 1-sigma
+        percentage move implied by the stdev of consecutive returns across
+        that whole window — scale-independent, interpretable, and coupled
+        to ``lookback`` (change one, re-tune the other; commented in the
+        shipped config). Requires ``confirmations_required`` consecutive
+        normal readings, mirroring ``AdjustmentConfig``'s own confirmation
+        pattern (``_maybe_adjust``) including resetting to 0 on any
+        not-normal reading — a rolling window's consecutive confirmations
+        overlap heavily (lookback-1 of lookback samples shared between
+        adjacent reads), so this filters an instantaneous blip, not a
+        correlated one; that is a deliberate, documented limitation, not a
+        bug.
+
+        Fails closed (not normal, counter reset) until the window is
+        genuinely full — a stalled feed cannot half-fill the window into a
+        false "calm" reading because the caller only reaches this method
+        while ``context.spot_is_fresh`` is true, so a stall simply stops
+        the window from ever advancing.
+        """
+        cfg = self._params.volatility_gate
+        gate = self._vol_gate
+        assert context.spot is not None  # caller already gated spot is None/stale
+        gate.samples.append(context.spot)
+
+        realized_vol_percent: float | None = None
+        if len(gate.samples) < cfg.lookback:
+            normal = False
+        else:
+            prices = list(gate.samples)
+            returns = [
+                (prices[i] - prices[i - 1]) / prices[i - 1]
+                for i in range(1, len(prices))
+                if prices[i - 1] != 0.0
+            ]
+            if len(returns) < 2:
+                normal = False
+            else:
+                realized_vol_percent = statistics.stdev(returns) * math.sqrt(len(returns)) * 100.0
+                normal = realized_vol_percent <= cfg.threshold_percent
+
+        gate.confirmations = gate.confirmations + 1 if normal else 0
+        self._log_volatility_reading(context, realized_vol_percent, normal)
+        return gate.confirmations >= cfg.confirmations_required
+
+    def _volatility_is_normal(self, context: PositionalContext) -> bool:
+        if self._params.volatility_gate.method == "displacement":
+            return self._displacement_is_normal(context)
+        # method == "realized" -- config rejects any other value.
+        return self._realized_vol_is_normal(context)
+
+    def _gap_veto_blocks(self, context: PositionalContext) -> bool:
+        """Optional AND-ed veto (requirement 4), off by default. "Volatility
+        is normal now" does not mean "the market didn't gap violently at
+        open and then go quiet" — entering right after a large gap means
+        the strikes are centered on a level that just repriced. Reuses
+        ``_displacement_percent`` rather than a second computation."""
+        cfg = self._params.volatility_gate
+        if not cfg.gap_veto_enabled:
+            return False
+        move_percent = self._displacement_percent(context)
+        return move_percent is not None and move_percent > cfg.gap_veto_percent
+
+    def _record_skip_incident_once(self, context: PositionalContext) -> None:
+        if self._vol_gate.skip_incident_recorded:
+            return
+        self._vol_gate.skip_incident_recorded = True
+        context.record_pre_entry_incident(
+            "weekly_delta_neutral: entry skipped for this week — volatility gate "
+            f"(method={self._params.volatility_gate.method!r}) never confirmed normal by "
+            f"skip_after ({self._params.opening_filter.skip_after})"
+        )
+
+    def _log_volatility_reading(
+        self, context: PositionalContext, realized_vol_percent: float | None, normal: bool
+    ) -> None:
+        """Observability for the UNPROVEN starting-point thresholds
+        (requirement 5) — this strategy had no logging at all before this
+        change. Logged on every normal/not-normal transition plus at most
+        once a minute otherwise, so ``logs/weekly_delta_neutral.log``
+        carries the realized-vol distribution needed to pick a real
+        threshold without spamming at the 5s evaluation cadence."""
+        gate = self._vol_gate
+        decision_changed = gate.last_logged_normal != normal
+        heartbeat_due = (
+            gate.last_logged_at is None
+            or (context.now - gate.last_logged_at).total_seconds() >= 60.0
+        )
+        if not (decision_changed or heartbeat_due):
+            return
+        cfg = self._params.volatility_gate
+        _log.info(
+            "weekly_delta_neutral volatility gate: realized_vol_percent=%s threshold_percent=%.4f "
+            "confirmations=%d/%d normal=%s",
+            f"{realized_vol_percent:.4f}" if realized_vol_percent is not None else "n/a",
+            cfg.threshold_percent,
+            gate.confirmations,
+            cfg.confirmations_required,
+            normal,
+        )
+        gate.last_logged_at = context.now
+        gate.last_logged_normal = normal
 
     def _entry_margin_estimate(
         self, candidate: IronCondorCandidate, context: PositionalContext

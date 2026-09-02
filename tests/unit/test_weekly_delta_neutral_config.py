@@ -22,8 +22,10 @@ from strategies.positional_options.weekly_delta_neutral.config import (
     AdjustmentConfig,
     ExecutionConfig,
     ExitsConfig,
+    OpeningFilterConfig,
     ScheduleConfig,
     SelectionConfig,
+    VolatilityGateConfig,
     WeeklyDeltaNeutralParameters,
 )
 from strategies.positional_options.weekly_delta_neutral.strategy import WeeklyDeltaNeutralStrategy
@@ -81,6 +83,57 @@ def test_expiry_day_phases_must_be_strictly_ordered() -> None:
 def test_adjustment_end_must_not_be_scheduled_after_hard_exit() -> None:
     with pytest.raises(ValidationError, match="adjustment_end"):
         ScheduleConfig(adjustment_end="15:20", hard_exit="15:15")
+
+
+# ------------------------------------------------------- VolatilityGateConfig
+def test_volatility_gate_method_atr_is_rejected_with_the_plumbing_reason() -> None:
+    with pytest.raises(ValidationError, match="TICKS"):
+        VolatilityGateConfig(method="atr")
+
+
+def test_volatility_gate_method_rejects_an_unknown_value() -> None:
+    with pytest.raises(ValidationError, match="must be 'displacement' or 'realized'"):
+        VolatilityGateConfig(method="ema_slope")
+
+
+def test_volatility_gate_lookback_must_be_at_least_three() -> None:
+    # 2 would yield exactly 1 return -- a standard deviation needs at
+    # least 2 data points, so lookback: 2 could never confirm "normal".
+    with pytest.raises(ValidationError):
+        VolatilityGateConfig(lookback=2)
+
+
+def test_volatility_gate_confirmations_required_must_be_positive() -> None:
+    with pytest.raises(ValidationError):
+        VolatilityGateConfig(confirmations_required=0)
+
+
+def test_volatility_gate_defaults_are_the_new_realized_method() -> None:
+    cfg = VolatilityGateConfig()
+    assert cfg.method == "realized"
+    assert cfg.gap_veto_enabled is False
+
+
+# ---------------------------------------- entry-window / skip_after cross-field
+def test_skip_after_must_not_be_before_entry_window_end() -> None:
+    with pytest.raises(ValidationError, match="skip_after"):
+        WeeklyDeltaNeutralParameters(
+            schedule=ScheduleConfig(entry_window_end="12:00"),
+            opening_filter=OpeningFilterConfig(skip_after="11:00"),
+        )
+
+
+def test_skip_after_equal_to_entry_window_end_is_allowed() -> None:
+    WeeklyDeltaNeutralParameters(
+        schedule=ScheduleConfig(entry_window_end="12:00"),
+        opening_filter=OpeningFilterConfig(skip_after="12:00"),
+    )
+
+
+def test_default_entry_window_is_widened_to_noon() -> None:
+    schedule = ScheduleConfig()
+    assert schedule.entry_window_end == "12:00"
+    assert OpeningFilterConfig().skip_after == "12:00"
 
 
 # ----------------------------------------------------------- ExecutionConfig

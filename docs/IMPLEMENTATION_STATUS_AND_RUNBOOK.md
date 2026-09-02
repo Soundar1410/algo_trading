@@ -8126,18 +8126,36 @@ moved to limitation 30's own entry (section 6) rather than duplicated here.
 
 ### 11.4 Strategy rules implemented (spec cross-reference)
 
-- **Entry** (§3): Wednesday-only, 09:25–09:40 window; opening-stability
+- **Entry** (§3): Wednesday-only, 09:25–12:00 window (widened 2026-09 from
+  09:25–09:40 — entry may fire the instant the volatility gate confirms
+  normal, anywhere in that window; no earliest-entry preference); entry
+  volatility gate, `volatility_gate.method` (§3.3 rewritten): `realized`
+  (new default) — tick-based realized volatility over a rolling
+  `lookback`-sample window (this strategy receives spot ticks only, never
+  completed candles: the positional runtime opts out of the candle channel,
+  `runtimes/positional_options/supervisor.py`'s `receive_candles=False`,
+  pinned by `tests/integration/test_positional_candle_channel_composition.py`
+  — so no ATR gate is possible without new engine-level plumbing), requiring
+  `confirmations_required` consecutive normal readings, counter reset on any
+  not-normal reading; or `displacement` — the original opening-stability
   filter (skip if the underlying has moved more than
-  `opening_filter.maximum_move_percent` since the reference tick, up to
-  `skip_after`); a runtime that first observes the market at/after 09:40
-  never enters that cycle (no reference ever captured); nearest weekly
-  expiry strictly *after* entry (`ScripMaster.nearest_expiry`, bumped by
-  one day only in the rare same-day-expiry edge case) — never weekday
-  arithmetic; the deterministic four-leg search
-  (`strategies/.../selection.py`: fresh complete quote+Greeks → liquidity/
-  spread → delta distance → hedge-width validity → the post-hoc
-  `maximum_entry_delta_per_lot` portfolio-delta gate) with no relaxation —
-  no qualifying candidate anywhere in the chain means no entry, full stop.
+  `opening_filter.maximum_move_percent` since the reference tick), preserved
+  unchanged and selectable by config for A/B in paper. Both methods share
+  one give-up cutoff, `opening_filter.skip_after` (now 12:00, validated
+  never to precede `entry_window_end`) — past it, skip the week, no retry.
+  An optional AND-ed directional-gap veto (`volatility_gate.gap_veto_enabled`,
+  off by default) reuses the same displacement computation. A runtime that
+  first observes the market at/after `entry_window_end` never enters that
+  cycle (no reference ever captured) — unchanged, just at the new, later
+  time. `threshold_percent`/`gap_veto_percent` are documented unproven
+  starting points, not tuned values. Nearest weekly expiry strictly *after*
+  entry (`ScripMaster.nearest_expiry`, bumped by one day only in the rare
+  same-day-expiry edge case) — never weekday arithmetic; the deterministic
+  four-leg search (`strategies/.../selection.py`: fresh complete
+  quote+Greeks → liquidity/spread → delta distance → hedge-width validity →
+  the post-hoc `maximum_entry_delta_per_lot` portfolio-delta gate) with no
+  relaxation — no qualifying candidate anywhere in the chain means no
+  entry, full stop.
 - **Adjustment** (§7): three consecutive over-threshold confirmations
   before rolling; only the untested short rolls, in the direction that
   reduces projected absolute portfolio delta; 1/day, 3/cycle, 90 minutes
@@ -11882,3 +11900,147 @@ including two pre-existing AppTest-based tests
 `test_rolling_strangle_otm1_dashboard.py`) updated for the selectbox →
 multiselect swap, not weakened. `ruff check .` and
 `mypy common strategies runtimes dashboards scripts` both clean.
+
+## `weekly_delta_neutral` entry-gate rewrite: widened window + volatility gate (2 September 2026)
+
+Operator-requested change to **how `weekly_delta_neutral` decides when to
+enter**, entry gate only — no change to legs, adjustments, exits, sizing, or
+any live gate. Still paper-only; `mode`, `live_approved` and every committed
+live gate are untouched (`scripts/assert_no_live_config_committed.py` re-run
+clean).
+
+**1. Entry window widened to 12:00** (spec §3.2). `schedule.entry_window_end`
+09:40 → 12:00 and `opening_filter.skip_after` 10:15 → 12:00, in both
+`config.py`'s own field defaults and the shipped YAML so the two cannot
+drift. Entry may now fire at any point in 09:25–12:00, the instant the
+volatility gate confirms — deliberately no earliest-entry preference or
+time-weighting, and the resulting variance in entry time / time-to-expiry is
+accepted (operator decision). New cross-field validator on
+`WeeklyDeltaNeutralParameters`: `opening_filter.skip_after` may never precede
+`schedule.entry_window_end`.
+
+**Collision check performed before the widening, not assumed.** (a)
+`runtimes/positional_options/config_adapter.py:161-162` derives
+`SessionConfig.start_time`/`end_time` from the entry window, feeding
+`MarketSession.can_enter` → `PositionalContext.can_enter` — but in the
+positional runtime `can_enter` is *informational only*: it is set at
+`positional_engine.py:892` and nothing, engine or strategy, ever gates on it
+(grep across `common/`, `strategies/`, `runtimes/` returns only that
+construction site). Both values move together from one YAML key, so they
+cannot drift. (b) The expiry-day 12:00 tighten cannot clash with the new
+12:00 entry cutoff: those rules are gated on `local_day == expiry_date`
+(`strategy.py:388-389`, `466-478`) and `_resolve_actual_expiry` resolves the
+nearest expiry *strictly after* entry, so the entry Wednesday is never the
+expiry date. (c) Behavioural note, deliberately not "fixed": with
+`adjustment_start` at 09:25, a late entry makes adjustments eligible almost
+immediately rather than hours later — still requires 3 confirmations and
+|delta| ≥ 12/lot, and `minimum_minutes_between` only constrains
+adjustment-to-adjustment. (d) `opening_filter.delay_minutes` was found to be
+**dead config** — declared and set, never read by any code path; retained
+(removing it is a config-contract change nobody asked for) and now commented
+as such.
+
+**2. Volatility gate replaces the opening-stability filter** (spec §3.3,
+rewritten). The old check was `abs(spot - reference)/reference` against a
+single reference tick — point-to-point *displacement*, not volatility, so a
+morning that gapped 0.9% then went calm was rejected while one chopping ±0.7%
+around the reference was accepted. Backwards for a range-selling
+delta-neutral strategy. New config block `volatility_gate`:
+
+- `method: realized` (new default) — **tick-based realized volatility**.
+  Required investigation first: **this strategy receives spot TICKS only,
+  never completed candles**, so an ATR gate is not possible without new
+  engine-level plumbing. `PositionalContext` carries a scalar `spot`/
+  `spot_is_fresh` and no bar history
+  (`positional_strategy.py:61-118`); the engine keeps two scalars and no
+  history (`positional_engine.py:221-222, 481-483`); and the positional
+  supervisor **deliberately opts out of the candle channel**
+  (`supervisor.py:298` `receive_candles=False`, hub drops them at
+  `common/feed/hub.py:585`), pinned by
+  `tests/integration/test_positional_candle_channel_composition.py` after a
+  real queue-overflow incident whose comment reads "do not restore the
+  publish". So: rolling `deque(maxlen=lookback)` of spot samples, one per
+  entry evaluation; once full, `stdev(returns) * sqrt(len(returns)) * 100` —
+  the 1-sigma % move over the whole window, interpretable and
+  scale-independent, but **coupled to `lookback`** (change one, re-tune the
+  other). `method: atr` is *rejected at load time with an explicit message*
+  rather than shipped inert.
+- `method: displacement` — the original behaviour, preserved unchanged and
+  selectable by config alone, so it can be A/B'd in paper without a code
+  change. No confirmation counter on this path, exactly as before.
+- `confirmations_required` (default 3) consecutive normal readings, resetting
+  to 0 on any not-normal reading — mirrors `AdjustmentConfig`'s own
+  confirmation pattern (`_maybe_adjust`, `strategy.py:484-489`). Documented
+  limitation: a rolling window's consecutive reads overlap by `lookback-1`
+  samples, so this filters an instantaneous blip, not a correlated one.
+- `gap_veto_enabled` (default **false**) — optional AND-ed veto reusing the
+  *same* `_displacement_percent` computation (one computation, two callers).
+  Defaulted off on purpose: this change exists to stop rejecting the "gapped
+  then went calm" morning, and a veto on by default near the old 0.80%
+  threshold would reinstate exactly that rejection. Its own shipped
+  threshold (1.50%) is deliberately looser, a "violent reprice" backstop.
+
+**Thresholds are explicitly unproven.** `threshold_percent: 0.15` and
+`gap_veto_percent: 1.50` are plausibility-chosen starting points, marked as
+such in both the config model and the YAML. To make tuning possible this
+strategy gained **its first logging**: `_log_volatility_reading` emits the
+measured `realized_vol_percent`, confirmation count and gate decision on
+every normal/not-normal transition plus a ~1/minute heartbeat, so
+`logs/weekly_delta_neutral.log` carries the distribution needed to pick a
+real threshold without spamming at the 5s cadence. A skipped week records
+exactly one `record_pre_entry_incident` (deduplicated by a flag — evaluation
+keeps firing past the cutoff all day).
+
+**Tests.** New `tests/unit/test_weekly_delta_neutral_entry_gate.py` (11
+tests) — there was previously **no test anywhere** touching `_evaluate_entry`,
+`opening_filter`, `maximum_move_percent` or `skip_after`, a real coverage
+gap. Covers: late (09:45 and 11:0x) entry once volatility confirms; a choppy
+morning that never normalises and is skipped past 12:00 with exactly one
+incident (and no second one later); Wednesday-only on the adjacent
+Tuesday/Thursday; the confirmation counter *resetting* rather than
+accumulating; stale spot contributing no samples; `method: displacement`
+still entering and still refusing past `maximum_move_percent`; the gap veto
+blocking and, off by default, not blocking; and `reset_daily` clearing the
+window. Gate-passage is observed through a spy `scrip_master` whose
+`lot_size` is falsy, so `_evaluate_entry` stops immediately after resolving
+the candidate expiry — no chain/margin fixture needed. Plus 8 new config
+tests. `tests/integration/_weekly_delta_neutral_fixtures.py` and the three
+standalone `WorkerConfig` builders are pinned to `method: displacement`:
+those tests script a handful of ticks and would never fill the new default's
+60-sample window — which doubles as end-to-end proof the legacy path is still
+reachable by config.
+
+`ruff check .` and `mypy common strategies runtimes dashboards scripts` (242
+files) both clean; full `weekly_delta_neutral` unit suite green.
+
+### Two pre-existing defects found while verifying (NOT caused by this change)
+
+Both reproduced on stashed, unmodified code — neither is a regression, and
+neither is fixed here (both are outside this change's entry-gate scope):
+
+1. **The whole `weekly_delta_neutral` integration suite is red on a stale
+   fixture.** Every test fails with `ScripMasterError: Every listed NIFTY
+   expiry is before 2026-09-02 (newest is 2026-08-26). The scrip master is
+   stale.` `runtimes/positional_options/worker.py:282` builds
+   `DhanOptionChainResolver(scrip_master)` with no expiry, so it resolves
+   "nearest expiry from *today*" off the real wall clock rather than the
+   test's own `trading_date`; the fixture's hardcoded expiry list has aged
+   out. 35/35 tests across four of those files fail identically with and
+   without this change. A date bomb, and it will stay red until the fixture
+   data is regenerated or the resolution is anchored to `trading_date`.
+2. **`test_positional_runtime_weekly_staged_entry.py` stalls for tens of
+   minutes instead of failing in 30 seconds.** Root cause is *not* a
+   deadlock — diagnosed with a live `faulthandler` stack dump plus CPU
+   sampling (both parent and spawned worker sit at ~0% CPU). Chain: defect 1
+   kills the spawned worker, so it never subscribes; the test's fake feed
+   waits for that subscription in `_wait_until_wanted` (bounded, 30s) and
+   raises `AssertionError`; but that assertion is raised on the feed thread
+   *inside the production reconnect wrapper*, and
+   `common/feed/reconnect.py:340` catches bare `except Exception` —
+   `AssertionError` is an `Exception` — so a harness assertion is misread as
+   a feed disconnection and the fake feed is restarted with backoff
+   (`reconnect.py:379-381`). With `max_attempts=8` and 1→2→4→8→16→32→60s
+   backoff, the run costs roughly 6–35 minutes before finally raising
+   `FeedUnavailableError`. Observed at 21, 26 and >20 minutes. The
+   `except Exception` breadth is the more serious half: it would equally
+   swallow and retry a genuine `AssertionError` escaping any adapter.
