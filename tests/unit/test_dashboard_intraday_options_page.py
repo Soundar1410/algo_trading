@@ -114,9 +114,9 @@ def test_closed_trades_empty_state():
     assert any("no closed trades" in i.lower() for i in st.infos)
 
 
-def _closed_trade(net_pnl: float = 500.0) -> ClosedTradeRow:
+def _closed_trade(net_pnl: float = 500.0, *, strategy_id: str = "st01") -> ClosedTradeRow:
     return ClosedTradeRow(
-        strategy_id="st01", execution_mode="paper", instrument="NIFTY", security_id="13",
+        strategy_id=strategy_id, execution_mode="paper", instrument="NIFTY", security_id="13",
         trading_date="2026-08-14", side="BUY", quantity=75, entry_price=100.0,
         exit_price=110.0, points=10.0, gross_pnl=net_pnl + 10.0, charges=10.0, net_pnl=net_pnl,
         entry_time="2026-08-14T03:45:00+00:00", exit_time="2026-08-14T04:00:00+00:00",
@@ -126,10 +126,34 @@ def _closed_trade(net_pnl: float = 500.0) -> ClosedTradeRow:
 def test_closed_trades_render_and_csv_export():
     st = FakeStreamlit()
     page._render_closed_trades(st, (_closed_trade(),))
-    assert len(st.dataframes) == 1
+    # Summary-by-strategy table, then the individual-trades table.
+    assert len(st.dataframes) == 2
     assert len(st.download_buttons) == 1
     _label, data = st.download_buttons[0]
     assert b"Net P" in data
+
+
+def test_closed_trades_summary_sums_gross_charges_net_per_strategy():
+    st = FakeStreamlit()
+    trades = (
+        _closed_trade(500.0, strategy_id="c921_ema_cross_buy"),
+        _closed_trade(-200.0, strategy_id="c921_ema_cross_buy"),
+        _closed_trade(300.0, strategy_id="c509_ema_cross_buy"),
+    )
+    page._render_closed_trades(st, trades)
+    summary = st.dataframes[0]
+    assert len(summary) == 2  # one row per strategy, not per trade
+    by_strategy = {row["Strategy"]: row for row in summary}
+    assert by_strategy["c921_ema_cross_buy"]["Trades"] == 2
+    assert by_strategy["c921_ema_cross_buy"]["Gross P&L"] == "₹320.00"  # (510) + (-190)
+    assert by_strategy["c921_ema_cross_buy"]["Charges"] == "₹20.00"  # 10 + 10
+    assert by_strategy["c921_ema_cross_buy"]["Net P&L"] == "₹300.00"  # 500 + (-200)
+    assert by_strategy["c509_ema_cross_buy"]["Trades"] == 1
+    assert by_strategy["c509_ema_cross_buy"]["Net P&L"] == "₹300.00"
+
+    # Individual trades still render below the summary, unaggregated.
+    trades_table = st.dataframes[1]
+    assert len(trades_table) == 3
 
 
 # ============================================================= Performance

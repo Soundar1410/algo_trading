@@ -491,10 +491,45 @@ def _closed_trades_table(trades: tuple[ClosedTradeRow, ...]) -> list[dict[str, o
     return table
 
 
+def _closed_trades_summary_table(trades: tuple[ClosedTradeRow, ...]) -> list[dict[str, object]]:
+    """One row per strategy — Gross/Charges/Net P&L summed across every
+    closed trade for that strategy in the current filter. Shown whether one
+    strategy or "All Strategies" is selected: with one strategy selected
+    this degrades to a single summary row, matching the individual-trades
+    table below it. Strategies are ordered by first appearance in ``trades``
+    (already ordered by ``load_closed_trades``)."""
+    order: list[str] = []
+    totals: dict[str, dict[str, float]] = {}
+    for t in trades:
+        bucket = totals.setdefault(
+            t.strategy_id, {"count": 0.0, "gross": 0.0, "charges": 0.0, "net": 0.0}
+        )
+        if t.strategy_id not in order:
+            order.append(t.strategy_id)
+        bucket["count"] += 1
+        bucket["gross"] += t.gross_pnl
+        bucket["charges"] += t.charges
+        bucket["net"] += t.net_pnl
+    return [
+        {
+            "Strategy": strategy_id,
+            "Trades": int(totals[strategy_id]["count"]),
+            "Gross P&L": format_inr(totals[strategy_id]["gross"]),
+            "Charges": format_inr(totals[strategy_id]["charges"]),
+            "Net P&L": format_inr(totals[strategy_id]["net"]),
+        }
+        for strategy_id in order
+    ]
+
+
 def _render_closed_trades(streamlit: Any, trades: tuple[ClosedTradeRow, ...]) -> None:
     if not trades:
         streamlit.info("No closed trades in this range.")
         return
+    streamlit.subheader("Summary by strategy")
+    streamlit.dataframe(_closed_trades_summary_table(trades), hide_index=True, width="stretch")
+
+    streamlit.subheader("Trades")
     table = _closed_trades_table(trades)
     streamlit.dataframe(table, hide_index=True, width="stretch")
     streamlit.caption("Exit reason is not persisted anywhere yet.")
