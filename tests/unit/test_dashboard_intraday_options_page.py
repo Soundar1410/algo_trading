@@ -67,18 +67,56 @@ def test_live_positions_empty_state():
     assert any("no open positions" in i.lower() for i in st.infos)
 
 
-def test_live_positions_never_fabricates_current_price():
-    st = FakeStreamlit()
-    row = LivePositionRow(
+def _live_position_row(**overrides: object) -> LivePositionRow:
+    defaults: dict[str, object] = dict(
         strategy_id="st01", execution_mode="paper", instrument="NIFTY", security_id="13",
         side="BUY", quantity=75, entry_time="2026-08-14T04:00:00+00:00", entry_price=100.0,
         stop_price=None, target_price=None, highest_favourable=None, lowest_favourable=None,
-        duration_seconds=120.0,
+        duration_seconds=120.0, last_price=None, unrealised_pnl=None, marked_at=None,
+        mark_age_seconds=None,
+    )
+    defaults.update(overrides)
+    return LivePositionRow(**defaults)  # type: ignore[arg-type]
+
+
+def test_live_positions_never_fabricates_current_price_with_no_mark():
+    st = FakeStreamlit()
+    row = _live_position_row()
+    page._render_live_positions(st, (row,))
+    table = st.dataframes[0]
+    assert table[0]["Current price"] == "—"
+    assert table[0]["MTM"] == "—"
+
+
+def test_live_positions_shows_a_fresh_mark():
+    st = FakeStreamlit()
+    row = _live_position_row(
+        last_price=105.0, unrealised_pnl=375.0, marked_at="2026-08-14T04:04:30+00:00",
+        mark_age_seconds=30.0,
+    )
+    page._render_live_positions(st, (row,))
+    table = st.dataframes[0]
+    assert table[0]["Current price"] == "₹105.00"
+    assert table[0]["Points"] == "₹5.00"
+    assert table[0]["MTM"] == "₹375.00"
+
+
+def test_live_positions_never_shows_a_stale_mark_as_current():
+    """A mark older than ``_MARK_STALE_AFTER_SECONDS`` must not be shown as
+    current -- exactly the "stale value shown as current" the spec forbids,
+    even though a value technically exists in the row."""
+    st = FakeStreamlit()
+    row = _live_position_row(
+        last_price=105.0,
+        unrealised_pnl=375.0,
+        marked_at="2026-08-14T03:00:00+00:00",
+        mark_age_seconds=page._MARK_STALE_AFTER_SECONDS + 1.0,
     )
     page._render_live_positions(st, (row,))
     table = st.dataframes[0]
     assert table[0]["Current price"] == "—"
     assert table[0]["MTM"] == "—"
+    assert any("stale" in c.lower() for c in st.captions)
 
 
 # ============================================================ Orders & fills

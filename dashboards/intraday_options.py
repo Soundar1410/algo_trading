@@ -18,11 +18,15 @@ traded.
 selected strikes/expiry, per-leg P&L and roll count are not shown: those
 describe ``MultiLegEngine``/``FixedStrikeEngine``, and per the runbook's
 D56/D34 neither engine is ported into this codebase yet — there is no data
-to read. Current price / points / unrealised MTM on Open Positions are not
-shown either: no mark-to-market is persisted for paper positions (see
-``dashboards/data/intraday_options.py``'s module docstring). Inventing
-either would be exactly the "looks finished but isn't" pattern the runbook
-already declines elsewhere.
+to read. Current price / points / unrealised MTM on Open Positions **are**
+shown, from migration 0014's ``position_marks`` (see ``dashboards/data/
+intraday_options.py``'s module docstring) — written once per closed
+underlying candle by the strategy's own worker process, never invented from
+the entry fill price. A mark older than ``_MARK_STALE_AFTER_SECONDS`` is
+shown as stale (with its age) rather than as current — inventing either would
+be exactly the "looks finished but isn't" pattern the runbook already
+declines elsewhere. The multi-leg basket/leg drill-down does not have a mark
+yet — a separate, later phase.
 
 Read-only/no-side-effect discipline is identical to ``dashboards/Home.py`` —
 see that module's docstring. Rankings on the Strategy Comparison tab are
@@ -95,6 +99,7 @@ from dashboards.formatting import (  # noqa: E402
     format_inr,
     format_ist,
     format_pct,
+    freshness_note,
     health_badge,
     mode_label,
     to_csv_bytes,
@@ -107,6 +112,15 @@ NOT_YET_AVAILABLE = (
     "shaped. FixedStrikeEngine is still not ported into this codebase "
     "(runbook D34)."
 )
+
+#: A position_marks row older than this is shown as stale (with its age) —
+#: never as current. Marks are written once per closed underlying candle
+#: (see repository.update_position_marks), and the longest timeframe any
+#: strategy configured today uses is c921_ema_cross_buy's 5 minutes
+#: (config/strategies/intraday_options/c921_ema_cross_buy.yaml). This is
+#: deliberately generous headroom above that, not a tight SLA — revisit if a
+#: future strategy configures a longer candle timeframe.
+_MARK_STALE_AFTER_SECONDS = 900.0
 
 _PRESETS = ("Today", "Last 7 trading days", "Last 30 trading days", "Custom")
 _MODES = ("All", "Paper", "Live")
@@ -225,39 +239,72 @@ def _render_overview(streamlit: Any, rows: tuple[OverviewRow, ...]) -> None:
 
 
 # =========================================================== Live positions
+def _mark_is_fresh(row: Any) -> bool:
+    """``True`` iff ``row`` has a mark that is not too old to trust — see
+    ``_MARK_STALE_AFTER_SECONDS``. A row with no mark yet (``mark_age_seconds
+    is None``) is not "fresh", it simply has nothing to show yet."""
+    return (
+        row.last_price is not None
+        and row.mark_age_seconds is not None
+        and freshness_note(row.mark_age_seconds, stale_after_seconds=_MARK_STALE_AFTER_SECONDS)
+        is None
+    )
+
+
 def _render_live_positions(streamlit: Any, rows: tuple[Any, ...]) -> None:
     if not rows:
         streamlit.info("No open positions.")
         return
-    table = [
-        {
-            "Strategy": r.strategy_id,
-            "Mode": mode_label(r.execution_mode),
-            "Instrument": r.instrument,
-            "Side": r.side,
-            "Quantity": r.quantity,
-            "Entry time (IST)": format_ist(r.entry_time),
-            "Entry price": format_inr(r.entry_price),
-            "Current price": MISSING,
-            "Points": MISSING,
-            "MTM": MISSING,
-            "Stop": format_inr(r.stop_price) if r.stop_price is not None else MISSING,
-            "Target": format_inr(r.target_price) if r.target_price is not None else MISSING,
-            "Highest favourable": (
-                format_inr(r.highest_favourable) if r.highest_favourable is not None else MISSING
-            ),
-            "Lowest favourable": (
-                format_inr(r.lowest_favourable) if r.lowest_favourable is not None else MISSING
-            ),
-            "Duration": format_age(r.duration_seconds),
-        }
-        for r in rows
-    ]
+    any_stale = False
+    table = []
+    for r in rows:
+        fresh = _mark_is_fresh(r)
+        if r.last_price is not None and not fresh:
+            any_stale = True
+        points: float | None = None
+        if fresh:
+            points = (
+                r.last_price - r.entry_price
+                if r.side == "BUY"
+                else r.entry_price - r.last_price
+            )
+        table.append(
+            {
+                "Strategy": r.strategy_id,
+                "Mode": mode_label(r.execution_mode),
+                "Instrument": r.instrument,
+                "Side": r.side,
+                "Quantity": r.quantity,
+                "Entry time (IST)": format_ist(r.entry_time),
+                "Entry price": format_inr(r.entry_price),
+                "Current price": format_inr(r.last_price) if fresh else MISSING,
+                "Points": format_inr(points),
+                "MTM": format_inr(r.unrealised_pnl) if fresh else MISSING,
+                "Stop": format_inr(r.stop_price) if r.stop_price is not None else MISSING,
+                "Target": format_inr(r.target_price) if r.target_price is not None else MISSING,
+                "Highest favourable": (
+                    format_inr(r.highest_favourable)
+                    if r.highest_favourable is not None
+                    else MISSING
+                ),
+                "Lowest favourable": (
+                    format_inr(r.lowest_favourable) if r.lowest_favourable is not None else MISSING
+                ),
+                "Duration": format_age(r.duration_seconds),
+            }
+        )
     streamlit.dataframe(table, hide_index=True, width="stretch")
     streamlit.caption(
-        "Current price / points / MTM are not shown: no mark-to-market is "
-        "persisted for paper positions today. A stale value is never shown "
-        "as current."
+        "Current price / points / MTM are the mark from this position's last "
+        "closed candle, written by the strategy's own worker process — never "
+        "invented from the entry price. Shown as — for a position with no "
+        "mark yet (before its first candle has closed)"
+        + (
+            f", or where the mark is stale — older than "
+            f"{format_age(_MARK_STALE_AFTER_SECONDS)} — and no longer shown as current."
+            if any_stale
+            else "."
+        )
     )
 
 

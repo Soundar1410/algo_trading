@@ -136,7 +136,7 @@ class TradingEngine:
         recover_daily_risk: Callable[[], DailyRiskRecovery | None] | None = None,
         recover_exit_state: Callable[[], dict[str, Any] | None] | None = None,
         persist_exit_state: Callable[[dict[str, Any] | None, str | None], None] | None = None,
-        persist_position_marks: Callable[[float, float], None] | None = None,
+        persist_position_marks: Callable[[float, float, float, float], None] | None = None,
         publish_account_mtm: Callable[[OpenPosition, datetime], None] | None = None,
         clock: Callable[[], datetime] = now_ist,
     ) -> None:
@@ -836,16 +836,20 @@ class TradingEngine:
             )
 
     def _persist_position_marks(self) -> None:
-        """Write the open position's running MFE/MAE excursion. Phase 6 Part 3.
+        """Write the open position's running MFE/MAE excursion and live mark.
+
+        Phase 6 Part 3 (MFE/MAE); ``last_price``/``unrealised_pnl`` added later
+        for the dashboard's live-P&L feature — same checkpoint, same callback,
+        no new call site.
 
         Same checkpoint as :meth:`_persist_exit_state`, and for the same
-        reason: a mid-position crash must not lose an excursion already
-        observed in memory. No-op if no callback was injected, or nothing is
-        open — unlike exit-state there is nothing to *clear* on close, since
-        ``highest_favourable``/``lowest_favourable`` are plain columns on the
-        position's own (now ``CLOSED``) row, not a cross-contract-leakable
-        blob key, and the final values are exactly the audit trail a closed
-        trade's MFE/MAE should carry.
+        reason: a mid-position crash must not lose an excursion (or a mark)
+        already observed in memory. No-op if no callback was injected, or
+        nothing is open — unlike exit-state there is nothing to *clear* on
+        close, since these are plain columns/rows keyed off the position's own
+        (now ``CLOSED``) identity, not a cross-contract-leakable blob key, and
+        the final values are exactly the audit trail a closed trade's MFE/MAE
+        and last mark should carry.
         """
         if self._persist_position_marks_cb is None:
             return
@@ -853,7 +857,12 @@ class TradingEngine:
         if pos is None:
             return
         try:
-            self._persist_position_marks_cb(pos.max_favorable_pnl, pos.max_adverse_pnl)
+            self._persist_position_marks_cb(
+                pos.max_favorable_pnl,
+                pos.max_adverse_pnl,
+                pos.last_price,
+                pos.unrealised_pnl,
+            )
         except Exception:
             log.exception(
                 "%s: could not persist position marks; a restart may lose the "

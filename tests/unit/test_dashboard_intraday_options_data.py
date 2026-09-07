@@ -210,12 +210,48 @@ def test_an_open_position_shows_up_in_live_positions_until_closed(
     assert open_positions[0].side == "BUY"
     assert open_positions[0].quantity == 75
     assert open_positions[0].entry_price == pytest.approx(100.0, abs=0.2)
+    # No candle has closed for this position yet -- no mark row exists.
+    assert open_positions[0].last_price is None
+    assert open_positions[0].unrealised_pnl is None
+    assert open_positions[0].mark_age_seconds is None
 
     lifecycle.handle_signal(_signal(Side.SELL, minute=16, close=105.0), trading_date=TRADING_DATE)
     conn = _ro(database_path)
     open_after_exit = load_live_positions(conn, RUNTIME_ID, TRADING_DATE)
     conn.close()
     assert open_after_exit == ()
+
+
+def test_a_position_mark_is_joined_in_when_present(
+    repository: ExecutionRepository, session, database_path: Path
+):
+    """Migration 0014's ``position_marks``, written by the same worker
+    process once a candle closes -- joined onto the open position it belongs
+    to, never invented from the entry price."""
+    lifecycle = _lifecycle(repository, session)
+    lifecycle.handle_signal(_signal(Side.BUY, minute=15, close=100.0), trading_date=TRADING_DATE)
+
+    repository.update_position_marks(
+        strategy_id=STRATEGY_ID,
+        execution_mode=ExecutionMode.PAPER,
+        trading_date=TRADING_DATE,
+        security_id="13",
+        highest_favourable=375.0,
+        lowest_favourable=0.0,
+        last_price=105.0,
+        unrealised_pnl=375.0,
+    )
+
+    conn = _ro(database_path)
+    open_positions = load_live_positions(conn, RUNTIME_ID, TRADING_DATE)
+    conn.close()
+
+    assert len(open_positions) == 1
+    assert open_positions[0].last_price == 105.0
+    assert open_positions[0].unrealised_pnl == 375.0
+    assert open_positions[0].marked_at is not None
+    assert open_positions[0].mark_age_seconds is not None
+    assert open_positions[0].mark_age_seconds >= 0.0
 
 
 def test_live_positions_mode_filter_separates_paper_from_live(

@@ -1209,22 +1209,34 @@ class ExecutionRepository:
         security_id: str,
         highest_favourable: float,
         lowest_favourable: float,
+        last_price: float,
+        unrealised_pnl: float,
     ) -> None:
-        """Persist the running MFE/MAE excursion for an open position.
+        """Persist the running MFE/MAE excursion and live mark for an open position.
 
-        Phase 6 Part 3. Deliberately **outside** the fill path — ``_upsert_position``
-        only ever runs from :meth:`apply_fill`, and MFE/MAE change on every tick
-        while a position is open, not just at entry/exit. Called from the same
-        per-candle-while-open checkpoint :class:`~common.engine.engine.TradingEngine`
-        already uses for ``_persist_exit_state`` (Part 2), not a new one — so this
-        adds no write frequency beyond what limitation 24 already scopes.
+        Phase 6 Part 3 (MFE/MAE); ``last_price``/``unrealised_pnl`` added later for
+        the dashboard's live-P&L feature. Deliberately **outside** the fill path —
+        ``_upsert_position`` only ever runs from :meth:`apply_fill`, and both the
+        excursion and the mark change on every tick while a position is open, not
+        just at entry/exit. Called from the same per-candle-while-open checkpoint
+        :class:`~common.engine.engine.TradingEngine` already uses for
+        ``_persist_exit_state`` (Part 2), not a new one — so this adds no write
+        frequency beyond what limitation 24 already scopes.
 
-        A no-op (0 rows affected) if the position is not OPEN or does not exist —
-        callers only invoke this while they hold an open position in memory, so
-        that should never happen, but the write itself makes no assumption about it.
+        ``highest_favourable``/``lowest_favourable`` remain plain columns on
+        ``positions`` (a no-op UPDATE if the position is not OPEN or does not
+        exist). ``last_price``/``unrealised_pnl`` are upserted into the separate
+        ``position_marks`` table (migration 0014) — "latest mark only, overwritten
+        never appended", the same convention as the live-only ``live_position_mtm``
+        — so a dashboard read can join it onto ``positions`` and, via its own
+        ``as_of``, decide for itself whether the mark is still fresh.
+
+        Callers only invoke this while they hold an open position in memory, so
+        the ``positions`` update should never affect 0 rows, but the write itself
+        makes no assumption about it.
         """
         with self._db.transaction() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 UPDATE positions
                 SET highest_favourable = ?, lowest_favourable = ?
@@ -1238,6 +1250,33 @@ class ExecutionRepository:
                     execution_mode.value,
                     trading_date,
                     security_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                # Same "no-op for a closed/nonexistent position" guarantee as
+                # the positions UPDATE above -- a mark must not be written (or
+                # resurrected) for a position that is not OPEN right now.
+                return
+            conn.execute(
+                """
+                INSERT INTO position_marks
+                    (strategy_id, execution_mode, trading_date, security_id,
+                     last_price, unrealised_pnl, as_of)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (strategy_id, execution_mode, trading_date, security_id)
+                DO UPDATE SET
+                    last_price = excluded.last_price,
+                    unrealised_pnl = excluded.unrealised_pnl,
+                    as_of = excluded.as_of
+                """,
+                (
+                    strategy_id,
+                    execution_mode.value,
+                    trading_date,
+                    security_id,
+                    last_price,
+                    unrealised_pnl,
+                    _now(),
                 ),
             )
 

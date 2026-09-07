@@ -12,12 +12,17 @@ option contract (see ``dashboards/intraday_options.py``'s own
 ``c921_ema_cross_buy``, trades the NIFTY index directly
 (``parameters.security_id: "13"``), not an option contract — so those fields
 are not merely unpersisted, they are not applicable to what actually runs.
-No current price / unrealised MTM is shown for paper positions either: no
-mark table exists for paper fills (only the live-only, shared-account
-``live_position_mtm``), and inventing one from the entry fill price would be
-exactly the "stale value shown as current" the spec forbids. Both gaps are
-documented in the plan's data-availability matrix and the final report, not
-silently patched over.
+
+Current price / unrealised P&L for an open single-leg position **is** now
+shown (migration 0014's ``position_marks`` — the both-modes, per-runtime-group
+counterpart of the live-only, shared-account ``live_position_mtm``), joined in
+by :func:`load_live_positions` below. It is written once per closed underlying
+candle by the same worker process, never invented from the entry fill price —
+a position with no mark row yet (before its first candle closes) comes back
+``None``, and the page itself is responsible for refusing to show a mark whose
+``as_of`` is too old to trust (never this read-model's job, which only reports
+what is there). The multi-leg equivalent (``strategy_legs``) does not have this
+yet — a separate, later phase.
 """
 
 from __future__ import annotations
@@ -201,6 +206,20 @@ class LivePositionRow:
     highest_favourable: float | None
     lowest_favourable: float | None
     duration_seconds: float
+    #: From migration 0014's ``position_marks``, joined by the same
+    #: (strategy_id, execution_mode, trading_date, security_id) key as
+    #: ``positions`` itself. ``None`` before the first candle closes since
+    #: this position opened — never backfilled from ``average_price``, which
+    #: would be exactly the stale-value-as-current pattern this schema
+    #: refuses elsewhere. Freshness (``marked_at`` vs. now) is the caller's
+    #: decision, not this read-model's.
+    last_price: float | None
+    unrealised_pnl: float | None
+    marked_at: str | None
+    #: Seconds since ``marked_at``, computed in SQL exactly like
+    #: ``duration_seconds`` above — never parsed from the timestamp string in
+    #: Python. ``None`` iff ``marked_at`` is ``None`` (no mark row yet).
+    mark_age_seconds: float | None
 
 
 def load_live_positions(
@@ -213,25 +232,32 @@ def load_live_positions(
     execution_mode: str | None = None,
 ) -> tuple[LivePositionRow, ...]:
     query = (
-        "SELECT strategy_id, execution_mode, instrument, security_id, quantity, "
-        "average_price, stop_price, target_price, highest_favourable, "
-        "lowest_favourable, opened_at, "
-        "(julianday('now') - julianday(opened_at)) * 86400.0 AS duration_seconds "
-        "FROM positions "
-        "WHERE runtime_id = ? AND trading_date = ? AND status = 'OPEN' AND quantity != 0"
+        "SELECT p.strategy_id, p.execution_mode, p.instrument, p.security_id, "
+        "p.quantity, p.average_price, p.stop_price, p.target_price, "
+        "p.highest_favourable, p.lowest_favourable, p.opened_at, "
+        "(julianday('now') - julianday(p.opened_at)) * 86400.0 AS duration_seconds, "
+        "m.last_price AS last_price, m.unrealised_pnl AS unrealised_pnl, "
+        "m.as_of AS marked_at, "
+        "(julianday('now') - julianday(m.as_of)) * 86400.0 AS mark_age_seconds "
+        "FROM positions AS p "
+        "LEFT JOIN position_marks AS m "
+        "ON m.strategy_id = p.strategy_id AND m.execution_mode = p.execution_mode "
+        "AND m.trading_date = p.trading_date AND m.security_id = p.security_id "
+        "WHERE p.runtime_id = ? AND p.trading_date = ? AND p.status = 'OPEN' "
+        "AND p.quantity != 0"
     )
     params: list[object] = [runtime_id, trading_date]
     if strategy_ids:
-        clause, id_params = _in_clause("strategy_id", strategy_ids)
+        clause, id_params = _in_clause("p.strategy_id", strategy_ids)
         query += f" AND {clause}"
         params.extend(id_params)
     elif strategy_id is not None:
-        query += " AND strategy_id = ?"
+        query += " AND p.strategy_id = ?"
         params.append(strategy_id)
     if execution_mode is not None:
-        query += " AND execution_mode = ?"
+        query += " AND p.execution_mode = ?"
         params.append(execution_mode)
-    query += " ORDER BY opened_at DESC"
+    query += " ORDER BY p.opened_at DESC"
     rows = conn.execute(query, params).fetchall()
     return tuple(
         LivePositionRow(
@@ -248,6 +274,14 @@ def load_live_positions(
             highest_favourable=row["highest_favourable"],
             lowest_favourable=row["lowest_favourable"],
             duration_seconds=max(0.0, float(row["duration_seconds"])),
+            last_price=row["last_price"],
+            unrealised_pnl=row["unrealised_pnl"],
+            marked_at=row["marked_at"],
+            mark_age_seconds=(
+                max(0.0, float(row["mark_age_seconds"]))
+                if row["mark_age_seconds"] is not None
+                else None
+            ),
         )
         for row in rows
     )

@@ -856,7 +856,12 @@ def _build(
             last_candle_end_at=last_candle_end_at,
         )
 
-    def _persist_position_marks(highest_favourable: float, lowest_favourable: float) -> None:
+    def _persist_position_marks(
+        highest_favourable: float,
+        lowest_favourable: float,
+        last_price: float,
+        unrealised_pnl: float,
+    ) -> None:
         # positions (the same PositionManager instance the engine drives) is
         # already in scope here -- the engine only calls this while it holds
         # exactly one open position, so this is the one it means.
@@ -870,6 +875,8 @@ def _build(
             security_id=current[0].contract.security_id,
             highest_favourable=highest_favourable,
             lowest_favourable=lowest_favourable,
+            last_price=last_price,
+            unrealised_pnl=unrealised_pnl,
         )
 
     def _publish_account_mtm(position: OpenPosition, as_of: datetime) -> None:

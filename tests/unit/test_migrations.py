@@ -300,6 +300,7 @@ def test_shipped_migrations_start_at_the_walking_skeleton():
         "0011",
         "0012",
         "0013",
+        "0014",
     ]
     assert shipped[0].name == "walking_skeleton"
     assert shipped[1].name == "feed_and_auth_health"
@@ -322,6 +323,8 @@ def test_shipped_migrations_start_at_the_walking_skeleton():
     assert shipped[11].name == "positional_entry_stage_deadline"
     # strategy-rolling-strangle-otm1: durable repeated-roll support (Phase 1).
     assert shipped[12].name == "basket_roll_state"
+    # Dashboard live-P&L feature, Phase 1: single-leg position marks.
+    assert shipped[13].name == "position_marks"
 
 
 def test_shipped_migrations_apply_to_a_fresh_database(tmp_path: Path):
@@ -352,6 +355,7 @@ def test_shipped_migrations_apply_to_a_fresh_database(tmp_path: Path):
         "0011",
         "0012",
         "0013",
+        "0014",
     ]
     assert database.integrity_check() == []
     assert database.foreign_key_check() == []
@@ -365,7 +369,7 @@ def test_shipped_migrations_apply_to_a_fresh_database(tmp_path: Path):
             row["name"]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
-    assert {"strategy_baskets", "strategy_legs"} <= tables
+    assert {"strategy_baskets", "strategy_legs", "position_marks"} <= tables
     assert {
         "strategy_cycles",
         "strategy_cycle_legs",
@@ -422,6 +426,7 @@ def test_later_migrations_upgrade_a_database_created_by_0001_alone(tmp_path: Pat
         "0011",
         "0012",
         "0013",
+        "0014",
     ]
     with database.connect() as conn:
         survivors = conn.execute("SELECT COUNT(*) FROM runtime_sessions").fetchone()[0]
@@ -911,7 +916,7 @@ def test_migration_0010_upgrades_a_database_created_by_0009_with_real_rows(tmp_p
     )
 
     applied = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
-    assert [m.version for m in applied] == ["0010", "0011", "0012", "0013"]
+    assert [m.version for m in applied] == ["0010", "0011", "0012", "0013", "0014"]
 
     assert database.integrity_check() == []
     assert database.foreign_key_check() == []
@@ -1127,7 +1132,7 @@ def test_migration_0013_upgrades_a_database_created_by_0012_with_real_rows(tmp_p
     )
 
     applied = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
-    assert [m.version for m in applied] == ["0013"]
+    assert [m.version for m in applied] == ["0013", "0014"]
 
     assert database.integrity_check() == []
     assert database.foreign_key_check() == []
@@ -1212,3 +1217,91 @@ def test_strategy_basket_rolls_enforces_one_row_per_role_and_sequence(tmp_path: 
             "'rolling_strangle_otm1:2026-08-17:CE:1', '2026-08-17T09:50:00+05:30', "
             "'now', 'now')"
         )
+
+
+# --------------------------------------- 0014 (dashboard live-P&L, Phase 1)
+def test_migration_0014_upgrades_a_database_created_by_0013_with_real_rows(tmp_path: Path):
+    """The real upgrade path for 0014: seed a database through 0001-0013 only,
+    insert a real ``positions`` row exactly as 0001 already shipped it, then
+    apply 0014 and prove that row survives completely untouched, the new
+    ``position_marks`` table exists, and a second run does not re-apply
+    anything."""
+    from common.persistence.migrations import VERSIONS_DIR
+
+    up_to_0013 = tmp_path / "up_to_0013"
+    up_to_0013.mkdir()
+    for migration in discover_migrations(VERSIONS_DIR):
+        # Zero-padded version strings sort lexicographically the same as
+        # numerically -- excludes 0014 *and* every later migration, not just
+        # 0014 by name, so this test's own "seed through 0013 only" intent
+        # survives a future migration being added.
+        if migration.version >= "0014":
+            continue
+        (up_to_0013 / migration.path.name).write_text(
+            migration.path.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+
+    database = Database(tmp_path / "operational" / "intraday_options.db")
+    MigrationRunner(database, versions_dir=up_to_0013).run_pending()
+
+    with database.transaction() as conn:
+        conn.execute(
+            "INSERT INTO positions (runtime_id, strategy_id, execution_mode, "
+            "trading_date, instrument, security_id, quantity, average_price, "
+            "status, opened_at, updated_at) VALUES "
+            "('intraday_options', 'c921_ema_cross_buy', 'paper', '2026-08-17', "
+            "'NIFTY', '13', 75, 20000.0, 'OPEN', 'now', 'now')"
+        )
+    before = dict(database.connect().execute("SELECT * FROM positions").fetchone())
+
+    applied = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
+    assert [m.version for m in applied] == ["0014"]
+
+    assert database.integrity_check() == []
+    assert database.foreign_key_check() == []
+
+    with database.connect() as conn:
+        after = dict(conn.execute("SELECT * FROM positions").fetchone())
+        assert after == before, "0014 must not touch any existing positions row"
+
+        tables = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        assert "position_marks" in tables
+
+    # A second startup must not attempt to reapply 0014.
+    second_run = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
+    assert second_run == []
+
+
+def test_position_marks_upserts_rather_than_appends(tmp_path: Path):
+    """The whole point of ``position_marks`` (like ``live_position_mtm``
+    before it): a repeated mark for the same position overwrites in place,
+    never accumulates a second row."""
+    from common.persistence.migrations import VERSIONS_DIR
+
+    database = Database(tmp_path / "operational" / "intraday_options.db")
+    MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
+
+    def upsert(conn: sqlite3.Connection, last_price: float, unrealised_pnl: float) -> None:
+        conn.execute(
+            "INSERT INTO position_marks (strategy_id, execution_mode, trading_date, "
+            "security_id, last_price, unrealised_pnl, as_of) VALUES "
+            "('c921_ema_cross_buy', 'paper', '2026-08-17', '13', ?, ?, 'now') "
+            "ON CONFLICT (strategy_id, execution_mode, trading_date, security_id) "
+            "DO UPDATE SET last_price = excluded.last_price, "
+            "unrealised_pnl = excluded.unrealised_pnl, as_of = excluded.as_of",
+            (last_price, unrealised_pnl),
+        )
+
+    with database.transaction() as conn:
+        upsert(conn, 20010.0, 750.0)
+    with database.transaction() as conn:
+        upsert(conn, 20025.0, 1875.0)
+
+    with database.connect() as conn:
+        rows = conn.execute("SELECT * FROM position_marks").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["last_price"] == 20025.0
+    assert rows[0]["unrealised_pnl"] == 1875.0

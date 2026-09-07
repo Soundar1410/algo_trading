@@ -12044,3 +12044,84 @@ neither is fixed here (both are outside this change's entry-gate scope):
    `FeedUnavailableError`. Observed at 21, 26 and >20 minutes. The
    `except Exception` breadth is the more serious half: it would equally
    swallow and retry a genuine `AssertionError` escaping any adapter.
+
+### Intraday Options: live mark-to-market for Open Positions, Phase 1 (single-leg) — 7 September 2026
+
+Operator asked why the Open Positions table's Current price/Points/MTM
+columns showed "—", then asked to implement it. Previously documented as a
+deliberate gap (this doc's earlier "Two deliberate non-changes" note above,
+and matching captions in `dashboards/intraday_options.py`/`dashboards/
+data/intraday_options.py`/`dashboards/data/multi_leg.py`): no mark-to-market
+was ever persisted for a paper position, only its entry fill. Research
+confirmed the live tick-updated price (`OpenPosition.last_price`/
+`.unrealised_pnl`, `common/engine/models.py`) already exists in the
+strategy worker's own memory, updated every option tick, but never reached
+a database the read-only Streamlit dashboard process could see — and the
+dashboard is structurally barred (`test_no_dashboard_module_imports_a_
+broker_or_a_feed`) from opening its own feed/broker connection to fetch a
+price another way. The fix follows this codebase's own established
+pattern: the worker persists the mark, the dashboard reads it — the same
+shape as the account-scoped, live-only `live_position_mtm` table, and the
+same per-candle-close checkpoint already used for `highest_favourable`/
+`lowest_favourable` (MFE/MAE).
+
+**Scope: single-leg `positions` only (the Open Positions page).** The
+multi-leg `strategy_legs` equivalent (`straddle_920`/`rolling_strangle_
+otm1`'s Baskets tab) is a deliberately separate, not-yet-started follow-on
+phase — `LegRow.unrealised_gross_pnl` already exists in the read-model,
+hard-coded to `None` today with a comment anticipating exactly that future
+work (`dashboards/data/multi_leg.py`).
+
+**What changed.**
+- New additive migration `0014_position_marks.sql` — one new table,
+  `position_marks` (`strategy_id, execution_mode, trading_date, security_id,
+  last_price, unrealised_pnl, as_of`, upserted in place, "latest mark only,
+  overwritten never appended"). A new table rather than `ALTER TABLE
+  positions ADD COLUMN`, for the same replay-safety reason 0011/0012/0013
+  already give (SQLite has no `ADD COLUMN IF NOT EXISTS`).
+- `ExecutionRepository.update_position_marks` (`common/execution/
+  repository.py`) gained `last_price`/`unrealised_pnl` parameters and now
+  also upserts `position_marks` — inside the same transaction, and only
+  when the `positions` UPDATE actually affected a row (guards the exact
+  same "no-op for a closed/nonexistent position" invariant the pre-existing
+  MFE/MAE write already had, checked via the UPDATE's own `rowcount` rather
+  than a second query).
+- `TradingEngine._persist_position_marks` (`common/engine/engine.py`) and
+  the worker's `_persist_position_marks` closure (`runtimes/
+  intraday_options/engine_worker.py`) both widened to pass `pos.last_price`/
+  `pos.unrealised_pnl` through — no new call site, no new write frequency:
+  same per-candle-while-open checkpoint the MFE/MAE write already used
+  (`_persist_open_position_checkpoint`, "limitation 24").
+- `load_live_positions` (`dashboards/data/intraday_options.py`) now `LEFT
+  JOIN`s `position_marks` onto `positions` by the shared four-column key,
+  exposing `last_price`/`unrealised_pnl`/`marked_at`/`mark_age_seconds`
+  (the last computed in SQL via `julianday`, matching `duration_seconds`'s
+  own existing convention — never parsed from a timestamp string in
+  Python). `None` for a position with no mark row yet.
+- `_render_live_positions` (`dashboards/intraday_options.py`) now shows real
+  Current price/Points/MTM values, gated by a new `_MARK_STALE_AFTER_
+  SECONDS` constant (900s — generously above `c921_ema_cross_buy`'s 5-minute
+  candle timeframe, the longest configured today) via `dashboards/
+  formatting.py`'s pre-existing, previously-unused `freshness_note` helper.
+  A mark with no reading yet, or older than that threshold, still renders
+  "—" — never invented from the entry price, and never shown as current
+  past its freshness window. "Points" is the per-unit favourable move
+  (`last_price - entry_price` for BUY, inverted for SELL) — the
+  un-multiplied counterpart of MTM's rupee figure.
+
+**Not touched**: `strategy_legs`/`strategy_baskets` and the Baskets tab
+(Phase 2, not started), `docs/ALGO_TRADING_FORWARD_TESTING_ARCHITECTURE_
+FINAL.md` (single source of truth per CLAUDE.md), the account-scoped
+`live_position_mtm`/Phase 10 live-only machinery (untouched — this feature
+is paper-mode's own read path, though `position_marks` also carries
+`execution_mode='live'` rows for schema uniformity with `positions` itself).
+
+Regression: `tests/unit/test_migrations.py` (new `0014` upgrade test plus
+every full applied/shipped-version list updated), `tests/integration/
+test_execution_persistence.py` (`update_position_marks` extended for the
+two new fields, upsert-not-append, and the closed-position no-op, now
+covering `position_marks` too), `tests/unit/test_dashboard_intraday_
+options_data.py` and `tests/unit/test_dashboard_intraday_options_page.py`
+(joined-mark-present, no-mark-yet, and stale-mark-not-shown-as-current
+cases). `ruff check .` clean; `mypy common strategies runtimes dashboards
+scripts` clean; full test suite run.

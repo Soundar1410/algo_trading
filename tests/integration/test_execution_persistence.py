@@ -670,6 +670,8 @@ def test_update_position_marks_writes_the_excursion(repository, session):
         security_id="99926000",
         highest_favourable=650.0,
         lowest_favourable=-130.0,
+        last_price=105.0,
+        unrealised_pnl=325.0,
     )
 
     row = (
@@ -680,10 +682,52 @@ def test_update_position_marks_writes_the_excursion(repository, session):
     assert row["highest_favourable"] == 650.0
     assert row["lowest_favourable"] == -130.0
 
+    mark = (
+        repository.database.connect()
+        .execute("SELECT last_price, unrealised_pnl, as_of FROM position_marks")
+        .fetchone()
+    )
+    assert mark["last_price"] == 105.0
+    assert mark["unrealised_pnl"] == 325.0
+    assert mark["as_of"]
+
+
+def test_update_position_marks_upserts_a_repeated_mark(repository, session):
+    """The live-P&L feature's whole point: a later mark overwrites the
+    earlier one in place, it never appends a second row."""
+    _lifecycle(repository, session).handle_signal(_signal(), trading_date=TRADING_DATE)
+
+    repository.update_position_marks(
+        strategy_id="st01",
+        execution_mode=ExecutionMode.PAPER,
+        trading_date=TRADING_DATE,
+        security_id="99926000",
+        highest_favourable=650.0,
+        lowest_favourable=-130.0,
+        last_price=105.0,
+        unrealised_pnl=325.0,
+    )
+    repository.update_position_marks(
+        strategy_id="st01",
+        execution_mode=ExecutionMode.PAPER,
+        trading_date=TRADING_DATE,
+        security_id="99926000",
+        highest_favourable=650.0,
+        lowest_favourable=-130.0,
+        last_price=110.0,
+        unrealised_pnl=650.0,
+    )
+
+    rows = repository.database.connect().execute("SELECT * FROM position_marks").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["last_price"] == 110.0
+    assert rows[0]["unrealised_pnl"] == 650.0
+
 
 def test_update_position_marks_is_a_no_op_for_a_closed_position(repository, session):
     """Outside the fill path deliberately -- must not resurrect or misdirect a
-    write against a position that is no longer open."""
+    write against a position that is no longer open, for either the excursion
+    columns on ``positions`` or the ``position_marks`` row."""
     lifecycle = _lifecycle(repository, session)
     lifecycle.handle_signal(_signal(Side.BUY, minute=15), trading_date=TRADING_DATE)
     lifecycle.handle_signal(_signal(Side.SELL, minute=16), trading_date=TRADING_DATE)
@@ -695,6 +739,8 @@ def test_update_position_marks_is_a_no_op_for_a_closed_position(repository, sess
         security_id="99926000",
         highest_favourable=999.0,
         lowest_favourable=-999.0,
+        last_price=999.0,
+        unrealised_pnl=999.0,
     )
 
     row = (
@@ -704,6 +750,11 @@ def test_update_position_marks_is_a_no_op_for_a_closed_position(repository, sess
     )
     assert row["highest_favourable"] is None
     assert row["lowest_favourable"] is None
+
+    mark = (
+        repository.database.connect().execute("SELECT * FROM position_marks").fetchone()
+    )
+    assert mark is None
 
 
 # ------------------------------------------------------- notifications
