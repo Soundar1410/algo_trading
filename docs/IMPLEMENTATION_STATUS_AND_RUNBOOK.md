@@ -9,7 +9,7 @@ the next phase. Updated after every phase.
 |---|---|
 | **Current phase** | **Phase 10 — Controlled live readiness: CODE HARDENED, fully disabled.** Production parent/worker preflight wiring, Dhan order/update handling, restart-safe account-loss emergency square-off, account-wide reserve-before-submit risk plus live MTM, shared rate limiting, broker-authoritative startup/mode-transition/session-end reconciliation, strict migration history, and restore validation exist and are tested with mocks/fakes only. `c921_ema_cross_buy` (renamed from `ema_cross_9_21_buy` 31 August 2026 — see addendum) and its Rev 3.1 matrix are unchanged. **Every committed live gate remains fail-closed** (`global.live_trading_enabled: false`, `live_execution_allowed: false`, `live_approved: false`, no `mode: live` in `config/`), enforced by `scripts.assert_no_live_config_committed`. No real Dhan order/network call was made. |
 | **Next phase** | Operational evidence and explicit human decisions, not more live-enabling code: complete/review the 30-day paper run for every now-enabled real strategy (`c509_ema_cross_buy`, `c521_ema_cross_buy`, `c921_ema_cross_buy`, `st12_supertrend_buy`, `st05_supertrend_buy`, `rolling_strangle_otm1`, `straddle_920` — see the dated addenda for each one's enable decision), choose/configure an approved egress-IP provider and static IP, revalidate authentication operationally, then separately decide whether to approve minimum-quantity live activation. |
-| **Last updated** | 8 September 2026 — a second SuperTrend intraday-options strategy, `st05_supertrend_buy` (SuperTrend(1, 0.5), a multiplier clone of the existing SuperTrend(1, 1.2) strategy), added and enabled for paper trading; the existing strategy renamed `supertrend_buy_1_1p2` → `st12_supertrend_buy` in the same change to avoid a correlation-ID token collision between the two — see the dated addendum near the end of this file. Earlier: five dashboard filters ported from Trading_Automation (Outcome, Severity, an adjustable refresh interval, a multi-select Strategy filter replacing the old exclusive one, and a new Options Buying/Selling Style filter backed by a new `StrategyConfig.style` field) — see the dated addendum near the end of this file. Earlier the same day (1 September 2026): a real UTC-vs-IST entry-gate bug found and fixed live in `straddle_920`/`rolling_strangle_otm1` (both strategies were structurally unable to enter near their intended times; fixed, tested, and confirmed with live entries the same session — see the dated addendum, which also covers a same-session operator mistake and its correction). Earlier still the same day: two Intraday Options dashboard renames, `dashboards/app.py` → `dashboards/Home.py` and the "Live Positions" tab → "Open Positions" (see the two dated addenda). The day before: the `intraday_options` supervisor gained active worker-crash detection, containment and bounded per-worker restart, plus a session-end deadline derived from configured square-off times, closing a real incident (a crashed worker went unnoticed for 6+ hours; see the dated addendum). Earlier the same day: all three real EMA-cross strategies renamed to fix a correlation-ID token collision: `ema_cross_5_9_buy`/`ema_cross_5_21_buy`/`ema_cross_9_21_buy` → `c509_ema_cross_buy`/`c521_ema_cross_buy`/`c921_ema_cross_buy` (see the earlier addendum for root cause and sequencing). All committed live gates remain disabled |
+| **Last updated** | 8 September 2026 (evening) — two shared-infrastructure faults fixed after they ended both SuperTrend strategies' session that morning: the Dhan token expiry margin is now session-aware (it was 5 minutes, and a token with 950 s of life was accepted at 09:00 then died at 09:15), and a transiently-refused order (a stale quote) is now retried on the next tick instead of killing the worker; `max_quote_age_ms` also recalibrated 2000 -> 5000 ms against measured fill data. See the dated addendum at the end of this file. Earlier the same day — a second SuperTrend intraday-options strategy, `st05_supertrend_buy` (SuperTrend(1, 0.5), a multiplier clone of the existing SuperTrend(1, 1.2) strategy), added and enabled for paper trading; the existing strategy renamed `supertrend_buy_1_1p2` → `st12_supertrend_buy` in the same change to avoid a correlation-ID token collision between the two — see the dated addendum near the end of this file. Earlier: five dashboard filters ported from Trading_Automation (Outcome, Severity, an adjustable refresh interval, a multi-select Strategy filter replacing the old exclusive one, and a new Options Buying/Selling Style filter backed by a new `StrategyConfig.style` field) — see the dated addendum near the end of this file. Earlier the same day (1 September 2026): a real UTC-vs-IST entry-gate bug found and fixed live in `straddle_920`/`rolling_strangle_otm1` (both strategies were structurally unable to enter near their intended times; fixed, tested, and confirmed with live entries the same session — see the dated addendum, which also covers a same-session operator mistake and its correction). Earlier still the same day: two Intraday Options dashboard renames, `dashboards/app.py` → `dashboards/Home.py` and the "Live Positions" tab → "Open Positions" (see the two dated addenda). The day before: the `intraday_options` supervisor gained active worker-crash detection, containment and bounded per-worker restart, plus a session-end deadline derived from configured square-off times, closing a real incident (a crashed worker went unnoticed for 6+ hours; see the dated addendum). Earlier the same day: all three real EMA-cross strategies renamed to fix a correlation-ID token collision: `ema_cross_5_9_buy`/`ema_cross_5_21_buy`/`ema_cross_9_21_buy` → `c509_ema_cross_buy`/`c521_ema_cross_buy`/`c921_ema_cross_buy` (see the earlier addendum for root cause and sequencing). All committed live gates remain disabled |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
 | **Live order placement** | Code path exists but is deliberately unreachable from committed configuration. Parent and child preflight both fail closed without approved operational inputs; `OPERATIONAL LIVE ACTIVATION ELIGIBLE: NO — BLOCKED`. |
@@ -12304,3 +12304,154 @@ does not mention the supertrend pair at all (before or after this rename).
 Per the build spec's explicit instruction, the exact edit is flagged to the
 operator rather than made unilaterally — see the addendum text itself for the
 suggested wording.
+
+### Two shared-infrastructure faults that ended a live paper session — 8 September 2026
+
+**The incident.** Both SuperTrend strategies stopped trading mid-session and
+were blocked for the rest of the day. `st05_supertrend_buy` at 09:45,
+`st12_supertrend_buy` at 10:50, via an identical chain:
+
+```
+STALE_QUOTE (quote marginally over the 2000 ms limit)
+  -> GatewayExecutionError escapes TradingEngine.run()  -> worker dies
+  -> supervisor restarts it  -> history fetch HTTP 401 (token expired 09:15:54)
+  -> warm-up COLD_START  -> "no new entries today"
+```
+
+Every individual step was fail-closed and correct. The composition was not: two
+strategies lost a session to a quote that was 64 ms too old. Both ended flat, no
+stranded exposure, and the 15:20 hard square-off did its job — `st12`'s adopted
+position was properly exited at 11:10 on `MOMENTUM_LOW` after its restart.
+Neither fault was in the strategies; both are shared infrastructure and could
+have hit any strategy on any day.
+
+**Why only the SuperTrend pair was blocked.** `c509_ema_cross_buy` hit the
+*identical* 401/`COLD_START` at 10:30 and was not blocked. `SuperTrend.
+warmup_requirement()` declares `continuity_required=True` (a latched indicator
+cannot be safely cold-started); EMA does not, because it converges. So
+`StrategyWarmupSpec.entry_blocked_by` fails the SuperTrend strategies closed and
+lets the EMA ones run on. That is correct design — and it means a
+continuity-required strategy is structurally the most fragile to any restart,
+which is exactly why root cause 1 mattered so much.
+
+#### Root cause 1 — the token expiry margin was 5 minutes, not a session
+
+`common/authentication/token_cache.py`'s `DEFAULT_EXPIRY_MARGIN_SECONDS = 300`
+carries the comment *"Regenerate once a token is within this many seconds of
+expiry, so a long session never runs off the end of its token mid-trade."* The
+intent is exactly right; `300` cannot deliver it. At 09:00:05 the cached token
+had ~950 s left — over the margin, so `StoredToken.is_usable()` returned True and
+`AuthBootstrap.get_token()` handed it back. It died at 09:15:54.
+
+This recurs **structurally**, it was not bad luck: Dhan tokens last 24 h, and
+yesterday's auto-start ran late (09:15:55), so yesterday's token expired at
+09:15:54 today. Any day starting earlier than the previous day's mint time loses
+the token that many minutes into the session.
+
+A worker cannot self-heal from this: `engine_worker._resolve_access_token` reads
+the env override then the cache and **deliberately never mints** ("generation is
+the bootstrap's job"), so a restarted worker re-reads the expired token and gets
+401. Token freshness is entirely the parent's responsibility.
+
+**Fix.** `DEFAULT_EXPIRY_MARGIN_SECONDS` is **unchanged** — tests pin
+`is_usable(margin_seconds=300)` directly, and a large global default would force
+needless regeneration against Dhan's rate limit in every ad-hoc script. Instead
+a new `common.utils.timeutils.seconds_until_session_close()` computes the
+remaining session (to `MARKET_CLOSE_TIME` 15:30, plus a 15-minute grace matching
+the supervisor's own `SESSION_DEADLINE_GRACE_SECONDS`), and both parent runtimes
+(`runtimes/intraday_options/__main__.py`, `runtimes/positional_options/__main__.py`)
+pass it as `expiry_margin_seconds`. Wrapped in
+`max(DEFAULT_EXPIRY_MARGIN_SECONDS, ...)` so it only ever *strengthens* the
+requirement — an out-of-hours run still gets the ordinary 300 s guard rather than
+zero. At 09:00 the parent now demands 24,300 s of token life, refuses the cached
+one, and mints a fresh 24-hour token through the already-working headless TOTP
+path. If generation is impossible, `get_token()` already raises and auto-start
+refuses to start, which is strictly better than starting into a token that dies
+at 09:15.
+
+#### Root cause 2 — a refused order killed the session instead of being retried
+
+`common/broker/paper.py`'s `_check_freshness` refuses correctly; never fabricate
+a fill. The defect was the **escalation**.
+
+`STALE_QUOTE` is now classified transient (`TRANSIENT_REJECTION_CODES`, with
+`is_transient_rejection()` reading the code back off the persisted
+`rejection_reason` — a format `PaperRejectionCode` already guarantees). It is the
+only transient code, and the distinction is load-bearing: every other code
+restates something equally true on the next attempt, so retrying them would be a
+busy-loop hiding a real defect. `GatewayExecutionError` carries a `retryable`
+flag, defaulting to `False`, so every untouched raise site and every unrecognised
+failure keeps the old fail-loud behaviour.
+
+* **Entries** reuse the mechanism that already existed: on a transient refusal
+  `_pending` is left set and the next tick for that contract retries. Nothing to
+  unwind — the refusal is raised inside the gateway before `PositionManager`
+  writes anything — and `session.can_enter` is re-evaluated every attempt, so a
+  retry can never open past the 15:15 cutoff.
+* **Exits** record the deferred exit *with its original reason* (a premium-candle
+  exit is decided once, on a completed candle, and re-deriving would silently drop
+  it) and retry on later ticks, bounded to **3 attempts or 10 s** —
+  `EXIT_RETRY_MAX_ATTEMPTS` / `EXIT_RETRY_MAX_SECONDS`, sized against the measured
+  654 ms median tick cadence, so three attempts spans ~1.4 s. On exhaustion it
+  raises exactly as before.
+* **`_close()` now returns a bool**, and the reversal path checks it. This is the
+  safety-critical half: a deferred close must never be followed by opening the
+  replacement leg, or the strategy would hold two legs at once — worse than the
+  crash being fixed. The deferred reversal drops that one entry and lets the next
+  genuine flip re-enter; pinned by
+  `test_a_deferred_reversal_close_never_opens_the_replacement_leg`.
+
+* **The hard square-off is exempt**, via `_close(..., allow_retry=False)`. Found
+  while reviewing this change rather than after it shipped: `_handle_square_off`
+  latches `_squared_off` and stops the feed immediately after closing, so a
+  deferral there would never get its retry — the position would be carried
+  overnight with nothing raised, silently worse than the crash being fixed. The
+  backstop stays all-or-raise; pinned by
+  `test_the_hard_square_off_never_defers_a_refused_close`.
+
+The two committed fail-loud exit tests were **not** weakened, and this was
+verified rather than assumed: they inject rejection via `reject_correlation_ids`,
+which yields `INJECTED_FAILURE` — not transient — so it is never retried at all.
+
+#### Contributing cause 3 — `max_quote_age_ms: 2000` was mis-calibrated
+
+Measured from the day's own database and logs, not assumed:
+
+| | quote age |
+|---|---|
+| successful fills (n=153) | p50 **654 ms**, p90 1230, p95 1584, **max 1962** |
+| every refusal (n=12) | **2064 – 2293 ms** |
+
+The largest *successful* fill sat 38 ms under the wall and 7 % of successful
+fills already exceeded 1500 ms. The limit was not catching stale data; it was
+clipping the upper tail of the normal tick cadence for NIFTY weekly options.
+
+**Operator decision: raised to 5000 ms** across all six real intraday strategies
+(`skeleton_fixture` already sets `null`; no positional config sets the key).
+5000 clears all 12 refusals with headroom while still refusing a genuinely dead
+quote — over five seconds unrefreshed in an active session really is stale. Each
+committed YAML carries the measured rationale rather than a silent edit. This is
+belt-and-braces with root cause 2: neither fix carries the whole load.
+
+**Files.** `common/utils/timeutils.py` (`MARKET_CLOSE_TIME`,
+`seconds_until_session_close`); `runtimes/{intraday,positional}_options/__main__.py`;
+`common/broker/paper.py` (`TRANSIENT_REJECTION_CODES`, `is_transient_rejection`);
+`common/engine/gateway.py` (`retryable`); `common/engine/engine.py` (retry bounds,
+`_pending_exit`, `_close` returning a bool, entry/exit/reversal handling); the six
+strategy YAMLs; three `_config.py` pins.
+
+**Regression.** 21 new tests across `tests/unit/test_session_close_margin.py`,
+`tests/unit/test_transient_rejection_retry.py` and
+`tests/unit/test_auth_token_cache.py` — including the incident's own numbers (a
+950 s token refused for a 09:00 start; a 2064 ms refusal retried not fatal), both
+retry bounds, the entry-cutoff guard, and the reversal double-exposure property.
+`ruff` clean; `mypy --strict` clean over 244 files;
+`assert_no_live_config_committed` OK. Full suite at the unchanged **65**
+pre-existing failures (`weekly_delta_neutral`/positional, stale scrip-master
+fixture) — same nine files, same counts, none new.
+
+**Not done here.** No runtime was started, stopped or restarted, and the live
+operational database was not touched. The real end-to-end proof is the next
+09:00 auto-start: expect `authenticated source=generated` (not `cache`) in
+`logs/auto_start.log`, and no `STALE_QUOTE`-induced `worker failed` in
+`logs/algo_trading.log`.

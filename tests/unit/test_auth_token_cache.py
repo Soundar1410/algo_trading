@@ -303,3 +303,33 @@ def test_a_contended_refresh_lock_times_out_rather_than_generating_anyway(tmp_pa
         other.refresh_lock(timeout=0.1),
     ):
         pass
+
+
+# ------------------------------------- session-lifetime margin (8 Sep 2026 fix)
+def test_a_token_that_dies_mid_session_is_refused_for_a_session_length_margin():
+    """The exact 2026-09-08 incident, pinned as a regression.
+
+    The cached token had ~950 s of life at the 09:00 start. Against the default
+    300 s margin it was ``is_usable`` and was handed out; it expired at 09:15:54
+    and every worker that restarted afterwards got HTTP 401 on its history fetch,
+    warmed up ``COLD_START``, and — being ``continuity_required`` — was blocked
+    from entering for the rest of the day.
+
+    Asking for the session's own remaining length instead refuses it, which is
+    what makes ``get_token()`` mint a fresh 24-hour token at startup.
+    """
+    nine_fifty_seconds_left = _jwt(int(time.time()) + 950)
+    token = StoredToken(nine_fifty_seconds_left, CLIENT_ID, "", None)
+
+    # What actually happened: the old margin accepted it.
+    assert token.is_usable(margin_seconds=300) is True
+    # What the runtimes now ask for — a whole trading session — refuses it.
+    assert token.is_usable(margin_seconds=6 * 60 * 60) is False
+
+
+def test_a_fresh_24_hour_token_still_satisfies_a_session_length_margin():
+    """The other half: the fix must not reject a genuinely good token and send
+    every startup into a needless regeneration against Dhan's rate limit."""
+    minted_moments_ago = _jwt(int(time.time()) + 24 * 60 * 60)
+    token = StoredToken(minted_moments_ago, CLIENT_ID, "", None)
+    assert token.is_usable(margin_seconds=6 * 60 * 60) is True

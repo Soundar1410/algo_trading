@@ -21,12 +21,20 @@ directly rather than parsing strings, so there was no existing helper to reuse.
 
 from __future__ import annotations
 
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 #: The exchange this project trades on. Every "now" the engine uses comes from
 #: here rather than a naive ``datetime.now()``.
 DEFAULT_TZ = "Asia/Kolkata"
+
+#: NSE's regular equity/F&O session close. The same 15:30 already assumed by
+#: :mod:`common.candles.aggregator` (its default grid ``end``),
+#: :mod:`common.engine.positional.lifecycle` (index options settle at the close)
+#: and :mod:`common.market_data.dhan`'s own session note — named here so a
+#: caller asking "how much longer does today's session run?" does not restate it
+#: a fourth time.
+MARKET_CLOSE_TIME = time(15, 30)
 
 
 def get_tz(tz_name: str = DEFAULT_TZ) -> ZoneInfo:
@@ -51,6 +59,45 @@ def combine(day: date, t: time, tz_name: str = DEFAULT_TZ) -> datetime:
 
 class NaiveDatetimeError(ValueError):
     """A timezone-naive datetime reached a decision that needs a real instant."""
+
+
+def seconds_until_session_close(
+    *,
+    now: datetime | None = None,
+    close: time = MARKET_CLOSE_TIME,
+    grace_seconds: int = 0,
+    tz_name: str = DEFAULT_TZ,
+) -> int:
+    """Whole seconds from ``now`` until today's session close, plus ``grace_seconds``.
+
+    ``0`` once that instant has passed — never negative, so a caller can use the
+    result as a lower bound without special-casing an evening run.
+
+    Exists for one specific job: telling
+    :class:`~common.authentication.bootstrap.AuthBootstrap` how much token life a
+    run actually needs. A Dhan access token lasts 24 hours, so whether the cached
+    one survives the trading day depends entirely on what time of day it was
+    minted — and the default 5-minute
+    :data:`~common.authentication.token_cache.DEFAULT_EXPIRY_MARGIN_SECONDS`
+    cannot express "must outlast this session".
+
+    That gap was not theoretical. On 2026-09-08 the cached token had ~950 s left
+    at the 09:00 start — comfortably over the 5-minute margin, so it was
+    accepted — and expired at 09:15:54, fifteen minutes into the session. Every
+    worker that restarted after that got HTTP 401 on its history fetch, warmed
+    up ``COLD_START``, and (for a ``continuity_required`` strategy) was blocked
+    from entering for the rest of the day. Two strategies lost the session that
+    way. See the dated addendum in ``docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md``.
+    """
+    reference = now or now_tz(tz_name)
+    if reference.tzinfo is None:
+        raise NaiveDatetimeError(
+            "seconds_until_session_close needs an aware 'now'; got a naive datetime"
+        )
+    local = reference.astimezone(get_tz(tz_name))
+    deadline = combine(local.date(), close, tz_name) + timedelta(seconds=grace_seconds)
+    remaining = (deadline - local).total_seconds()
+    return max(0, int(remaining))
 
 
 def local_time_in(moment: datetime, tz_name: str = DEFAULT_TZ, *, argument: str = "moment") -> time:

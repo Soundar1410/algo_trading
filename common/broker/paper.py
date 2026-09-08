@@ -106,6 +106,50 @@ class PaperRejection(BrokerError):
         self.code = code
 
 
+#: Rejection codes describing a *momentary* condition that the very next tick can
+#: clear on its own, as opposed to a standing fact about the order.
+#:
+#: Only ``STALE_QUOTE`` qualifies, and the distinction is load-bearing rather than
+#: cosmetic. Every other code restates something that will be equally true on the
+#: next attempt — an invalid quantity, an off-tick limit price, a closed market, a
+#: duplicate correlation id, an unknown instrument, a risk block, an injected
+#: failure. Retrying those is a busy-loop that hides a real defect. A stale quote
+#: is the opposite: it says only "no fresh tick has arrived *yet*", and one
+#: arriving is precisely what the engine is already waiting for.
+#:
+#: Measured, not assumed: on 2026-09-08 every one of the 12 stale-quote refusals
+#: fell between 2064 ms and 2293 ms against a 2000 ms limit, while successful
+#: fills that same day ran to 1962 ms — the refusals were the upper tail of the
+#: ordinary tick cadence, not dead data. Each one killed a worker outright,
+#: because the resulting GatewayExecutionError propagated out of
+#: ``TradingEngine.run()``. See the dated addendum in
+#: ``docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md``.
+TRANSIENT_REJECTION_CODES: frozenset[PaperRejectionCode] = frozenset(
+    {PaperRejectionCode.STALE_QUOTE}
+)
+
+
+def is_transient_rejection(rejection_reason: str | None) -> bool:
+    """True when a persisted ``rejection_reason`` names a transient code.
+
+    Reads the code back off the front of the stored string, which
+    :class:`PaperRejection` puts there precisely so the machine-readable code
+    survives into ``orders.rejection_reason`` without a schema change (see
+    :class:`PaperRejectionCode`'s own docstring). Anything unrecognised — a
+    reason from another broker, a free-text string, ``None`` — is treated as
+    **not** transient, so an unknown failure keeps today's fail-loud behaviour
+    rather than being retried on a guess.
+    """
+    if not rejection_reason:
+        return False
+    head, _, _ = rejection_reason.partition(":")
+    try:
+        code = PaperRejectionCode(head.strip())
+    except ValueError:
+        return False
+    return code in TRANSIENT_REJECTION_CODES
+
+
 #: What the exchange says about one instrument. Supplied by the caller because the
 #: broker must not reach into the scrip master itself — see
 #: :class:`PaperBroker`'s ``instrument_rules``.

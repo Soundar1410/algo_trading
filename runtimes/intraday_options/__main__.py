@@ -27,6 +27,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from common.authentication import AuthBootstrap, AuthCredentials, AuthError
+from common.authentication.token_cache import DEFAULT_EXPIRY_MARGIN_SECONDS
 from common.broker.base import Broker
 from common.config import (
     ProjectPaths,
@@ -49,10 +50,14 @@ from common.persistence import Database, MigrationRunner
 from common.process import legacy_system_status
 from common.reconciliation import ReconciliationRunner
 from common.retention import backup_database, run_retention, verify_backup_restorable
-from common.utils.timeutils import local_date_in, now_ist
+from common.utils.timeutils import local_date_in, now_ist, seconds_until_session_close
 
 from .config_adapter import build_worker_config
-from .supervisor import IntradayOptionsSupervisor, SupervisorConfig
+from .supervisor import (
+    SESSION_DEADLINE_GRACE_SECONDS,
+    IntradayOptionsSupervisor,
+    SupervisorConfig,
+)
 
 _log = get_logger(__name__)
 
@@ -359,6 +364,27 @@ def main(argv: list[str] | None = None) -> int:
         print("DHAN_CLIENT_ID is not set. Fill it in .env (see .env.example).")
         return EXIT_NO_CREDENTIALS
 
+    # The token must outlast the whole session, not merely the next five
+    # minutes. AuthBootstrap's default expiry margin is
+    # DEFAULT_EXPIRY_MARGIN_SECONDS (300 s), which on 2026-09-08 accepted a
+    # cached token with ~950 s of life at the 09:00 start; it expired at
+    # 09:15:54 and every worker that restarted afterwards got HTTP 401 on its
+    # history fetch, warmed up COLD_START and — being continuity_required —
+    # was blocked from entering for the rest of the day. Two strategies lost
+    # the session that way (see the dated addendum in
+    # docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md).
+    #
+    # Asking for the remaining session length instead makes get_token() mint a
+    # fresh 24-hour token at startup rather than inherit one that dies
+    # mid-morning. max(...) with the shared default is deliberate: this only
+    # ever *strengthens* the requirement, so an out-of-hours run (where the
+    # session figure is 0) still gets the ordinary 300 s guard rather than none.
+    # The grace matches the supervisor's own SESSION_DEADLINE_GRACE_SECONDS, so
+    # the token is guaranteed to outlive the run's own hard deadline.
+    token_lifetime_required = max(
+        DEFAULT_EXPIRY_MARGIN_SECONDS,
+        seconds_until_session_close(grace_seconds=SESSION_DEADLINE_GRACE_SECONDS),
+    )
     bootstrap = AuthBootstrap(
         AuthCredentials(
             client_id=client_id,
@@ -367,6 +393,7 @@ def main(argv: list[str] | None = None) -> int:
             access_token=read_secret(settings.dhan_access_token),
         ),
         cache_dir=paths.cache_root,
+        expiry_margin_seconds=token_lifetime_required,
         on_token_minted=lambda token: redactor.add_secrets([token]),
     )
     try:
@@ -374,7 +401,11 @@ def main(argv: list[str] | None = None) -> int:
     except AuthError as exc:
         print(f"Cannot authenticate ({type(exc).__name__}): {exc}")
         return EXIT_FAILED
-    _log.info("authenticated source=%s", outcome.source)
+    _log.info(
+        "authenticated source=%s (required %ds of token life for this session)",
+        outcome.source,
+        token_lifetime_required,
+    )
 
     # Imported here, not at module level, so this module can be read and
     # linted without the Dhan SDK present — the same discipline

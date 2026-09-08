@@ -26,6 +26,7 @@ import sys
 from pathlib import Path
 
 from common.authentication import AuthBootstrap, AuthCredentials, AuthError
+from common.authentication.token_cache import DEFAULT_EXPIRY_MARGIN_SECONDS
 from common.config import (
     ConfigError,
     discover_enabled_strategies,
@@ -41,10 +42,17 @@ from common.notifications import build_notifier
 from common.persistence import Database, MigrationRunner
 from common.process import legacy_system_status
 from common.retention import backup_database, run_retention, verify_backup_restorable
+from common.utils.timeutils import seconds_until_session_close
 
 from .supervisor import EXIT_OK, build_positional_supervisor
 
 _log = get_logger(__name__)
+
+#: Grace added to the session close when deciding how much token life this
+#: run needs. Mirrors the intraday supervisor's own
+#: SESSION_DEADLINE_GRACE_SECONDS (15 min) rather than importing across
+#: runtime packages, which would couple two otherwise independent groups.
+_TOKEN_SESSION_GRACE_SECONDS = 15 * 60
 
 EXIT_FAILED = 1
 EXIT_RUNTIME_DISABLED = 10
@@ -166,6 +174,17 @@ def main(argv: list[str] | None = None) -> int:
     # Authenticated exactly once, here, in the parent — every spawned child
     # reads this same cached token from disk (worker._cached_dhan_token),
     # never re-authenticating over the network itself.
+    # Same session-lifetime requirement the intraday runtime applies, and for
+    # the same incident: a cached token with only minutes of life left is
+    # accepted by the default 300 s margin, then expires mid-session, and every
+    # worker that restarts afterwards gets HTTP 401 on its history fetch. A
+    # positional worker restarting into a dead token is worse, not better --
+    # it manages an open multi-day cycle. max(...) keeps the ordinary 300 s
+    # guard for an out-of-hours run rather than dropping to nothing.
+    token_lifetime_required = max(
+        DEFAULT_EXPIRY_MARGIN_SECONDS,
+        seconds_until_session_close(grace_seconds=_TOKEN_SESSION_GRACE_SECONDS),
+    )
     bootstrap = AuthBootstrap(
         AuthCredentials(
             client_id=client_id,
@@ -174,6 +193,7 @@ def main(argv: list[str] | None = None) -> int:
             access_token=read_secret(settings.dhan_access_token),
         ),
         cache_dir=paths.cache_root,
+        expiry_margin_seconds=token_lifetime_required,
         on_token_minted=lambda token: redactor.add_secrets([token]),
     )
     try:
@@ -182,7 +202,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Cannot authenticate ({type(exc).__name__}): {exc}")
         return EXIT_FAILED
     redactor.add_secrets([token])
-    _log.info("authenticated source=%s", outcome.source)
+    _log.info(
+        "authenticated source=%s (required %ds of token life for this session)",
+        outcome.source,
+        token_lifetime_required,
+    )
 
     # Imported here, not at module level, so this module can be read and
     # linted without the Dhan SDK present — the same discipline

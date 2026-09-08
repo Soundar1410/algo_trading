@@ -43,6 +43,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
+from common.broker.paper import is_transient_rejection
 from common.config.models import ExecutionMode
 from common.logging import get_logger
 from common.models import Candle, OrderStatus, Side, Signal
@@ -73,7 +74,19 @@ class GatewayExecutionError(RuntimeError):
     Always raised, never swallowed into a plausible-looking ``FillOutcome``: the
     caller is :class:`~common.engine.positions.PositionManager`, whose next act
     would be to record a position that does not exist or to forget one that does.
+
+    ``retryable`` says whether the *reason* was momentary — today only a stale
+    quote (:data:`~common.broker.paper.TRANSIENT_REJECTION_CODES`), i.e. "no
+    fresh tick has arrived yet". It is advice to the engine, never permission to
+    invent a fill: the order still did not trade, and the position is still
+    exactly as the database has it either way. Defaults to ``False`` so any
+    caller that does not consult it, and any failure whose cause is unrecognised,
+    keeps the original fail-loud behaviour.
     """
+
+    def __init__(self, *args: object, retryable: bool = False) -> None:
+        super().__init__(*args)
+        self.retryable = retryable
 
 
 @dataclass(frozen=True)
@@ -475,10 +488,19 @@ class LifecycleGateway:
 
         # Loud on purpose. The position stays as the database has it — open if this
         # was a close — which is the state restart recovery knows how to adopt.
+        #
+        # `retryable` only classifies *why* it failed; it changes nothing about the
+        # refusal itself. A momentary cause (a quote the next tick will refresh) is
+        # flagged so the engine can try again rather than lose the session, while
+        # every standing cause — and anything unrecognised — stays fatal exactly as
+        # before.
         raise GatewayExecutionError(
             f"{side.value} of {contract.symbol} did not trade: {problem}. "
             "No fill is reported to the position manager, because a fabricated one "
-            "would record a trade that never happened."
+            "would record a trade that never happened.",
+            retryable=is_transient_rejection(
+                order.rejection_reason if order is not None else None
+            ),
         )
 
     @staticmethod

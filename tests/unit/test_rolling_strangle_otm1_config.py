@@ -286,7 +286,12 @@ def test_paper_execution_uses_the_current_model_not_the_legacy_zero_slippage(wor
     assert paper["tick_size"] == 0.05
     assert paper["allow_ltp_fallback"] is True
     assert paper["ltp_fallback_extra_ticks"] == 1
-    assert paper["max_quote_age_ms"] == 2000
+    # Raised 2000 -> 5000 on 8 September 2026: 2000 ms was clipping the normal
+    # tick cadence of NIFTY weekly options rather than catching stale data (the
+    # largest successful fill that day sat 38 ms under the wall, and all 12
+    # refusals fell in 2064-2293 ms). See the committed YAML's own comment and
+    # the dated runbook addendum.
+    assert paper["max_quote_age_ms"] == 5000
 
     ema = build_worker_config(
         load_resolved_config(CONFIG_ROOT, RUNTIME_ID, "c921_ema_cross_buy"),

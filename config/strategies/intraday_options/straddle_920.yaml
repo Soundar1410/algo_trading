@@ -153,4 +153,18 @@ parameters:
     tick_size: 0.05
     allow_ltp_fallback: true
     ltp_fallback_extra_ticks: 0
-    max_quote_age_ms: 2000
+    # Live feed: reject a quote older than this rather than fill on stale data.
+    #
+    # Raised 2000 -> 5000 on 8 September 2026 after measurement, not guesswork.
+    # 2000 ms was clipping the normal tick cadence of NIFTY weekly option
+    # contracts rather than catching stale data: across 153 real paper fills on
+    # 2026-09-08 the quote age ran p50 654 ms / p95 1584 ms / max 1962 ms -- the
+    # largest successful fill sat 38 ms under the wall -- while all 12 refusals
+    # that day fell in 2064-2293 ms, i.e. the same distribution's upper tail.
+    # Those refusals killed two workers outright (see the dated addendum in
+    # docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md). 5000 ms keeps a genuine
+    # staleness guard -- a quote unrefreshed for over five seconds in an active
+    # session really is stale -- with headroom over the observed distribution.
+    # A refusal is also no longer fatal: the engine now retries a transient
+    # rejection on the next tick instead of ending the session.
+    max_quote_age_ms: 5000

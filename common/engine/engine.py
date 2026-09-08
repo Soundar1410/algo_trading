@@ -83,6 +83,7 @@ if TYPE_CHECKING:
 from .config import EngineConfig
 from .daily_guard import DailyRiskConfig, DailyRiskGuard, DailyRiskRecovery
 from .feed import MarketDataFeed
+from .gateway import GatewayExecutionError
 from .models import (
     AdoptedPosition,
     OpenPosition,
@@ -108,6 +109,23 @@ from .square_off import SessionSquareOffAuthority, SquareOffAuthority
 from .strategy import BaseStrategy
 
 log = get_logger(__name__)
+
+#: How many times an exit refused for a *momentary* reason is retried on
+#: subsequent ticks before the refusal is treated as real and raised.
+#:
+#: Three, bounded jointly by EXIT_RETRY_MAX_SECONDS below. Sized against the
+#: measured tick cadence rather than guessed: option quote ages on 2026-09-08
+#: had a median of 654 ms, so three attempts spans roughly 1.4 s of real
+#: ticks -- comfortably longer than the 64-293 ms by which that day's stale
+#: quotes overshot their limit, and far short of leaving a genuinely stuck
+#: exit unreported. The 15:20 hard square-off remains the backstop beneath
+#: both bounds.
+EXIT_RETRY_MAX_ATTEMPTS = 3
+
+#: Wall-clock ceiling on the same retry, so a contract that simply stops
+#: ticking cannot hold an exit open indefinitely while never reaching the
+#: attempt count.
+EXIT_RETRY_MAX_SECONDS = 10.0
 
 
 class TradingEngine:
@@ -262,6 +280,12 @@ class TradingEngine:
         self._pending: OptionContract | None = None  # awaiting first option tick
         self._pending_side: OrderSide | None = None
         self._squared_off = False
+        #: An exit the broker refused for a momentary reason (a stale quote), kept
+        #: so the next tick for that contract retries the *same* decision rather
+        #: than re-deriving it — a premium-candle exit reason is computed once, on
+        #: a completed candle, and would otherwise simply be lost. Holds
+        #: ``(position_id, reason, attempts, first_attempt_ts)``.
+        self._pending_exit: tuple[str, ExitReason, int, datetime] | None = None
 
         # Shutdown coordination. The event is injectable so the process's single
         # signal owner can hand in the one it already holds, rather than this
@@ -592,6 +616,7 @@ class TradingEngine:
         self._spot = None
         self._pending = None
         self._pending_side = None
+        self._pending_exit = None
         self._squared_off = False
         # A new day is the ONLY thing that clears a warm-up block; _warm_up() runs
         # straight after this and may set it again.
@@ -1047,6 +1072,22 @@ class TradingEngine:
 
     def _on_option_tick(self, tick: Tick) -> None:
         pos = self.positions.get(tick.security_id)
+        # A momentarily-refused exit is retried before anything else this tick,
+        # and with the reason it was originally decided on. Re-deriving would not
+        # do: a premium-candle exit is computed once, on a completed candle, so a
+        # deferred one would otherwise be silently dropped. This tick's price is
+        # used, not the stale one that was refused.
+        if (
+            self._pending_exit is not None
+            and pos is not None
+            and self._pending_exit[0] == tick.security_id
+        ):
+            deferred_position_id, deferred_reason, _, _ = self._pending_exit
+            pos.update_price(tick.last_price)
+            self._close(
+                deferred_position_id, tick.last_price, tick.exchange_time, deferred_reason
+            )
+            return
         if pos is not None:
             pos.update_price(tick.last_price)
             if self._publish_account_mtm_cb is not None:
@@ -1091,7 +1132,31 @@ class TradingEngine:
             and tick.security_id == self._pending.security_id
         ):
             if self.session.can_enter(tick.exchange_time) and self._pending_side is not None:
-                self._open(self._pending, self._pending_side, tick.last_price, tick.exchange_time)
+                try:
+                    self._open(
+                        self._pending, self._pending_side, tick.last_price, tick.exchange_time
+                    )
+                except GatewayExecutionError as exc:
+                    if not exc.retryable:
+                        raise
+                    # A momentary refusal — today only a stale quote, i.e. "no
+                    # fresh tick has arrived yet". Leave the entry pending and let
+                    # the next tick for this contract try again, which is exactly
+                    # what `_pending` already exists to wait for; returning here
+                    # rather than clearing it is the whole retry.
+                    #
+                    # Nothing to unwind: the refusal is raised inside the gateway
+                    # before PositionManager writes anything, and
+                    # `risk_manager.new_position()` (called first in `_open`) just
+                    # re-seeds its own state, so re-entering is idempotent. The
+                    # entry-cutoff gate above is re-evaluated on every retry, so a
+                    # pending entry can never sneak past 15:15 by retrying.
+                    log.warning(
+                        "entry for %s refused transiently (%s); retrying on the next tick",
+                        self._pending.symbol,
+                        exc,
+                    )
+                    return
             self._pending = None
             self._pending_side = None
 
@@ -1175,8 +1240,22 @@ class TradingEngine:
             return
 
         # Different/opposite leg open -> exit it first (_close() persists/clears).
-        if pos is not None:
-            self._close(pos.contract.security_id, pos.last_price, ts, ExitReason.OPPOSITE_SIGNAL)
+        if pos is not None and not self._close(
+            pos.contract.security_id, pos.last_price, ts, ExitReason.OPPOSITE_SIGNAL
+        ):
+            # The close was refused for a momentary reason and is queued for
+            # retry. The replacement leg is deliberately NOT opened: "close
+            # before open" is the invariant here, and opening now would double
+            # the exposure this strategy is only ever allowed one of. The
+            # retry closes the old leg within a tick or two, leaving the book
+            # flat — a safe state — and the next genuine flip re-enters.
+            # Dropping this one entry is the conservative half of the trade.
+            log.warning(
+                "reversal deferred: %s could not be closed yet, so the replacement "
+                "leg is not being opened this candle",
+                pos.contract.symbol,
+            )
+            return
 
         # Enter the new leg if still within the entry window. Nothing to persist
         # here yet -- _enter() only queues a pending contract; the exit-state
@@ -1253,17 +1332,78 @@ class TradingEngine:
             self._last_option_tick_ts = ts
             self._premium_gap_logged = False
 
-    def _close(self, position_id: str, price: float, ts: datetime, reason: ExitReason) -> None:
+    def _close(
+        self,
+        position_id: str,
+        price: float,
+        ts: datetime,
+        reason: ExitReason,
+        *,
+        allow_retry: bool = True,
+    ) -> bool:
+        """Close a position. ``True`` when it actually closed.
+
+        ``False`` means the broker refused for a *momentary* reason (a stale
+        quote) and the exit has been recorded in :attr:`_pending_exit` for the
+        next tick to retry. **A caller that would act on the book being flat must
+        check the return value** — the reversal path in particular must not open
+        its replacement leg while the old one is demonstrably still open.
+
+        A non-retryable refusal, or a retryable one past
+        :data:`EXIT_RETRY_MAX_ATTEMPTS` / :data:`EXIT_RETRY_MAX_SECONDS`, still
+        raises ``GatewayExecutionError`` exactly as before: the position stays as
+        the database has it, which is the state restart recovery adopts.
+
+        ``allow_retry=False`` disables deferral entirely, so this either closes or
+        raises. The hard square-off passes it, and must: deferring there would be
+        a silent failure rather than a retry, because ``_handle_square_off``
+        latches ``_squared_off`` and stops the feed immediately afterwards — there
+        is no "next tick" left to retry on, and the position would be carried
+        overnight with nothing raised. The square-off is the backstop beneath
+        every other exit path, so it is the one place that must stay all-or-raise.
+        """
         pos = self.positions.get(position_id)
         contract = pos.contract if pos else None
-        trade = self.positions.close(
-            position_id,
-            price,
-            ts,
-            reason,
-            exit_regime=self._regime.current_regime(),
-            session_tags=self._regime.session_tags(contract, ts),
-        )
+        try:
+            trade = self.positions.close(
+                position_id,
+                price,
+                ts,
+                reason,
+                exit_regime=self._regime.current_regime(),
+                session_tags=self._regime.session_tags(contract, ts),
+            )
+        except GatewayExecutionError as exc:
+            if not exc.retryable or not allow_retry:
+                self._pending_exit = None
+                raise
+            attempts, first_at = 1, ts
+            if self._pending_exit is not None and self._pending_exit[0] == position_id:
+                attempts = self._pending_exit[2] + 1
+                first_at = self._pending_exit[3]
+            elapsed = (ts - first_at).total_seconds()
+            if attempts >= EXIT_RETRY_MAX_ATTEMPTS or elapsed >= EXIT_RETRY_MAX_SECONDS:
+                # Bound reached: a refusal that keeps repeating is no longer
+                # "momentary", whatever the code says. Fail loudly, as before.
+                self._pending_exit = None
+                log.error(
+                    "exit for %s still refused after %d attempt(s) over %.1fs; "
+                    "failing loudly rather than retrying indefinitely",
+                    position_id,
+                    attempts,
+                    elapsed,
+                )
+                raise
+            self._pending_exit = (position_id, reason, attempts, first_at)
+            log.warning(
+                "exit for %s refused transiently (%s); retry %d/%d on the next tick",
+                position_id,
+                exc,
+                attempts,
+                EXIT_RETRY_MAX_ATTEMPTS,
+            )
+            return False
+        self._pending_exit = None
         # Book realised P&L into the daily guard (so a big losing exit that lands
         # past the cap also halts the day, even if the per-tick MTM check didn't
         # trip first). No-op once already halted.
@@ -1288,6 +1428,7 @@ class TradingEngine:
         # after on_position_closed's reset(), so what's written (nothing) agrees
         # with what a restart would find in memory.
         self._persist_exit_state()
+        return True
 
     def _shutdown(self, ts: datetime) -> None:
         """Honour a square-off request, on the thread that owns the feed.
@@ -1319,7 +1460,16 @@ class TradingEngine:
             return
         for pos in list(self.positions.positions):
             log.info("square-off reached; force-closing %s", pos.contract.symbol)
-            self._close(pos.contract.security_id, pos.last_price, ts, ExitReason.SQUARE_OFF)
+            # allow_retry=False: the feed stops a few lines below, so a deferred
+            # close here would never get its retry and would leave the position
+            # open with nothing raised. See _close()'s own docstring.
+            self._close(
+                pos.contract.security_id,
+                pos.last_price,
+                ts,
+                ExitReason.SQUARE_OFF,
+                allow_retry=False,
+            )
         self._squared_off = True
         # Only now, and only if every close above returned: a completion recorded
         # optimistically would let a restart skip a book that is still open.
