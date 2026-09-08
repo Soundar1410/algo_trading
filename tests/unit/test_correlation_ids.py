@@ -202,7 +202,8 @@ def test_the_ema_cross_family_has_pairwise_distinct_tokens():
         "weekly_delta_neutral",
         "rolling_strangle_otm1",
         "skeleton_fixture",
-        "supertrend_buy_1_1p2",
+        "st12_supertrend_buy",
+        "st05_supertrend_buy",
     ]
     other_tokens = {strategy_token(sid) for sid in other_ids}
     assert not (set(tokens) & other_tokens), (

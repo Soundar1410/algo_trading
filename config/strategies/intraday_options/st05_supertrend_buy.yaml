@@ -1,24 +1,39 @@
-# supertrend_buy_1_1p2 — NIFTY 5-minute SuperTrend(1, 1.2), ATM weekly options,
-# BUY-only, intraday. Full spec: strategies/intraday_options/
-# supertrend_buy_1_1p2/SUPERTREND_BUY_1_1P2_ALGO_TRADING_SPEC.md.
+# st05_supertrend_buy — NIFTY 5-minute SuperTrend(1, 0.5), ATM weekly options,
+# BUY-only, intraday. A faithful clone of st12_supertrend_buy (formerly
+# supertrend_buy_1_1p2), changing only the SuperTrend multiplier (1.2 -> 0.5)
+# and identity. Full spec: strategies/intraday_options/
+# st05_supertrend_buy/SUPERTREND_BUY_1_0P5_ALGO_TRADING_SPEC.md.
 #
-# Parity source is the legacy Trading_Automation `supertrend_fast` strategy's own
-# code, config and tests. The legacy tree's
-# NiftyFixedStrikeSuperTrend_Master_Specification.md is deliberately NOT a parity
-# source: it documents a different strategy (one strike fixed at 09:16 all day,
-# SuperTrend on the CE/PE premium charts, multiplier 1, two simultaneous
-# positions).
+# Naming: the obvious id supertrend_buy_1_0p5 sanitises to the same 4-char
+# correlation token "supe" as supertrend_buy_1_1p2 did, which the supervisor's
+# admission guard refuses (common/execution/correlation.py's strategy_token,
+# STRATEGY_TOKEN_LENGTH=4 -- not modified). Named st05_supertrend_buy instead,
+# following the same stNN_ convention st12_supertrend_buy was renamed to on
+# 8 September 2026 for the identical reason. Tokens verified pairwise distinct
+# via strategy_token() across every committed strategy id before this file was
+# enabled -- see the dated addendum in docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md.
 #
-# DISABLED AND PAPER-ONLY AT DELIVERY. `enabled: false` below is what keeps the
-# unattended startup from spawning it — orchestration.auto_start names no
-# strategy of its own, it starts exactly what each strategies/*.yaml enables.
-# Setting mode to `live` would additionally NOT start a live strategy: the
-# broker factory consults the live gate (common.config.models.
-# effective_live_gate) and refuses while global.live_trading_enabled and the
-# runtime's live_execution_allowed stay false. Enabling this strategy for paper
-# is a separate, deliberate operator decision after review.
+# Parity source is the in-repo st12_supertrend_buy strategy (config/strategies/
+# intraday_options/st12_supertrend_buy.yaml), itself extracted from the legacy
+# Trading_Automation `supertrend_fast` strategy's own code, config and tests.
+# The legacy tree's NiftyFixedStrikeSuperTrend_Master_Specification.md is
+# deliberately NOT a parity source for either strategy: it documents a
+# different strategy (one strike fixed at 09:16 all day, SuperTrend on the
+# CE/PE premium charts, multiplier 1, two simultaneous positions).
+#
+# PAPER-ONLY. `enabled: true` below is a deliberate operator decision made
+# before implementation (8 September 2026), accepting the higher expected
+# flip rate at this multiplier -- and therefore higher write volume against
+# the still-open SQLite "database is locked" contention -- explicitly
+# disclosed and accepted at that time; not a default this file shipped with.
+# orchestration.auto_start names no strategy of its own, it starts exactly
+# what each strategies/*.yaml enables. Setting mode to `live` would
+# additionally NOT start a live strategy: the broker factory consults the
+# live gate (common.config.models.effective_live_gate) and refuses while
+# global.live_trading_enabled and the runtime's live_execution_allowed stay
+# false.
 
-strategy_id: supertrend_buy_1_1p2
+strategy_id: st05_supertrend_buy
 runtime_id: intraday_options
 enabled: true
 
@@ -57,23 +72,25 @@ parameters:
   security_id: "13"
 
   # ------------------------------------------------- engine-path discriminator
-  strategy_ref: "strategies.intraday_options.supertrend_buy_1_1p2.strategy:SupertrendBuy1x1p2Strategy"
+  strategy_ref: "strategies.intraday_options.st05_supertrend_buy.strategy:SupertrendBuy1x0p5Strategy"
 
-  # SupertrendBuy1x1p2Strategy's own constructor kwargs. Travels through
+  # SupertrendBuy1x0p5Strategy's own constructor kwargs. Travels through
   # config_adapter.py verbatim -- see its _build_engine_worker_config docstring.
   strategy_kwargs:
-    # Spec section 6. The legacy values; changing either is a strategy-spec
+    # Spec section 6. supertrend_multiplier is the one behavioural delta from
+    # st12_supertrend_buy; changing either value here is a strategy-spec
     # change, not a tuning knob.
     supertrend_period: 1
-    supertrend_multiplier: 1.2
+    supertrend_multiplier: 0.5
     # lots_per_trade is a sizing CHOICE (config); lot_size is NOT configured
     # anywhere here -- it is resolved from the scrip master at runtime (see
     # contract_resolver below) and multiplied in by
     # OpenPosition.quantity = lots * contract.lot_size. Order quantity for
     # this strategy = 10 * <scrip-master NIFTY weekly lot size>.
     #
-    # Ten lots is LEGACY PARITY for paper testing. It is not a statement that
-    # this size is safe for live capital, and it authorises nothing.
+    # Ten lots matches st12_supertrend_buy for parity in paper testing. It is
+    # not a statement that this size is safe for live capital, and it
+    # authorises nothing.
     lots_per_trade: 10
     # Spec section 10: 4% activates the best-close trail only; the momentum
     # structure leg has no activation gate and can fire from the second
@@ -81,9 +98,11 @@ parameters:
     # thresholds are inclusive (>=); the momentum rule is strict (<).
     trail_percentage: 8.0
     activation_minimum_favourable_move_percentage: 4.0
-    # Spec section 7.1, operator-approved. NOT the indicator's own
+    # Spec section 7.1, operator-approved, UNCHANGED from st12_supertrend_buy
+    # and NOT recomputed for this multiplier. NOT the indicator's own
     # min_bars = period = 1, which states when the ATR has a value and says
-    # nothing about whether a latched, path-dependent trend can be trusted.
+    # nothing about whether a latched, path-dependent trend can be trusted --
+    # a property of the indicator's latching, not of its band width.
     #
     # A conservative 75-COMPLETED-BUCKET trust floor, deliberately NOT "one
     # session": a 09:15-15:20 lifecycle contributes 73 completed 5-minute
@@ -94,10 +113,11 @@ parameters:
     # boundaries, walked by MarketSession.prior_trading_day.
     warmup_min_bars: 75
     # Minimal per-position backstop, disabled by default -- the premium-candle
-    # combined exit above is the primary exit. The legacy config selected
-    # `sl_lock_trail` with all four of its thresholds null, i.e. a per-tick
-    # rupee rule that never fires; `hard_stop` with its own disabled default is
-    # the behavioural equivalent under this repository's RiskManager contract.
+    # combined exit above is the primary exit. Same choice st12_supertrend_buy
+    # made: `hard_stop` with its own disabled default
+    # (catastrophic_stop_rupees_per_lot: none) is the behavioural equivalent of
+    # the legacy config's `sl_lock_trail` with all four thresholds null, i.e.
+    # a per-tick rupee rule that never fires.
     risk_manager_name: hard_stop
     risk_manager_params:
       catastrophic_stop_rupees_per_lot: none
@@ -123,7 +143,7 @@ parameters:
   # key does not by itself make an accidental switch to "simulated" fail
   # loudly on this path -- it would quietly size 10 lots x 50. What actually
   # guards that here is `contract_resolver: dhan` being pinned by
-  # tests/unit/test_supertrend_buy_1_1p2_config.py, plus the fact that the
+  # tests/unit/test_st05_supertrend_buy_config.py, plus the fact that the
   # "dhan" resolver ignores this value entirely. Closing the asymmetry in the
   # adapter would be a shared-code change affecting every existing simulated
   # fixture, so it is reported rather than made here.
@@ -143,14 +163,15 @@ parameters:
   scrip_master_cache_dir: ""
 
   # ----------------------------------------------------- daily 3% live-MTM cap
-  # Spec section 12. capital_base = Rs 10,00,000 (the legacy paper_trading
-  # starting_capital), so daily_max_loss_pct converts to an ABSOLUTE
-  # 0.03 * 1_000_000 = Rs 30,000, evaluated every tick on live MTM (realised so
-  # far + this position's open unrealised P&L) --
+  # Spec section 12. capital_base = Rs 10,00,000, so daily_max_loss_pct
+  # converts to an ABSOLUTE 0.03 * 1_000_000 = Rs 30,000, evaluated every tick
+  # on live MTM (realised so far + this position's open unrealised P&L) --
   # common.engine.daily_guard.DailyRiskGuard.check_open_mtm, wired by
   # TradingEngine itself. The trip is inclusive (<= -30,000). Latching: squares
   # off and halts new entries for the rest of the day, and survives a same-day
   # worker restart because the realised half is rebuilt from strategy_state.
+  # This cap is entirely INDEPENDENT of st12_supertrend_buy's own -- there is
+  # no combined cap across the two strategies.
   capital_base: 1000000
   daily_max_loss_pct: 3.0
 
@@ -177,22 +198,23 @@ parameters:
   #
   # Copied verbatim from config/global.yaml's verified NSE 2026 Capital Market /
   # F&O trading-holiday calendar (checked 2026-08-20 against NSE's holiday-master
-  # endpoint and cross-checked against three published calendars). Weekend dates
-  # are retained for an exact audit trail even though MarketSession already
-  # rejects Saturdays and Sundays -- keeping this list line-for-line comparable
-  # with global.yaml is what makes the next reconciliation cheap. In particular,
-  # listing 2026-11-08 does NOT make this strategy trade the Diwali Muhurat
-  # session: that is a one-hour Sunday evening special and the weekend rule
-  # excludes it.
+  # endpoint and cross-checked against three published calendars) -- the same
+  # list st12_supertrend_buy.yaml carries. Weekend dates are retained for an
+  # exact audit trail even though MarketSession already rejects Saturdays and
+  # Sundays -- keeping this list line-for-line comparable with global.yaml and
+  # st12_supertrend_buy.yaml is what makes the next reconciliation cheap. In
+  # particular, listing 2026-11-08 does NOT make this strategy trade the
+  # Diwali Muhurat session: that is a one-hour Sunday evening special and the
+  # weekend rule excludes it.
   #
   # OWNERSHIP AND MAINTENANCE (operator-approved decision, recorded here because
   # this is the only place it is enforced for this strategy):
   #
-  #   * This calendar is STRATEGY-SCOPED. It applies to supertrend_buy_1_1p2 only.
-  #     Editing config/global.yaml's list does NOT change it, and editing this one
-  #     does NOT change any other strategy or the unattended auto-start gate. The
-  #     two lists are maintained together, deliberately duplicated so they stay
-  #     line-for-line comparable.
+  #   * This calendar is STRATEGY-SCOPED. It applies to st05_supertrend_buy only.
+  #     Editing config/global.yaml's list, or st12_supertrend_buy.yaml's, does
+  #     NOT change it, and editing this one does NOT change any other strategy
+  #     or the unattended auto-start gate. The three lists are maintained
+  #     together, deliberately duplicated so they stay line-for-line comparable.
   #   * It is ANNUAL and it must be maintained when the calendar year changes. A
   #     2027 list must be committed here before January 2027, or every 2027 holiday
   #     is treated as an ordinary trading day by this strategy's MarketSession --
@@ -200,7 +222,7 @@ parameters:
   #     existed, downgrading an otherwise-good replay to PARTIAL and blocking
   #     entries for the day. Re-verify against NSE's own circular, never by
   #     copying an unverified source.
-  #   * Re-verify after any ad-hoc NSE closure circular, in BOTH files.
+  #   * Re-verify after any ad-hoc NSE closure circular, in ALL THREE files.
   holidays:
     - "2026-01-15"  # Municipal Corporation Election - Maharashtra
     - "2026-01-26"  # Republic Day
@@ -226,15 +248,17 @@ parameters:
   regime_enabled: false
 
   # ------------------------------------------------------------ paper execution
-  # Spec section 13, and the one intentional architecture-level deviation from
-  # the legacy simulator: the legacy config ran `slippage_points: 0.0` and no
-  # latency at all. That is not reproduced. This block is c921_ema_cross_buy's
-  # canonical intraday paper block, so the two single-leg intraday strategies
-  # are filled by the same model and their results stay comparable.
+  # Spec section 13, and the same intentional architecture-level deviation from
+  # the legacy simulator st12_supertrend_buy already records: the legacy config
+  # ran `slippage_points: 0.0` and no latency at all. That is not reproduced.
+  # This block is c921_ema_cross_buy's/st12_supertrend_buy's canonical intraday
+  # paper block, so results stay comparable across all three single-leg
+  # intraday strategies.
   #
   # Charges are deliberately NOT overridden here: no strategy YAML sets
   # `cost_rates`, so this inherits common.broker.costs.CostRates' defaults, the
-  # same rates c921_ema_cross_buy and straddle_920 book against.
+  # same rates c921_ema_cross_buy, straddle_920 and st12_supertrend_buy book
+  # against.
   paper_execution:
     slippage:
       options:

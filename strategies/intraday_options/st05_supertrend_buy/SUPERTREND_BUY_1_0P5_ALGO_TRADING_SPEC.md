@@ -1,73 +1,71 @@
-# SuperTrend Buy 1/1.2 Strategy — `algo_trading` Implementation Specification
+# SuperTrend Buy 1/0.5 Strategy — `algo_trading` Implementation Specification
 
-**Strategy ID:** `supertrend_buy_1_1p2`  
-**Display name:** SuperTrend Buy 1/1.2 — NIFTY ATM Option  
-**Legacy source:** `Soundar1410/Trading_Automation`, under `option_strategies/Trading_Strategies_Automation_v2/strategies/supertrend_fast/`  
+**Strategy ID:** `st05_supertrend_buy`  
+**Display name:** SuperTrend Buy 1/0.5 — NIFTY ATM Option  
+**Parity source:** the in-repo `st12_supertrend_buy` strategy (formerly `supertrend_buy_1_1p2`), itself a port of `Soundar1410/Trading_Automation`'s legacy `supertrend_fast` under `option_strategies/Trading_Strategies_Automation_v2/strategies/supertrend_fast/`  
 **Target repository:** `Soundar1410/algo_trading`  
-**Initial operating mode:** PAPER only, disabled by default
+**Initial operating mode:** PAPER only; see the enablement note under §17
 
 ## 1. Objective
 
-Port the trading behavior of the legacy `supertrend_fast` strategy into the current `algo_trading` architecture.
+This is a **multiplier clone of the in-repo `st12_supertrend_buy` strategy**, changing only the SuperTrend ATR band multiplier (`1.2` → `0.5`) and this strategy's own identity. It is not an independent port of the legacy `supertrend_fast` code — `st12_supertrend_buy` already is that port, and it is the authoritative source for every rule below except the multiplier itself.
 
-“Same strategy” means preserving the legacy signal, contract-selection, position, exit, session, and daily-loss rules. It does **not** mean copying legacy framework code, imports, process control, database access, notification code, or dashboard code.
+“Same strategy” means preserving `st12_supertrend_buy`'s signal, contract-selection, position, exit, session, and daily-loss rules exactly. It does **not** mean copying legacy framework code, imports, process control, database access, notification code, or dashboard code — none of which `st12_supertrend_buy` does either.
 
 The implementation must reuse the current platform’s generic components and safety boundaries. It must not introduce a strategy-specific branch into `TradingEngine`, the runtime supervisor, broker routing, persistence, dashboard, or auto-start controller.
 
 ## 2. Naming Decision
 
-Use `supertrend_buy_1_1p2` instead of `supertrend_fast`.
+`st05_supertrend_buy` follows the same `stNN_supertrend_buy` convention `st12_supertrend_buy` was renamed to on 8 September 2026, for the identical reason: `common/execution/correlation.py`'s `strategy_token()` truncates a sanitised strategy id to its first 4 alphanumeric characters, and the naive name `supertrend_buy_1_0p5` sanitises to the same `"supe"` token as `supertrend_buy_1_1p2` (now `st12_supertrend_buy`) — a collision the supervisor's admission guard refuses outright. Putting the distinguishing digits first (`st05`) diverges inside 4 characters from every other admitted strategy id, verified directly with `strategy_token()` rather than assumed (see the dated addendum in `docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md`).
 
 Reasons:
 
-- `fast` is ambiguous and becomes misleading if the period or multiplier is later configured differently.
-- `supertrend_buy_1_1p2` identifies the SuperTrend-driven BUY-only structure and its defining parameters: ATR period `1` and multiplier `1.2`.
-- `1p2` is used instead of `1.2` because a dot would conflict with Python package/import naming.
+- `st05_supertrend_buy` identifies the SuperTrend-driven BUY-only structure and its defining parameters: ATR period `1` and multiplier `0.5`.
+- `0p5` is used instead of `0.5` because a dot would conflict with Python package/import naming — the same reason `st12_supertrend_buy` uses `1p2`.
 - NIFTY, the exact fresh-flip behavior, and ATM weekly option selection remain explicit strategy rules in this specification and configuration.
 - The name remains readable in logs, configuration, dashboards, database rows, and Telegram messages.
 
 Use consistently:
 
-- Strategy ID: `supertrend_buy_1_1p2`
-- Package: `strategies/intraday_options/supertrend_buy_1_1p2/`
-- Config: `config/strategies/supertrend_buy_1_1p2.yaml`
-- Suggested class: `SupertrendBuy1x1p2Strategy`
+- Strategy ID: `st05_supertrend_buy`
+- Package: `strategies/intraday_options/st05_supertrend_buy/`
+- Config: `config/strategies/intraday_options/st05_supertrend_buy.yaml`
+- Suggested class: `SupertrendBuy1x0p5Strategy`
 
-Do not retain `supertrend_fast`, `supertrend_1`, or other legacy aliases as production identifiers.
+Do not retain `supertrend_buy_1_0p5`, `supertrend_fast`, or other prior/legacy aliases as production identifiers.
 
-## 3. Authoritative Legacy Sources Reviewed
+## 3. Authoritative Sources Reviewed
 
-The strategy requirements were extracted from these legacy files:
+The strategy requirements were extracted from:
 
-- `strategies/supertrend_fast/strategy.py`
-- `strategies/supertrend_fast/config/config.yaml`
-- `strategies/supertrend_fast/tests/test_strategy.py`
-- `strategies/supertrend_fast/main.py`
-- `strategies/supertrend_fast/trade_manager.py`
-- `strategies/supertrend_fast/app.py`
-- Framework `indicators/supertrend.py`
-- Framework `exit/combined_candle_exit.py`
-- Framework `execution/engine.py`
-- Global `config/strategies.yaml`
-- `NiftyFixedStrikeSuperTrend_Master_Specification.md`
+- `strategies/intraday_options/st12_supertrend_buy/strategy.py` (this variant's direct parity source).
+- `strategies/intraday_options/st12_supertrend_buy/SUPERTREND_BUY_1_1P2_ALGO_TRADING_SPEC.md` (that strategy's own spec, transitively authoritative here for every rule this document does not itself override).
+- Framework `common/indicators/supertrend.py`.
+- Framework `common/exit/combined_candle_exit.py`.
+- `config/strategies/intraday_options/st12_supertrend_buy.yaml`.
 
-When the legacy implementation and prose disagree, stop and report the exact conflict before choosing behavior. Do not silently invent a rule.
+Transitively, via `st12_supertrend_buy`'s own review: the legacy `Trading_Automation` `supertrend_fast` strategy's `strategy.py` / `config/config.yaml` / `tests/test_strategy.py`, and the deliberately-excluded `NiftyFixedStrikeSuperTrend_Master_Specification.md` (see §3.1).
 
-### 3.1 Recorded conflict and resolution (operator-approved)
+When this document and `st12_supertrend_buy`'s own spec disagree on anything other than the multiplier, that is a defect in this document — stop and report the exact conflict rather than silently resolving it either way.
+
+### 3.1 Recorded conflict and resolution (inherited, operator-approved)
 
 `NiftyFixedStrikeSuperTrend_Master_Specification.md` describes a **different**
 strategy from `supertrend_fast`'s actual code: it documents a strike fixed at
 09:16 for the whole trading day, SuperTrend applied to the CE and PE **premium**
-charts (not the underlying), multiplier `1` (not `1.2`), and two simultaneous
+charts (not the underlying), multiplier `1` (not `0.5`), and two simultaneous
 open positions (CE and PE independently). None of that matches `strategy.py`,
 `config/config.yaml` or `tests/test_strategy.py`, which are mutually
-consistent with each other and with this document's own rules (sections 4–14).
+consistent with each other and with `st12_supertrend_buy`'s own rules (sections 4–14
+below, inherited unchanged).
 
-**Resolution: the authoritative parity source for this port is the legacy
-`supertrend_fast` strategy's own code, config and tests.**
-`NiftyFixedStrikeSuperTrend_Master_Specification.md` is deliberately **not**
-used as a parity source — it is listed above only because it was reviewed and
-the conflict it presents is recorded here, not silently discarded.
+**Resolution (inherited from `st12_supertrend_buy`, re-affirmed here): the
+authoritative parity source for this strategy is `st12_supertrend_buy` itself,
+whose own parity source is the legacy `supertrend_fast` strategy's code, config
+and tests.** `NiftyFixedStrikeSuperTrend_Master_Specification.md` is
+deliberately **not** used as a parity source for either strategy — it is listed
+above only because it was reviewed and the conflict it presents is recorded
+here, not silently discarded.
 
 ## 4. Strategy Summary
 
@@ -80,6 +78,8 @@ The strategy observes completed 5-minute NIFTY underlying candles and maintains 
 | No fresh flip | No entry | Continue managing the existing option |
 
 The initial SuperTrend direction is context only. It is never itself an entry signal.
+
+**Behavioural consequence of the lower multiplier (informational, not a rule change):** a `0.5` multiplier on a period-1 SuperTrend produces substantially tighter ATR bands than `1.2`, so the trend latch flips more often — more entries, more reversals, more round trips per day. This is the intended point of the variant. No cooldown, confirmation, or de-bounce logic compensates for it; doing so would make this not-a-clone of `st12_supertrend_buy`.
 
 ## 5. Market, Clock, and Candle Semantics
 
@@ -96,7 +96,7 @@ The initial SuperTrend direction is context only. It is never itself an entry si
 - At exactly or after 15:15, an existing position may still be exited, but an opposite signal must not open a replacement.
 - At 15:20, the hard square-off must run regardless of strategy indicator state or optional exit configuration.
 
-Timestamp boundary behavior must be deterministic under injected clocks in tests.
+Timestamp boundary behavior must be deterministic under injected clocks in tests. Identical to `st12_supertrend_buy`; unaffected by the multiplier.
 
 ## 6. SuperTrend Definition
 
@@ -104,8 +104,8 @@ Use the existing canonical implementation in `common/indicators/supertrend.py`. 
 
 Required parameters:
 
-- ATR period: `1`
-- Multiplier: `1.2`
+- ATR period: `1` (unchanged from `st12_supertrend_buy`)
+- Multiplier: `0.5` (**the one behavioural delta from `st12_supertrend_buy`**)
 - ATR method: Wilder ATR
 - Price source and band-carry behavior: exactly the existing TradingView-compatible implementation already used by the repository.
 
@@ -117,7 +117,9 @@ Required signal semantics:
 - Repeated candles in the same trend produce no entry.
 - One flip produces at most one actionable signal.
 
-The parameters must be configurable but ship with the legacy values above. Changing them later is a strategy-spec change, not an implementation detail.
+The parameters must be configurable but ship with the values above. Changing them later is a strategy-spec change, not an implementation detail.
+
+**Seed-direction boundary note, specific to this multiplier.** On the very first candle, the ATR is the bar's own true range, so `lower_basic = hl2 - 0.5*(h-l)` reduces to exactly `l` for a candle whose high and low are true midpoint-symmetric around the close — unlike at `1.2`, where `lower_basic` sits strictly below `l` for every candle. At exactly `0.5`, a candle closing at or very near its own low can seed either UP or DOWN depending on IEEE-754 floating-point rounding of `hl2 - 0.5*(h-l)` against `l`. This is a property of the shared indicator at this specific multiplier, not a strategy defect: the "no entry on the initial state" rule (above) still applies regardless of which direction the seed lands on, so no seed candle ever trades either way. Tests must derive this boundary from the real indicator rather than assume the `st12_supertrend_buy` seed-direction test's reasoning carries over unchanged.
 
 ## 7. Warm-up and Context Trust
 
@@ -135,15 +137,13 @@ Requirements:
 - A mid-session restart must reconstruct the indicator state without replaying historical trades.
 - Trust must reset at every new run/day according to the existing engine lifecycle.
 
-Choose the minimum warm-up bar count from the existing SuperTrend component’s continuity contract and repository conventions. Do not reduce it merely to make a test pass. Record the chosen value and reasoning in the final report.
+### 7.1 Recorded decision — `min_bars = 75`, unchanged from `st12_supertrend_buy` (operator-approved)
 
-### 7.1 Recorded decision — `min_bars = 75` (operator-approved)
+**Chosen value: `min_bars = 75`, `continuity_required = true` — identical to `st12_supertrend_buy`, not recomputed for this multiplier.**
 
-**Chosen value: `min_bars = 75`, `continuity_required = true`.**
+`SuperTrend.warmup_requirement()` declares `min_bars = period`, which is `1` regardless of multiplier. That number is a correct statement about **ATR readiness** and an unsafe one about **trend-context trust**: the SuperTrend direction is latched and path-dependent, so a replay of a single recent candle seeds a direction outright and the first live crossing can then be read as a fresh flip that never happened — or the opposite direction held and a real flip swallowed. This reasoning is about the *indicator's* latching behaviour, not about how wide its bands are — **the multiplier does not enter it**, so 75 is not re-derived here.
 
-`SuperTrend.warmup_requirement()` declares `min_bars = period`, which is `1` for this strategy. That number is a correct statement about **ATR readiness** and an unsafe one about **trend-context trust**: the SuperTrend direction is latched and path-dependent, so a replay of a single recent candle seeds a direction outright and the first live crossing can then be read as a fresh flip that never happened — or the opposite direction held and a real flip swallowed. ATR calculation readiness and trustworthy trend-context reconstruction are different requirements, and the bar count must express the second.
-
-The floor is raised inside the strategy’s own `warmup_spec()` (`max(indicator_min_bars, 75)`, inheriting `continuity_required` from the indicator). The shared `common/indicators/supertrend.py` contract is **not** modified, so no other `SuperTrend` consumer inherits this strategy’s trading-risk decision, and no `TradingEngine` branch is added.
+The floor is raised inside the strategy’s own `warmup_spec()` (`max(indicator_min_bars, 75)`, inheriting `continuity_required` from the indicator). The shared `common/indicators/supertrend.py` contract is **not** modified, so no other `SuperTrend` consumer — including `st12_supertrend_buy` — inherits this strategy’s trading-risk decision, and no `TradingEngine` branch is added.
 
 **Describe the value accurately.** A 09:15–15:20 lifecycle contains **73** completed five-minute buckets (09:15 through the 15:15–15:20 bar — `common.warmup.session_buckets.session_bucket_count`). `75` is therefore **not** “one complete session”. It is a conservative 75-completed-bucket trust floor that **intentionally spans trading sessions**:
 
@@ -153,19 +153,20 @@ The floor is raised inside the strategy’s own `warmup_spec()` (`max(indicator_
 - Missing, stale, unordered, duplicate or in-session-gapped coverage remains non-`WARMED`, and `StrategyWarmupSpec.entry_blocked_by` latches entries off for the whole day.
 - Warm-up replay still seeds indicator state only and never emits an order.
 
-Sizing consequence: `WarmupManager._lookback_sessions` requests `ceil(75 / 73) = 2` prior sessions plus today, which the committed `warmup_max_lookback_sessions: 3` accommodates.
+Sizing consequence: `WarmupManager._lookback_sessions` requests `ceil(75 / 73) = 2` prior sessions plus today, which the committed `warmup_max_lookback_sessions: 3` accommodates — identical to `st12_supertrend_buy`.
 
-### 7.2 Recorded decision — strategy-scoped trading calendar (operator-approved)
+### 7.2 Recorded decision — strategy-scoped trading calendar (inherited, operator-approved)
 
 The engine's own `MarketSession` reads its holiday calendar from `parameters.holidays`
 in the strategy configuration. `config/global.yaml`'s verified NSE list feeds only the
-unattended auto-start gate, and no strategy configuration in this repository had ever
-declared one — so every running engine's session relied on the weekday rule alone.
+unattended auto-start gate.
 
-`config/strategies/supertrend_buy_1_1p2.yaml` therefore carries the verified NSE 2026
-calendar, copied from `config/global.yaml`. **This is strategy-scoped**: it applies to
-`supertrend_buy_1_1p2` only, changes nothing for `c921_ema_cross_buy` or
-`straddle_920`, and is not affected by edits to `config/global.yaml`.
+`config/strategies/intraday_options/st05_supertrend_buy.yaml` carries the identical
+verified NSE 2026 calendar `st12_supertrend_buy.yaml` does, copied verbatim (both are
+in turn copied from `config/global.yaml`). **This is strategy-scoped**: it applies to
+`st05_supertrend_buy` only, changes nothing for `st12_supertrend_buy`,
+`c921_ema_cross_buy` or `straddle_920`, and is not affected by edits to either
+`config/global.yaml` or `st12_supertrend_buy.yaml`.
 
 It matters twice: no entry on a closed day (acceptance row 18.1 "Holiday/weekend"),
 and a correct warm-up walk-back — the 75-completed-bucket trust floor spans sessions,
@@ -175,7 +176,8 @@ and `MarketSession.prior_trading_day` is what decides which prior sessions those
 before January 2027, or every 2027 holiday will be treated as an ordinary trading day
 by this strategy, and its warm-up will expect buckets that never existed — downgrading
 a good replay to `PARTIAL` and blocking entries for that day. Re-verify against NSE's
-own circular after any ad-hoc closure, in both this file and `config/global.yaml`.
+own circular after any ad-hoc closure, in this file, `st12_supertrend_buy.yaml`, and
+`config/global.yaml` together — the three are meant to stay line-for-line comparable.
 
 ## 8. Contract Selection and Quantity
 
@@ -187,18 +189,17 @@ On an actionable fresh flip:
 - Select the nearest valid weekly expiry from the current Dhan scrip master, including holiday-shifted expiries.
 - Resolve the real security ID, segment, tick size, expiry, and exchange lot size from current reference data.
 - Never hardcode the production NIFTY lot size. Test/simulated resolvers may receive an explicit fixture lot size.
-- Legacy quantity is `10` lots per trade. Preserve this as configurable `lots_per_trade: 10` for parity.
+- Quantity is `10` lots per trade, matching `st12_supertrend_buy`. Preserve this as configurable `lots_per_trade: 10` for parity — this variant is not a sizing change.
 
-Ten lots is a parity requirement, not a recommendation that the size is safe for live capital. The strategy must remain PAPER and disabled by default.
+Ten lots is a parity requirement, not a recommendation that the size is safe for live capital. The strategy must remain PAPER.
 
-Contract selection must happen again on every new entry or reversal. Do not reuse a stale ATM contract from an earlier signal.
+Contract selection must happen again on every new entry or reversal. Do not reuse a stale ATM contract from an earlier signal. With a tighter multiplier producing more flips, this rule is exercised more often per day than in `st12_supertrend_buy`, but is not different in kind.
 
-### 8.1 Recorded clarification — expiry resolution timing (operator-approved)
+### 8.1 Recorded clarification — expiry resolution timing (inherited, operator-approved)
 
-The bullets above, read together, could be misread as "expiry is re-resolved on
-every entry." That is not the accurate description of what the implementation
-does, and the distinction matters for anyone reasoning about which entries in a
-long-running session could ever land on a different expiry:
+Identical to `st12_supertrend_buy` — the bullets above, read together, could be
+misread as "expiry is re-resolved on every entry." That is not the accurate
+description of what the implementation does:
 
 - **ATM strike, contract security ID and exchange lot size are resolved fresh
   for every new entry or reversal.** Each signal computes its own strike from
@@ -239,7 +240,7 @@ Reuse `common/exit/combined_candle_exit.py` and its existing supporting componen
 
 Evaluate exits on the currently traded option’s own completed 5-minute premium candles, not on the NIFTY candle.
 
-The two exit legs use OR logic:
+The two exit legs use OR logic — identical thresholds to `st12_supertrend_buy`:
 
 ### 10.1 Momentum structure exit
 
@@ -291,7 +292,7 @@ After restart:
 
 ## 12. Daily Risk and Session Exit
 
-Preserve the legacy daily loss guard:
+Preserve the same daily loss guard `st12_supertrend_buy` uses — **independent of it**, not shared or combined:
 
 - Starting capital reference: ₹1,000,000.
 - Maximum daily loss: `3%`, equivalent to ₹30,000 under the reference capital.
@@ -300,15 +301,13 @@ Preserve the legacy daily loss guard:
 - The guard must not reset on a same-day worker restart.
 - Reset only for the next valid trading day under the existing session lifecycle.
 
-Use the current engine’s generic daily guard and P&L sign conventions. Do not create a second strategy-local risk ledger.
+Use the current engine’s generic daily guard and P&L sign conventions. Do not create a second strategy-local risk ledger, and do not build a combined cap across this strategy and `st12_supertrend_buy` — each strategy's ₹30,000 cap is evaluated entirely independently.
 
 All exit priorities must remain fail-safe: hard square-off and daily-loss exits cannot be blocked by missing indicator, premium-candle, or warm-up data.
 
 ## 13. Execution-Model Reconciliation
 
-The legacy framework used zero configured slippage. The target repository has a newer, shared paper-execution model designed to approximate real fills.
-
-Preserve the strategy’s trading rules, but use the current `algo_trading` execution model rather than recreating legacy zero-slippage fills. Configure this strategy consistently with the repository’s current intraday paper strategies, including:
+Use the same current `algo_trading` paper-execution model `st12_supertrend_buy` and `c921_ema_cross_buy` use — not the legacy zero-slippage simulator either strategy's own legacy source ran. Configure this strategy consistently with the repository’s current intraday paper strategies, including:
 
 - Paper mode.
 - Fresh quote/tick enforcement.
@@ -316,7 +315,7 @@ Preserve the strategy’s trading rules, but use the current `algo_trading` exec
 - Existing quote-age and fallback controls.
 - Existing charges and realised-P&L accounting.
 
-Document the exact chosen execution fields in the final report as an intentional architecture-level deviation from the legacy simulator, not a change to the signal rules.
+Not a new deviation — this variant inherits the same intentional architecture-level deviation from the legacy simulator that `st12_supertrend_buy` already records.
 
 ## 14. Gap Handling
 
@@ -353,35 +352,44 @@ Reuse these existing components instead of porting their legacy equivalents:
 | Dashboard | Existing config-driven strategy discovery and read-only data layer |
 | Runtime | Existing `intraday_options` supervisor/worker |
 | Auto-start | Existing generic auto-start discovery; no special controller branch |
+| Correlation IDs | `common.execution.correlation`; **not modified** for this port (see §2) |
 
-Before modifying shared/common code, grep all callers and tests and prove why the existing extension hooks are insufficient. Prefer a strategy-only implementation. Any unavoidable common change must be generic, additive, regression-tested, and reported before implementation continues.
+Before modifying shared/common code, grep all callers and tests and prove why the existing extension hooks are insufficient. Prefer a strategy-only implementation. Any unavoidable common change must be generic, additive, regression-tested, and reported before implementation continues. This port needed none.
 
 ## 16. Expected Files
 
 Expected strategy-specific additions:
 
-- `strategies/intraday_options/supertrend_buy_1_1p2/__init__.py`
-- `strategies/intraday_options/supertrend_buy_1_1p2/strategy.py`
-- `config/strategies/supertrend_buy_1_1p2.yaml`
+- `strategies/intraday_options/st05_supertrend_buy/__init__.py`
+- `strategies/intraday_options/st05_supertrend_buy/strategy.py`
+- `strategies/intraday_options/st05_supertrend_buy/SUPERTREND_BUY_1_0P5_ALGO_TRADING_SPEC.md` (this file)
+- `config/strategies/intraday_options/st05_supertrend_buy.yaml`
 - Unit tests for strategy signals, exits, state, and boundaries.
 - Integration tests through the real engine wiring.
 - Runbook update.
 
 Do not add a new runtime. Do not add a separate dashboard page solely for this strategy. Existing strategy selectors/comparison pages must discover it generically from config/data.
 
-A migration should not be necessary. If structured persistence cannot represent required state, stop and report the exact missing field and generic schema implications before creating a migration.
+No migration is necessary — structured persistence already represents every field this strategy needs, identically to `st12_supertrend_buy`.
 
 ## 17. Configuration Requirements
 
-The committed configuration must ship fail-closed:
+The committed configuration:
 
 ```yaml
-strategy_id: supertrend_buy_1_1p2
+strategy_id: st05_supertrend_buy
 runtime_id: intraday_options
-enabled: false
+enabled: true
 mode: paper
 live_approved: false
 ```
+
+**Enablement note.** Unlike `st12_supertrend_buy`'s original disabled-at-delivery
+shipment, `enabled: true` here is a deliberate operator decision made before
+implementation began (8 September 2026), taken with the higher expected flip
+rate — and therefore higher write volume against the still-open SQLite
+"database is locked" contention — explicitly disclosed and accepted. See the
+dated addendum in `docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md`.
 
 It must also configure, using the repository’s actual schema:
 
@@ -389,7 +397,7 @@ It must also configure, using the repository’s actual schema:
 - Strategy reference/class and constructor parameters.
 - Underlying NIFTY security/reference mapping.
 - 5-minute signal timeframe.
-- SuperTrend period `1` and multiplier `1.2`.
+- SuperTrend period `1` and multiplier `0.5`.
 - `lots_per_trade: 10`.
 - BUY side.
 - ATM weekly Dhan contract resolver.
@@ -397,7 +405,7 @@ It must also configure, using the repository’s actual schema:
 - Dhan historical warm-up with continuity required.
 - 09:15 entry start, 15:15 entry cutoff, 15:20 square-off.
 - Combined premium-candle exit: 4% activation, 8% retracement, momentum enabled.
-- ₹1,000,000 capital reference and 3% daily loss cap.
+- ₹1,000,000 capital reference and 3% daily loss cap — independent of `st12_supertrend_buy`'s own, not combined.
 - Current canonical paper execution/charges settings.
 
 Do not change:
@@ -406,10 +414,8 @@ Do not change:
 - Runtime `live_execution_allowed`
 - Any strategy’s `live_approved`
 - `auto_start.enabled`
-- Existing enabled/disabled states of other strategies
+- Existing enabled/disabled states of other strategies (including `st12_supertrend_buy`, whose behaviour is unaffected by this port)
 - LaunchAgents
-
-Adding the disabled config must not cause the strategy to start automatically. Paper enablement is a later, separate operator decision after implementation and review.
 
 ## 18. Required Acceptance Matrix
 
@@ -492,10 +498,10 @@ Adding the disabled config must not cause the strategy to start automatically. P
 ### 18.7 Architecture regression
 
 - Existing EMA Rev 3.1 acceptance matrix remains unchanged and passing.
-- Existing `straddle_920` acceptance/durability/reconciliation suites remain passing.
+- Existing `st12_supertrend_buy` acceptance/durability/reconciliation suites remain passing, unaffected by this port.
+- Existing `straddle_920`, `rolling_strangle_otm1` acceptance/durability/reconciliation suites remain passing.
 - Existing `weekly_delta_neutral`, positional runtime, shared-feed, dashboard, auto-start, and notification-guard suites remain passing.
-- Disabled strategy is discovered but not spawned.
-- Enabling it in a test fixture adds a third isolated intraday worker with the correct tick/control channels.
+- This strategy is discovered and, per §17, spawned as an isolated worker with the correct tick/control channels, coexisting with every other admitted strategy — no correlation-token collision.
 - Dashboard selector and comparison views show it generically without page-specific SQL or conditionals.
 - Tests cannot send real Telegram/Dhan traffic, including spawned child processes.
 
@@ -505,13 +511,13 @@ Follow `CLAUDE.md` phase-by-phase discipline. Stop after each phase, report resu
 
 ### Phase 1 — Parity tests and strategy core
 
-- Port the legacy regression scenarios before changing shared internals.
+- Port `st12_supertrend_buy`'s regression scenarios, re-deriving every candle sequence against the real SuperTrend(1, 0.5) math rather than copying its numerics.
 - Implement the strategy using existing SuperTrend and combined-exit components.
-- Prove fresh-flip, no-seed-entry, and exact parameter behavior.
+- Prove fresh-flip, no-seed-entry, and exact parameter behavior at the new multiplier.
 
 ### Phase 2 — Engine/config integration
 
-- Add disabled paper config.
+- Add the paper config, `enabled: true` per §17's enablement note.
 - Wire through the existing generic strategy loader and intraday runtime.
 - Prove dynamic ATM weekly resolution, lot sizing, reversal, and premium candles.
 
@@ -528,7 +534,7 @@ Follow `CLAUDE.md` phase-by-phase discipline. Stop after each phase, report resu
 - Run all targeted and repository-wide gates.
 - Update the implementation runbook.
 
-Do not enable the strategy, install/reload LaunchAgents, start a runtime, call a broker/order endpoint, or perform a live-feed diagnostic during these phases.
+Do not enable live trading, install/reload LaunchAgents beyond what discovery already covers, call a broker/order endpoint, or perform a live-feed diagnostic during these phases.
 
 ## 20. Verification Commands
 
@@ -549,38 +555,39 @@ Do not weaken, delete, skip, or rewrite an existing test merely because the new 
 ## 21. Safety Constraints
 
 - PAPER only.
-- New strategy disabled in committed config.
 - No live gate changed.
 - No live order-capable endpoint called.
-- No runtime/dashboard/LaunchAgent started or modified.
+- No runtime/dashboard/LaunchAgent started or modified by implementation itself (the operator's own supervisor restart, to admit the enabled strategy, is a separate operational step).
 - No legacy repo write.
 - No legacy imports or runtime dependency.
 - No secret printed, copied, committed, or embedded in fixtures.
 - No external Telegram notification from tests or spawned descendants.
 - No Phase 10/live activation work as part of this strategy port.
+- `st12_supertrend_buy`'s own behaviour unaffected — this port changes only files listed in §16.
 
 ## 22. Final Report Format
 
 Provide:
 
-1. **Root Cause / Legacy Parity Summary** — what behavior was extracted and any legacy ambiguity found.
+1. **Root Cause / Parity Summary** — what behavior was inherited from `st12_supertrend_buy` and any conflict found.
 2. **Architecture Mapping** — reused components and confirmation that no strategy-specific engine/runtime branch was added.
 3. **Strategy Rules Implemented** — signals, contracts, reversals, exits, risk, session, and warm-up.
-4. **Intentional Deviations** — especially current paper execution versus legacy zero-slippage simulation.
+4. **Intentional Deviations** — the multiplier itself, and any test-numeric re-derivation.
 5. **Tests Changed** — named files and acceptance rows.
 6. **Acceptance Matrix** — every row in section 18 with PASS/FAIL/BLOCKED.
 7. **Regression** — exact pytest/ruff/mypy/safety-gate results, including skips/failures without hiding them.
-8. **Safety Confirmation** — disabled PAPER config, live gates unchanged, no network/order/runtime/LaunchAgent action.
+8. **Safety Confirmation** — PAPER config, live gates unchanged, no network/order/runtime/LaunchAgent action, `st12_supertrend_buy` unaffected.
 9. **Files Changed and Commit** — branch and commit SHA.
-10. **Operational Eligibility** — explicitly state that implementation completion does not authorize paper auto-start or live trading; enabling remains a separate operator action.
+10. **Operational Eligibility** — explicitly state that implementation completion does not authorize live trading; live activation remains a separate operator action, unaffected by this strategy shipping `enabled: true` for paper.
 
 ## 23. Definition of Done
 
 The implementation is complete only when:
 
-- Legacy trading behavior is represented by deterministic tests.
+- `st12_supertrend_buy`'s trading behavior is represented by deterministic tests re-derived at multiplier 0.5.
 - The strategy runs through the existing intraday architecture without a special-case branch.
 - Warm-up, restart, reversal, premium exit, gaps, daily loss, and square-off are fail-conservative.
 - All acceptance and regression gates pass or any unrelated pre-existing failure is reproduced and disclosed precisely.
-- The committed strategy remains disabled and PAPER-only.
+- The committed strategy remains PAPER-only.
+- `common/execution/correlation.py` is unmodified and correlation tokens are verified pairwise distinct across every committed strategy id.
 - The runbook accurately records implementation status and remaining operational checks.

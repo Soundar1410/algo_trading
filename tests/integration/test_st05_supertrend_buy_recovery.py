@@ -1,5 +1,5 @@
 """Phase 3: warm-up trust, restart, adoption and exit-state recovery for
-``supertrend_buy_1_1p2`` — through a real ``TradingEngine`` over a **real
+``st05_supertrend_buy`` — through a real ``TradingEngine`` over a **real
 ExecutionRepository on a temporary database**.
 
 No persisted row here is fabricated. The ``positions`` row, the contract record a
@@ -9,7 +9,7 @@ written by production code (``LifecycleGateway`` / ``OrderLifecycle`` /
 recovery readers (``recover_position`` / ``recover_exit_state`` /
 ``recover_daily_risk``). A "restart" is two sequential engines over one database.
 
-See ``_supertrend_buy_1_1p2_fixtures.py`` for the harness and for why the engine is
+See ``_st05_supertrend_buy_fixtures.py`` for the harness and for why the engine is
 assembled there rather than by calling ``run_worker`` (a worker-level run would build
 a real Dhan history client; these tests make no network call).
 
@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from _supertrend_buy_1_1p2_fixtures import (
+from _st05_supertrend_buy_fixtures import (
     LOT_SIZE,
     LOTS,
     NEXT_TRADING_DAY,

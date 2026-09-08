@@ -5,7 +5,7 @@ Nothing here builds a config by hand: every assertion goes through
 ``load_resolved_config`` / ``discover_strategies`` / ``build_worker_config``
 against the file that is actually committed, because a hand-built config
 would pass whatever the committed one said. Mirrors ``tests/unit/
-test_supertrend_buy_1_1p2_config.py``'s structure exactly.
+test_st12_supertrend_buy_config.py``'s structure exactly.
 
 Spec sections 13 (configuration requirements), 14 (validation rules), and
 16 (safety boundary).
@@ -279,7 +279,7 @@ def test_a_holiday_and_a_weekend_are_both_closed_to_this_strategy(worker, multi_
 def test_paper_execution_uses_the_current_model_not_the_legacy_zero_slippage(worker):
     """Spec section 13's intentional architecture-level deviation: the legacy
     simulator ran zero slippage and no latency. This uses the same canonical
-    intraday paper block c921_ema_cross_buy/supertrend_buy_1_1p2 use."""
+    intraday paper block c921_ema_cross_buy/st12_supertrend_buy use."""
     paper = worker.paper_execution
     assert paper["slippage"] == {"options": {"mode": "ticks", "market_order_ticks": 1}}
     assert paper["submission_latency_ms"] == 250

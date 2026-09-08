@@ -260,10 +260,13 @@ def test_an_invalid_style_value_is_rejected(populated_config: Path):
 
 
 def test_every_real_intraday_options_strategy_declares_its_style():
-    """The six real strategies (1 September 2026 addendum) each set
-    ``style:`` explicitly — never inferred from ``EngineKind`` (see
-    ``common.config.models.StrategyStyle``'s own docstring for why).
-    ``skeleton_fixture`` is deliberately excluded: disabled, non-real."""
+    """The seven real strategies (1 September 2026 addendum, plus
+    ``st05_supertrend_buy`` added 8 September 2026 — see the dated
+    addendum for the ``supertrend_buy_1_1p2`` -> ``st12_supertrend_buy``
+    rename that accompanied it) each set ``style:`` explicitly — never
+    inferred from ``EngineKind`` (see ``common.config.models.StrategyStyle``'s
+    own docstring for why). ``skeleton_fixture`` is deliberately excluded:
+    disabled, non-real."""
     from common.config.paths import resolve_project_root
 
     config_root = resolve_project_root() / "config"
@@ -271,7 +274,8 @@ def test_every_real_intraday_options_strategy_declares_its_style():
         "c509_ema_cross_buy": StrategyStyle.BUYING,
         "c521_ema_cross_buy": StrategyStyle.BUYING,
         "c921_ema_cross_buy": StrategyStyle.BUYING,
-        "supertrend_buy_1_1p2": StrategyStyle.BUYING,
+        "st12_supertrend_buy": StrategyStyle.BUYING,
+        "st05_supertrend_buy": StrategyStyle.BUYING,
         "straddle_920": StrategyStyle.SELLING,
         "rolling_strangle_otm1": StrategyStyle.SELLING,
     }

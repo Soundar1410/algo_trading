@@ -1,5 +1,9 @@
-"""``supertrend_buy_1_1p2`` — NIFTY 5-minute SuperTrend(period 1, multiplier 1.2),
-ATM weekly options, BUY-only, intraday.
+"""``st12_supertrend_buy`` — NIFTY 5-minute SuperTrend(period 1, multiplier 1.2),
+ATM weekly options, BUY-only, intraday. Renamed from ``supertrend_buy_1_1p2`` on
+8 September 2026 (correlation-ID token collision with the new
+``st05_supertrend_buy`` variant — see the dated addendum in
+``docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md``); no behaviour changed, and the
+class name kept its ``1x1p2`` form since it names the parameters, not the id.
 
 Full functional/design spec: ``SUPERTREND_BUY_1_1P2_ALGO_TRADING_SPEC.md`` in this
 directory. Read that before touching this file — it, and the legacy
@@ -111,11 +115,11 @@ def _pick(explicit: Any, params: dict[str, Any], key: str, default: Any) -> Any:
     return explicit if explicit is not None else params.get(key, default)
 
 
-@register_strategy("supertrend_buy_1_1p2")
+@register_strategy("st12_supertrend_buy")
 class SupertrendBuy1x1p2Strategy(BaseStrategy):
     """NIFTY 5m SuperTrend(1, 1.2) fresh flip -> ATM weekly CE/PE, BUY-only."""
 
-    name = "supertrend_buy_1_1p2"
+    name = "st12_supertrend_buy"
     #: For a UI that wants a human label; not read by the engine.
     display_name = "SuperTrend Buy 1/1.2 — NIFTY ATM Option"
 

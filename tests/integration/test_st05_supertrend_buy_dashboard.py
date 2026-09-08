@@ -1,5 +1,5 @@
 """Phase 4: dashboard discovery, labelling and filtering for
-``supertrend_buy_1_1p2`` — through the real committed ``config/`` tree and a real,
+``st05_supertrend_buy`` — through the real committed ``config/`` tree and a real,
 production-written database, never a hand-typed row.
 
 Two things are proven here that the generic dashboard test suites (which use
@@ -11,12 +11,13 @@ it (written through the same ``TradingEngine`` / ``ExecutionRepository`` stack
 Phase 3 uses) — is correctly isolated from another strategy's data by every read
 model's ``strategy_id`` filter.
 
-Was ``DISABLED`` at delivery (Phase 4); the operator enabled it for real,
-committed paper trading on 31 August 2026 (see
-docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md), so the discovery/labelling tests
-below now assert ``STOPPED`` (configured and enabled, no live heartbeat visible
-with no database connection) — the committed flag changed, not the mechanism
-these tests exist to prove.
+Shipped ``enabled: true`` from the start (8 September 2026 operator decision,
+made before implementation — see the dated addendum in
+docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md), unlike ``st12_supertrend_buy``'s
+original disabled-at-delivery shipment. The discovery/labelling tests below
+therefore assert ``STOPPED`` (configured and enabled, no live heartbeat visible
+with no database connection) directly, with no disabled-then-enabled fixture
+inversion needed.
 
 No dashboard file is touched by this port; this file exists to demonstrate that
 fact against real data, not to add one.
@@ -26,7 +27,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from _supertrend_buy_1_1p2_fixtures import (
+from _st05_supertrend_buy_fixtures import (
     LOT_SIZE,
     Stack,
     build_stack,
@@ -48,7 +49,7 @@ from dashboards.data.strategy_scope import (
 REPO_ROOT = Path(__file__).resolve().parents[2]
 REPO_CONFIG = REPO_ROOT / "config"
 RUNTIME_ID = "intraday_options"
-STRATEGY_ID = "supertrend_buy_1_1p2"
+STRATEGY_ID = "st05_supertrend_buy"
 
 PE = contract_id(19500.0, "PE")
 

@@ -1,4 +1,4 @@
-"""Shared Phase 3 harness for ``supertrend_buy_1_1p2``: a real engine over a real
+"""Shared Phase 3 harness for ``st05_supertrend_buy``: a real engine over a real
 repository, on a temporary database.
 
 Nothing here fabricates a persisted row. Positions, order intents, the contract
@@ -59,11 +59,11 @@ from runtimes.intraday_options.worker import (
     WorkerConfig,
     resolved_config_from_worker,
 )
-from strategies.intraday_options.supertrend_buy_1_1p2.strategy import SupertrendBuy1x1p2Strategy
+from strategies.intraday_options.st05_supertrend_buy.strategy import SupertrendBuy1x0p5Strategy
 
 IST = ZoneInfo("Asia/Kolkata")
 RUNTIME_ID = "intraday_options"
-STRATEGY_ID = "supertrend_buy_1_1p2"
+STRATEGY_ID = "st05_supertrend_buy"
 UNDERLYING = "INDEX"
 LOT_SIZE = 75
 LOTS = 10
@@ -277,8 +277,8 @@ def worker_config(
         },
         engine=EngineWorkerConfig(
             strategy_ref=(
-                "strategies.intraday_options.supertrend_buy_1_1p2.strategy:"
-                "SupertrendBuy1x1p2Strategy"
+                "strategies.intraday_options.st05_supertrend_buy.strategy:"
+                "SupertrendBuy1x0p5Strategy"
             ),
             strategy_kwargs={"lots_per_trade": lots},
             timeframe="5m",
@@ -301,7 +301,7 @@ class Stack:
     """One assembled engine plus the real persistence behind it."""
 
     engine: TradingEngine
-    strategy: SupertrendBuy1x1p2Strategy
+    strategy: SupertrendBuy1x0p5Strategy
     positions: PositionManager
     repository: ExecutionRepository
     config: WorkerConfig
@@ -342,7 +342,7 @@ def build_stack(
     *,
     warmup: Sequence[Candle] | None = None,
     clock_at: datetime | None = None,
-    strategy: SupertrendBuy1x1p2Strategy | None = None,
+    strategy: SupertrendBuy1x0p5Strategy | None = None,
     lot_size: int = LOT_SIZE,
     warmup_fetch: Callable[..., list[Candle]] | None = None,
     recover: bool = True,
@@ -400,7 +400,7 @@ def build_stack(
         runtime_id=config.runtime_id,
     )
     positions = PositionManager(gateway, lots=engine_config.lots)
-    strategy = strategy or SupertrendBuy1x1p2Strategy(**engine_config.strategy_kwargs)
+    strategy = strategy or SupertrendBuy1x0p5Strategy(**engine_config.strategy_kwargs)
 
     candles = list(warmup) if warmup is not None else warmup_candles(market_session)
 

@@ -1,6 +1,6 @@
 """Behaviour-level proofs for ``SupertrendBuy1x1p2Strategy``.
 
-Full spec: ``strategies/intraday_options/supertrend_buy_1_1p2/
+Full spec: ``strategies/intraday_options/st12_supertrend_buy/
 SUPERTREND_BUY_1_1P2_ALGO_TRADING_SPEC.md``. Parity source: the legacy
 ``Trading_Automation`` ``supertrend_fast`` strategy's own code, config and tests —
 **not** ``NiftyFixedStrikeSuperTrend_Master_Specification.md``, which documents a
@@ -45,7 +45,7 @@ from common.engine.models import (
 from common.engine.strategy import BaseStrategy, available_strategies, get_strategy
 from common.indicators.base import OHLC
 from common.indicators.supertrend import DOWNTREND, UPTREND
-from strategies.intraday_options.supertrend_buy_1_1p2.strategy import (
+from strategies.intraday_options.st12_supertrend_buy.strategy import (
     DEFAULT_WARMUP_MIN_BARS,
     SupertrendBuy1x1p2Strategy,
 )
@@ -125,9 +125,9 @@ def _close_trade(
 
 
 # --------------------------------------------------------------- registration
-def test_strategy_registers_as_supertrend_buy_1_1p2():
-    assert "supertrend_buy_1_1p2" in available_strategies()
-    assert SupertrendBuy1x1p2Strategy.name == "supertrend_buy_1_1p2"
+def test_strategy_registers_as_st12_supertrend_buy():
+    assert "st12_supertrend_buy" in available_strategies()
+    assert SupertrendBuy1x1p2Strategy.name == "st12_supertrend_buy"
     assert issubclass(SupertrendBuy1x1p2Strategy, BaseStrategy)
 
 
@@ -142,7 +142,7 @@ def test_get_strategy_by_name_builds_from_cfg_parameters():
             "warmup_min_bars": 90,
         }
     )
-    strategy = get_strategy("supertrend_buy_1_1p2", cfg)
+    strategy = get_strategy("st12_supertrend_buy", cfg)
     assert isinstance(strategy, SupertrendBuy1x1p2Strategy)
     assert strategy._supertrend.period == 2
     assert strategy._supertrend.multiplier == 3.0

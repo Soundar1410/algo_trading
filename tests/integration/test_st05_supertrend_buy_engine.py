@@ -1,4 +1,4 @@
-"""``supertrend_buy_1_1p2`` driven by a real, fully-constructed ``TradingEngine``
+"""``st05_supertrend_buy`` driven by a real, fully-constructed ``TradingEngine``
 over a simulated tape. No monkeypatching, no ``__new__`` shortcuts — mirrors
 ``tests/integration/test_c921_ema_cross_buy_engine.py``'s discipline.
 
@@ -7,7 +7,7 @@ sections 8 and 9): contract and ATM-strike resolution, order quantity from the
 exchange lot size, fresh-tick execution, close-before-open reversal, the entry
 cutoff and the mandatory square-off are all engine-owned, and this is where that is
 demonstrated end to end. The flip logic itself is proven at unit level in
-``tests/unit/test_supertrend_buy_1_1p2_strategy.py``.
+``tests/unit/test_st05_supertrend_buy_strategy.py``.
 
 A warm-up manager is mandatory here, not optional scaffolding: SuperTrend is
 ``continuity_required``, so ``TradingEngine.__init__`` refuses outright
@@ -15,7 +15,7 @@ A warm-up manager is mandatory here, not optional scaffolding: SuperTrend is
 real ``WarmupManager`` returning a verified-complete replay — the same shape
 production uses.
 
-Verified sequence (walked through the real ``SuperTrend(1, 1.2)`` before being
+Verified sequence (walked through the real ``SuperTrend(1, 0.5)`` before being
 hard-coded, not hand-derived): 75 flat warm-up candles at 20000 leave the indicator
 in an uptrend with its band at 20000 and no flips at all, so every flip below belongs
 to the live tape. Live closes ``19500 -> 20200 -> 20300 -> 19000`` then flip DOWN, UP,
@@ -54,7 +54,7 @@ from common.models import Candle, Tick
 from common.warmup.manager import WarmupManager
 from common.warmup.session_buckets import session_bucket_starts
 from common.warmup.source import WarmupSource
-from strategies.intraday_options.supertrend_buy_1_1p2.strategy import SupertrendBuy1x1p2Strategy
+from strategies.intraday_options.st05_supertrend_buy.strategy import SupertrendBuy1x0p5Strategy
 
 IST = ZoneInfo("Asia/Kolkata")
 UNDERLYING = "INDEX"
@@ -161,11 +161,11 @@ def _build_engine(
     *,
     session: SessionConfig | None = None,
     lot_size: int = DEFAULT_LOT_SIZE,
-    strategy: SupertrendBuy1x1p2Strategy | None = None,
-) -> tuple[TradingEngine, SupertrendBuy1x1p2Strategy, PositionManager]:
+    strategy: SupertrendBuy1x0p5Strategy | None = None,
+) -> tuple[TradingEngine, SupertrendBuy1x0p5Strategy, PositionManager]:
     session_cfg = session or _session_config()
     market_session = MarketSession(session_cfg)
-    strategy = strategy or SupertrendBuy1x1p2Strategy()
+    strategy = strategy or SupertrendBuy1x0p5Strategy()
     # Mirrors the real wiring (config_adapter + engine_worker._build):
     # PositionManager's own `lots` is what sizes every order, and the adapter reads
     # it from strategy_kwargs.lots_per_trade — the same 10 the strategy reports.
@@ -391,7 +391,7 @@ def test_consecutive_actionable_signals_always_alternate_side():
         assert earlier is not later
 
 
-class _RepeatsTheSameEntry(SupertrendBuy1x1p2Strategy):
+class _RepeatsTheSameEntry(SupertrendBuy1x0p5Strategy):
     """The real strategy with one behaviour forced: every completed bar emits the same
     BUY PE entry. Used only to reach the engine's same-leg dedupe, which the genuine
     flip logic above structurally cannot reach."""

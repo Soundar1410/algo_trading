@@ -1,4 +1,4 @@
-"""Warm-up trust proofs for ``supertrend_buy_1_1p2`` (spec section 7).
+"""Warm-up trust proofs for ``st05_supertrend_buy`` (spec section 7).
 
 Driven through the **real** :class:`~common.warmup.manager.WarmupManager` and
 :class:`~common.engine.session.MarketSession`, with only the history *fetch* stubbed —
@@ -12,10 +12,15 @@ this strategy. That is a correct statement about when the *ATR* has a value and 
 dangerous one about when the *trend* can be trusted: the direction is latched and
 path-dependent, so a replay of a single recent candle seeds a direction outright and
 the first live crossing can then be read as a fresh flip that never happened — or the
-opposite direction held and a real flip swallowed. ``SupertrendBuy1x1p2Strategy``
+opposite direction held and a real flip swallowed. ``SupertrendBuy1x0p5Strategy``
 therefore raises its own floor to :data:`~strategies.intraday_options.
-supertrend_buy_1_1p2.strategy.DEFAULT_WARMUP_MIN_BARS` (75) inside ``warmup_spec()``,
-leaving the shared indicator untouched.
+st05_supertrend_buy.strategy.DEFAULT_WARMUP_MIN_BARS` (75) inside ``warmup_spec()``,
+leaving the shared indicator untouched. Identical to ``st12_supertrend_buy``'s own
+75 — this floor is about the indicator's latching behaviour, not its band width, so
+it is not recomputed for this strategy's lower multiplier. None of the assertions
+below depend on the specific trend direction or SuperTrend line value the ramp
+sequence produces at multiplier 0.5 (only replay ``count``/``status``), so this file
+needed no numeric re-derivation.
 
 Sizing, verified rather than assumed: the canonical 5-minute grid for a 09:15-15:20
 lifecycle holds **73** completed buckets (``session_bucket_count``), the 09:15 through
@@ -41,9 +46,9 @@ from common.warmup.manager import WarmupManager
 from common.warmup.requirements import StrategyWarmupSpec
 from common.warmup.session_buckets import session_bucket_count, session_bucket_starts
 from common.warmup.source import WarmupSource
-from strategies.intraday_options.supertrend_buy_1_1p2.strategy import (
+from strategies.intraday_options.st05_supertrend_buy.strategy import (
     DEFAULT_WARMUP_MIN_BARS,
-    SupertrendBuy1x1p2Strategy,
+    SupertrendBuy1x0p5Strategy,
 )
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -95,8 +100,8 @@ def _candles(starts: list[datetime]) -> list[Candle]:
     return [_candle(s, 24000.0 + i) for i, s in enumerate(starts)]
 
 
-def _strategy(**kwargs: object) -> SupertrendBuy1x1p2Strategy:
-    return SupertrendBuy1x1p2Strategy(**kwargs)  # type: ignore[arg-type]
+def _strategy(**kwargs: object) -> SupertrendBuy1x0p5Strategy:
+    return SupertrendBuy1x0p5Strategy(**kwargs)  # type: ignore[arg-type]
 
 
 def _warm(
@@ -105,7 +110,7 @@ def _warm(
     now: datetime,
     session: MarketSession | None = None,
     spec: StrategyWarmupSpec | None = None,
-    strategy: SupertrendBuy1x1p2Strategy | None = None,
+    strategy: SupertrendBuy1x0p5Strategy | None = None,
     max_lookback_sessions: int = 3,
     requested: list[int] | None = None,
 ):
@@ -197,7 +202,7 @@ def test_the_same_single_candle_would_have_been_warmed_at_min_bars_one():
 
     assert result.status == "WARMED"
     assert naive_spec.entry_blocked_by(result.status) is False
-    assert SupertrendBuy1x1p2Strategy().warmup_spec().min_bars == 75  # type: ignore[union-attr]
+    assert SupertrendBuy1x0p5Strategy().warmup_spec().min_bars == 75  # type: ignore[union-attr]
 
 
 # ------------------------------------------- 2. fewer than 75 buckets is blocked

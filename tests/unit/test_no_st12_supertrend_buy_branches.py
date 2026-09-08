@@ -1,4 +1,4 @@
-"""Negative space: ``supertrend_buy_1_1p2`` must never appear as a code branch in
+"""Negative space: ``st12_supertrend_buy`` must never appear as a code branch in
 generic infrastructure.
 
 The strategy's own package and its own configuration file may name it; generic
@@ -73,7 +73,7 @@ def _all_python_files(root: Path) -> list[Path]:
 #: which would flag ``common/indicators/supertrend.py`` and ``common/exit/
 #: supertrend_exit.py``: those are generic components this strategy *uses*, and their
 #: existence is the opposite of a violation.
-_LITERAL_RE = re.compile(r"""["']supertrend_buy_1_1p2["']""")
+_LITERAL_RE = re.compile(r"""["']st12_supertrend_buy["']""")
 
 
 def _python_files(target: Path) -> list[Path]:
@@ -110,7 +110,7 @@ def test_no_generic_module_contains_the_strategy_id_as_a_literal():
                 offenders[str(path.relative_to(REPO_ROOT))] = hits
 
     assert offenders == {}, (
-        f"generic infrastructure names 'supertrend_buy_1_1p2' as a literal at: "
+        f"generic infrastructure names 'st12_supertrend_buy' as a literal at: "
         f"{offenders}. Route by EngineKind, parameters.strategy_ref, a capability "
         "flag, or strategy_id as data (a config lookup / WHERE-clause parameter) "
         "instead — never as a branch naming this one strategy."
@@ -185,7 +185,7 @@ def test_the_strategy_does_not_reimplement_supertrend_or_the_combined_exit():
         REPO_ROOT
         / "strategies"
         / "intraday_options"
-        / "supertrend_buy_1_1p2"
+        / "st12_supertrend_buy"
         / "strategy.py"
     )
     source = path.read_text(encoding="utf-8")
@@ -218,7 +218,7 @@ def test_the_strategy_package_is_the_only_place_the_id_naturally_appears():
         REPO_ROOT
         / "strategies"
         / "intraday_options"
-        / "supertrend_buy_1_1p2"
+        / "st12_supertrend_buy"
         / "strategy.py"
     )
     assert _LITERAL_RE.search(strategy_file.read_text(encoding="utf-8"))

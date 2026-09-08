@@ -53,7 +53,7 @@ risk:
   # MarketSession.can_enter and the strategy's own cutoff check agree on the
   # exact same instant — one configured pair, not two independently
   # configured times that can drift apart (the same reasoning straddle_920's
-  # and supertrend_buy_1_1p2's own risk blocks record). square_off_at is the
+  # and st12_supertrend_buy's own risk blocks record). square_off_at is the
   # operator-approved 15:15 CAS deviation from the legacy 15:20 (spec section
   # 3.4) — engine-owned hard square-off, unconditional, independent of
   # strategy state.
@@ -159,7 +159,7 @@ parameters:
   # The engine's own MarketSession reads its holidays from HERE, not from
   # config/global.yaml (whose list feeds only the unattended auto-start
   # gate) — strategy-scoped ownership, the same convention
-  # supertrend_buy_1_1p2.yaml documents and this list is copied from
+  # st12_supertrend_buy.yaml documents and this list is copied from
   # (verified 2026-08-20 against NSE's holiday-master endpoint and
   # cross-checked against three published calendars; weekend dates retained
   # for an exact audit trail even though MarketSession already rejects
@@ -207,7 +207,7 @@ parameters:
   # Intentional architecture-level execution-model deviation (spec section
   # 13): the legacy simulator ran zero slippage and zero latency. This uses
   # the repository's canonical intraday paper-execution block instead — the
-  # same one c921_ema_cross_buy and supertrend_buy_1_1p2 use — so results
+  # same one c921_ema_cross_buy and st12_supertrend_buy use — so results
   # stay comparable across strategies. This changes only the fill/charge
   # model, never the strategy's signal or its gross combined-stop formula
   # (spec section 10.1's stop compares gross P&L, unaffected by charges).

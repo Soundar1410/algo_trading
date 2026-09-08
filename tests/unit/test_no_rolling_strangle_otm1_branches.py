@@ -7,10 +7,10 @@ strategy_ref``, capability flags, basket actions and ``strategy_id`` **as
 data** (a config lookup, a WHERE-clause parameter) — never as a literal
 naming this one strategy. Enforced by reading source text rather than
 trusting review, exactly as ``tests/unit/test_no_straddle_920_branches.py``
-and ``tests/unit/test_no_supertrend_buy_1_1p2_branches.py`` already do.
+and ``tests/unit/test_no_st12_supertrend_buy_branches.py`` already do.
 
 This file follows the more thorough (later) of the two existing patterns —
-``test_no_supertrend_buy_1_1p2_branches.py``'s recursive ``dashboards``/
+``test_no_st12_supertrend_buy_branches.py``'s recursive ``dashboards``/
 ``orchestration``/``scripts`` walk — combined with straddle_920's own
 ``multi_leg_*`` module list, since this strategy (like straddle_920) runs on
 the generic multi-leg engine rather than the single-leg one.
@@ -37,7 +37,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 #: Generic infrastructure this strategy's identity must never leak into as a
 #: literal comparison/branch. Straddle_920's own multi_leg_* module list,
 #: since this strategy runs on the same generic multi-leg engine, plus
-#: supertrend_buy_1_1p2's later, broader recursive dashboards/orchestration/
+#: st12_supertrend_buy's later, broader recursive dashboards/orchestration/
 #: scripts coverage.
 GENERIC_TARGETS: tuple[Path, ...] = (
     REPO_ROOT / "common" / "engine" / "engine.py",

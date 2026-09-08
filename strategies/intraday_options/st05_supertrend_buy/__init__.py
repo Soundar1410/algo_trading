@@ -1,8 +1,10 @@
-"""``supertrend_buy_1_1p2`` — SuperTrend(1, 1.2) on NIFTY 5-minute underlying
-candles, BUY-only ATM weekly CE/PE, intraday. See
-``SUPERTREND_BUY_1_1P2_ALGO_TRADING_SPEC.md`` in this directory for the full
-functional specification; it, and the legacy ``supertrend_fast`` code it was
-extracted from, are the authoritative sources — not this docstring.
+"""``st05_supertrend_buy`` — SuperTrend(1, 0.5) on NIFTY 5-minute underlying
+candles, BUY-only ATM weekly CE/PE, intraday. A faithful clone of
+``st12_supertrend_buy`` (formerly ``supertrend_buy_1_1p2``), changing only the
+SuperTrend multiplier (1.2 -> 0.5) and identity — see
+``SUPERTREND_BUY_1_0P5_ALGO_TRADING_SPEC.md`` in this directory for the full
+functional specification and ``st12_supertrend_buy``'s own spec for the
+authoritative behaviour both strategies share.
 
 **Deliberately not imported by** :mod:`strategies.intraday_options` (the
 parent package's ``__init__.py``), and this file deliberately does not import

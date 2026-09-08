@@ -1,6 +1,6 @@
-"""Warm-up handoff for ``supertrend_buy_1_1p2``, through a real ``TradingEngine``.
+"""Warm-up handoff for ``st12_supertrend_buy``, through a real ``TradingEngine``.
 
-The unit-level companion (``tests/unit/test_supertrend_buy_1_1p2_warmup.py``) proves
+The unit-level companion (``tests/unit/test_st12_supertrend_buy_warmup.py``) proves
 what :class:`~common.warmup.manager.WarmupManager` *decides*. This file proves what
 that decision actually does to the engine: mandated proofs 7 and 8 of the warm-up
 requirement — a replay places no order however many flips it contains, and the first
@@ -42,7 +42,7 @@ from common.models import Candle, Tick
 from common.warmup.manager import WarmupManager
 from common.warmup.session_buckets import session_bucket_starts
 from common.warmup.source import WarmupSource
-from strategies.intraday_options.supertrend_buy_1_1p2.strategy import SupertrendBuy1x1p2Strategy
+from strategies.intraday_options.st12_supertrend_buy.strategy import SupertrendBuy1x1p2Strategy
 
 IST = ZoneInfo("Asia/Kolkata")
 UNDERLYING = "INDEX"

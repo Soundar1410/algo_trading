@@ -1,14 +1,15 @@
-"""``supertrend_buy_1_1p2`` through the **real** intraday composition root.
+"""``st05_supertrend_buy`` through the **real** intraday composition root.
 
 Spec 18.7: "Disabled strategy is discovered but not spawned" and "Enabling it
 adds an isolated intraday worker with the correct tick/control channels."
-Shipped disabled at delivery; the operator enabled it for real, paper-only
-trading on 31 August 2026 (see docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md) —
-so this file now asserts the *real* committed ``config/`` tree directly
-registers this strategy correctly, rather than proving it via a synthetic
-enabled-copy fixture. The "not spawned while disabled" property is still
-proven, just against a synthetic *disabled* copy now (the fixture's role is
-inverted from this file's original form, not dropped).
+Shipped ``enabled: true`` from the start (8 September 2026 operator decision,
+made before implementation — see the dated addendum in
+docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md), unlike ``st12_supertrend_buy``'s
+original disabled-at-delivery shipment. This file therefore asserts the *real*
+committed ``config/`` tree directly registers this strategy correctly, and
+proves the "not spawned while disabled" half against a synthetic *disabled*
+copy — the same two-fixture shape ``st12_supertrend_buy``'s own composition
+test settled on, with no inversion needed here.
 
 Everything here goes through ``runtimes.intraday_options.__main__.build_supervisor``,
 never a hand-built ``WorkerConfig`` handed straight to ``add_worker`` — the defect
@@ -40,7 +41,7 @@ from runtimes.intraday_options.worker import EngineWorkerConfig
 RUNTIME_ID = "intraday_options"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 REPO_CONFIG = REPO_ROOT / "config"
-STRATEGY_ID = "supertrend_buy_1_1p2"
+STRATEGY_ID = "st05_supertrend_buy"
 
 
 @pytest.fixture(autouse=True)
@@ -175,7 +176,7 @@ def test_the_enabled_worker_carries_the_committed_trading_parameters(adapter, tm
 
     config, _ = _registrations(supervisor)[STRATEGY_ID]
     engine = config.engine
-    assert engine.strategy_ref.endswith(":SupertrendBuy1x1p2Strategy")
+    assert engine.strategy_ref.endswith(":SupertrendBuy1x0p5Strategy")
     assert engine.lots == 10
     assert engine.contract_resolver == "dhan"
     assert engine.warmup_source == "dhan"

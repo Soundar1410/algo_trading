@@ -1,10 +1,10 @@
 """Phase 3: daily risk, session boundaries, premium/underlying gaps and fail-closed
-exit behaviour for ``supertrend_buy_1_1p2`` — through a real ``TradingEngine`` over a
+exit behaviour for ``st05_supertrend_buy`` — through a real ``TradingEngine`` over a
 real ``ExecutionRepository`` on a temporary database.
 
-Companion to ``test_supertrend_buy_1_1p2_recovery.py``; the shared harness and the
+Companion to ``test_st05_supertrend_buy_recovery.py``; the shared harness and the
 reason the engine is assembled rather than run through ``run_worker`` are documented
-in ``_supertrend_buy_1_1p2_fixtures.py``.
+in ``_st05_supertrend_buy_fixtures.py``.
 
 Spec sections 18.4 (premium exit), 18.6 (risk and square-off) and 14 (gap handling).
 Every price sequence below was walked through the real engine before being
@@ -19,7 +19,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from _supertrend_buy_1_1p2_fixtures import (
+from _st05_supertrend_buy_fixtures import (
     EXACT_FILL_PAPER_EXECUTION,
     LOT_SIZE,
     LOTS,
@@ -44,9 +44,9 @@ PE = contract_id(19500.0, "PE")
 #: per strategy and trading date and starts at 0001 on a fresh database, so the
 #: entry is 0001, a reversal's closing SELL is 0002 and a forced square-off retry
 #: is 0003 — verified against the ids the repository actually wrote.
-ENTRY_CORRELATION = "p_io_supe_20260820_0001"
-CLOSE_CORRELATION = "p_io_supe_20260820_0002"
-SQUARE_OFF_CORRELATION = "p_io_supe_20260820_0003"
+ENTRY_CORRELATION = "p_io_st05_20260820_0001"
+CLOSE_CORRELATION = "p_io_st05_20260820_0002"
+SQUARE_OFF_CORRELATION = "p_io_st05_20260820_0003"
 
 
 def _open_pe(tmp_path: Path, premium: list, **kwargs) -> Stack:

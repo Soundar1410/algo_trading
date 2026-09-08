@@ -1,4 +1,4 @@
-"""The committed ``config/strategies/supertrend_buy_1_1p2.yaml``, read through the
+"""The committed ``config/strategies/st12_supertrend_buy.yaml``, read through the
 real loader and the real intraday config adapter.
 
 Nothing here builds a config by hand: every assertion goes through
@@ -31,14 +31,14 @@ from common.warmup.session_buckets import session_bucket_count
 from runtimes.intraday_options.config_adapter import build_worker_config
 from runtimes.intraday_options.engine_worker import load_strategy
 from runtimes.intraday_options.worker import EngineWorkerConfig
-from strategies.intraday_options.supertrend_buy_1_1p2.strategy import (
+from strategies.intraday_options.st12_supertrend_buy.strategy import (
     DEFAULT_WARMUP_MIN_BARS,
     SupertrendBuy1x1p2Strategy,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_ROOT = REPO_ROOT / "config"
-STRATEGY_ID = "supertrend_buy_1_1p2"
+STRATEGY_ID = "st12_supertrend_buy"
 RUNTIME_ID = "intraday_options"
 CONFIG_FILE = CONFIG_ROOT / "strategies" / RUNTIME_ID / f"{STRATEGY_ID}.yaml"
 
@@ -137,7 +137,7 @@ def test_it_routes_to_the_single_leg_trading_engine_generically(resolved, worker
 def test_the_worker_requires_a_tick_channel(worker):
     """What the supervisor's registration keys on. Proven end to end against the real
     composition root in
-    ``tests/integration/test_supertrend_buy_1_1p2_supervisor_composition.py``."""
+    ``tests/integration/test_st12_supertrend_buy_supervisor_composition.py``."""
     assert worker.requires_tick_channel is True
 
 

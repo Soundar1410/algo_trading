@@ -10,7 +10,7 @@ correctly, rather than proving it via a synthetic enabled-copy fixture. The
 "not spawned while disabled" property is still proven, just against a
 synthetic *disabled* copy now (the fixture's role is inverted from this
 file's original form, not dropped). Mirrors ``tests/integration/
-test_supertrend_buy_1_1p2_supervisor_composition.py``'s structure exactly —
+test_st12_supertrend_buy_supervisor_composition.py``'s structure exactly —
 see that file's own docstring for why this goes through the real
 ``build_supervisor`` rather than a hand-built ``WorkerConfig``: the defect
 that discipline exists for (a ``multi_leg_engine`` worker registered with no
@@ -47,8 +47,8 @@ def _legacy_system_inactive(monkeypatch: pytest.MonkeyPatch) -> None:
     """Nothing here is about the legacy-exclusion gate; stub it inactive so
     these tests do not depend on whether the real legacy LaunchAgent happens
     to be loaded on the machine running the suite (the identical fixture
-    ``test_supervisor_tick_channel_registration.py``/``test_supertrend_buy_
-    1_1p2_supervisor_composition.py`` use, for the same reason)."""
+    ``test_supervisor_tick_channel_registration.py``/``test_st12_supertrend_
+    buy_supervisor_composition.py`` use, for the same reason)."""
     monkeypatch.setattr(
         runtime_main,
         "legacy_system_status",
@@ -159,7 +159,13 @@ def test_the_correlation_token_is_deterministic_and_generic() -> None:
     assert strategy_token(STRATEGY_ID) == "roll"
     assert strategy_token(STRATEGY_ID) == strategy_token(STRATEGY_ID)
     assert len(strategy_token(STRATEGY_ID)) <= 4  # STRATEGY_TOKEN_LENGTH
-    for other in ("c921_ema_cross_buy", "straddle_920", "supertrend_buy_1_1p2", "skeleton_fixture"):
+    for other in (
+        "c921_ema_cross_buy",
+        "straddle_920",
+        "st12_supertrend_buy",
+        "st05_supertrend_buy",
+        "skeleton_fixture",
+    ):
         assert strategy_token(other) != strategy_token(STRATEGY_ID)
 
 

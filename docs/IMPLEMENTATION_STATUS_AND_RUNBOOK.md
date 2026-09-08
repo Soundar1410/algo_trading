@@ -8,8 +8,8 @@ the next phase. Updated after every phase.
 | | |
 |---|---|
 | **Current phase** | **Phase 10 — Controlled live readiness: CODE HARDENED, fully disabled.** Production parent/worker preflight wiring, Dhan order/update handling, restart-safe account-loss emergency square-off, account-wide reserve-before-submit risk plus live MTM, shared rate limiting, broker-authoritative startup/mode-transition/session-end reconciliation, strict migration history, and restore validation exist and are tested with mocks/fakes only. `c921_ema_cross_buy` (renamed from `ema_cross_9_21_buy` 31 August 2026 — see addendum) and its Rev 3.1 matrix are unchanged. **Every committed live gate remains fail-closed** (`global.live_trading_enabled: false`, `live_execution_allowed: false`, `live_approved: false`, no `mode: live` in `config/`), enforced by `scripts.assert_no_live_config_committed`. No real Dhan order/network call was made. |
-| **Next phase** | Operational evidence and explicit human decisions, not more live-enabling code: complete/review the 30-day paper run for every now-enabled real strategy (`c509_ema_cross_buy`, `c521_ema_cross_buy`, `c921_ema_cross_buy`, `supertrend_buy_1_1p2`, `rolling_strangle_otm1`, `straddle_920` — see the dated addenda for each one's enable decision), choose/configure an approved egress-IP provider and static IP, revalidate authentication operationally, then separately decide whether to approve minimum-quantity live activation. |
-| **Last updated** | 1 September 2026 — five dashboard filters ported from Trading_Automation (Outcome, Severity, an adjustable refresh interval, a multi-select Strategy filter replacing the old exclusive one, and a new Options Buying/Selling Style filter backed by a new `StrategyConfig.style` field) — see the dated addendum near the end of this file. Earlier the same day: a real UTC-vs-IST entry-gate bug found and fixed live in `straddle_920`/`rolling_strangle_otm1` (both strategies were structurally unable to enter near their intended times; fixed, tested, and confirmed with live entries the same session — see the dated addendum, which also covers a same-session operator mistake and its correction). Earlier still the same day: two Intraday Options dashboard renames, `dashboards/app.py` → `dashboards/Home.py` and the "Live Positions" tab → "Open Positions" (see the two dated addenda). The day before: the `intraday_options` supervisor gained active worker-crash detection, containment and bounded per-worker restart, plus a session-end deadline derived from configured square-off times, closing a real incident (a crashed worker went unnoticed for 6+ hours; see the dated addendum). Earlier the same day: all three real EMA-cross strategies renamed to fix a correlation-ID token collision: `ema_cross_5_9_buy`/`ema_cross_5_21_buy`/`ema_cross_9_21_buy` → `c509_ema_cross_buy`/`c521_ema_cross_buy`/`c921_ema_cross_buy` (see the earlier addendum for root cause and sequencing). All committed live gates remain disabled |
+| **Next phase** | Operational evidence and explicit human decisions, not more live-enabling code: complete/review the 30-day paper run for every now-enabled real strategy (`c509_ema_cross_buy`, `c521_ema_cross_buy`, `c921_ema_cross_buy`, `st12_supertrend_buy`, `st05_supertrend_buy`, `rolling_strangle_otm1`, `straddle_920` — see the dated addenda for each one's enable decision), choose/configure an approved egress-IP provider and static IP, revalidate authentication operationally, then separately decide whether to approve minimum-quantity live activation. |
+| **Last updated** | 8 September 2026 — a second SuperTrend intraday-options strategy, `st05_supertrend_buy` (SuperTrend(1, 0.5), a multiplier clone of the existing SuperTrend(1, 1.2) strategy), added and enabled for paper trading; the existing strategy renamed `supertrend_buy_1_1p2` → `st12_supertrend_buy` in the same change to avoid a correlation-ID token collision between the two — see the dated addendum near the end of this file. Earlier: five dashboard filters ported from Trading_Automation (Outcome, Severity, an adjustable refresh interval, a multi-select Strategy filter replacing the old exclusive one, and a new Options Buying/Selling Style filter backed by a new `StrategyConfig.style` field) — see the dated addendum near the end of this file. Earlier the same day (1 September 2026): a real UTC-vs-IST entry-gate bug found and fixed live in `straddle_920`/`rolling_strangle_otm1` (both strategies were structurally unable to enter near their intended times; fixed, tested, and confirmed with live entries the same session — see the dated addendum, which also covers a same-session operator mistake and its correction). Earlier still the same day: two Intraday Options dashboard renames, `dashboards/app.py` → `dashboards/Home.py` and the "Live Positions" tab → "Open Positions" (see the two dated addenda). The day before: the `intraday_options` supervisor gained active worker-crash detection, containment and bounded per-worker restart, plus a session-end deadline derived from configured square-off times, closing a real incident (a crashed worker went unnoticed for 6+ hours; see the dated addendum). Earlier the same day: all three real EMA-cross strategies renamed to fix a correlation-ID token collision: `ema_cross_5_9_buy`/`ema_cross_5_21_buy`/`ema_cross_9_21_buy` → `c509_ema_cross_buy`/`c521_ema_cross_buy`/`c921_ema_cross_buy` (see the earlier addendum for root cause and sequencing). All committed live gates remain disabled |
 | **Python** | 3.11.9 (arm64 macOS) |
 | **`dhanhq` pin** | `2.2.0` — **ratified**, see [Package decisions](#4-package-decisions) |
 | **Live order placement** | Code path exists but is deliberately unreachable from committed configuration. Parent and child preflight both fail closed without approved operational inputs; `OPERATIONAL LIVE ACTIVATION ELIGIBLE: NO — BLOCKED`. |
@@ -12125,3 +12125,182 @@ options_data.py` and `tests/unit/test_dashboard_intraday_options_page.py`
 (joined-mark-present, no-mark-yet, and stale-mark-not-shown-as-current
 cases). `ruff check .` clean; `mypy common strategies runtimes dashboards
 scripts` clean; full test suite run.
+
+### Second SuperTrend intraday-options strategy, and a rename to keep it — 8 September 2026
+
+**Operator decisions, made before implementation, per CLAUDE.md's "additional
+real strategies require separate approval per strategy" rule.** A new
+strategy, `st05_supertrend_buy` (SuperTrend period 1, multiplier **0.5**), was
+requested as a faithful clone of the existing `supertrend_buy_1_1p2`
+(SuperTrend period 1, multiplier **1.2**) — changing only the multiplier and
+identity, per the build spec at `strategies/intraday_options/
+supertrend_buy_1_0p5/supertrend_buy_1_0p5_spec.md`.
+
+**The blocking issue.** The obvious id `supertrend_buy_1_0p5` sanitises to the
+same 4-character `strategy_token()` prefix, `"supe"`, as `supertrend_buy_1_1p2`
+— the exact failure that forced the `ema_cross_*` family rename on 31 August
+2026. `IntradayOptionsSupervisor.add_worker` would have refused the second one
+outright. Raising `STRATEGY_TOKEN_LENGTH` does not help: at 5/6/7 characters
+both ids still truncate to `"super"`/`"supert"`/`"supertr"`, identically, and
+Dhan's 25-character correlation-ID limit caps the token at 6 anyway.
+`common/execution/correlation.py` was **not** modified.
+
+**Decision 1 — naming path.** Two paths were presented (rename only the new
+strategy so it diverges within 4 characters, leaving `supertrend_buy_1_1p2`
+untouched; or rename both to the `stNN_supertrend_buy` convention the
+`c921`/`c509`/`c521` ema family already established). **The operator chose to
+rename both**: `supertrend_buy_1_1p2` → `st12_supertrend_buy`, new strategy as
+`st05_supertrend_buy`. Class names (`SupertrendBuy1x1p2Strategy`,
+`SupertrendBuy1x0p5Strategy`) were left as-is — they encode the parameters
+(`1x1p2`/`1x0p5`), not the strategy id, matching the ema rename's own decision
+to leave `EmaCross9x21BuyStrategy` etc. unchanged.
+
+**Decision 2 — enabled flag.** `st05_supertrend_buy` ships `enabled: true` from
+its first commit — a deliberate operator decision, made and disclosed *before*
+implementation, accepting that a 0.5 multiplier on a period-1 SuperTrend flips
+substantially more often than 1.2, and therefore writes more often against the
+still-open SQLite "database is locked" contention (a known, separate issue —
+not fixed here) with no worker auto-restart. This is a different sequencing
+from every strategy enabled so far (`c509`/`c521`/`c921_ema_cross_buy`,
+`supertrend_buy_1_1p2`, `rolling_strangle_otm1` were all enabled *after*
+review), made explicitly because the operator had already seen and accepted
+the trade-off ahead of the build.
+
+**Correlation-token verification, run directly (not assumed).**
+`strategy_token()` at the real `STRATEGY_TOKEN_LENGTH=4`:
+
+| strategy_id | token |
+|---|---|
+| `c921_ema_cross_buy` | `c921` |
+| `c509_ema_cross_buy` | `c509` |
+| `c521_ema_cross_buy` | `c521` |
+| `straddle_920` | `stra` |
+| `weekly_delta_neutral` | `week` |
+| `rolling_strangle_otm1` | `roll` |
+| `skeleton_fixture` | `skel` |
+| `st12_supertrend_buy` (renamed) | `st12` |
+| `st05_supertrend_buy` (new) | `st05` |
+
+All nine pairwise distinct — verified against the real committed
+`config/strategies/**` tree via `discover_strategies`, not a hand-typed list.
+A new regression test (`tests/unit/test_st05_supertrend_buy_config.py::
+test_every_committed_intraday_options_strategy_id_has_a_pairwise_distinct_
+token`) re-runs this check generically against whatever the committed tree
+discovers, so a *future* similarly-prefixed strategy fails it too, not just
+today's set.
+
+**The rename, executed safely.** Preconditions checked directly before
+touching any file, the same discipline the 31 August ema rename used:
+confirmed no `intraday_options` supervisor or worker process was running
+(only the Streamlit dashboard was up), confirmed zero `OPEN` rows for
+`supertrend_buy_1_1p2` in `positions` by direct query against
+`data/operational/intraday_options.db`, and confirmed the per-strategy
+process lock (`data/runtime/locks/intraday_options.supertrend_buy_1_1p2.lock`)
+was not actually held (stale file, no process — `flock` acquired cleanly).
+Renamed via `git mv` (folder, config file, all 11 test files, `_fixtures.py`)
+to preserve history, then updated identity references
+(`strategy_id`/`name`/`@register_strategy`/`strategy_ref`/module paths) inside
+each file, plus three cross-references in `rolling_strangle_otm1.yaml`'s
+comments, `tests/unit/test_config_loader.py`, `tests/unit/
+test_correlation_ids.py`, and `tests/integration/
+test_rolling_strangle_otm1_supervisor_composition.py`. **No behaviour
+changed** — every renamed test suite (11 files) was run and confirmed green
+before moving on, mirroring the ema rename's own "run the renamed tests
+before proceeding" discipline (that rename's own false start, caught the same
+way, is recorded in its own addendum above).
+
+**Historical narrative left unrewritten, deliberately.** Two existing
+docstrings (`tests/unit/test_supervisor_worker_liveness.py`,
+`tests/end_to_end/test_supervisor.py`) describe the 31 August 2026
+worker-crash incident using the strategy's name *at the time it happened*,
+`supertrend_buy_1_1p2`. Rewriting those to the new id would misdate the
+incident record; they were left as-written, the same treatment this
+runbook's own historical addenda already receive.
+
+**Accepted database split — no migration.** `supertrend_buy_1_1p2` has 8 days
+of real paper history in `data/operational/intraday_options.db` under the old
+id: 21 `trade_ledger` rows, 44 `order_intents`/`orders`/`signals`, 42 `fills`,
+13 `positions`, 4 `strategy_state` rows, 7 `runtime_sessions`, 7,924
+`runtime_heartbeats` (2026-08-31 → 2026-09-07). **None of it was migrated.**
+`strategy_id` is a plain `TEXT` column everywhere in `common/persistence/
+migrations/versions/*.sql`, never a foreign key, so the old history stays
+queryable forever; the dashboard's `strategy_id`-filtered read models simply
+show it as two entries in the strategy picker going forward — the exact same
+outcome the `ema_cross_9_21_buy` → `c921_ema_cross_buy` rename already
+produced in this database (visible directly: `ema_cross_9_21_buy` still
+carries 2 `trade_ledger` rows and 2,176 heartbeats, never migrated). New
+correlation IDs allocate fresh from `0001` under the `st12`/`st05` tokens — a
+distinct namespace from the historical `p_io_supe_*` rows, which are not
+rewritten (they are the audit record of what was actually sent).
+
+**Files created.**
+`strategies/intraday_options/st05_supertrend_buy/{__init__.py,strategy.py,
+SUPERTREND_BUY_1_0P5_ALGO_TRADING_SPEC.md}`,
+`config/strategies/intraday_options/st05_supertrend_buy.yaml` (`enabled:
+true`, `mode: paper`, `live_approved: false`; the full NSE-2026 holiday
+calendar and every warning comment — PAPER-ONLY/live-gate paragraph,
+no-`lot_size`-key rationale with the adapter asymmetry note, expiry note,
+daily-cap explanation — copied verbatim from `st12_supertrend_buy.yaml`), and
+11 test files: `tests/unit/test_st05_supertrend_buy_{strategy,config,
+warmup}.py`, `tests/unit/test_no_st05_supertrend_buy_branches.py`,
+`tests/integration/_st05_supertrend_buy_fixtures.py`, `tests/integration/
+test_st05_supertrend_buy_{engine,recovery,risk_and_gaps,dashboard,
+warmup_handoff,supervisor_composition}.py`.
+
+**Every candle sequence re-derived, not copied.** Walked the real
+`common.indicators.supertrend.SuperTrend` at multiplier 0.5 against every
+sequence before hard-coding a test. Flip patterns matched the 1.2 variant on
+every carried-over sequence (the tapes use large gap moves where the
+carried-forward band dominates either width), **except**:
+- The `warmup_handoff` suite's warmed-band value: `24178.0` at 1.2 vs.
+  **`24185.0`** at 0.5 on the identical 75-bar zigzag (10 flips either way),
+  so `CONTINUATION_CLOSE`/`FLIP_CLOSE` became `24235.0`/`24135.0`.
+- One unit test's stated invariant, which is **false at exactly 0.5**:
+  `st12_supertrend_buy`'s `test_the_first_candle_always_seeds_uptrend_at_
+  this_multiplier` argues the bar-0 seed is always UP "for any multiplier
+  above 0.5" — at exactly 0.5 that inequality degenerates to an equality
+  (`lower_basic == low`), so the seed direction becomes IEEE-754
+  rounding-sensitive. Fuzzed 200,000 random candles: ~12% of candles closing
+  at their own low seed DOWNTREND at 0.5. Replaced with
+  `test_the_seed_direction_at_multiplier_0p5_is_boundary_sensitive`, which
+  pins a concrete counterexample (`h=19921.11, l=19739.91, c=19739.91` → DOWN
+  at 0.5, UP at 1.2 on the identical candle) and re-proves the actual
+  invariant that survives regardless of seed direction: "no entry on the
+  initial state" (`test_the_seeding_candle_never_produces_an_entry`, which
+  never conditions on which way the seed lands).
+
+**Regression.** All 22 supertrend test files (11 renamed + 11 new) green
+individually and together (365 tests). `ruff check .` clean. `mypy common
+strategies runtimes dashboards scripts --strict` clean over 244 source files.
+`python -m scripts.assert_no_live_config_committed` OK. `python -m
+orchestration.launchd.generate_plists --check` — 2 plists match. Full suite:
+65 pre-existing failures, all confined to `weekly_delta_neutral`/
+`positional_options`/`test_dashboard_positional_real_data.py`, same root
+cause the 31 August addendum already documents
+(`ScripMasterError: Every listed NIFTY expiry is before 2026-09-08 ... The
+scrip master is stale` — D35's fail-closed behaviour correctly firing against
+a fixture CSV the advancing simulated date has now passed; the real running
+system downloads a fresh scrip master from Dhan every morning and is
+unaffected). Nothing new; one representative failure's traceback confirmed
+directly against the exact `ScripMasterError` message. The known
+`test_positional_runtime_weekly_staged_entry.py` `multiprocessing` hang was
+excluded from the run, unrelated to this change.
+
+**Safety.** No live gate touched. `common/execution/correlation.py` and
+`STRATEGY_TOKEN_LENGTH` unmodified. No file under `common/`, `runtimes/`,
+`dashboards/`, `orchestration/`, or `scripts/` touched — discovery and
+dashboard rendering are fully config-driven, exactly as the build spec
+required. `st12_supertrend_buy`'s behaviour is unchanged; every one of its 11
+renamed test suites passed before and after, unmodified in substance. No
+runtime, LaunchAgent, or dashboard process was started, stopped, or
+restarted by this work — admitting both strategies into a live supervisor run
+(confirming no `token collides` refusal end to end) remains an operator
+action, not performed here. `OPERATIONAL LIVE ACTIVATION ELIGIBLE` remains
+**NO — BLOCKED**, unaffected by this change.
+
+**Flagged, not applied.** CLAUDE.md's strategy-list bullet currently names
+only `c921_ema_cross_buy`, `c509_ema_cross_buy` and `c521_ema_cross_buy`; it
+does not mention the supertrend pair at all (before or after this rename).
+Per the build spec's explicit instruction, the exact edit is flagged to the
+operator rather than made unilaterally — see the addendum text itself for the
+suggested wording.
