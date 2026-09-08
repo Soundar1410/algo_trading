@@ -9,6 +9,8 @@ covered for every tab; DB-backed value correctness lives in
 
 from __future__ import annotations
 
+from datetime import date, timedelta
+
 from _dashboard_fakes import FakeStreamlit
 
 import dashboards.intraday_options as page
@@ -305,3 +307,69 @@ def test_signals_render_with_data():
     )
     page._render_signals(st, (signal,), (notification,), (error,))
     assert len(st.dataframes) == 3
+
+
+# ======================================================== Date-range presets
+def test_the_date_range_presets_offer_yesterday_between_today_and_the_windows():
+    """The selector's own option list, in order — ``Yesterday`` sits next to
+    ``Today`` rather than after the multi-day windows."""
+    assert page._PRESETS == (
+        "Today",
+        "Yesterday",
+        "Last 7 trading days",
+        "Last 30 trading days",
+        "Custom",
+    )
+
+
+def test_today_preset_resolves_to_a_single_day():
+    st = FakeStreamlit()
+    st.selectbox_returns = {"closed_trades_preset": "Today"}
+    start, end = page._resolve_date_range(st, "closed_trades", date(2026, 9, 8))
+    assert (start, end) == (date(2026, 9, 8), date(2026, 9, 8))
+
+
+def test_yesterday_preset_resolves_to_the_previous_trading_day_only():
+    """A single-day range, and it is the *previous* day — not today, and not a
+    two-day window that would silently include today's trades."""
+    st = FakeStreamlit()
+    st.selectbox_returns = {"closed_trades_preset": "Yesterday"}
+    # Tuesday 2026-09-08 -> Monday 2026-09-07.
+    start, end = page._resolve_date_range(st, "closed_trades", date(2026, 9, 8))
+    assert start == end == date(2026, 9, 7)
+
+
+def test_yesterday_preset_is_offered_on_every_tab_that_takes_a_date_range():
+    """Closed Trades, Performance and Strategy Comparison share one resolver,
+    so the preset must reach all three — asserted through the widget each tab
+    actually builds, not by reading the shared constant twice."""
+    for key in ("closed_trades", "performance", "comparison"):
+        st = FakeStreamlit()
+        st.selectbox_returns = {f"{key}_preset": "Yesterday"}
+        start, end = page._resolve_date_range(st, key, date(2026, 9, 8))
+        assert start == end == date(2026, 9, 7), key
+        label, options, kwargs = st.selectbox_calls[0]
+        assert label == "Date range"
+        assert "Yesterday" in options
+        assert kwargs["key"] == f"{key}_preset"
+
+
+def test_yesterday_on_a_monday_walks_back_over_the_weekend_to_friday():
+    """The reason this is not calendar-yesterday: a literal previous day would
+    make the preset show an empty Sunday every Monday."""
+    assert page._previous_trading_day(date(2026, 9, 7)) == date(2026, 9, 4)
+
+
+def test_yesterday_on_a_weekend_resolves_to_the_last_session_not_another_weekend_day():
+    """Saturday's calendar-yesterday (Friday) happens to be a session, but
+    Sunday's (Saturday) is not — both must land on Friday."""
+    assert page._previous_trading_day(date(2026, 9, 12)) == date(2026, 9, 11)  # Sat -> Fri
+    assert page._previous_trading_day(date(2026, 9, 13)) == date(2026, 9, 11)  # Sun -> Fri
+
+
+def test_previous_trading_day_is_always_strictly_before_today():
+    """The invariant that separates Yesterday from Today: never the same date,
+    on any day of the week, including when today itself is not a session."""
+    for offset in range(14):
+        today = date(2026, 9, 7) + timedelta(days=offset)
+        assert page._previous_trading_day(today) < today, today

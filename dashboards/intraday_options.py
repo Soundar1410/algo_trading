@@ -39,7 +39,7 @@ from __future__ import annotations
 import re
 import sys
 from dataclasses import replace
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -122,7 +122,7 @@ NOT_YET_AVAILABLE = (
 #: future strategy configures a longer candle timeframe.
 _MARK_STALE_AFTER_SECONDS = 900.0
 
-_PRESETS = ("Today", "Last 7 trading days", "Last 30 trading days", "Custom")
+_PRESETS = ("Today", "Yesterday", "Last 7 trading days", "Last 30 trading days", "Custom")
 _MODES = ("All", "Paper", "Live")
 _MODE_VALUES = {"All": None, "Paper": "paper", "Live": "live"}
 _SECRET_KEY_PATTERN = re.compile(r"secret|token|password|pin|api[_-]?key", re.IGNORECASE)
@@ -138,10 +138,32 @@ _OUTCOMES = ("Winning", "Losing")
 _SEVERITIES = ("INFO", "WARNING", "ERROR", "CRITICAL")
 
 
+def _previous_trading_day(today: date) -> date:
+    """The most recent trading day strictly before ``today`` — what "Yesterday"
+    means to a trader, not the literal calendar day before.
+
+    Calendar-yesterday would be an empty page every Monday (Sunday) and every
+    Sunday (Saturday). Walking back to the previous *session* instead keeps the
+    preset useful on all seven days: Monday shows Friday, Saturday and Sunday
+    both show Friday.
+
+    Inherits :data:`~dashboards.data.calendar_stats.TRADING_DAY_CAVEAT` — a
+    "trading day" here is Monday-Friday, because ``calendar_stats`` models no
+    exchange holiday calendar. The day after a holiday therefore resolves to
+    that holiday and shows nothing, exactly as the "Last 7/30 trading days"
+    presets already over-count it. Fixing that is a change to the shared
+    calendar helper, not to this preset.
+    """
+    return n_trading_days_back(today - timedelta(days=1), 1)
+
+
 def _resolve_date_range(streamlit: Any, key: str, today: date) -> tuple[date, date]:
     preset = streamlit.selectbox("Date range", _PRESETS, key=f"{key}_preset")
     if preset == "Today":
         return today, today
+    if preset == "Yesterday":
+        previous = _previous_trading_day(today)
+        return previous, previous
     if preset == "Last 7 trading days":
         return n_trading_days_back(today, 7), today
     if preset == "Last 30 trading days":
