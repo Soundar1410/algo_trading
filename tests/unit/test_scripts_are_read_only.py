@@ -119,10 +119,20 @@ CONFIRMATION_SCRIPTS = {"live_confirmation.py"}
 #: proven in ``tests/unit/test_install_launch_agents.py``.
 AGENT_INSTALL_SCRIPTS = {"install_launch_agents.py"}
 
+#: The one destructive tier. ``purge_retired_strategies.py`` deletes rows from
+#: trading tables outright — that is its entire purpose, so it cannot sit in
+#: ``CONTROL_SCRIPTS``, whose defining guarantee is that it never does. It gets
+#: its own guarantees instead, asserted below: no broker, ``--apply`` required
+#: before anything is deleted, a full snapshot written before the first
+#: ``DELETE``, and a ``foreign_key_check`` before the transaction commits (the
+#: 9 September 2026 orphaning is why that last one exists).
+DESTRUCTIVE_SCRIPTS = {"purge_retired_strategies.py"}
+
 READ_ONLY_FILES = [p for p in SCRIPT_FILES if p.name in READ_ONLY_SCRIPTS]
 CONTROL_FILES = [p for p in SCRIPT_FILES if p.name in CONTROL_SCRIPTS]
 CONFIRMATION_FILES = [p for p in SCRIPT_FILES if p.name in CONFIRMATION_SCRIPTS]
 AGENT_INSTALL_FILES = [p for p in SCRIPT_FILES if p.name in AGENT_INSTALL_SCRIPTS]
+DESTRUCTIVE_FILES = [p for p in SCRIPT_FILES if p.name in DESTRUCTIVE_SCRIPTS]
 
 #: Tables a control script must never write directly — trades, positions and
 #: the state that gates them. Contrast ``audit_events``, which every control
@@ -143,9 +153,19 @@ def test_the_scripts_directory_is_what_we_think_it_is():
     """Guards every parametrisation below: an empty glob would pass everything."""
     names = {path.name for path in SCRIPT_FILES}
     assert names == (
-        READ_ONLY_SCRIPTS | CONTROL_SCRIPTS | CONFIRMATION_SCRIPTS | AGENT_INSTALL_SCRIPTS
+        READ_ONLY_SCRIPTS
+        | CONTROL_SCRIPTS
+        | CONFIRMATION_SCRIPTS
+        | AGENT_INSTALL_SCRIPTS
+        | DESTRUCTIVE_SCRIPTS
     )
-    tiers = (READ_ONLY_SCRIPTS, CONTROL_SCRIPTS, CONFIRMATION_SCRIPTS, AGENT_INSTALL_SCRIPTS)
+    tiers = (
+        READ_ONLY_SCRIPTS,
+        CONTROL_SCRIPTS,
+        CONFIRMATION_SCRIPTS,
+        AGENT_INSTALL_SCRIPTS,
+        DESTRUCTIVE_SCRIPTS,
+    )
     assert all(left.isdisjoint(right) for i, left in enumerate(tiers) for right in tiers[i + 1 :])
 
 
@@ -442,3 +462,44 @@ def test_no_launcher_script_writes_a_trading_table(script: Path):
         match = pattern.search(code_only)
         in_code = bool(match) and match.group(0) not in docstring_text
         assert not in_code, f"{script.name} writes directly to {table!r}"
+
+
+# ------------------------------------------------------------- destructive
+@pytest.mark.parametrize("script", DESTRUCTIVE_FILES, ids=lambda p: p.name)
+def test_the_destructive_script_reaches_no_broker(script: Path):
+    """It deletes history; it must never be able to touch an account."""
+    assert _broker_imports(script) == set(), f"{script.name} imports a broker"
+
+
+@pytest.mark.parametrize("script", DESTRUCTIVE_FILES, ids=lambda p: p.name)
+def test_the_destructive_script_deletes_nothing_without_apply(script: Path):
+    source = script.read_text(encoding="utf-8")
+    assert '"--apply"' in source
+    assert "args.apply" in source
+
+
+@pytest.mark.parametrize("script", DESTRUCTIVE_FILES, ids=lambda p: p.name)
+def test_the_destructive_script_snapshots_before_it_deletes(script: Path):
+    """The snapshot is the only route back once a purge commits, so it has to
+    be taken *before* the first DELETE.
+
+    Scoped to ``main``'s own body deliberately: the helpers that issue the
+    DELETEs are defined above ``main`` in the file, so a whole-file position
+    comparison would compare definition order rather than execution order and
+    fail for the wrong reason.
+    """
+    source = script.read_text(encoding="utf-8")
+    body = source[source.index("def main(") :]
+    assert "snapshot = _snapshot(" in body
+    assert body.index("snapshot = _snapshot(") < body.index('f"DELETE FROM {table}')
+    assert body.index("snapshot = _snapshot(") < body.index("_delete_orphan_children(conn)")
+
+
+@pytest.mark.parametrize("script", DESTRUCTIVE_FILES, ids=lambda p: p.name)
+def test_the_destructive_script_verifies_referential_integrity_before_committing(script: Path):
+    """The 9 September 2026 defect: deleting parents by ``strategy_id`` left
+    46 orphaned ``paper_fill_quotes`` rows, unnoticed because a raw sqlite3
+    connection does not enforce foreign keys."""
+    source = script.read_text(encoding="utf-8")
+    assert "PRAGMA foreign_key_check" in source
+    assert "refusing to commit" in source
