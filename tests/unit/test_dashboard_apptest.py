@@ -226,7 +226,6 @@ def test_intraday_options_page_loads_and_every_tab_is_present(project_root: Path
         "Performance",
         "Strategy Comparison",
         "Signals & Events",
-        "Health",
     ]
 
 
@@ -403,11 +402,12 @@ def test_the_baskets_tab_shows_a_basket_and_its_legs(
 
 
 # ==================================================== pure filter helpers
-# _filter_by_outcome/_scope_health_view are new/changed for the 1 September
-# 2026 filter batch and have no coverage anywhere else (unlike the Mode
-# filter, whose logic is proven at the load_*() level, not as a private
-# helper) — worth a direct, isolated check rather than trusting the wiring
-# alone.
+# _filter_by_outcome is from the 1 September 2026 filter batch and has no
+# coverage anywhere else (unlike the Mode filter, whose logic is proven at
+# the load_*() level, not as a private helper) — worth a direct, isolated
+# check rather than trusting the wiring alone. Its sibling
+# _scope_health_view was removed with the Health tab on 9 September 2026;
+# see dashboards/intraday_options.py's own module docstring.
 def test_filter_by_outcome_splits_on_net_pnl_sign():
     from dashboards.data.intraday_options import ClosedTradeRow
     from dashboards.intraday_options import _filter_by_outcome
@@ -429,39 +429,3 @@ def test_filter_by_outcome_splits_on_net_pnl_sign():
     # ``Net Profit <= 0`` convention this filter was ported from.
     assert _filter_by_outcome(trades, ("Losing",)) == (loser, breakeven)
     assert _filter_by_outcome(trades, ("Winning", "Losing")) == trades
-
-
-def test_scope_health_view_filters_pids_and_incidents_to_the_given_ids():
-    from dataclasses import dataclass
-
-    from dashboards.intraday_options import _scope_health_view
-
-    @dataclass(frozen=True)
-    class _Pid:
-        strategy_id: str
-
-    @dataclass(frozen=True)
-    class _Incident:
-        strategy_id: str | None
-
-    @dataclass(frozen=True)
-    class _View:
-        strategy_pids: tuple[_Pid, ...]
-        active_incidents: tuple[_Incident, ...]
-        resolved_incidents: tuple[_Incident, ...]
-
-    view = _View(
-        strategy_pids=(_Pid("st01"), _Pid("st02"), _Pid("st03")),
-        active_incidents=(_Incident("st01"), _Incident("st03"), _Incident(None)),
-        resolved_incidents=(_Incident("st02"), _Incident(None)),
-    )
-
-    unscoped = _scope_health_view(view, ())
-    assert unscoped is view  # empty selection = no filter, same object back
-
-    scoped = _scope_health_view(view, ("st01", "st02"))
-    assert {p.strategy_id for p in scoped.strategy_pids} == {"st01", "st02"}
-    # A runtime-wide incident (strategy_id=None) survives scoping to any
-    # selection — same rule the loaders' own "runtime-wide" clauses use.
-    assert {i.strategy_id for i in scoped.active_incidents} == {"st01", None}
-    assert {i.strategy_id for i in scoped.resolved_incidents} == {"st02", None}

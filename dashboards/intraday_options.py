@@ -1,8 +1,20 @@
 """Read-only Streamlit page — Intraday Options.
 
-Eight tabs (spec): Overview, Open Positions, Orders & Fills, Closed Trades,
-Performance, Strategy Comparison, Signals & Events, Health — all backed by
+Eight tabs: Overview, Open Positions, Baskets, Orders & Fills, Closed
+Trades, Performance, Strategy Comparison, Signals & Events — all backed by
 :mod:`dashboards.data.intraday_options`, never by SQL written in this file.
+
+A ninth "Health" tab existed until 9 September 2026 and was removed on the
+operator's own call: it rendered exactly what the standalone System Health
+page renders (same ``load_system_health``, same ``render``), merely filtered
+to the selected strategies, so it duplicated a page already one click away in
+the sidebar. Per-strategy scoping of the health view is the only thing that
+went with it. The other diagnostic tabs were deliberately kept — each holds
+data reachable nowhere else: Signals & Events is the only view of a signal
+that fired without becoming a trade and of the incident history (26 CRITICAL
+rows as of that date), Orders & Fills the only view of a rejected or unfilled
+order (Closed Trades shows completed round trips only), Baskets the only view
+of a multi-leg strategy's legs.
 
 **A persistent "Strategy:" selector**, right below the title and above the
 tabs, scopes every tab except Strategy Comparison (which has its own
@@ -28,6 +40,16 @@ be exactly the "looks finished but isn't" pattern the runbook already
 declines elsewhere. The multi-leg basket/leg drill-down does not have a mark
 yet — a separate, later phase.
 
+**Performance vs. Strategy Comparison.** They answer different questions and
+deliberately scope differently. Performance shows *every* strategy id with
+activity in the window — including an id no config file declares any more,
+labelled retired, and one that was up all session without firing — scoped only
+by the page-level Strategy selector, as a per-strategy table plus one explicit
+combined row. Strategy Comparison stays a ranked leaderboard over the
+configured ids you pick in its own multiselect. The combined row is computed
+from the union of the in-scope trades, never by adding the per-strategy rows
+up: win rate, profit factor, expectancy and max drawdown are not additive.
+
 Read-only/no-side-effect discipline is identical to ``dashboards/Home.py`` —
 see that module's docstring. Rankings on the Strategy Comparison tab are
 computed read-only, on demand — the reference dashboard's "save today's
@@ -38,7 +60,6 @@ from __future__ import annotations
 
 import re
 import sys
-from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
@@ -49,12 +70,9 @@ for _parent in Path(__file__).resolve().parents:
             sys.path.insert(0, str(_parent))
         break
 
-from dashboards import system_health as health_page  # noqa: E402
 from dashboards._shared import SnapshotUnavailable, load_snapshot, run_bounded  # noqa: E402
 from dashboards.data.calendar_stats import (  # noqa: E402
     TRADING_DAY_CAVEAT,
-    execution_day_stats,
-    merge_daily_outcomes,
     n_trading_days_back,
 )
 from dashboards.data.intraday_options import (  # noqa: E402
@@ -62,12 +80,12 @@ from dashboards.data.intraday_options import (  # noqa: E402
     ClosedTradeRow,
     OrderRow,
     OverviewRow,
+    PerformanceBreakdown,
+    StrategyPerformanceRow,
+    build_performance_breakdown,
     build_strategy_comparison,
-    compute_metrics,
-    drawdown_curve,
-    equity_curve,
+    equity_curves_by_strategy,
     load_closed_trades,
-    load_daily_outcomes,
     load_errors,
     load_live_positions,
     load_notifications,
@@ -75,8 +93,6 @@ from dashboards.data.intraday_options import (  # noqa: E402
     load_overview,
     load_signals,
     load_strategy_config_raw,
-    pnl_by_day,
-    pnl_by_month,
 )
 from dashboards.data.multi_leg import (  # noqa: E402
     BasketRow,
@@ -611,14 +627,162 @@ def _render_closed_trades(streamlit: Any, trades: tuple[ClosedTradeRow, ...]) ->
 
 
 # ============================================================= Performance
+#: Table label for a ``strategy_id`` no longer declared by any config file.
+#: Its ``trade_ledger`` history is real and stays counted; only the strategy
+#: picker stops offering the id (see ``dashboards/data/strategy_scope.py``'s
+#: 31 August 2026 note), so without this label a rename would look like a
+#: strategy that mysteriously stopped rather than one that changed name.
+RETIRED_LABEL = "retired (not in config)"
+
+_COMBINED_SERIES = "Combined"
+
+#: Streamlit's own dataframe metrics, used to size the per-strategy table
+#: to its row count instead of letting it scroll internally.
+_TABLE_ROW_PX = 35
+_TABLE_HEADER_PX = 38
+
+_DAY_COUNT_CAVEAT = (
+    "\"Days ran\" counts distinct dates with a recorded runtime session for "
+    "that strategy — days it was up, whether or not it fired. \"Days traded\" "
+    "counts dates with at least one closed trade. They are counted "
+    "independently and routinely differ; a selective strategy is not a "
+    "stopped one. ₹/trading day divides net P&L by days traded, never by "
+    "days ran."
+)
+
+_COMBINED_CAVEAT = (
+    "The combined row is computed from every in-scope trade, never by adding "
+    "the rows up. Win rate, profit factor, expectancy and max drawdown are "
+    "not additive — two strategies drawing down on different days have a "
+    "combined drawdown shallower than their sum, so adding them would "
+    "overstate the portfolio's worst moment."
+)
+
+
+def _series_label(strategy_id: str, execution_mode: str, *, dual_mode: bool) -> str:
+    """A chart/table series name. The mode is appended only for a strategy
+    that appears in more than one mode in this window — with a single mode it
+    is noise on every label."""
+    return f"{strategy_id} · {execution_mode}" if dual_mode else strategy_id
+
+
+def _dual_mode_ids(rows: tuple[StrategyPerformanceRow, ...]) -> set[str]:
+    seen: dict[str, set[str]] = {}
+    for row in rows:
+        seen.setdefault(row.strategy_id, set()).add(row.execution_mode)
+    return {sid for sid, modes in seen.items() if len(modes) > 1}
+
+
+def _performance_table(breakdown: PerformanceBreakdown) -> list[dict[str, object]]:
+    """The per-strategy table, TOTAL row appended last. Split out from the
+    renderer so the numbers can be asserted without a Streamlit stub."""
+    dual = _dual_mode_ids(breakdown.rows)
+    table = []
+    for row in (*breakdown.rows, breakdown.combined):
+        combined = row is breakdown.combined
+        m = row.metrics
+        table.append(
+            {
+                "Strategy": "TOTAL" if combined else _series_label(
+                    row.strategy_id, row.execution_mode, dual_mode=row.strategy_id in dual
+                ),
+                "Mode": mode_label(row.execution_mode),
+                "Status": (
+                    "all strategies"
+                    if combined
+                    else ("active" if row.configured else RETIRED_LABEL)
+                ),
+                "Days ran": row.days_ran,
+                "Days traded": row.days_traded,
+                "Trades": m.sample_size,
+                "Win rate": format_pct(m.win_rate) if m.win_rate is not None else MISSING,
+                "Profit factor": _fmt_ratio(m.profit_factor),
+                "Expectancy": format_inr(m.expectancy) if m.expectancy is not None else MISSING,
+                "Net P&L": format_inr(m.net_profit),
+                "Charges": format_inr(m.total_charges),
+                "Max drawdown": (
+                    format_inr(m.max_drawdown) if m.max_drawdown is not None else MISSING
+                ),
+                "Avg win / loss": (
+                    f"{format_inr(m.avg_win)} / {format_inr(m.avg_loss)}"
+                    if m.avg_win is not None or m.avg_loss is not None
+                    else MISSING
+                ),
+                "₹ / trading day": (
+                    format_inr(row.pnl_per_trading_day)
+                    if row.pnl_per_trading_day is not None
+                    else MISSING
+                ),
+                "First trade": row.first_trade_date or MISSING,
+                "Last trade": row.last_trade_date or MISSING,
+                "Sample": "reliable" if m.reliable else f"insufficient (n={m.sample_size})",
+            }
+        )
+    return table
+
+
+def _render_equity_chart(
+    streamlit: Any,
+    breakdown: PerformanceBreakdown,
+    curves: dict[tuple[str, str], tuple[tuple[str, float], ...]],
+) -> None:
+    """One line per strategy plus a combined line, on a shared exit-time axis.
+
+    Each series is seeded at zero at the window's first exit and
+    forward-filled after its last, so a strategy that started trading late
+    does not draw a line back through time it was never in, and one that
+    stopped holds its final equity instead of vanishing.
+    """
+    import pandas as pd
+
+    dual = _dual_mode_ids(breakdown.rows)
+    series: dict[str, dict[str, float]] = {}
+    # Iterate the breakdown's own rows, not the curves dict, so the legend
+    # reads top-to-bottom in the same order as the table above it. A curve
+    # with no points (a strategy that ran without trading) contributes no
+    # series — a flat zero line would claim it broke even, not that it
+    # never traded.
+    for row in breakdown.rows:
+        points = curves.get((row.strategy_id, row.execution_mode), ())
+        if not points:
+            continue
+        label = _series_label(
+            row.strategy_id, row.execution_mode, dual_mode=row.strategy_id in dual
+        )
+        series[label] = {ts: value for ts, value in points}
+
+    if not series:
+        streamlit.caption(
+            "No closed trades in this range yet — the equity curve appears once there are."
+        )
+        return
+
+    frame = pd.DataFrame(series)
+    # Parse the ISO exit timestamps into a real datetime index. As plain
+    # strings the axis is categorical: every one of the (up to hundreds of)
+    # timestamps is drawn as its own rotated tick label, and points are
+    # spaced evenly regardless of the real gaps between them, so an
+    # overnight gap looks the same as two seconds.
+    frame.index = pd.to_datetime(frame.index, format="mixed", utc=True)
+    frame = frame.sort_index().ffill().fillna(0.0)
+    # Summing the *cumulative* per-strategy series at each timestamp is
+    # exactly the combined cumulative equity — the same figure
+    # ``equity_curve`` over every trade would produce — because each
+    # series is already forward-filled to that timestamp.
+    frame[_COMBINED_SERIES] = frame.sum(axis=1)
+    frame.index.name = "Exit time"
+    streamlit.line_chart(frame)
+
+
 def _render_performance(
     streamlit: Any,
-    trades: tuple[ClosedTradeRow, ...],
-    outcomes: tuple[Any, ...],
-    window_start: date,
-    window_end: date,
+    breakdown: PerformanceBreakdown,
+    curves: dict[tuple[str, str], tuple[tuple[str, float], ...]],
 ) -> None:
-    metrics = compute_metrics(trades)
+    combined = breakdown.combined
+    metrics = combined.metrics
+
+    streamlit.subheader("All strategies combined")
     row1 = streamlit.columns(4)
     row1[0].metric("Trades", metrics.sample_size)
     row1[1].metric(
@@ -639,51 +803,57 @@ def _render_performance(
         "Avg win / loss",
         f"{format_inr(metrics.avg_win)} / {format_inr(metrics.avg_loss)}",
     )
+    row3 = streamlit.columns(4)
+    # Distinct ids, not table rows: a strategy that has run in both modes
+    # occupies two rows but is still one strategy.
+    row3[0].metric("Strategies", len({r.strategy_id for r in breakdown.rows}))
+    row3[1].metric("Days ran", f"{combined.days_ran}/{breakdown.eligible_days}")
+    row3[2].metric("Days traded", f"{combined.days_traded}/{breakdown.eligible_days}")
+    row3[3].metric(
+        "₹ / trading day",
+        format_inr(combined.pnl_per_trading_day)
+        if combined.pnl_per_trading_day is not None
+        else MISSING,
+    )
     if not metrics.reliable:
         streamlit.warning(
             f"Only {metrics.sample_size} trade(s) in this range — statistics are not yet "
             f"a reliable sample (n≥{MIN_SAMPLE_SIZE} recommended)."
         )
 
-    equity = equity_curve(trades)
-    if equity:
-        import pandas as pd
-
-        streamlit.line_chart(
-            pd.DataFrame(equity, columns=["Exit time", "Cumulative net P&L"]).set_index(
-                "Exit time"
-            )
-        )
-        drawdown = drawdown_curve(equity)
-        streamlit.line_chart(
-            pd.DataFrame(drawdown, columns=["Exit time", "Drawdown"]).set_index("Exit time")
-        )
-        daily = pnl_by_day(trades)
-        streamlit.bar_chart(pd.DataFrame(daily, columns=["Date", "Net P&L"]).set_index("Date"))
-        monthly = pnl_by_month(trades)
-        streamlit.bar_chart(
-            pd.DataFrame(monthly, columns=["Month", "Net P&L"]).set_index("Month")
-        )
-    else:
-        streamlit.caption("No closed trades in this range yet — charts will appear once there are.")
-
-    day_stats = execution_day_stats(outcomes, window_start=window_start, window_end=window_end)
-    execution_pct_label = (
-        format_pct(day_stats.execution_pct) if day_stats.execution_pct is not None else MISSING
+    streamlit.subheader("Per strategy")
+    if not breakdown.rows:
+        streamlit.info("No strategy ran or traded in this range.")
+        return
+    table = _performance_table(breakdown)
+    # Height the table to its own contents. Streamlit's default caps a
+    # dataframe at ten rows and scrolls the rest inside its own frame, which
+    # here would put the TOTAL row — the one row the reader most wants —
+    # below the fold of an inner scrollbar they have no reason to expect.
+    streamlit.dataframe(
+        table,
+        hide_index=True,
+        width="stretch",
+        height=_TABLE_HEADER_PX + len(table) * _TABLE_ROW_PX,
     )
-    streamlit.caption(
-        f"Executed {day_stats.executed_days} of {day_stats.eligible_trading_days} eligible "
-        f"trading days ({execution_pct_label}); {day_stats.skipped_days} no-trade day(s)."
-    )
+    streamlit.caption(_DAY_COUNT_CAVEAT)
+    streamlit.caption(_COMBINED_CAVEAT)
+    if any(not r.configured for r in breakdown.rows):
+        streamlit.caption(
+            f"A row marked \"{RETIRED_LABEL}\" is a strategy id no config file "
+            "declares any more — usually a rename. Its trades are real and stay "
+            "counted here; only the Strategy picker above stops offering the id."
+        )
     streamlit.caption(TRADING_DAY_CAVEAT)
-
-    table = _closed_trades_table(trades)
     streamlit.download_button(
-        "Download performance trades (CSV)",
+        "Download per-strategy performance (CSV)",
         data=to_csv_bytes(table),
-        file_name="performance_trades.csv",
+        file_name="strategy_performance.csv",
         mime="text/csv",
     )
+
+    streamlit.subheader("Equity curve")
+    _render_equity_chart(streamlit, breakdown, curves)
 
 
 # ========================================================= Strategy comparison
@@ -825,27 +995,6 @@ def _render_signals(
         streamlit.caption("No errors recorded.")
 
 
-def _scope_health_view(view: Any, strategy_ids: tuple[str, ...]) -> Any:
-    """Filter a runtime-wide ``SystemHealthView`` down to the selected
-    strategies' PIDs and incidents. Auth/feed/database sections stay
-    runtime-wide — they are not per-strategy facts, so there is nothing
-    honest to filter them to. ``dataclasses.replace`` only;
-    ``system_health.py`` itself is untouched, so the standalone System
-    Health page keeps showing every strategy."""
-    if not strategy_ids:
-        return view
-    return replace(
-        view,
-        strategy_pids=tuple(p for p in view.strategy_pids if p.strategy_id in strategy_ids),
-        active_incidents=tuple(
-            i for i in view.active_incidents if i.strategy_id in (*strategy_ids, None)
-        ),
-        resolved_incidents=tuple(
-            i for i in view.resolved_incidents if i.strategy_id in (*strategy_ids, None)
-        ),
-    )
-
-
 # =================================================================== main
 def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
     import streamlit as st
@@ -897,7 +1046,6 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
             "Performance",
             "Strategy Comparison",
             "Signals & Events",
-            "Health",
         ]
     )
 
@@ -1063,45 +1211,39 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
             strategy_ids: tuple[str, ...] = selected_strategies,
             execution_mode: str | None = performance_mode,
         ) -> None:
-            trades = run_bounded(
-                database_path,
-                lambda conn: load_closed_trades(
+            def _read(
+                conn: Any,
+            ) -> tuple[
+                PerformanceBreakdown, dict[tuple[str, str], tuple[tuple[str, float], ...]]
+            ]:
+                """Breakdown and equity curves off one connection — the two
+                reads must see the same snapshot, or the chart could show a
+                trade the table has not counted."""
+                breakdown = build_performance_breakdown(
+                    conn,
+                    runtime_id,
+                    paths.config_root,
+                    strategy_ids=strategy_ids or None,
+                    execution_mode=execution_mode,
+                    start_date=start.isoformat(),
+                    end_date=end.isoformat(),
+                )
+                trades = load_closed_trades(
                     conn,
                     runtime_id,
                     strategy_ids=strategy_ids or None,
                     execution_mode=execution_mode,
                     start_date=start.isoformat(),
                     end_date=end.isoformat(),
-                ),
-            )
-            scope_ids = strategy_ids if strategy_ids else all_strategy_ids
-            raw_outcomes = run_bounded(
-                database_path,
-                lambda conn: tuple(
-                    o
-                    for sid in scope_ids
-                    for o in load_daily_outcomes(
-                        conn,
-                        runtime_id,
-                        strategy_id=sid,
-                        execution_mode=execution_mode,
-                        start_date=start.isoformat(),
-                        end_date=end.isoformat(),
-                    )
-                ),
-            )
-            outcomes = (
-                ()
-                if isinstance(raw_outcomes, SnapshotUnavailable)
-                else merge_daily_outcomes(raw_outcomes)
-            )
-            _render_performance(
-                st,
-                () if isinstance(trades, SnapshotUnavailable) else trades,
-                outcomes,
-                start,
-                end,
-            )
+                )
+                return breakdown, equity_curves_by_strategy(trades)
+
+            result = run_bounded(database_path, _read)
+            if isinstance(result, SnapshotUnavailable):
+                st.info(result.reason)
+                return
+            breakdown, curves = result
+            _render_performance(st, breakdown, curves)
 
         _performance()
 
@@ -1193,16 +1335,6 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
 
         _signals()
 
-    with tabs[8]:
-
-        @st.fragment(run_every=5)
-        def _health(strategy_ids: tuple[str, ...] = selected_strategies) -> None:
-            view = health_page.load_system_health(database_path, runtime_id, trading_date)
-            if not isinstance(view, SnapshotUnavailable):
-                view = _scope_health_view(view, strategy_ids)
-            health_page.render(st, view)
-
-        _health()
 
 
 if __name__ == "__main__":  # pragma: no cover

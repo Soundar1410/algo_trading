@@ -951,6 +951,218 @@ def build_strategy_comparison(
     return tuple(rows)
 
 
+# ================================================= Per-strategy performance
+#: The ``strategy_id`` carried by :attr:`PerformanceBreakdown.combined`. Not a
+#: real strategy — a sentinel so the combined row can share
+#: :class:`StrategyPerformanceRow` with the per-strategy rows and be formatted
+#: by exactly the same code path. No configured strategy may use this id;
+#: ``correlation.strategy_token()`` would truncate it to "all" anyway, and
+#: every committed id is far longer.
+COMBINED_STRATEGY_ID = "ALL"
+
+#: :attr:`StrategyPerformanceRow.execution_mode` for a combined row spanning
+#: more than one mode. Paper and live are never blended into one *strategy*
+#: row (see :func:`build_strategy_comparison`), but the portfolio total the
+#: Performance tab shows is explicitly whatever the tab's own Mode filter
+#: selected — this value says so out loud rather than naming one mode.
+MIXED_EXECUTION_MODE = "mixed"
+
+
+@dataclass(frozen=True)
+class StrategyPerformanceRow:
+    """One strategy's own performance over the window, plus how long it was
+    actually up.
+
+    ``days_ran`` and ``days_traded`` are counted independently and routinely
+    differ: a strategy can be up all session and never fire (straddle_920 ran
+    10 session days and traded on 4), and one can even have run under a
+    previous ``strategy_id`` on a date its current id has trades for, on the
+    day of a rename cutover. Neither count is derived from the other.
+    """
+
+    strategy_id: str
+    execution_mode: str
+    #: False when no ``config/strategies/**/<id>.yaml`` declares this id — a
+    #: retired identity whose ``trade_ledger`` history is still real and still
+    #: counted, but which ``strategy_scope.discover_strategy_options``
+    #: deliberately no longer offers in the picker (31 August 2026 decision).
+    configured: bool
+    #: Distinct ``runtime_sessions`` dates in the window. "Up", not "traded".
+    days_ran: int
+    #: Distinct ``trade_ledger.trading_date`` values with at least one closed
+    #: trade in the window.
+    days_traded: int
+    first_trade_date: str | None
+    last_trade_date: str | None
+    metrics: PerformanceMetrics
+
+    @property
+    def pnl_per_trading_day(self) -> float | None:
+        """Net P&L divided by days *traded*, not by days ran or by eligible
+        trading days — dividing by days the strategy never fired would
+        understate a selective strategy for being selective. ``None`` when it
+        never traded."""
+        if self.days_traded == 0:
+            return None
+        return self.metrics.net_profit / self.days_traded
+
+
+@dataclass(frozen=True)
+class PerformanceBreakdown:
+    """The Performance tab's whole read model: one row per
+    ``(strategy, execution_mode)`` pair with activity in the window, plus the
+    combined portfolio row."""
+
+    rows: tuple[StrategyPerformanceRow, ...]
+    combined: StrategyPerformanceRow
+    eligible_days: int
+
+
+def _session_dates(
+    conn: sqlite3.Connection,
+    runtime_id: str,
+    *,
+    execution_mode: str | None,
+    start_date: str,
+    end_date: str,
+) -> dict[tuple[str, str], set[str]]:
+    """Distinct session dates per ``(strategy_id, execution_mode)``.
+
+    Same UTC-date reasoning as :func:`load_daily_outcomes`: every NSE session
+    falls inside one UTC calendar date, so ``date(started_at)`` matches the
+    IST trading date in practice. Supervisor rows carry a NULL ``strategy_id``
+    and are excluded — they say the runtime group was up, not that any one
+    strategy was.
+    """
+    query = (
+        "SELECT strategy_id, execution_mode, date(started_at) AS d "
+        "FROM runtime_sessions "
+        "WHERE runtime_id = ? AND strategy_id IS NOT NULL "
+        "AND date(started_at) BETWEEN ? AND ?"
+    )
+    params: list[object] = [runtime_id, start_date, end_date]
+    if execution_mode is not None:
+        query += " AND execution_mode = ?"
+        params.append(execution_mode)
+    dates: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for row in conn.execute(query, params):
+        dates[(row["strategy_id"], row["execution_mode"])].add(row["d"])
+    return dates
+
+
+def build_performance_breakdown(
+    conn: sqlite3.Connection,
+    runtime_id: str,
+    config_root: object,
+    *,
+    strategy_ids: tuple[str, ...] | None = None,
+    execution_mode: str | None = None,
+    start_date: str,
+    end_date: str,
+) -> PerformanceBreakdown:
+    """Per-strategy performance plus the combined portfolio row.
+
+    The pair list is the **union** of everything with a ``trade_ledger`` row
+    and everything with a ``runtime_sessions`` row in the window — the one
+    difference that matters against :func:`build_strategy_comparison`, which
+    iterates only the ids handed to it. That union is what lets this surface
+    two things the comparison leaderboard structurally cannot: a retired
+    ``strategy_id`` that still holds real history, and a strategy that was up
+    all day and never traded (both exist in the live database today).
+
+    ``strategy_ids`` narrows to the page's own selector; ``None`` means every
+    pair discovered. Paper and live are never blended into one strategy row.
+
+    :attr:`PerformanceBreakdown.combined` is computed from the union of all
+    in-scope trades, never by summing the rows: win rate, profit factor,
+    expectancy and max drawdown are not additive. Max drawdown especially —
+    two strategies drawing down on different days have a combined drawdown
+    strictly shallower than either summed, and a caller that added them would
+    overstate the portfolio's worst moment.
+    """
+    session_dates = _session_dates(
+        conn,
+        runtime_id,
+        execution_mode=execution_mode,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    trades = load_closed_trades(
+        conn,
+        runtime_id,
+        strategy_ids=strategy_ids,
+        execution_mode=execution_mode,
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+    wanted = set(strategy_ids) if strategy_ids else None
+    trades_by_pair: dict[tuple[str, str], list[ClosedTradeRow]] = defaultdict(list)
+    for trade in trades:
+        trades_by_pair[(trade.strategy_id, trade.execution_mode)].append(trade)
+
+    pairs = set(trades_by_pair)
+    pairs.update(p for p in session_dates if wanted is None or p[0] in wanted)
+
+    rows = []
+    for strategy_id, mode in sorted(pairs):
+        pair_trades = tuple(trades_by_pair.get((strategy_id, mode), ()))
+        trading_dates = {t.trading_date for t in pair_trades}
+        rows.append(
+            StrategyPerformanceRow(
+                strategy_id=strategy_id,
+                execution_mode=mode,
+                configured=load_strategy_config_raw(config_root, strategy_id) is not None,
+                days_ran=len(session_dates.get((strategy_id, mode), ())),
+                days_traded=len(trading_dates),
+                first_trade_date=min(trading_dates) if trading_dates else None,
+                last_trade_date=max(trading_dates) if trading_dates else None,
+                metrics=compute_metrics(pair_trades),
+            )
+        )
+    rows.sort(key=lambda r: r.metrics.net_profit, reverse=True)
+
+    in_scope_trades = tuple(t for pair in pairs for t in trades_by_pair.get(pair, ()))
+    all_session_dates = {d for pair in pairs for d in session_dates.get(pair, ())}
+    all_trading_dates = {t.trading_date for t in in_scope_trades}
+    modes = {mode for _, mode in pairs}
+    combined = StrategyPerformanceRow(
+        strategy_id=COMBINED_STRATEGY_ID,
+        execution_mode=next(iter(modes)) if len(modes) == 1 else MIXED_EXECUTION_MODE,
+        configured=True,
+        days_ran=len(all_session_dates),
+        days_traded=len(all_trading_dates),
+        first_trade_date=min(all_trading_dates) if all_trading_dates else None,
+        last_trade_date=max(all_trading_dates) if all_trading_dates else None,
+        metrics=compute_metrics(in_scope_trades),
+    )
+
+    from .calendar_stats import trading_days
+
+    return PerformanceBreakdown(
+        rows=tuple(rows),
+        combined=combined,
+        eligible_days=len(
+            trading_days(date.fromisoformat(start_date), date.fromisoformat(end_date))
+        ),
+    )
+
+
+def equity_curves_by_strategy(
+    trades: tuple[ClosedTradeRow, ...],
+) -> dict[tuple[str, str], tuple[tuple[str, float], ...]]:
+    """One cumulative-net-P&L series per ``(strategy_id, execution_mode)``,
+    each built by the same :func:`equity_curve` the combined series uses.
+
+    Returns plain tuples, not a DataFrame: pandas is a page-layer concern
+    here, and keeping it out means every series is comparable in a test
+    without one.
+    """
+    grouped: dict[tuple[str, str], list[ClosedTradeRow]] = defaultdict(list)
+    for trade in trades:
+        grouped[(trade.strategy_id, trade.execution_mode)].append(trade)
+    return {pair: equity_curve(tuple(rows)) for pair, rows in grouped.items()}
+
 def load_strategy_config_raw(config_root: object, strategy_id: str) -> dict[str, object] | None:
     """The raw, unvalidated ``config/strategies/**/<id>.yaml`` mapping, or
     ``None`` if it does not exist, does not parse, or is ambiguous — a

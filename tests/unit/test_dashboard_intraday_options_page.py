@@ -24,8 +24,11 @@ from dashboards.data.intraday_options import (
     NotificationRow,
     OrderRow,
     OverviewRow,
+    PerformanceBreakdown,
     SignalRow,
+    StrategyPerformanceRow,
     compute_metrics,
+    equity_curves_by_strategy,
 )
 
 
@@ -197,22 +200,129 @@ def test_closed_trades_summary_sums_gross_charges_net_per_strategy():
 
 
 # ============================================================= Performance
-def test_performance_flags_insufficient_sample():
-    from datetime import date
+def _perf_row(
+    strategy_id: str = "st01",
+    *,
+    trades: tuple[ClosedTradeRow, ...] = (),
+    configured: bool = True,
+    days_ran: int = 1,
+    execution_mode: str = "paper",
+) -> StrategyPerformanceRow:
+    dates = sorted({t.trading_date for t in trades})
+    return StrategyPerformanceRow(
+        strategy_id=strategy_id,
+        execution_mode=execution_mode,
+        configured=configured,
+        days_ran=days_ran,
+        days_traded=len(dates),
+        first_trade_date=dates[0] if dates else None,
+        last_trade_date=dates[-1] if dates else None,
+        metrics=compute_metrics(trades),
+    )
 
+
+def _breakdown(
+    *rows: StrategyPerformanceRow,
+    trades: tuple[ClosedTradeRow, ...] = (),
+    eligible_days: int = 5,
+) -> PerformanceBreakdown:
+    dates = sorted({t.trading_date for t in trades})
+    combined = StrategyPerformanceRow(
+        strategy_id="ALL",
+        execution_mode="paper",
+        configured=True,
+        days_ran=max((r.days_ran for r in rows), default=0),
+        days_traded=len(dates),
+        first_trade_date=dates[0] if dates else None,
+        last_trade_date=dates[-1] if dates else None,
+        metrics=compute_metrics(trades),
+    )
+    return PerformanceBreakdown(rows=rows, combined=combined, eligible_days=eligible_days)
+
+
+def test_performance_flags_insufficient_sample():
     st = FakeStreamlit()
-    page._render_performance(st, (_closed_trade(),), (), date(2026, 8, 14), date(2026, 8, 14))
+    trades = (_closed_trade(),)
+    page._render_performance(st, _breakdown(_perf_row(trades=trades), trades=trades), {})
     assert any("not yet" in w and "reliable" in w for w in st.warnings)
 
 
-def test_performance_charts_render_for_populated_trades():
+def test_performance_table_ends_with_a_total_row_that_matches_the_combined_metrics():
     st = FakeStreamlit()
-    from datetime import date
+    alpha = tuple(_closed_trade(100.0, strategy_id="alpha") for _ in range(4))
+    beta = tuple(_closed_trade(-50.0, strategy_id="beta") for _ in range(2))
+    breakdown = _breakdown(
+        _perf_row("alpha", trades=alpha, days_ran=3),
+        _perf_row("beta", trades=beta, days_ran=2),
+        trades=alpha + beta,
+    )
 
-    trades = tuple(_closed_trade(100.0) for _ in range(6))
-    page._render_performance(st, trades, (), date(2026, 8, 14), date(2026, 8, 14))
-    assert st.warnings == [] or all("reliable" not in w for w in st.warnings)
-    assert len(st.charts) >= 2
+    page._render_performance(st, breakdown, equity_curves_by_strategy(alpha + beta))
+
+    table = st.dataframes[0]
+    assert [row["Strategy"] for row in table] == ["alpha", "beta", "TOTAL"]
+    assert table[-1]["Trades"] == 6
+    assert table[-1]["Trades"] == sum(row["Trades"] for row in table[:-1])
+    # Days ran is per strategy, never summed into the total by the renderer.
+    assert table[0]["Days ran"] == 3
+    assert table[-1]["Days ran"] == breakdown.combined.days_ran
+
+
+def test_performance_marks_a_strategy_id_no_config_declares():
+    st = FakeStreamlit()
+    trades = tuple(_closed_trade(100.0, strategy_id="supertrend_buy_1_1p2") for _ in range(2))
+    breakdown = _breakdown(
+        _perf_row("supertrend_buy_1_1p2", trades=trades, configured=False), trades=trades
+    )
+
+    page._render_performance(st, breakdown, equity_curves_by_strategy(trades))
+
+    table = st.dataframes[0]
+    assert table[0]["Status"] == page.RETIRED_LABEL
+    assert any("rename" in c for c in st.captions)
+
+
+def test_performance_chart_carries_a_combined_series():
+    st = FakeStreamlit()
+    alpha = tuple(_closed_trade(100.0, strategy_id="alpha") for _ in range(3))
+    beta = tuple(_closed_trade(-50.0, strategy_id="beta") for _ in range(3))
+    breakdown = _breakdown(
+        _perf_row("alpha", trades=alpha), _perf_row("beta", trades=beta), trades=alpha + beta
+    )
+
+    page._render_performance(st, breakdown, equity_curves_by_strategy(alpha + beta))
+
+    assert len(st.charts) == 1
+    columns = list(st.charts[0].columns)
+    assert columns == ["alpha", "beta", "Combined"]
+    # The combined line is the per-timestamp sum of the strategy lines.
+    last = st.charts[0].iloc[-1]
+    assert last["Combined"] == last["alpha"] + last["beta"]
+
+
+def test_performance_reports_a_strategy_that_ran_without_trading():
+    st = FakeStreamlit()
+    traded = tuple(_closed_trade(100.0, strategy_id="alpha") for _ in range(5))
+    breakdown = _breakdown(
+        _perf_row("alpha", trades=traded, days_ran=4),
+        _perf_row("quiet", trades=(), days_ran=4),
+        trades=traded,
+    )
+
+    page._render_performance(st, breakdown, equity_curves_by_strategy(traded))
+
+    quiet = next(row for row in st.dataframes[0] if row["Strategy"] == "quiet")
+    assert quiet["Days ran"] == 4
+    assert quiet["Days traded"] == 0
+    assert quiet["Trades"] == 0
+    assert any("Days traded" in c and "Days ran" in c for c in st.captions)
+
+
+def test_performance_empty_state():
+    st = FakeStreamlit()
+    page._render_performance(st, _breakdown(), {})
+    assert any("no strategy" in i.lower() for i in st.infos)
+    assert st.charts == []
 
 
 # ========================================================= Strategy comparison
