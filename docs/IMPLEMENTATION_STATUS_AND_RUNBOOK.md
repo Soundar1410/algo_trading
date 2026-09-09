@@ -12455,3 +12455,517 @@ operational database was not touched. The real end-to-end proof is the next
 09:00 auto-start: expect `authenticated source=generated` (not `cache`) in
 `logs/auto_start.log`, and no `STALE_QUOTE`-induced `worker failed` in
 `logs/algo_trading.log`.
+
+### Intraday Options: Performance tab rebuilt as a per-strategy breakdown — 9 September 2026
+
+Operator screenshot showed the Performance tab reporting "77 trades, 44.2%
+win rate, profit factor 1.21, net ₹58,886.26" with no indication of *whose*
+trades those were, and asked to replace the whole tab with per-strategy
+performance, a combined view, and how many days each strategy ran.
+
+**What the old tab actually was.** One blended `compute_metrics` over every
+closed trade in the range, four charts (equity, drawdown, daily bars, monthly
+bars), and a one-line "executed N of M eligible trading days" caption. The 77
+trades were the sum of **nine** strategy identities, three of which
+(`ema_cross_9_21_buy`, `supertrend_buy_1_1p2`, `ema_cross_5_21_buy`) are the
+pre-rename ids from the two rename events documented above and no longer exist
+in `config/strategies/**`. The tab could not say which strategy earned the
+money or how long any of them had been running — the two questions that matter
+during a 30-day paper evaluation.
+
+**A pre-existing inconsistency this exposed.** The old tab's headline metrics
+came from `load_closed_trades(strategy_ids=None)` (every id, retired ones
+included) while its day-count caption came from `load_daily_outcomes` iterated
+over `all_strategy_ids` (configured ids only). The two halves of the same tab
+were scoped differently. The rebuild scopes everything one way and labels the
+retired ids rather than silently mixing them in.
+
+**Read model** (`dashboards/data/intraday_options.py`).
+`build_performance_breakdown` returns a `PerformanceBreakdown`: one
+`StrategyPerformanceRow` per `(strategy_id, execution_mode)` pair, sorted by net
+P&L descending, plus a combined row. Three properties are load-bearing:
+
+- **The pair list is a union of `trade_ledger` and `runtime_sessions`**, not the
+  caller's id list. This is the one structural difference from the neighbouring
+  `build_strategy_comparison`, which iterates only the ids handed to it and
+  therefore cannot surface either a retired id or a strategy that was up all
+  session without firing. Both exist in the live database today:
+  `ema_cross_5_21_buy` has one session date and zero trades.
+- **`days_ran` and `days_traded` are counted independently.** `days_ran` is
+  distinct `date(started_at)` values in `runtime_sessions` for that strategy
+  (days it was up); `days_traded` is distinct `trade_ledger.trading_date` values
+  with at least one closed trade. They routinely differ — `straddle_920` shows
+  11 and 4. `₹ / trading day` divides by `days_traded`, never by `days_ran`:
+  dividing by days it never fired would penalise a selective strategy for being
+  selective.
+- **The combined row is recomputed from the union of the in-scope trades, never
+  summed from the rows.** Win rate, profit factor, expectancy and max drawdown
+  are not additive. Max drawdown is the sharp case: against the live database
+  the per-strategy drawdowns sum to ₹-118,418.88 while the true combined
+  drawdown is ₹-78,623.60, because strategies draw down on different days. A
+  summing implementation would overstate the portfolio's worst moment by ~51%.
+
+`equity_curves_by_strategy` groups trades by pair and reuses the existing
+`equity_curve` per group. It returns plain tuples — pandas stays a page-layer
+concern, so every series is comparable in a test without one.
+
+**Page** (`dashboards/intraday_options.py`). `_render_performance` now shows a
+12-metric "All strategies combined" header (the previous eight plus strategy
+count, days ran, days traded and ₹/trading day, the day counts written as
+`n/eligible`), a per-strategy table ending in a TOTAL row, and **one** chart:
+an equity curve with one line per strategy plus a `Combined` line. The
+drawdown, daily-bar and monthly-bar charts are gone. The chart iterates
+`breakdown.rows` rather than the curves dict so its legend order matches the
+table; a strategy that ran without trading contributes no series, because a flat
+zero line would claim it broke even rather than that it never traded. The
+combined line is the per-timestamp sum of the forward-filled cumulative
+per-strategy series, which is exactly `equity_curve` over every trade — verified
+against the real database: the chart's final `Combined` value is ₹58,886.26, the
+combined row's net P&L to the paisa. The old per-trade CSV is dropped (the
+Closed Trades tab already offers that file) in favour of a per-strategy CSV.
+
+**Verified against the real read-only database** (`data/operational/
+intraday_options.db`, 2026-07-28 to 2026-09-09, Mode = All): the combined row
+reproduces the screenshot exactly — 77 trades, 44.2%, 1.21, ₹58,886.26,
+₹-78,623.60 — so nothing is dropped or double-counted by the regrouping.
+
+**A pre-existing `drawdown_curve` behaviour left alone.** It seeds its running
+peak from the first point of the curve, not from zero, so a strategy whose very
+first trade in the window loses reports no drawdown from it —
+`ema_cross_9_21_buy` shows ₹0.00 despite a losing first trade. This is shared
+with the Strategy Comparison tab and with the ₹-78,623.60 headline the operator
+has been reading all along; changing it would silently move every published
+drawdown figure. Flagged, not changed. Fixing it is its own decision.
+
+**Regression.** 14 new DB-backed tests in
+`tests/unit/test_dashboard_performance_breakdown.py` (fixtures through the real
+`ExecutionRepository`/`OrderLifecycle`/`PaperBroker` write path, sessions
+backdated with the same `UPDATE runtime_sessions SET started_at` technique
+`test_dashboard_intraday_options_data.py` already uses for
+`load_daily_outcomes`) plus six rewritten render tests in
+`tests/unit/test_dashboard_intraday_options_page.py`. They pin the ran-without-
+trading row, the retired-id flag, the non-additive drawdown, the recomputed
+combined win rate, the distinct-date union for combined `days_ran`, mode
+separation, scoping, and the chart's `Combined` series.
+
+The paper/live never-blend test deliberately gives the live pair a session but
+no trades: `OrderLifecycle` correctly refuses a live signal with no account
+reservation gate wired (Phase 10 remains fully disabled), so faking a live fill
+would be testing a path that cannot happen. The live session is real, so the row
+it produces is real.
+
+**Not done here.** No live gate touched, no schema migration, no new query on
+any table the dashboard did not already read, no write path. Only the Intraday
+Options page changed; the Positional Options page keeps its own Performance tab
+unchanged. `strategy_scope.discover_strategy_options` is untouched, so the
+Strategy picker still does not offer retired ids — the 31 August 2026 decision
+recorded in that module stands; the Performance tab surfaces their history
+without making them selectable again.
+
+### Purging retired strategy ids from the operational database — 9 September 2026
+
+Operator asked to remove the three retired identities from the system
+outright, having seen them labelled in the new Performance tab (previous
+entry). Chose permanent deletion over hiding them in the dashboard or
+archiving the rows, and chose to run it after market close rather than
+against a live session.
+
+**What the three ids own.** They are not dashboard-only artefacts: 10,374
+rows across ten tables in `data/operational/intraday_options.db`.
+
+| id | trades | net P&L | rows |
+|---|---|---|---|
+| `supertrend_buy_1_1p2` | 21 | ₹23,163.59 | ~9,000 |
+| `ema_cross_9_21_buy` | 2 | ₹4,264.05 | ~1,300 |
+| `ema_cross_5_21_buy` | 0 | — | ~60 |
+
+The bulk is `runtime_heartbeats` (10,108). Every one of their `positions`
+rows is `CLOSED`, so there is no open exposure to strand. Deleting them takes
+the Intraday Options combined record from 78 trades / ₹52,539.92 to 55 trades
+/ ₹25,112.28, profit factor 1.19 → 1.12, max drawdown ₹-78,623.60 →
+₹-70,417.78. **That is a permanent reduction of the 30-day paper evaluation
+record**, which CLAUDE.md names as a gate for live activation.
+
+**`scripts/purge_retired_strategies.py` — the only destructive script in this
+repository.** Everything else that touches the operational database appends
+or is read-only, so this one is built to refuse far more often than it runs:
+
+- `--apply` is required; the default prints the plan and changes nothing.
+- An id any `config/strategies/**/*.yaml` still declares is refused. This is
+  the gate that matters most — purging a live strategy would destroy the
+  running evaluation record with no way back.
+- An id holding a non-`CLOSED` position is refused.
+- **Any** live process in the runtime group is refused, not merely one
+  belonging to a purged id. A retired id never has a worker, so the narrower
+  check would always pass while the delete still took a write lock on the
+  file seven live workers write to every tick. Verified against the live
+  database at 10:05 IST: refused, naming all eight running processes.
+- `ended_at IS NULL` alone is *not* the liveness test. This database carries
+  stale supervisor rows from sessions that died without shutting down
+  cleanly (14 August, 1 September), so an `ended_at`-only gate would refuse
+  forever. The PID is probed with signal 0.
+- A full snapshot is written to `data/backups/<runtime>_pre_purge_<utc>.db`
+  via SQLite's own backup API before the first `DELETE`. Once applied the
+  deletion is unrecoverable from inside the database; that file is the only
+  route back and is deliberately left for the operator to remove.
+- All deletes run in one transaction, so a failure halfway cannot leave a
+  strategy whose trades are gone but whose fills remain.
+
+**Rehearsed before shipping.** Dry run and `--apply` were both exercised
+against a byte copy of the real database, not a synthetic fixture: 10,374
+rows deleted across 10 tables, all three ids verified absent afterwards, and
+the resulting Performance tab showing exactly the seven configured
+strategies. The numbers quoted above are from that rehearsal.
+
+**Regression.** 14 tests in `tests/unit/test_purge_retired_strategies.py`,
+one per gate. Two are worth naming: a schema-drift guard asserting
+`STRATEGY_SCOPED_TABLES` is exactly the set of strategy-scoped tables in the
+migrated schema (so a future migration adding one cannot leave rows behind),
+and a test that a crashed session's stale `ended_at IS NULL` row does *not*
+block a purge, which is the failure mode an `ended_at`-only gate would have.
+
+**Not done at the time of writing.** The purge had NOT been applied to the
+live database — the market was open (10:05 IST, seven workers up) and the
+script correctly refused. It is to be run after the session shuts down.
+
+### `weekly_delta_neutral` has never entered: the silent entry margin cap — 9 September 2026
+
+Operator asked whether the positional strategy had taken any positions. It
+has not, and had never placed an order: `positions`, `strategy_cycles`,
+`strategy_cycle_legs`, `order_intents`, `orders`, `fills`, `trade_ledger` and
+`signals` are all **zero rows** for it in
+`data/operational/positional_options.db`. Its only rows are 12
+`runtime_sessions`, 28,365 `runtime_heartbeats`, one notification and one
+error (the 1 September `supervisor.duplicate_worker` refusal).
+
+**Most of that is by design.** It ran on 10 dates, of which only two were
+Wednesdays — 2 and 9 September. `schedule.entry_day: WEDNESDAY` means the
+other eight sessions could never have entered.
+
+**On both Wednesdays it reached the last gate and was silently refused.**
+Evidence from `logs/weekly_delta_neutral.log`, established without changing
+any code:
+
+- The volatility gate passes comfortably. Today's readings run 0.033-0.045
+  against `threshold_percent: 0.15`, `confirmations=541/3 normal=True`. The
+  rewritten gate (2 September entry above) is not the blocker.
+- Option-chain fetches and margin-calculator calls sit at an exact **4.0
+  ratio** on both Wednesdays (today: 553 and 2,212; 2 September: 594 and
+  2,376). Four is the leg count of an iron condor, and
+  `_entry_margin_estimate` is the only margin caller in the entry path, so
+  `select_iron_condor` returned a **valid candidate on every evaluation**.
+- `grep -c INCIDENT` over the whole log is **0**. Both `return None` paths
+  inside `_entry_margin_estimate` (`MarginUnavailable`, and the staleness
+  re-check) call `record_pre_entry_incident`, and `_record_incident` logs at
+  CRITICAL with the literal string `INCIDENT`. So margin estimation
+  *succeeded*.
+
+By elimination that leaves exactly one path between a valid candidate and a
+`CycleSignal`: the `maximum_margin_utilization_percent` check, whose own
+source comment reads "over the cap: an ordinary blocked entry, not an
+incident". It writes nothing anywhere. **A strategy can be refused entry on
+every evaluation of every entry window it has ever seen and leave no trace
+except the shape of its HTTP traffic.**
+
+**The likely underlying cause, not yet measured.**
+`common.margin.estimator.estimate_basket`'s own docstring is "Every leg's
+margin, summed", `_from_fetcher` loops one API call per leg (hence the 4.0
+ratio), and `MarginEstimate.source` is
+`"dhan_margin_calculator_summed_legs"`. A hedged iron condor is therefore
+priced as two naked short options plus two long premiums with **no hedge
+benefit**. At `lots: 20` (1,500 quantity) that plausibly runs several times
+the ₹20,00,000 budget that `maximum_margin_utilization_percent: 50.0` allows
+against `allocated_capital: 4000000.0`. Dhan's real portfolio margin for the
+hedged structure would be a fraction of it. This is a hypothesis about
+*magnitude*; the elimination argument above for *which gate* is not.
+
+**Change made: observability only.** `_log_margin_reading` in
+`strategies/positional_options/weekly_delta_neutral/strategy.py` logs
+`estimated_margin`, `allocated_capital`, `utilization_percent`,
+`cap_percent`, `blocked`, `source` and the **per-leg breakdown** at the cap
+check. Same rate limit as the neighbouring `_log_volatility_reading` (every
+blocked/allowed transition, plus at most once a minute), because entry
+evaluation runs about every five seconds for the whole 09:25-12:00 window.
+The per-leg breakdown is the point: whether summed naked-short margin is
+what busts the cap cannot be read off the total. **No decision changed** —
+`over_cap` is computed from the same expression and used the same way.
+
+**Regression.** 10 tests in
+`tests/unit/test_weekly_delta_neutral_margin_log.py`, driving the method
+directly. They pin the logged fields, the per-leg breakdown, that an
+*allowed* entry logs too (a gate that speaks only when it refuses cannot be
+distinguished from one that is never reached), the once-a-minute rate limit,
+the immediate blocked→allowed transition line, that `reset_daily` clears the
+limiter, and the cap's strict `>` boundary at exactly 50%.
+
+**Not done.** The running worker (pid 997 family, started 09:30 IST) has the
+old code loaded, so **no reading exists yet**. Getting one today requires
+restarting the worker inside the 09:25-12:00 entry window; it holds no
+position and no cycle, so a restart strands nothing. Not restarted here —
+that is an operator action on a live paper session. Nothing was done about
+the summed-leg margin itself; that is a separate decision.
+
+**Also unexplained, logged for later.** On 2 September the evaluation loop
+stopped at exactly 10:15:00 and never resumed, though the worker stayed up
+until its clean shutdown at 23:43 IST. Today it is still evaluating normally
+past 10:18. Not diagnosed.
+
+### The entry margin fix: hedged multi-leg calculator, and the first `weekly_delta_neutral` entry — 9 September 2026
+
+Follows directly from the previous entry. With the observability line in place
+the blocked reading was captured on the first evaluation after a restart, and
+it confirmed the elimination argument exactly:
+
+```
+estimated_margin=6107252 utilization_percent=152.68 cap_percent=50.00
+blocked=True source=dhan_margin_calculator_summed_legs
+per_leg=[47278=16640 47321=13520 47288=2877560 47309=3199532]
+```
+
+The two short legs carried full naked-short margin (₹28.78L + ₹32.00L) while
+the two long hedges contributed ₹30,160 between them, 0.5% of the total. A
+defined-risk iron condor was priced as two uncovered short options.
+
+**The premise behind that was wrong, not the code.**
+`common/market_data/dhan_margin.py` stated it plainly: "The pinned SDK/API
+exposes no *basket*-margin endpoint (only single-instrument
+`POST /v2/margincalculator`)". Dhan v2 does have one —
+`POST /v2/margincalculator/multi`. The pinned `dhanhq` 2.2.0 SDK still does not
+wrap it (`grep basket` over the package returns nothing), but this module has
+always called the REST API directly with `httpx`, so no SDK change was needed.
+
+**Probed live before trusting it**, which mattered twice over:
+
+- The documented response is snake_case (`total_margin`); the **real** response
+  is camelCase (`totalMargin`, `spanMargin`, `exposure`, `hedgeBenefit`). The
+  parser accepts both plus a `data` envelope, and raises otherwise.
+- `hedgeBenefit` comes back **0.0** even on a basket where the relief is
+  obvious (`spanMargin` ₹2.99L against ₹22.72L for one short leg alone).
+  Recorded verbatim, never read as evidence that hedging was applied.
+- Quantities must be whole multiples of the lot size. **NIFTY's lot size is
+  65, not 75** — an early probe at 1500 was rejected with `DH-905` ("Missing
+  required fields, bad values for parameters"), an error naming neither field
+  nor reason and indistinguishable from a malformed body. Cost several
+  minutes; worth knowing.
+
+Measured, same four legs, same quantity:
+
+| source | margin | utilization |
+|---|---|---|
+| per-leg summed | ₹61,07,252 | 152.68% |
+| hedged basket | ₹15,92,934 | 39.82% |
+
+**Change.** `build_dhan_basket_margin_fetcher` (one POST for the whole basket,
+`includePosition`/`includeOrders` both false — a pre-entry check on
+hypothetical legs, not a portfolio revaluation); `MarginEstimator` gains
+`basket_margin_fetcher` and prefers it, `source="dhan_margin_calculator_multi"`;
+`MarginEstimate` gains an optional `components` field for the broker's own
+breakdown; the positional worker wires the basket fetcher alongside the per-leg
+one. **A failing basket source raises `MarginUnavailable` and never falls back
+to summing** — a silent fallback would restore the naked total, re-block entry
+and look exactly like the original bug. Nothing else moved: `lots: 20`,
+`allocated_capital: 4000000.0` and the 50% cap are untouched, and they were
+never the problem.
+
+**Result, 10:57:52 IST.** After a second restart:
+
+```
+estimated_margin=1558289 utilization_percent=38.96 cap_percent=50.00
+blocked=False source=dhan_margin_calculator_multi per_leg=[]
+```
+
+Four seconds later `weekly_delta_neutral` took **the first position of its
+life**: cycle `positional_options:weekly_delta_neutral:paper:NIFTY:2026-09-15`,
+ACTIVE, net credit ₹62,521.21, max loss ₹2,62,478.79, 250-point wings, 1300
+quantity per leg. The engine legged in hedges-first (HEDGE_PUT 23050 @13.85,
+HEDGE_CALL 24100 @9.05, then SHORT_PUT 23300 @38.55, SHORT_CALL 23850 @32.60),
+which is the intended risk-first ordering, not an accident of timing.
+
+**Regression.** 17 tests in `tests/unit/test_basket_margin.py`, using the real
+measured numbers as fixtures: one request not four, every leg's own
+side/quantity, the include flags, the component breakdown, all three response
+shapes, an unrecognisable payload raising rather than inventing a number, basket
+preferred over per-leg, invalid/non-finite totals blocking, freshness, and above
+all **that a failing basket source never silently falls back to summing**. The
+existing `test_margin_estimator.py` and `test_no_margin_order_calls.py` pass
+unchanged. `ruff` clean; `mypy` clean over 176 files;
+`assert_no_live_config_committed` OK. Unit suite at the unchanged 3 pre-existing
+stale-scrip-master failures in `test_dashboard_positional_real_data.py`.
+
+**Note on headroom.** 38.96% against a 50% cap is comfortable but not large.
+A different strike/width selection on a more expensive day could push a 20-lot
+condor back over the cap — legitimately this time. Worth watching before
+reading a future blocked entry as a bug.
+
+**Still paper.** The positional runtime refuses `mode: live` outright
+(`runtimes/positional_options/config_adapter.py`); no live gate was touched.
+
+### Intraday Options: Health tab removed; three diagnostic tabs deliberately kept — 9 September 2026
+
+Operator asked what Baskets, Orders & Fills, Signals & Events and Health are
+for, said they were not using them, and asked whether all four could go.
+Checked against the real database before answering rather than reasoning from
+the code alone:
+
+| tab | backing data | available elsewhere? |
+|---|---|---|
+| Health | `load_system_health` | **yes — the System Health page** |
+| Signals & Events | 198 signals; 26 CRITICAL / 7 ERROR / 19 WARNING | no |
+| Orders & Fills | 198 orders against 188 fills | no |
+| Baskets | 13 baskets, 22 legs (`straddle_920`, `rolling_strangle_otm1`) | no |
+
+**Only Health was removed**, and only because it genuinely duplicated: it
+called the same `load_system_health` and `render` as
+`dashboards/pages/4_System_Health.py`, merely filtered through
+`_scope_health_view` to the selected strategies. Per-strategy scoping of the
+health view is the only capability lost. `_scope_health_view` and the
+`system_health` import went with it.
+
+The other three were kept because each is the only surface for something real:
+
+- **Signals & Events** is the only view of a signal that fired without
+  becoming a trade, and of the incident history — which currently includes the
+  8 September session-ending failures (worker died with its queue suspended,
+  three restarts, the `STALE_QUOTE` rejections).
+- **Orders & Fills** — the ten-order gap between 198 orders and 188 fills *is*
+  the value. Closed Trades shows completed round trips only, so a rejected or
+  unfilled order appears nowhere else.
+- **Baskets** is the only view of a multi-leg strategy's legs; Overview and
+  Open Positions are single-position-shaped by construction.
+
+Worth recording alongside the same day's `weekly_delta_neutral` investigation,
+which existed entirely because a silent refusal had no UI surface: these tabs
+read as unused mostly because nothing signals when to open one. Adding unread
+counts or a badge to the tab bar was offered and not taken; if blind spots
+recur it is the cheaper fix than re-adding tabs.
+
+**Regression.** `test_dashboard_apptest.py`'s tab-list assertion updated to
+eight tabs; its `_scope_health_view` test removed with the helper. `ruff`
+clean, `mypy` clean over 21 dashboard files, dashboard suite at the unchanged
+3 pre-existing stale-scrip-master failures.
+
+### Purge defect: 46 orphaned `paper_fill_quotes` rows, found on the dashboard — 9 September 2026
+
+The purge two entries above **damaged referential integrity**, and the
+Health tab caught it: "Foreign-key violations: 46" where the pre-purge
+snapshot has zero. Found only because the operator screenshotted that tab
+while asking whether it could be deleted.
+
+**Cause.** `STRATEGY_SCOPED_TABLES` is, by construction, every table carrying
+a `strategy_id`. `paper_fill_quotes` carries none — it hangs off
+`orders(id)` — so the purge deleted its parents and left its rows dangling:
+42 from `supertrend_buy_1_1p2` and 4 from `ema_cross_9_21_buy`, exactly 46.
+
+**Why nothing objected.** The application's own `Database` turns
+`PRAGMA foreign_keys` on; the purge script opened a plain `sqlite3.connect`,
+where the default is **off**. SQLite dropped the parents without a word. The
+schema-drift test that was supposed to catch exactly this class of gap
+asserted only that every *strategy-scoped* table was listed, which
+`paper_fill_quotes` is not — it tested the invariant the code already had,
+not the one that mattered.
+
+**Fix.** The script now ends every run with an orphan sweep derived from
+`PRAGMA foreign_key_list` rather than a hardcoded list (a future migration
+adding a child table is covered without anyone remembering), deletes rows
+whose parent is gone **inside the same transaction** as the strategy
+deletes, and runs `PRAGMA foreign_key_check` before committing — raising
+rather than committing if anything would remain. The sweep runs even when no
+`strategy_id` rows match, which makes re-running the script the repair path.
+
+**Repair applied.** Re-ran against the live database: 0 strategy rows found,
+46 orphans swept. `foreign_key_check` 0, `integrity_check` ok, 188
+`paper_fill_quotes` and all 94 trades intact. A second pre-purge snapshot was
+written before the sweep.
+
+**Regression.** 4 new tests (18 total in that file): a purge leaves no
+dangling children; the sweep spares a surviving strategy's rows; the sweep
+repairs an already-orphaned database; a dry run reports orphans and changes
+nothing. The orphan is created over a raw FK-off connection, because that is
+precisely how the damage happened.
+
+**The lesson worth keeping.** A diagnostic tab the operator was about to
+delete as unused is what surfaced silent data corruption from an hour
+earlier. Nothing else in the system would have reported it.
+
+### Positional Options: live P&L and charges for an open cycle (migration 0015) — 9 September 2026
+
+Operator asked to see profit, loss and charges for the cycle opened this
+morning. All four legs showed Exit and Gross P&L as "—", because
+`realized_gross_pnl` only populates on exit. Checked before designing:
+
+| | available | source |
+|---|---|---|
+| Charges | yes, ₹203.79 | `fills.charges` on the four entry fills |
+| Realised | yes, ₹0 | nothing closed |
+| Unrealised | **no** | in the worker's memory only |
+
+**The number already existed and already mattered.**
+`LegInstance.unrealised_pnl` is maintained by `leg.update_price()` on every
+tick, summed by `Cycle.unrealised_gross_pnl()`, and fed to `compute_pnl`,
+which decides the 55% profit target and the 1.25/1.50/1.75 credit-multiple
+stops. It simply never reached the database: `strategy_cycle_legs` has no mark
+columns and `persist_cycle_leg` runs only on state transitions. Same gap the
+intraday page had before migration 0014, same fix — worker persists, dashboard
+reads.
+
+**Migration 0015, `cycle_leg_marks`.** Additive side table (0011-0014's
+replayability reasoning), latest mark only, overwritten never appended.
+Written once per **evaluation** (5s) rather than per tick: ticks are orders of
+magnitude more frequent and the evaluation is exactly when the engine has
+re-priced every leg and asked whether to exit, so the stored mark is the one
+the decision was made on. **No foreign key, and it carries its own
+`strategy_id`** — a direct consequence of the `paper_fill_quotes` orphaning
+earlier the same day, so the purge script sweeps it with no cascade to
+remember. A test asserts both properties.
+
+**`_checkpoint_leg_marks` is best-effort and must stay that way.** It writes
+only `OPEN` legs, skips a leg with no price yet (a structural zero is not a
+measurement), and swallows every error. The evaluation it precedes is what
+closes a losing cycle; failing to record a number for a dashboard has no
+business stopping it. Tested directly, including that one failing leg does not
+stop the others.
+
+**Charges need no persistence** — read from `fills` by correlation id, per leg.
+`LegRow.net_pnl` nets the live mark while a leg is open and the realised figure
+once it closes; an unmarked open leg reports `None`, never its charges as a
+loss.
+
+**Deployed and verified.** Restarted the positional runtime at 22:32 IST with
+four legs open — the first restart against a real position. **Recovery was
+clean**: same `cycle_id`, ACTIVE, credit ₹62,521.21, all four legs `OPEN` with
+identical entry prices. Migration applied in 8 seconds, four marks written 8
+seconds later.
+
+The plan predicted unrealised would read zero tonight (marks come from ticks,
+market closed, recovery seeds `last_price` from `entry_price`). **That was
+wrong in a good way** — real closing prices arrived within seconds, so the
+first true P&L reading for this strategy is:
+
+| leg | entry | current | unrealised |
+|---|---|---|---|
+| SHORT_CALL 23850 | 32.60 | 19.55 | +₹16,965 |
+| HEDGE_PUT 23050 | 13.85 | 20.85 | +₹9,100 |
+| HEDGE_CALL 24100 | 9.05 | 7.40 | -₹2,145 |
+| SHORT_PUT 23300 | 38.55 | 60.00 | -₹27,885 |
+
+Unrealised -₹3,965.00, charges ₹203.79, **net -₹4,168.79**, credit captured
+-6.67%. NIFTY moved down through the short put; the short call and long put
+offset most of it. Well clear of the 1.25x credit soft stop (₹78,152).
+
+**Regression.** 16 tests in `tests/unit/test_cycle_leg_marks.py` (upsert-not-
+append, the excursion round trip, repository-stamped `as_of`, the short/long
+sign convention on real condor prices, the charges join, and "no mark" versus
+"zero"), 10 in `tests/unit/test_positional_leg_mark_checkpoint.py`, plus a 0015
+upgrade test and the three shipped-version lists in `test_migrations.py`.
+`ruff` clean, `mypy` clean over 218 files, live-config gate OK, unit suite at
+the unchanged 3 pre-existing stale-scrip-master failures.
+
+**A UI note worth keeping.** The first cut added five columns to an already
+twelve-column table and Streamlit collapsed all of them to unreadable slivers.
+Fixed by dropping Strike (Symbol carries it), folding Replacement into Role as
+a `*`, and moving the mark timestamp to a single caption — all four legs are
+marked in the same checkpoint, so a per-row age column repeated one number four
+times.
+
+**Tomorrow.** This is also the first time the exit ladder runs against live
+marks on a real position, so the 09:15 open is worth watching.
