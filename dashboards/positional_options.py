@@ -29,6 +29,7 @@ see that module's docstring.
 from __future__ import annotations
 
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -57,7 +58,16 @@ from dashboards.data.strategy_scope import (  # noqa: E402
     discover_strategy_options,
     render_strategy_selector,
 )
-from dashboards.formatting import MISSING, format_inr, format_ist, health_badge  # noqa: E402
+from dashboards.formatting import (  # noqa: E402
+    MISSING,
+    format_age,
+    format_inr,
+    format_ist,
+    format_pct,
+    format_signed_inr,
+    health_badge,
+    parse_utc,
+)
 
 _TERMINAL_CYCLE_STATES = frozenset({"COMPLETED", "FAILED", "ABANDONED"})
 
@@ -153,6 +163,21 @@ def _render_overview(streamlit: Any, database_path: object, strategy_id: str | N
         f"cycle_id={cycle.cycle_id} · opened {cycle.opened_trading_date} · "
         f"underlying={cycle.underlying} · square_off={cycle.square_off_state}"
     )
+
+    legs_result = run_bounded(
+        database_path,  # type: ignore[arg-type]
+        lambda conn: load_legs_for_cycle(conn, cycle_id=cycle.cycle_id),
+    )
+    if not isinstance(legs_result, SnapshotUnavailable) and legs_result:
+        _render_leg_totals(streamlit, legs_result)
+        captured = _credit_captured_percent(legs_result, cycle.original_net_credit)
+        if captured is not None:
+            streamlit.caption(
+                f"Credit captured: {format_pct(captured)} of "
+                f"{format_inr(cycle.original_net_credit)} — the same ratio the exit "
+                "ladder tests against its profit target. Per-leg detail is on the "
+                "Legs tab."
+            )
     if cycle.day_blocked_reason:
         streamlit.warning(f"Entries blocked today: {cycle.day_blocked_reason}")
     if cycle.pending_adjustment_role:
@@ -207,24 +232,124 @@ def _render_legs(streamlit: Any, database_path: object, strategy_id: str | None)
     if not legs:
         streamlit.info(f"No legs recorded for cycle {cycle_id}.")
         return
+    # Twelve columns already crowd this table; Strike is dropped because
+    # Symbol carries it ("NIFTY 15 SEP 23050 PUT"), Replacement moves onto
+    # Role as a marker, and the mark timestamp becomes one caption below
+    # rather than a column repeated identically on every row — all four legs
+    # are marked in the same checkpoint, so per-row ages would always agree.
     streamlit.dataframe(
         [
             {
-                "Role": leg.leg_role,
-                "Replacement": "yes" if leg.is_replacement else "no",
+                "Role": f"{leg.leg_role}*" if leg.is_replacement else leg.leg_role,
                 "Symbol": leg.symbol or MISSING,
-                "Strike": leg.strike if leg.strike is not None else MISSING,
                 "Side": leg.side or MISSING,
                 "Qty": leg.quantity if leg.quantity is not None else MISSING,
                 "Entry": leg.entry_price if leg.entry_price is not None else MISSING,
+                "Current": leg.last_price if leg.last_price is not None else MISSING,
                 "Exit": leg.exit_price if leg.exit_price is not None else MISSING,
                 "State": leg.state,
-                "Gross P&L": format_inr(leg.realized_gross_pnl),
+                "Unrealised": format_signed_inr(leg.unrealised_pnl),
+                "Realised": format_inr(leg.realized_gross_pnl),
+                "Charges": format_inr(leg.total_charges),
+                "Net P&L": format_signed_inr(leg.net_pnl),
             }
             for leg in legs
         ],
         width="stretch",
+        height=_TABLE_HEADER_PX + len(legs) * _TABLE_ROW_PX,
     )
+    if any(leg.is_replacement for leg in legs):
+        streamlit.caption("* a roll replacement, not an original entry leg.")
+    _mark_freshness_caption(streamlit, legs)
+    _render_leg_totals(streamlit, legs)
+    streamlit.caption(
+        "Current price and Unrealised come from the mark the worker writes on "
+        "every evaluation (migration 0015) — the same number the exit ladder "
+        "runs on, never re-derived here. Charges are the real amounts on this "
+        "leg's own fills, never estimated. A leg shows \u2014 rather than zero "
+        "where the value is genuinely unknown."
+    )
+    streamlit.caption(
+        "A mark stops updating when the worker is down, and a positional cycle "
+        "is held for days — so an age of many hours overnight or over a weekend "
+        "is ordinary, not a fault. The age is shown so you can judge it; nothing "
+        "here claims a stale price is current."
+    )
+
+
+def _credit_captured_percent(
+    legs: tuple[LegRow, ...], original_net_credit: float | None
+) -> float | None:
+    """Net P&L as a percentage of the credit originally collected.
+
+    The figure ``is_profit_target`` compares against
+    ``profit_credit_capture_percent`` (55%) in
+    ``strategies/positional_options/weekly_delta_neutral/risk.py``. ``None``
+    when there is no credit to measure against, rather than a division that
+    would read as 0%.
+    """
+    if not original_net_credit:
+        return None
+    realised = sum(leg.realized_gross_pnl or 0.0 for leg in legs)
+    unrealised = sum(leg.unrealised_pnl or 0.0 for leg in legs)
+    charges = sum(leg.total_charges or 0.0 for leg in legs)
+    return 100.0 * (realised + unrealised - charges) / original_net_credit
+
+
+#: Streamlit's own dataframe metrics, used to size the legs table to its row
+#: count rather than letting a four-row table scroll inside its own frame.
+_TABLE_ROW_PX = 35
+_TABLE_HEADER_PX = 38
+
+
+def _mark_freshness_caption(streamlit: Any, legs: tuple[LegRow, ...]) -> None:
+    """When these marks were taken, stated once rather than per row.
+
+    All open legs are marked in the same per-evaluation checkpoint, so a
+    per-row age column would repeat one number four times. The age is always
+    shown and never judged: a positional cycle is held for days, so a mark
+    hours old overnight or over a weekend is ordinary, and only the reader
+    knows whether the market was open.
+    """
+    stamps = [parse_utc(leg.mark_as_of) for leg in legs if leg.mark_as_of]
+    newest = max((s for s in stamps if s is not None), default=None)
+    if newest is None:
+        streamlit.caption(
+            "No mark has been written for any leg yet, so Current and Unrealised "
+            "are shown as \u2014. Marks appear once the worker has seen a price."
+        )
+        return
+    age = format_age((datetime.now(UTC) - newest).total_seconds())
+    streamlit.caption(f"Marked {age} ago, at {format_ist(newest.isoformat())}.")
+
+
+def _render_leg_totals(streamlit: Any, legs: tuple[LegRow, ...]) -> None:
+    """Cycle-level P&L, summed from the legs actually shown above.
+
+    Summed here rather than read from a separate total so the figures can
+    never disagree with the table a reader is looking at. The arithmetic is
+    the same as ``compute_pnl``'s (realised + unrealised - charges) in
+    ``strategies/positional_options/weekly_delta_neutral/risk.py``, which is
+    what the exit ladder evaluates.
+    """
+    realised = sum(leg.realized_gross_pnl or 0.0 for leg in legs)
+    unrealised = sum(leg.unrealised_pnl or 0.0 for leg in legs)
+    charges = sum(leg.total_charges or 0.0 for leg in legs)
+    marked = sum(1 for leg in legs if leg.last_price is not None)
+    open_legs = sum(1 for leg in legs if leg.state == "OPEN")
+
+    row = streamlit.columns(4)
+    row[0].metric("Realised", format_signed_inr(realised))
+    row[1].metric("Unrealised", format_signed_inr(unrealised))
+    row[2].metric("Charges", format_inr(charges))
+    row[3].metric("Net P&L", format_signed_inr(realised + unrealised - charges))
+
+    if open_legs and marked < open_legs:
+        streamlit.warning(
+            f"{open_legs - marked} of {open_legs} open leg(s) have no mark yet, so "
+            "Unrealised and Net P&L below understate this cycle. A mark appears "
+            "once the worker has seen a price for that leg."
+        )
 
 
 def _render_adjustments(streamlit: Any, database_path: object, strategy_id: str | None) -> None:

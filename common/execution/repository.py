@@ -1280,6 +1280,69 @@ class ExecutionRepository:
                 ),
             )
 
+    def update_cycle_leg_marks(
+        self,
+        *,
+        runtime_id: str,
+        strategy_id: str,
+        execution_mode: ExecutionMode,
+        cycle_id: str,
+        leg_id: str,
+        last_price: float,
+        unrealised_pnl: float,
+        max_favorable_pnl: float,
+        max_adverse_pnl: float,
+    ) -> None:
+        """Persist the live mark and excursion for one open positional leg.
+
+        The multi-leg counterpart of :meth:`update_position_marks`, and
+        deliberately **outside the fill path** for the same reason: a fill
+        happens twice in a leg's life, while its mark moves on every tick it
+        is open. Called from the positional engine's own per-evaluation
+        checkpoint, not from :meth:`apply_fill`.
+
+        Upsert, never append (migration 0015): a cycle's current worth is the
+        sum over this table, so a second write for the same leg must replace
+        the first rather than double-count it.
+
+        Unlike :meth:`update_position_marks` there is no companion row to
+        guard on — that method returns early when its ``positions`` UPDATE
+        touches nothing, so a mark can never be resurrected for a closed
+        position. Here the caller holds the live :class:`LegInstance` and
+        writes only for legs it already knows are ``OPEN``; the leg's own
+        state in ``strategy_cycle_legs`` is authoritative for a reader, which
+        joins against it and so cannot surface a mark for a leg that has
+        since closed.
+        """
+        with self._db.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO cycle_leg_marks
+                    (runtime_id, strategy_id, execution_mode, cycle_id, leg_id,
+                     last_price, unrealised_pnl, max_favorable_pnl, max_adverse_pnl, as_of)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (runtime_id, strategy_id, execution_mode, cycle_id, leg_id)
+                DO UPDATE SET
+                    last_price = excluded.last_price,
+                    unrealised_pnl = excluded.unrealised_pnl,
+                    max_favorable_pnl = excluded.max_favorable_pnl,
+                    max_adverse_pnl = excluded.max_adverse_pnl,
+                    as_of = excluded.as_of
+                """,
+                (
+                    runtime_id,
+                    strategy_id,
+                    execution_mode.value,
+                    cycle_id,
+                    leg_id,
+                    last_price,
+                    unrealised_pnl,
+                    max_favorable_pnl,
+                    max_adverse_pnl,
+                    _now(),
+                ),
+            )
+
     # ------------------------------------------------- notifications/errors
     def record_notification(
         self,

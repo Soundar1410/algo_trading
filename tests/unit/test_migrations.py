@@ -301,6 +301,7 @@ def test_shipped_migrations_start_at_the_walking_skeleton():
         "0012",
         "0013",
         "0014",
+        "0015",
     ]
     assert shipped[0].name == "walking_skeleton"
     assert shipped[1].name == "feed_and_auth_health"
@@ -356,6 +357,7 @@ def test_shipped_migrations_apply_to_a_fresh_database(tmp_path: Path):
         "0012",
         "0013",
         "0014",
+        "0015",
     ]
     assert database.integrity_check() == []
     assert database.foreign_key_check() == []
@@ -427,6 +429,7 @@ def test_later_migrations_upgrade_a_database_created_by_0001_alone(tmp_path: Pat
         "0012",
         "0013",
         "0014",
+        "0015",
     ]
     with database.connect() as conn:
         survivors = conn.execute("SELECT COUNT(*) FROM runtime_sessions").fetchone()[0]
@@ -916,7 +919,7 @@ def test_migration_0010_upgrades_a_database_created_by_0009_with_real_rows(tmp_p
     )
 
     applied = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
-    assert [m.version for m in applied] == ["0010", "0011", "0012", "0013", "0014"]
+    assert [m.version for m in applied] == ["0010", "0011", "0012", "0013", "0014", "0015"]
 
     assert database.integrity_check() == []
     assert database.foreign_key_check() == []
@@ -1132,7 +1135,7 @@ def test_migration_0013_upgrades_a_database_created_by_0012_with_real_rows(tmp_p
     )
 
     applied = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
-    assert [m.version for m in applied] == ["0013", "0014"]
+    assert [m.version for m in applied] == ["0013", "0014", "0015"]
 
     assert database.integrity_check() == []
     assert database.foreign_key_check() == []
@@ -1255,7 +1258,7 @@ def test_migration_0014_upgrades_a_database_created_by_0013_with_real_rows(tmp_p
     before = dict(database.connect().execute("SELECT * FROM positions").fetchone())
 
     applied = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
-    assert [m.version for m in applied] == ["0014"]
+    assert [m.version for m in applied] == ["0014", "0015"]
 
     assert database.integrity_check() == []
     assert database.foreign_key_check() == []
@@ -1305,3 +1308,63 @@ def test_position_marks_upserts_rather_than_appends(tmp_path: Path):
     assert len(rows) == 1
     assert rows[0]["last_price"] == 20025.0
     assert rows[0]["unrealised_pnl"] == 1875.0
+
+
+def test_migration_0015_upgrades_a_database_created_by_0014_with_real_rows(tmp_path: Path):
+    """The real upgrade path for 0015: seed a database through 0001-0014 only,
+    insert a real ``strategy_cycle_legs`` row, then apply 0015 and prove that
+    row survives untouched, ``cycle_leg_marks`` exists, and a second run
+    re-applies nothing.
+
+    Also pins the property that made this a side table rather than an
+    ``ALTER TABLE`` on ``strategy_cycle_legs``, and the one that keeps it
+    purgeable: it carries its own ``strategy_id`` and no foreign key, so a
+    strategy-scoped delete can see it without a cascade. See the 9 September
+    2026 ``paper_fill_quotes`` orphaning for what the alternative costs.
+    """
+    from common.persistence.migrations import VERSIONS_DIR
+
+    up_to_0014 = tmp_path / "up_to_0014"
+    up_to_0014.mkdir()
+    for migration in discover_migrations(VERSIONS_DIR):
+        if migration.version >= "0015":
+            continue
+        (up_to_0014 / migration.path.name).write_text(
+            migration.path.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+
+    database = Database(tmp_path / "operational" / "positional_options.db")
+    MigrationRunner(database, versions_dir=up_to_0014).run_pending()
+
+    with database.transaction() as conn:
+        conn.execute(
+            "INSERT INTO strategy_cycle_legs (runtime_id, strategy_id, execution_mode, "
+            "cycle_id, leg_id, leg_role, leg_sequence, is_replacement, side, quantity, "
+            "entry_price, state, version, created_at, updated_at) VALUES "
+            "('positional_options', 'weekly_delta_neutral', 'paper', 'cycle-1', 'leg-1', "
+            "'SHORT_CALL', 1, 0, 'SELL', 1300, 38.55, 'OPEN', 1, 'now', 'now')"
+        )
+    before = dict(database.connect().execute("SELECT * FROM strategy_cycle_legs").fetchone())
+
+    applied = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
+    assert [m.version for m in applied] == ["0015"]
+
+    assert database.integrity_check() == []
+    assert database.foreign_key_check() == []
+
+    with database.connect() as conn:
+        after = dict(conn.execute("SELECT * FROM strategy_cycle_legs").fetchone())
+        assert after == before, "0015 must not touch any existing leg row"
+
+        tables = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        assert "cycle_leg_marks" in tables
+
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(cycle_leg_marks)")}
+        assert "strategy_id" in columns
+        assert list(conn.execute("PRAGMA foreign_key_list(cycle_leg_marks)")) == []
+
+    second_run = MigrationRunner(database, versions_dir=VERSIONS_DIR).run_pending()
+    assert second_run == []

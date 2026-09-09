@@ -61,7 +61,10 @@ from common.greeks import GreeksService, ModelAssumptions
 from common.health import HealthState, HeartbeatWriter
 from common.logging import get_logger, setup_logging
 from common.margin import MarginEstimate, MarginEstimator
-from common.market_data.dhan_margin import build_dhan_margin_fetcher
+from common.market_data.dhan_margin import (
+    build_dhan_basket_margin_fetcher,
+    build_dhan_margin_fetcher,
+)
 from common.market_data.dhan_option_chain import build_dhan_chain_fetcher
 from common.market_data.option_chain import ChainFetcher, OptionChainService
 from common.market_data.scrip_master import ScripMaster, ScripMasterCache, resolve_index_meta
@@ -306,6 +309,19 @@ def build_engine(
             cycle_id=leg.basket_id,
         )
 
+    def _persist_leg_mark(cycle_id, leg) -> None:  # type: ignore[no-untyped-def]
+        repository.update_cycle_leg_marks(
+            runtime_id=config.runtime_id,
+            strategy_id=config.strategy_id,
+            execution_mode=execution_mode,
+            cycle_id=cycle_id,
+            leg_id=leg.leg_id,
+            last_price=leg.last_price,
+            unrealised_pnl=leg.unrealised_pnl,
+            max_favorable_pnl=leg.max_favorable_pnl,
+            max_adverse_pnl=leg.max_adverse_pnl,
+        )
+
     def _record_incident(cycle_id: str, message: str) -> None:
         repository.record_error(
             runtime_id=config.runtime_id,
@@ -374,6 +390,7 @@ def build_engine(
         recover_cycle=_recover,
         persist_cycle=_persist_cycle,
         persist_cycle_leg=_persist_leg,
+        persist_leg_mark=_persist_leg_mark,
         persist_margin_snapshot=_persist_margin_snapshot,
         record_incident=_record_incident,
         clock=clock,
@@ -740,12 +757,24 @@ def _run_positional_worker_locked(
             client_id, token = _credentials()
             chain_fetcher = build_dhan_chain_fetcher(client_id=client_id, access_token=token)
 
+        # The hedged multi-leg calculator is the production source; the
+        # per-leg fetcher stays wired as the fallback for a composition that
+        # injects only the old factory (tests, offline analysis). Summing
+        # legs prices a defined-risk basket as if it were uncovered — see
+        # common.market_data.dhan_margin's own module docstring for the
+        # measured difference and what it cost.
+        basket_margin_fetcher = None
         if config.margin_fetcher_factory is not None:
             margin_fetcher = _resolve_factory(config.margin_fetcher_factory)()
         else:
             client_id, token = _credentials()
             margin_fetcher = build_dhan_margin_fetcher(client_id=client_id, access_token=token)
-        margin_estimator = MarginEstimator(margin_fetcher=margin_fetcher)
+            basket_margin_fetcher = build_dhan_basket_margin_fetcher(
+                client_id=client_id, access_token=token
+            )
+        margin_estimator = MarginEstimator(
+            margin_fetcher=margin_fetcher, basket_margin_fetcher=basket_margin_fetcher
+        )
 
         if config.scrip_master_factory is not None:
             scrip_master = _resolve_factory(config.scrip_master_factory)()

@@ -104,6 +104,21 @@ class _VolatilityGateState:
     last_logged_normal: bool | None = None
 
 
+@dataclass
+class _MarginLogState:
+    """Rate-limiter state for :meth:`_log_margin_reading`.
+
+    The margin utilization cap is the last gate an entry candidate passes
+    through and the only one that was silent — its ``return None`` is
+    commented "an ordinary blocked entry, not an incident", so a strategy
+    blocked there every evaluation for a whole entry window left no trace
+    anywhere. Observability only; the decision itself is unchanged.
+    """
+
+    last_logged_at: datetime | None = None
+    last_logged_blocked: bool | None = None
+
+
 #: Keys ``runtimes.positional_options.config_adapter.build_worker_config``
 #: reads out of the *same* ``parameters:`` YAML block for the worker's own
 #: use (order-fill simulation, strategy resolution, evaluation cadence) —
@@ -135,6 +150,7 @@ class WeeklyDeltaNeutralStrategy(BasePositionalMultiLegStrategy):
         self._vol_gate = _VolatilityGateState(
             samples=deque(maxlen=self._params.volatility_gate.lookback)
         )
+        self._margin_log = _MarginLogState()
         self._trigger_confirmations = 0
 
     # -------------------------------------------------------------- BasePositionalMultiLegStrategy
@@ -143,6 +159,7 @@ class WeeklyDeltaNeutralStrategy(BasePositionalMultiLegStrategy):
         self._vol_gate = _VolatilityGateState(
             samples=deque(maxlen=self._params.volatility_gate.lookback)
         )
+        self._margin_log = _MarginLogState()
         self._trigger_confirmations = 0
 
     @property
@@ -271,10 +288,12 @@ class WeeklyDeltaNeutralStrategy(BasePositionalMultiLegStrategy):
         margin_estimate = self._entry_margin_estimate(candidate, context)
         if margin_estimate is None:
             return None
-        if (
+        over_cap = (
             margin_estimate.utilization_percent
             > self._params.exits.maximum_margin_utilization_percent
-        ):
+        )
+        self._log_margin_reading(context, margin_estimate, blocked=over_cap)
+        if over_cap:
             return None  # over the cap: an ordinary blocked entry, not an incident
 
         legs = tuple(
@@ -431,6 +450,52 @@ class WeeklyDeltaNeutralStrategy(BasePositionalMultiLegStrategy):
         )
         gate.last_logged_at = context.now
         gate.last_logged_normal = normal
+
+    def _log_margin_reading(
+        self, context: PositionalContext, estimate: MarginEstimate, *, blocked: bool
+    ) -> None:
+        """Observability for the entry margin cap — the last gate a candidate
+        clears, and until now the only silent one.
+
+        Same rate limit as :meth:`_log_volatility_reading`: on every
+        blocked/allowed transition plus at most once a minute otherwise, so
+        the reading is in the log without spamming at the evaluation cadence.
+
+        The per-leg breakdown is included deliberately. The production
+        estimator sums each leg independently (``MarginEstimate.source`` is
+        ``"dhan_margin_calculator_summed_legs"``; see
+        ``common.margin.estimator.estimate_basket``'s own docstring, "Every
+        leg's margin, summed"), so a hedged iron condor is priced as two
+        naked shorts plus two long premiums with no hedge benefit. Whether
+        that is what makes this strategy exceed its cap is exactly the
+        question the breakdown answers, and it cannot be answered from the
+        total alone.
+        """
+        state = self._margin_log
+        decision_changed = state.last_logged_blocked != blocked
+        heartbeat_due = (
+            state.last_logged_at is None
+            or (context.now - state.last_logged_at).total_seconds() >= 60.0
+        )
+        if not (decision_changed or heartbeat_due):
+            return
+        per_leg = " ".join(
+            f"{security_id}={margin:.0f}" for security_id, margin in estimate.per_leg
+        )
+        _log.info(
+            "weekly_delta_neutral entry margin: estimated_margin=%.0f "
+            "allocated_capital=%.0f utilization_percent=%.2f cap_percent=%.2f "
+            "blocked=%s source=%s per_leg=[%s]",
+            estimate.estimated_margin,
+            estimate.allocated_capital,
+            estimate.utilization_percent,
+            self._params.exits.maximum_margin_utilization_percent,
+            blocked,
+            estimate.source,
+            per_leg,
+        )
+        state.last_logged_at = context.now
+        state.last_logged_blocked = blocked
 
     def _entry_margin_estimate(
         self, candidate: IronCondorCandidate, context: PositionalContext

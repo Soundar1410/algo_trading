@@ -71,7 +71,19 @@ class MarginEstimate:
     #: One entry per leg this estimate was built from — (security_id,
     #: margin component) — kept for audit/dashboard display, never used to
     #: recompute ``estimated_margin`` (that sum is fixed at construction).
+    #: Empty on the hedged-basket path, which returns portfolio totals and
+    #: no per-leg split; :attr:`components` carries that path's breakdown
+    #: instead.
     per_leg: tuple[tuple[str, float], ...] = ()
+    #: The broker's own named breakdown of ``estimated_margin`` — e.g.
+    #: ``(("spanMargin", ...), ("exposure", ...), ("hedgeBenefit", ...))``
+    #: from the hedged multi-leg calculator. Audit/observability only,
+    #: never used to recompute the total. Note that Dhan reports
+    #: ``hedgeBenefit`` as ``0.0`` even on a basket where the benefit is
+    #: plainly applied (it shows up as a much smaller ``spanMargin``), so
+    #: this field is recorded as returned and never treated as the measure
+    #: of whether hedging was recognised.
+    components: tuple[tuple[str, float], ...] = ()
 
     @property
     def utilization_percent(self) -> float:

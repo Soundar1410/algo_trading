@@ -9,11 +9,15 @@ from __future__ import annotations
 import math
 from collections.abc import Callable
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from common.logging import get_logger
 
 from .model import ConservativeMarginModel
 from .models import LegMarginRequest, MarginEstimate, MarginUnavailable
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from common.market_data.dhan_margin import BasketMargin
 
 _log = get_logger(__name__)
 
@@ -30,13 +34,21 @@ DEFAULT_MAX_MARGIN_AGE_SECONDS = 30.0
 class MarginEstimator:
     """Estimate one basket's margin requirement.
 
-    ``margin_fetcher`` — when provided — is called once per leg against the
-    real, read-only Dhan margin-calculator endpoint
-    (:func:`common.market_data.dhan_margin.build_dhan_margin_fetcher`) and
-    the results are **summed**: a deliberately conservative choice (no
-    cross-margin/hedge netting between legs is assumed), so the estimate
-    never *understates* margin relative to what real hedge netting could
-    achieve.
+Sources, in the order this class prefers them:
+
+    ``basket_margin_fetcher`` — **the production default.** One call to
+    Dhan's hedged multi-leg calculator
+    (:func:`common.market_data.dhan_margin.build_dhan_basket_margin_fetcher`),
+    which prices the legs against each other.
+
+    ``margin_fetcher`` — one call per leg, results **summed**: no
+    cross-margin/hedge netting assumed. Long presented as a merely
+    conservative choice, and it is conservative, but for a defined-risk
+    structure it is not *usefully* conservative: it prices an iron condor as
+    two uncovered short options. Measured on 9 September 2026, same legs,
+    same quantity — summed Rs 61,07,252 against hedged Rs 15,92,934, which
+    was the difference between a strategy that could never enter and one
+    that could. Kept as the fallback for a caller with no basket source.
 
     ``fallback_model`` — **production must never set this.** It exists only
     for an explicit offline/test caller (see
@@ -53,11 +65,13 @@ class MarginEstimator:
         self,
         *,
         margin_fetcher: Callable[[LegMarginRequest], float] | None,
+        basket_margin_fetcher: Callable[[list[LegMarginRequest]], BasketMargin] | None = None,
         fallback_model: ConservativeMarginModel | None = None,
         max_age_seconds: float = DEFAULT_MAX_MARGIN_AGE_SECONDS,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._margin_fetcher = margin_fetcher
+        self._basket_margin_fetcher = basket_margin_fetcher
         self._fallback_model = fallback_model
         self._max_age_seconds = max_age_seconds
         self._now: Callable[[], datetime] = clock if clock is not None else self._utc_now
@@ -85,6 +99,11 @@ class MarginEstimator:
         """
         evaluated_at = now if now is not None else self._now()
 
+        if self._basket_margin_fetcher is not None:
+            return self._from_basket_fetcher(
+                legs, allocated_capital=allocated_capital, now=evaluated_at
+            )
+
         if self._margin_fetcher is not None:
             return self._from_fetcher(legs, allocated_capital=allocated_capital, now=evaluated_at)
 
@@ -102,6 +121,47 @@ class MarginEstimator:
             "this is the fail-closed default; a caller that wants an offline/test estimate "
             "must inject ConservativeMarginModel itself"
         )
+
+    def _from_basket_fetcher(
+        self, legs: list[LegMarginRequest], *, allocated_capital: float, now: datetime
+    ) -> MarginEstimate:
+        """One hedged call. A failure raises rather than quietly re-summing.
+
+        Falling back to ``margin_fetcher`` here would be the worst possible
+        behaviour: it would silently restore the naked per-leg total, which
+        for a defined-risk basket reads as three to four times the real
+        requirement, and block entry with no explanation — precisely the
+        failure this whole path exists to end. The caller blocks entry and
+        records an incident on ``MarginUnavailable``, so a broken basket
+        source is loud.
+        """
+        assert self._basket_margin_fetcher is not None
+        try:
+            basket = self._basket_margin_fetcher(legs)
+            total = basket.total_margin
+            if total is None or not math.isfinite(total) or total < 0:
+                raise MarginUnavailable(
+                    f"multi-leg margin calculator returned an invalid total: {total!r}"
+                )
+        except MarginUnavailable:
+            raise
+        except Exception as exc:
+            _log.warning("multi-leg margin-calculator fetch failed: %s", exc)
+            raise MarginUnavailable(f"multi-leg margin-calculator fetch failed: {exc}") from exc
+
+        estimate = MarginEstimate(
+            estimated_margin=float(total),
+            source="dhan_margin_calculator_multi",
+            estimated_at=now,
+            allocated_capital=allocated_capital,
+            components=basket.components,
+        )
+        if not estimate.is_fresh(now=now, max_age_seconds=self._max_age_seconds):
+            raise MarginUnavailable(
+                f"margin estimate is stale (age={estimate.age_seconds(now=now):.1f}s > "
+                f"{self._max_age_seconds:.1f}s)"
+            )
+        return estimate
 
     def _from_fetcher(
         self, legs: list[LegMarginRequest], *, allocated_capital: float, now: datetime

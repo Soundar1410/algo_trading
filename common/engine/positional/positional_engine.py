@@ -158,6 +158,7 @@ class PositionalMultiLegEngine:
         recover_cycle: Callable[[], Cycle | None] | None = None,
         persist_cycle: Callable[[Cycle], None] | None = None,
         persist_cycle_leg: Callable[[LegInstance], None] | None = None,
+        persist_leg_mark: Callable[[str, LegInstance], None] | None = None,
         persist_margin_snapshot: Callable[[str, MarginEstimate], None] | None = None,
         record_incident: Callable[[str, str], None] | None = None,
         clock: Callable[[], datetime] = now_ist,
@@ -213,6 +214,7 @@ class PositionalMultiLegEngine:
         self._recover_cycle = recover_cycle
         self._persist_cycle_cb = persist_cycle
         self._persist_cycle_leg_cb = persist_cycle_leg
+        self._persist_leg_mark_cb = persist_leg_mark
         self._persist_margin_snapshot_cb = persist_margin_snapshot
         self._record_incident_cb = record_incident
         self._now = clock
@@ -576,6 +578,7 @@ class PositionalMultiLegEngine:
             if self._cycle.state is CycleState.CRITICAL_UNRESOLVED:
                 return  # the resume attempt itself found unmanageable state
 
+        self._checkpoint_leg_marks(ts)
         context = self._build_context(ts)
         signal = self.strategy.evaluate(cycle=self._cycle, context=context)
         if signal is None or signal.action is CycleAction.NONE:
@@ -1686,6 +1689,34 @@ class PositionalMultiLegEngine:
                 raise MultiLegDurabilityError(str(exc)) from exc
             log.exception("%s: best-effort cycle persistence failed", self.label)
             self._record_incident(self._cycle.cycle_id, f"cycle persist failed: {exc}")
+
+    def _checkpoint_leg_marks(self, ts: datetime) -> None:
+        """Persist the live mark for every open leg, once per evaluation.
+
+        Deliberately *not* on the tick path: ``leg.update_price`` runs on
+        every tick, orders of magnitude more often, and persisting there
+        would be write amplification for no extra fidelity. Running here
+        instead also means the stored mark is the one the strategy's own
+        ``evaluate`` is about to decide on, rather than trailing it.
+
+        **Best effort, and it must stay that way.** This is observability;
+        the evaluation it sits in front of is what closes a losing cycle. A
+        failure to record a number the operator would like to look at has no
+        business preventing the exit ladder from running, so every error is
+        logged and swallowed — the opposite of ``_persist_leg(critical=True)``,
+        where losing a leg's *state* really does warrant blocking entries.
+        """
+        if self._persist_leg_mark_cb is None or self._cycle is None:
+            return
+        for leg in self._cycle.open_legs():
+            if leg.last_price is None:
+                continue  # no price seen yet — nothing honest to record
+            try:
+                self._persist_leg_mark_cb(self._cycle.cycle_id, leg)
+            except Exception:
+                log.exception(
+                    "%s: leg mark checkpoint failed for %s (continuing)", self.label, leg.leg_id
+                )
 
     def _persist_leg(self, leg: LegInstance, *, critical: bool = False) -> None:
         if self._persist_cycle_leg_cb is None or self._cycle is None:

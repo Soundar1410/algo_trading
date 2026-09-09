@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
+from typing import Any
 
 #: The Home page's category-tile message (``dashboards/Home.py``) for when no
 #: strategy is enabled under this runtime group at all — distinct from, but
@@ -83,6 +84,36 @@ class LegRow:
     exit_reason: str | None
     realized_gross_pnl: float | None
     state: str
+    #: Live mark, from ``cycle_leg_marks`` (migration 0015). ``None`` means no
+    #: mark has ever been written for this leg — a leg that never opened, or a
+    #: cycle predating the migration. Never conflated with a mark of zero.
+    last_price: float | None = None
+    unrealised_pnl: float | None = None
+    mark_as_of: str | None = None
+    #: Real charges from ``fills``, correlated by this leg's own entry/exit
+    #: correlation ids. ``None`` means no fill exists yet, which is a
+    #: different statement from "this leg cost nothing".
+    entry_charges: float | None = None
+    exit_charges: float | None = None
+
+    @property
+    def total_charges(self) -> float | None:
+        if self.entry_charges is None and self.exit_charges is None:
+            return None
+        return (self.entry_charges or 0.0) + (self.exit_charges or 0.0)
+
+    @property
+    def net_pnl(self) -> float | None:
+        """Gross (realised if closed, else the live mark) net of charges.
+
+        ``None`` when there is no gross figure to net against — an open leg
+        with no mark yet reports nothing rather than reporting its charges as
+        a loss.
+        """
+        gross = self.realized_gross_pnl if self.state != "OPEN" else self.unrealised_pnl
+        if gross is None:
+            return None
+        return gross - (self.total_charges or 0.0)
 
 
 @dataclass(frozen=True)
@@ -162,9 +193,24 @@ def load_legs_for_cycle(conn: sqlite3.Connection, *, cycle_id: str) -> tuple[Leg
     leg it replaced."""
     rows = conn.execute(
         """
-        SELECT * FROM strategy_cycle_legs
-        WHERE cycle_id = ?
-        ORDER BY leg_role, leg_sequence
+        SELECT
+            l.*,
+            m.last_price     AS mark_last_price,
+            m.unrealised_pnl AS mark_unrealised_pnl,
+            m.as_of          AS mark_as_of,
+            (SELECT SUM(f.charges) FROM fills f
+              WHERE f.correlation_id = l.entry_correlation_id) AS entry_charges,
+            (SELECT SUM(f.charges) FROM fills f
+              WHERE f.correlation_id = l.exit_correlation_id)  AS exit_charges
+        FROM strategy_cycle_legs l
+        LEFT JOIN cycle_leg_marks m
+               ON m.runtime_id = l.runtime_id
+              AND m.strategy_id = l.strategy_id
+              AND m.execution_mode = l.execution_mode
+              AND m.cycle_id = l.cycle_id
+              AND m.leg_id = l.leg_id
+        WHERE l.cycle_id = ?
+        ORDER BY l.leg_role, l.leg_sequence
         """,
         (cycle_id,),
     ).fetchall()
@@ -231,6 +277,20 @@ def _row_to_cycle(row: sqlite3.Row) -> CycleRow:
     )
 
 
+def _optional(row: sqlite3.Row, column: str) -> Any:
+    """A column that only the joined leg query selects.
+
+    ``load_legs_for_cycle`` joins the marks and charges in, but ``LegRow`` is
+    also built from plain ``strategy_cycle_legs`` rows elsewhere; those simply
+    have no such key. Missing and NULL both mean "not known", which is
+    deliberately not the same as zero.
+    """
+    try:
+        return row[column]
+    except (IndexError, KeyError):
+        return None
+
+
 def _row_to_leg(row: sqlite3.Row) -> LegRow:
     return LegRow(
         leg_id=row["leg_id"],
@@ -253,6 +313,11 @@ def _row_to_leg(row: sqlite3.Row) -> LegRow:
         exit_reason=row["exit_reason"],
         realized_gross_pnl=row["realized_gross_pnl"],
         state=row["state"],
+        last_price=_optional(row, "mark_last_price"),
+        unrealised_pnl=_optional(row, "mark_unrealised_pnl"),
+        mark_as_of=_optional(row, "mark_as_of"),
+        entry_charges=_optional(row, "entry_charges"),
+        exit_charges=_optional(row, "exit_charges"),
     )
 
 
