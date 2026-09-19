@@ -131,11 +131,19 @@ def test_the_selector_and_the_resolver_agree_on_the_expiry(
 
     ``nearest_expiry()`` defaults to real wall-clock "today" in IST when no
     explicit date is passed (by design — see its own docstring), and the
-    fixture CSV's newest listed expiry (2026-08-04) is a fixed, historical
-    date. Pinning ``now_ist`` to an instant inside the fixture's own expiry
-    range makes this test's outcome independent of the date it happens to
-    run on, rather than assuming wall-clock time stays before the fixture's
-    newest expiry forever.
+    fixture CSV's newest listed option expiry (2026-08-11) is a fixed,
+    historical date. Pinning ``now_ist`` to an instant inside the fixture's
+    own expiry range makes this test's outcome independent of the date it
+    happens to run on, rather than assuming wall-clock time stays before the
+    fixture's newest expiry forever.
+
+    2026-08-01 is chosen because it sits before every listed OPTIDX expiry
+    (2026-07-28 is already past, then 2026-08-04 and 2026-08-11), so the
+    resolver has a genuine choice to make and settles on 2026-08-04 — the
+    "no expiry configured → resolver picks one → selector agrees" path this
+    test exists for. Unpinned, this raised ``ScripMasterError`` (*"Every
+    listed NIFTY expiry is before ...; the scrip master is stale"*) from
+    12 August 2026 onward. See D87.
     """
     from datetime import datetime
 

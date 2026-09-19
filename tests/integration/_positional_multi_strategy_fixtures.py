@@ -33,15 +33,32 @@ from __future__ import annotations
 import csv
 import io
 from collections.abc import Callable
+from datetime import date, timedelta
 from typing import Any
 
 from common.margin import LegMarginRequest
 from common.market_data.scrip_master import ScripMaster
+from common.utils.timeutils import now_ist
 
-#: Deliberately far in the future so ScripMaster.nearest_expiry() (which
-#: only ever compares against the real wall clock — this fixture module
-#: injects no clock) never finds every listed expiry already in the past.
-_FIXTURE_EXPIRY = "2030-12-25"
+#: How far ahead of "today" the fixture's single listed expiry sits.
+#:
+#: Derived from the clock at call time rather than written as a literal, because
+#: ``ScripMaster.nearest_expiry()`` only ever compares against the real wall
+#: clock and this module injects none: it is resolved by dotted path *inside a
+#: spawned worker* (see this module's own docstring), where no ``monkeypatch``
+#: in the pytest process can reach it. A hard-coded future date — this was
+#: ``"2030-12-25"`` — is therefore a time bomb, not a fix: it only postpones
+#: the day every listed expiry is in the past and ``nearest_expiry()`` raises
+#: ``ScripMasterError``. An offset is date-independent for good. See D87.
+#:
+#: Any positive offset works; a month keeps the generated symbol plausible as a
+#: monthly-series contract.
+_FIXTURE_EXPIRY_DAYS_AHEAD = 30
+
+
+def _fixture_expiry() -> date:
+    """The fixture master's only expiry, always comfortably in the future."""
+    return now_ist().date() + timedelta(days=_FIXTURE_EXPIRY_DAYS_AHEAD)
 
 
 def _fixture_chain_fetcher(security_id: int, segment: str, expiry: str) -> dict[str, object]:
@@ -107,7 +124,12 @@ def fixture_scrip_master() -> ScripMaster:
     ``ScripMaster.nearest_expiry()`` unconditionally inside ``build_engine``
     (even though ``FixtureSecondStrategy`` never selects a candidate), so at
     least one real, future-dated row is required for that call alone to
-    succeed."""
+    succeed.
+
+    The expiry is computed from today, not written down — see
+    :data:`_FIXTURE_EXPIRY_DAYS_AHEAD`. Nothing asserts on its value.
+    """
+    expiry = _fixture_expiry()
     rows = [
         [
             "SEM_SMST_SECURITY_ID", "SEM_INSTRUMENT_NAME", "SEM_TRADING_SYMBOL",
@@ -118,8 +140,9 @@ def fixture_scrip_master() -> ScripMaster:
     for option_type, security_id in (("CE", "970001"), ("PE", "970002")):
         rows.append(
             [
-                security_id, "OPTIDX", f"NIFTY-25DEC2030-24000-{option_type}",
-                f"NIFTY 24000 {option_type}", f"{_FIXTURE_EXPIRY} 00:00:00",
+                security_id, "OPTIDX",
+                f"NIFTY-{expiry:%d%b%Y}-24000-{option_type}".upper(),
+                f"NIFTY 24000 {option_type}", f"{expiry.isoformat()} 00:00:00",
                 "24000", option_type, "75", "NSE", "D",
             ]
         )
