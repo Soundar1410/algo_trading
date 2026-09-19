@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import csv
 import io
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -55,6 +55,40 @@ _SECURITY_IDS = {
     (HEDGE_CALL_STRIKE, "CE"): "90004",
 }
 
+#: Days ahead of *today* for the never-traded sentinel expiry below.
+_SENTINEL_DAYS_AHEAD = 30
+
+
+def _staleness_sentinel_rows() -> list[list[str]]:
+    """A second, never-traded expiry, always live against the real clock.
+
+    ``runtimes/positional_options/worker.py`` builds a bare
+    ``DhanOptionChainResolver(scrip_master)`` to read ``lot_size``, and that
+    calls ``nearest_expiry()`` with no date — so it resolves against real wall
+    time, not this module's simulated 2026-08-19. Listing only
+    ``EXPIRY_DATE`` made that raise ``ScripMasterError`` the moment real time
+    passed 2026-08-26, while the strategy's own dated lookups kept working.
+
+    Computed, never written down: a literal future date only resets the clock
+    on the same failure. See D87, and the shared
+    ``_weekly_delta_neutral_fixtures.staleness_sentinel_rows`` this duplicates
+    — deliberately, because pytest puts only the test file's *own* directory
+    on ``sys.path``, so a unit test cannot import that integration helper.
+    """
+    from common.utils.timeutils import now_ist
+
+    horizon = now_ist().date() + timedelta(days=_SENTINEL_DAYS_AHEAD)
+    sentinel = max(horizon, date.fromisoformat(EXPIRY_DATE) + timedelta(days=7))
+    return [
+        [
+            f"8{security_id[1:]}", "OPTIDX",
+            f"NIFTY-{sentinel:%d%b%Y}-{strike:.0f}-{option_type}".upper(),
+            f"NIFTY {strike:.0f} {option_type}", f"{sentinel.isoformat()} 00:00:00",
+            f"{strike:.0f}", option_type, "75", "NSE", "D",
+        ]
+        for (strike, option_type), security_id in _SECURITY_IDS.items()
+    ]
+
 
 def _scrip_master_csv() -> str:
     rows = [
@@ -72,6 +106,7 @@ def _scrip_master_csv() -> str:
                 f"{strike:.0f}", option_type, "75", "NSE", "D",
             ]
         )
+    rows.extend(_staleness_sentinel_rows())
     buffer = io.StringIO()
     csv.writer(buffer).writerows(rows)
     return buffer.getvalue()
@@ -150,6 +185,14 @@ def _build_worker_config(strategy_id: str = "weekly_delta_neutral") -> WorkerCon
         min_minutes_between_adjustments=90,
         parameters={
             "underlying": "NIFTY",
+            # Pinned to the pre-2026-09 legacy path, exactly as this fixture's
+            # three sibling suites already do (test_weekly_delta_neutral_
+            # {entry,restart,lot_size}.py): the gate default became
+            # ``method: realized``, whose 60-sample window a handful of
+            # scripted ticks can never fill, so the cycle never enters and
+            # this page has nothing to render. Masked until now by the stale
+            # scrip master failing first — see D87.
+            "volatility_gate": {"method": "displacement"},
             "index_security_id": NIFTY_SECURITY_ID,
             "index_segment": "IDX_I",
             "fno_segment": "NSE_FNO",
@@ -188,6 +231,21 @@ def _build_fixture_database(
             clock=lambda: entry_ts,
         )
         built.engine.run()
+        # A real paper worker beats while it runs, and the strategy picker
+        # admits a strategy only via a config entry or a healthy heartbeat —
+        # ``discover_strategy_options`` deliberately dropped its old third
+        # condition ("left a trace in the trade tables"), which is all this
+        # fixture used to supply. This page is rendered with
+        # ``config_root=None`` on purpose (its subject is real data read from
+        # the database, not config discovery), so the heartbeat is the branch
+        # that has to exist. State only, never age: ``_HEALTHY_STATES`` matches
+        # on ``health_state`` alone, so this stays date-independent. See D87.
+        repository.record_heartbeat(
+            session_id=session.id,
+            runtime_id=config.runtime_id,
+            strategy_id=config.strategy_id,
+            health_state="RUNNING_PAPER",
+        )
     finally:
         database.close()
 

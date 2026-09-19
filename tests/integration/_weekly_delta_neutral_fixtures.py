@@ -32,7 +32,7 @@ import csv
 import io
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -48,6 +48,70 @@ from runtimes.positional_options.config_adapter import WorkerConfig
 IST = ZoneInfo("Asia/Kolkata")
 NIFTY_SECURITY_ID = "13"
 EXPIRY_DATE = "2026-08-26"  # a Wednesday — never a real exchange-shifted date
+
+#: A second expiry, always in the real future, listed alongside
+#: :data:`EXPIRY_DATE` and never traded. It exists solely to keep
+#: ``ScripMaster.nearest_expiry()`` from declaring this master stale.
+#:
+#: Two different clocks read this one master, and only one of them can be
+#: controlled from a test:
+#:
+#: * the **strategy** asks ``nearest_expiry(on=entry_local_date)`` with a date
+#:   on the *simulated* timeline (2026-08-19), and must keep getting
+#:   ``EXPIRY_DATE`` — every cycle id, leg and assertion depends on it;
+#: * ``runtimes/positional_options/worker.py`` builds a bare
+#:   ``DhanOptionChainResolver(scrip_master)`` (just to read ``lot_size``),
+#:   which calls ``nearest_expiry()`` with **no** date, so it resolves against
+#:   the real wall clock — inside a *spawned* worker, where no ``monkeypatch``
+#:   in the pytest process can reach it.
+#:
+#: With only ``EXPIRY_DATE`` listed, that second call began raising
+#: ``ScripMasterError`` the moment real time passed 2026-08-26 — D35's
+#: fail-closed behaviour firing correctly against stale *fixture* data. A
+#: sentinel strictly after ``EXPIRY_DATE`` satisfies both readers at once: the
+#: dated call still returns ``EXPIRY_DATE`` (nearest on-or-after 2026-08-19),
+#: and the undated one returns this. Derived from the clock rather than written
+#: down, so it cannot go stale in its turn — a literal would only reset the
+#: bomb. This also mirrors a real Dhan master, which always lists live
+#: expiries. See D87.
+_STALENESS_SENTINEL_DAYS_AHEAD = 30
+
+
+def _staleness_sentinel_expiry() -> str:
+    """An expiry comfortably after both ``EXPIRY_DATE`` and today."""
+    from common.utils.timeutils import now_ist  # local, as in OffsetClock below
+
+    horizon = now_ist().date() + timedelta(days=_STALENESS_SENTINEL_DAYS_AHEAD)
+    return max(horizon, date.fromisoformat(EXPIRY_DATE) + timedelta(days=7)).isoformat()
+
+
+def staleness_sentinel_rows(
+    security_ids: dict[tuple[float, str], str], lot_size: str
+) -> list[list[str]]:
+    """Sentinel scrip-master rows for a master that otherwise lists only
+    :data:`EXPIRY_DATE` — see :data:`_STALENESS_SENTINEL_DAYS_AHEAD` for why
+    every such master needs them.
+
+    Shared rather than copied: three test modules
+    (``test_weekly_delta_neutral_restart``, ``test_weekly_delta_neutral_lot_size``,
+    ``test_dashboard_positional_real_data``) each build their own near-identical
+    master, and a fix applied to only some of them is how this went unnoticed
+    the first time.
+    """
+    sentinel = _staleness_sentinel_expiry()
+    sentinel_date = date.fromisoformat(sentinel)
+    return [
+        [
+            # ``9`` prefix -> ``8``: a distinct id per row, so a lookup that
+            # wrongly reached the sentinel series resolves to a security id no
+            # assertion expects, rather than silently passing.
+            f"8{security_id[1:]}", "OPTIDX",
+            f"NIFTY-{sentinel_date:%d%b%Y}-{strike:.0f}-{option_type}".upper(),
+            f"NIFTY {strike:.0f} {option_type}", f"{sentinel} 00:00:00",
+            f"{strike:.0f}", option_type, lot_size, "NSE", "D",
+        ]
+        for (strike, option_type), security_id in security_ids.items()
+    ]
 
 # ------------------------------------------------------------- strike layout
 HEDGE_PUT_STRIKE = 23150.0
@@ -95,6 +159,12 @@ LOT_SIZE = "75"
 
 
 def build_scrip_master() -> ScripMaster:
+    """The fixture master: every traded strike at :data:`EXPIRY_DATE`, plus one
+    never-traded sentinel series at :func:`_staleness_sentinel_expiry`.
+
+    See :data:`_STALENESS_SENTINEL_DAYS_AHEAD` for why the second series has to
+    be there and why its date is computed rather than written down.
+    """
     rows = [
         [
             "SEM_SMST_SECURITY_ID", "SEM_INSTRUMENT_NAME", "SEM_TRADING_SYMBOL",
@@ -110,6 +180,7 @@ def build_scrip_master() -> ScripMaster:
                 f"{strike:.0f}", option_type, LOT_SIZE, "NSE", "D",
             ]
         )
+    rows.extend(staleness_sentinel_rows(SECURITY_IDS, LOT_SIZE))
     buffer = io.StringIO()
     csv.writer(buffer).writerows(rows)
     return ScripMaster("NIFTY", exchange="NSE").load_from_text(buffer.getvalue())

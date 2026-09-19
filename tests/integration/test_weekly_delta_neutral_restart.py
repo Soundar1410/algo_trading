@@ -17,6 +17,8 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from _weekly_delta_neutral_fixtures import staleness_sentinel_rows
+
 from common.config.models import ExecutionMode
 from common.engine.config import SessionConfig
 from common.engine.feed import SimulatedFeed
@@ -73,6 +75,10 @@ def _scrip_master_csv() -> str:
                 f"{strike:.0f}", option_type, "75", "NSE", "D",
             ]
         )
+    # Without a live expiry alongside EXPIRY_DATE, the bare nearest_expiry()
+    # in runtimes/positional_options/worker.py declares this master stale once
+    # real time passes 2026-08-26. See _weekly_delta_neutral_fixtures.
+    rows.extend(staleness_sentinel_rows(_SECURITY_IDS, "75"))
     buffer = io.StringIO()
     csv.writer(buffer).writerows(rows)
     return buffer.getvalue()

@@ -49,6 +49,7 @@ from _weekly_delta_neutral_fixtures import (
     initial_chain_payload,
     leg_tick,
     open_repository,
+    staleness_sentinel_rows,
     underlying_tick,
 )
 
@@ -158,6 +159,11 @@ def _monday_shifted_scrip_master() -> ScripMaster:
                 f"{strike:.0f}", option_type, "75", "NSE", "D",
             ]
         )
+    # Strictly after the Monday expiry, so the shift this test exists to prove
+    # (nearest-after-2026-08-19 is 2026-08-24) is unchanged, while the bare,
+    # real-clock nearest_expiry() in the worker still finds a live series.
+    # See _weekly_delta_neutral_fixtures.
+    rows.extend(staleness_sentinel_rows(_MONDAY_SECURITY_IDS, "75"))
     buffer = io.StringIO()
     csv.writer(buffer).writerows(rows)
     return ScripMaster("NIFTY", exchange="NSE").load_from_text(buffer.getvalue())
