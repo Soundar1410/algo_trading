@@ -6,7 +6,7 @@ than the real clock, so the suite says the same thing at any hour of any day.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -131,9 +131,44 @@ def test_a_timezone_mismatch_can_be_deliberately_accepted(monkeypatch: pytest.Mo
 
 
 def test_a_matching_offset_counts_even_when_the_zone_name_differs(monkeypatch: pytest.MonkeyPatch):
-    """Asia/Calcutta is Asia/Kolkata. A name comparison alone would be wrong."""
+    """Asia/Calcutta is Asia/Kolkata. A name comparison alone would be wrong.
+
+    Both of the decision's host-derived inputs are substituted, not just the
+    name: until D89 this patched ``system_timezone_name`` only and then let
+    the offset branch read the *real* machine, so it asserted "the offsets
+    match" while proving nothing but that the developer's Mac was set to IST.
+    On the reporting Linux container (UTC) it failed —
+    ``assert gate.system_timezone_matches("Asia/Kolkata", at=_at(9, 0))`` →
+    ``False`` — even though the production behaviour it was aimed at is
+    correct and unchanged. The module docstring's promise, "every case here
+    is decided against an explicit, timezone-aware ``now`` rather than the
+    real clock", now holds for this case too.
+    """
     monkeypatch.setattr(gate, "system_timezone_name", lambda: "Asia/Calcutta")
+    monkeypatch.setattr(gate, "system_utcoffset", lambda moment: timedelta(hours=5, minutes=30))
     assert gate.system_timezone_matches("Asia/Kolkata", at=_at(9, 0))
+
+
+def test_a_differing_offset_with_a_differing_name_does_not_count(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The other side of the same decision, which nothing pinned before: a
+    host on a genuinely different zone must fail *both* checks. Without this,
+    the test above could be satisfied by a ``system_timezone_matches`` that
+    ignored the offset and returned ``True``."""
+    monkeypatch.setattr(gate, "system_timezone_name", lambda: "America/New_York")
+    monkeypatch.setattr(gate, "system_utcoffset", lambda moment: timedelta(hours=-4))
+    assert not gate.system_timezone_matches("Asia/Kolkata", at=_at(9, 0))
+
+
+def test_an_unreadable_host_offset_does_not_count_as_a_match(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """``utcoffset()`` returning ``None`` is refused rather than compared —
+    an undeterminable host clock is not an agreeing one."""
+    monkeypatch.setattr(gate, "system_timezone_name", lambda: None)
+    monkeypatch.setattr(gate, "system_utcoffset", lambda moment: None)
+    assert not gate.system_timezone_matches("Asia/Kolkata", at=_at(9, 0))
 
 
 def test_the_env_TZ_wins_when_set(monkeypatch: pytest.MonkeyPatch):

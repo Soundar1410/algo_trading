@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from common.config import AutoStartConfig
@@ -97,6 +97,22 @@ def system_timezone_name() -> str | None:
     return "/".join(tail) if tail else None
 
 
+def system_utcoffset(moment: datetime) -> timedelta | None:
+    """This process's own UTC offset at ``moment`` — the *host* clock.
+
+    Reading the machine rather than the configured zone is the point: this is
+    one of the two inputs :func:`system_timezone_matches` compares, and a
+    mismatch is exactly what it exists to detect. Split out from that function
+    so it can be substituted the same way :func:`system_timezone_name` already
+    is — a decision with two host-derived inputs is only testable when both of
+    them are reachable. Without it the offset branch could only ever be
+    exercised on a machine already set to the configured zone, which made
+    ``tests/unit/test_auto_start_gate.py`` pass on an IST Mac and fail on every
+    other host (D89). No behaviour changed.
+    """
+    return moment.astimezone().utcoffset()
+
+
 def system_timezone_matches(configured: str, *, at: datetime | None = None) -> bool:
     """Whether the Mac's clock agrees with the configured trading timezone.
 
@@ -115,7 +131,7 @@ def system_timezone_matches(configured: str, *, at: datetime | None = None) -> b
     name = system_timezone_name()
     if name == configured:
         return True
-    system_offset = moment.astimezone().utcoffset()
+    system_offset = system_utcoffset(moment)
     configured_offset = moment.astimezone(now_tz(configured).tzinfo).utcoffset()
     return system_offset is not None and system_offset == configured_offset
 
