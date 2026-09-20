@@ -2613,6 +2613,7 @@ guard. See deviation D6.
 | **D89** | **`test_a_matching_offset_counts_even_when_the_zone_name_differs` read the *real* host offset, so it asserted nothing on an IST Mac and failed on every other host** | Reported failure (UTC Linux): `assert gate.system_timezone_matches("Asia/Kolkata", at=_at(9, 0))` → `False`. Reproduced here in one command — `TZ=UTC .venv/bin/python -m pytest tests/unit/test_auto_start_gate.py` → 1 failed, 16 passed, at `tests/unit/test_auto_start_gate.py:136`. Root cause: the test patched `gate.system_timezone_name()` to `"Asia/Calcutta"` to force the decision onto its *offset* fallback, and `gate.py:118` then read the offset from `moment.astimezone()` — the machine. It passed only because this Mac is set to IST, which is the one value that makes the assertion true; its own module docstring already promised the opposite ("every case here is decided against an explicit, timezone-aware `now` rather than the real clock"). **The gate's production behaviour is correct and unchanged** — refusing to auto-start when the Mac's clock is not the configured zone is the whole point, since `launchd`'s `StartCalendarInterval` fires in the Mac's local zone. **Fix: an injectable seam, not a process-global `TZ` override.** The one host read moved into `gate.system_utcoffset(moment)`, which `system_timezone_matches` now calls; the test substitutes it exactly as it already substitutes `system_timezone_name`. Chosen over `TZ` + `time.tzset()` because that mutates process-global state every other module in the same interpreter shares, is POSIX-only, and needs teardown care — whereas this makes both host-derived inputs to a two-input decision reachable the same way, which is what the test needed and never had. Behaviour is byte-identical; no decision changes. Two further cases added while the seam was there, both previously unpinned: a genuinely different host zone must fail *both* checks (without it, a `system_timezone_matches` that ignored the offset entirely would satisfy the original test), and a `utcoffset()` of `None` must not count as agreement. **Audit of the rest of the file:** no other hidden dependency — every other case either passes `check_system_timezone=False` or patches `system_timezone_matches` wholesale, and `test_the_env_TZ_wins_when_set` sets `TZ` itself and only reads `os.environ`. Confirmed by the reproduction above naming one failure, not five. The file now passes identically under `TZ=UTC`, `TZ=America/New_York` and `TZ=Asia/Kolkata` (19 passed each). |
 | **D90** | **The two duplicate-worker end-to-end tests handed the holder an empty queue, so it released its lock 0.5 s after starting — when the contender lost that race the test passed a *second live worker for the same strategy*** | Reported: `test_duplicate_worker_startup_is_refused` and `test_a_live_mode_contender_is_still_refused_as_a_duplicate` (`tests/end_to_end/test_walking_skeleton.py`) failing in 2 of 6 Linux runs of the file alone. Root cause, confirmed in the source rather than inferred: the fixture path's loop is `candle_queue.get(timeout=_QUEUE_POLL_SECONDS)` with `_QUEUE_POLL_SECONDS = 0.5` (`runtimes/intraday_options/worker.py:130`, `:713`), and `queue.Empty` is its clean end-of-tape exit — so a holder given an empty `mp.Queue` gives its lock up half a second after it starts, while a `spawn` start routinely costs more than that. Both tests waited only for the holder's PID file and then *assumed* it still held the lock. **Not a production defect, and checked as one before concluding that:** the 0.5 s idle exit belongs to the Phase 1 fixture signal path (CLAUDE.md's test-only deterministic path); every real strategy runs `config.engine`/`config.multi_leg_engine`, which never reach this loop. No production file was changed. **Fail-first, by forcing the interleaving** — a throwaway copy of both tests with a single added 1.0 s delay before the contender starts (deleted immediately; `git status` clean afterwards) reproduced both reported symptoms on this Mac: the paper variant gave `assert 0 == 3` (`0 = get(timeout=5)`) — the contender had run to completion as a duplicate and exited *successfully*, which is the defect stated as plainly as it can be — and the live variant logged `acquired process lock identity=intraday_options.skelfix pid=2793` followed by the same line for `pid=2794`, then `ValidationError: strategy 'skelfix' is mode: live but sets no live_quantity_lots`, put nothing on its result queue, and failed with `queue.Empty`, matching the external report line for line. **Fixed** by removing the clock from the test rather than widening a margin: a picklable `_HeldFeed` whose `get()` ignores its timeout and blocks on a `spawn`-context `Event` (never a default-context primitive across a spawn boundary — D86) until the test releases it, then returns the `None` sentinel the worker already understands, so the lock is surrendered through the worker's own ordinary exit (holder exit code still `0`, PID file still removed). `holder.is_alive()` is now asserted both before the contender starts and after it exits, so "the holder still held the lock" is proven rather than assumed. The live contender was also given the **complete** live contract — the report named `live_quantity_lots`, but `ResolvedConfig._live_requires_a_complete_preflight_contract` (`common/config/models.py:464`) also requires `expected_static_ip`, `egress_ip_provider`, `max_preflight_age_seconds`, a rule for all four `RateLimitCallClass` values and all five `account_risk` fields — so the duplicate lock is now the only thing that can refuse it. **Every live gate stays false** (`global_live_trading_enabled`, `runtime_live_execution_allowed`, `strategy_live_approved`, `live_preflight_passed`), asserted in the test itself: a valid live *config* is not an approved live *run*, and `build_broker` still fails closed if the lock were ever to miss. **Proof:** a deliberate 3.0 s gap (6× the window that broke the old test) now passes, and 20 consecutive runs of the whole file passed 17/17 tests each. |
 | **D91** | **The launchd installer's tests stubbed one of `_preconditions`' two host facts and not the other, so 16 of them could only pass on a Mac already set to IST** | Found while verifying D88–D90 and fixed on a follow-up instruction, the launchd installer tests having been out of scope in the original report. Under `TZ=UTC` and `TZ=America/New_York` alike, 16 tests in `tests/unit/test_install_launch_agents.py` failed on assertions with nothing to do with timezones — `AssertionError: assert 'bootout' in []` and its neighbours — because `scripts/install_launch_agents.py::_preconditions` had already refused the install and returned before issuing a single `launchctl` command: `Refusing to install: this Mac's timezone is UTC, but auto_start expects Asia/Kolkata. launchd fires StartCalendarInterval in the Mac's local zone, so the 09:00 trigger would not be at the configured start time.` **Pre-existing and proven so, not assumed:** the working tree was stashed, the file re-run at `2cb5f38` under `TZ=UTC`, and the failing sets compared name by name — identical, 16 and 16 — so none of it was caused by D88–D90. Root cause is one omission with a precedent sitting three lines above it: `_preconditions` reads exactly two properties of the *host* — a legacy Trading_Automation system, and a clock matching the configured trading zone — and the test file's autouse `_no_legacy` fixture stubbed the first while nothing stubbed the second. Every test that reaches past the refusal list therefore depended silently on the developer's Mac being set to `Asia/Kolkata`. **The installer's behaviour is correct and unchanged** — refusing to make a mismatched Mac trade by itself is the entire reason the check exists — so the fix is a second autouse fixture, `_matching_system_timezone`, modelled on `_no_legacy` and patching `ila.system_timezone_matches` to `True`: "assume a correctly-configured Mac", which is what those tests were always written to mean. `test_install_refuses_on_a_system_timezone_mismatch` patches the same name in its own body, after the fixture, so the mismatch case still wins and is still pinned. **That pin was verified non-vacuous rather than trusted:** the production precondition was temporarily short-circuited, the refusal test failed as it must, and the file was restored byte-identical (`git diff` empty) and the test passed again — the same technique D86 used in reverse. The file now passes 36/36 identically under `TZ=UTC`, `TZ=America/New_York` and `TZ=Asia/Kolkata`. This is the fourth instance of the D89 class and the one that closes it: the full suite is now timezone-independent end to end. |
+| **D92** | **`BoundedWorkerQueue.drain()` could not empty a `multiprocessing.Queue` at all — it lost the item to the feeder thread in 197 of 200 trials, so a respawned worker was fed market data addressed to the process that had just died** | Reported as a 1-in-10 Linux flake: `tests/unit/test_supervisor_worker_liveness.py::test_a_dead_worker_is_respawned_reaped_drained_and_resumed` failing `DID NOT RAISE Empty` on `channel.tick_queue.get(timeout=0.2)`. **A production defect, not a test artefact** — the suspicion was verified rather than assumed, and the truth is far worse than the reported rate. `multiprocessing.Queue.put_nowait` does not write to the pipe: it appends to an in-process buffer and wakes a **feeder thread** that pickles and writes later, while `get_nowait` reads the pipe. `drain()` looped `get_nowait` until `queue.Empty`, so it saw an empty pipe and stopped while the item was still in the feeder's hands — and the item then arrived for the *respawned* worker, which is precisely the delivery `drain()`'s own docstring exists to prevent ("would corrupt candle building and could trip an elapsed-time gate meant for real ticks"). Measured on this Mac against the unmodified code: publish immediately followed by `drain()` left the stale item behind **197/200 times**; a 0.05 s gap between them dropped that to 0/100, which is exactly why the test only *flaked* — `old_process.die()` and `_check_worker_liveness()` (database writes, the notifier) usually gave the feeder enough time. **Fix (a), a fresh queue — not (b), a better drain, and (b) was rejected on evidence rather than taste.** `multiprocessing.Queue` offers a consumer no way to learn its feeder has flushed: `qsize()` raises `NotImplementedError` on macOS (already documented in `depth()`), `empty()` races identically, and `join_thread()` **hangs** when the pipe fills with no reader — measured in this repository at ~65 KB of undelivered ticks, "a few hundred events" (`IntradayOptionsSupervisor._abandon_undelivered_events`). Every "correct drain" therefore degenerates into sleep-and-hope, and a restart path that can hang is the one thing it must never become. So `drain()` now enumerates what it can see, then **replaces** the underlying queue with a fresh one from a new `_queue_factory` field (defaulted beside `_queue` in `__post_init__` so the two can never disagree about the kind) and abandons the old one via a shared `_abandon()` helper — `cancel_join_thread()` before `close()`, never `join_thread()`, the same judgement and the same idiom this project already applies to undelivered market data at shutdown (`supervisor.py:878`, `positional_options/supervisor.py:466`). Losing those items is the intent, not a side effect. The new queue is provably empty because it is new, with no timing argument anywhere. **No call site changed**: `_restart_worker` already drained both queues in the right order (reap → drain → respawn) and `_spawn_worker` reads `channel.queue.raw` *at spawn time* (`supervisor.py:576,583`), so the swap hands the fresh queue to the new child automatically and every held reference — hub registry, `self._workers`, `_WorkerState.channel` — stays valid. Safe without locking, and the invariant was checked rather than assumed: `hub.suspend_channel()` runs before `_restart_worker` (`supervisor.py:1263`), so the feed callback thread is not publishing during the swap. **Fail-first, forced rather than waited for, three ways:** (1) a `_FeederBufferedQueue` double that models the feeder — an item `put` is invisible to `get_nowait` until an explicit `flush()` — makes the property deterministic with no timing at all; (2) the same assertion against a genuine `mp.Queue`, which failed `DID NOT RAISE Empty` — the reported error verbatim; (3) a throwaway probe drove the *reported* test itself with the channel's queues swapped for the double and `drain` parametrised old-vs-new: `[old]` failed `DID NOT RAISE Empty`, `[new]` passed (probe deleted, `git status` clean). A fourth new test pins that draining a 2048-deep queue holding 2000 undelivered items returns promptly instead of wedging on the feeder — pre-fix that case hung the interpreter at exit, which is the `join_thread` hazard above reproduced by accident. The reported liveness test is **unchanged**, and passed 30 consecutive runs (21 tests each). **Audit of every `drain()`/queue reuse in both supervisors:** `_restart_worker`'s two calls are the defect and are fixed at the source; the two `cancel_join_thread` shutdown sites are correct as-is and are the precedent this follows; `_control_queues`, reused across a respawn and re-handed to the new child, is **not affected** because it runs worker → supervisor, so a stale message reaches the supervisor and never the respawned worker; `_drain_control_queues`/`_drain_feed_health_events` in both supervisors are supervisor-side reads of upstream queues, not a worker's inbound channel; and `positional_options/supervisor.py` has **no respawn path at all** (no `_restart_worker`, no liveness check), so it has nothing to fix and inherits the corrected `drain()` if one is ever added. |
 
 #### D22 in detail: the rebuilt premium-candle mapping
 
@@ -13435,3 +13436,163 @@ dependency are closed (D91).
 No live gate was flipped, no production `EgressIpProvider` was added or chosen, no
 `mode: live` reached any committed YAML, and `OPERATIONAL LIVE ACTIVATION ELIGIBLE`
 remains **NO — BLOCKED**.
+
+---
+
+## Maintenance: stale market data after a worker respawn (20 September 2026)
+
+Not a phase. Reported as an intermittent Linux failure, 1 run in ~10. Decisions
+table: **D92**. The other half of the same brief — the launchd installer's 16
+timezone-bound tests — was already closed as **D91**, above; it is not repeated
+here. No live gate, no production `EgressIpProvider`, no `mode: live` YAML, no
+runtime or operational database touched.
+
+```
+tests/unit/test_supervisor_worker_liveness.py::test_a_dead_worker_is_respawned_reaped_drained_and_resumed
+Failed: DID NOT RAISE Empty
+  channel.tick_queue.get(timeout=0.2)
+```
+
+### This is a production defect, and it is not intermittent
+
+The reported suspicion — that `BoundedWorkerQueue.drain()` loses items to a
+`multiprocessing.Queue` feeder thread — is correct. It was verified before being
+acted on, and the measurement is much worse than the report:
+
+```
+publish, then drain() immediately:   stale item survived 197/200 trials
+publish, wait 0.05 s, then drain():  stale item survived   0/100 trials
+```
+
+`drain()` was very nearly a **no-op** against exactly the item it exists to discard.
+
+The mechanism: `put_nowait` does not write to the pipe. It appends to an in-process
+buffer and wakes a **feeder thread**, which pickles and writes later. `get_nowait`
+reads the *pipe*. Looping `get_nowait` until `queue.Empty` therefore sees an empty
+pipe and returns while the item is still in the feeder's hands — and it is then
+delivered to the **respawned** worker.
+
+That is the delivery `drain()`'s own docstring exists to prevent: stale market data
+reaching a fresh engine "would corrupt candle building and could trip an
+elapsed-time gate meant for real ticks". The 1-in-10 figure is a property of the
+*test*, not of the defect — `old_process.die()` and `_check_worker_liveness()`
+(database writes, the notifier) sit between the publish and the drain, and usually
+give the feeder the few milliseconds it needs. In production the drain follows the
+worker's death by however long the poll loop takes, so the window is real.
+
+### (a) a fresh queue, not (b) a better drain
+
+**(b) cannot be made correct**, and was rejected on evidence rather than taste. A
+consumer has no way to learn that a `multiprocessing.Queue`'s feeder has flushed:
+
+* `qsize()` raises `NotImplementedError` on macOS — this module already says so, in
+  `depth()`;
+* `empty()` races in exactly the same way;
+* `join_thread()` **hangs** when the pipe fills and nothing is reading it. This
+  repository measured that at ~65 KB of undelivered ticks, "a few hundred events",
+  and wrote it up at `IntradayOptionsSupervisor._abandon_undelivered_events`.
+
+So every "correct drain" degenerates into sleeping and hoping, on a restart path
+whose whole point is not to hang. **(a) is correct by construction**: a queue built a
+moment ago is empty because it is new, and there is no timing argument anywhere in
+it.
+
+It is realised by replacing the **underlying** queue inside the existing
+`BoundedWorkerQueue` rather than building a new `WorkerChannel`. A new
+`_queue_factory` field — defaulted beside `_queue` in `__post_init__`, so the two
+can never disagree about the kind of queue — lets a queue build a fresh one of its
+own kind. `drain()` enumerates what it can see, counts it, swaps in the replacement
+and abandons the old queue.
+
+Abandonment is `cancel_join_thread()` then `close()`, via a small shared `_abandon()`
+helper, and never `join_thread()` — the same judgement and the same idiom this
+project already applies to undelivered market data at shutdown
+(`intraday_options/supervisor.py:878`, `positional_options/supervisor.py:466`).
+Losing those items *is* the intent.
+
+**No call site changed.** `_restart_worker` already drained both queues in the right
+order (reap → drain → respawn), and `_spawn_worker` reads `channel.queue.raw` *at
+spawn time* (`supervisor.py:576,583`) — so the swap hands the fresh queue to the new
+child automatically, and every held reference (the hub registry, `self._workers`,
+`_WorkerState.channel`, and the reported test's own captured `channel`) stays valid.
+
+**No lock is needed, and the invariant was checked rather than assumed:**
+`hub.suspend_channel()` runs before `_restart_worker` (`supervisor.py:1263`), so the
+feed callback thread is not publishing while the queue is swapped.
+
+The return value is now documented for what it is: exact for an in-process queue, a
+**lower bound** for a multiprocessing one, whose in-flight items are discarded
+without ever being countable. Nothing in production reads it.
+
+### Fail-first — forced, not waited for
+
+The brief asked for the interleaving to be forced rather than for the suite to be
+re-run until it flaked. Three proofs, all against the unmodified code:
+
+1. **Deterministic, no timing at all.** A `_FeederBufferedQueue` double models the
+   feeder: an item `put` is not visible to `get_nowait()` until an explicit
+   `flush()`. `publish → drain → flush → get` must raise `queue.Empty`, and pre-fix
+   it never did. This is the difference between a proof and a coin toss — against a
+   real `mp.Queue` the pre-fix rate is 197/200, emphatic but still not certain.
+2. **The genuine article.** The same property over a real `mp.Queue` failed with
+   `Failed: DID NOT RAISE Empty` — the reported error, verbatim.
+3. **The reported test itself.** A throwaway probe drove
+   `test_a_dead_worker_is_respawned_reaped_drained_and_resumed` with the channel's
+   queues swapped for the double and `drain` parametrised old-versus-new:
+
+   ```
+   FAILED ...[old]  Failed: DID NOT RAISE Empty
+   PASSED ...[new]
+   ```
+
+   Probe deleted immediately; `git status` clean, no committed test weakened.
+
+A fourth new test pins that draining a 2048-deep queue holding 2000 undelivered
+items returns promptly rather than wedging on the feeder. Pre-fix that case **hung
+the interpreter at exit** — the `join_thread` hazard above, reproduced by accident
+while writing the test, and the clearest possible argument against option (b).
+
+**The reported test is unchanged** — not touched, not weakened. It is the symptom,
+and it must now pass by construction. It did, 30 consecutive times (21 tests each).
+
+### Audit — every `drain()` / queue reuse in both supervisors
+
+| Site | Verdict |
+|---|---|
+| `intraday_options/supervisor.py:1368,1370` — `state.channel.queue.drain()` / `tick_queue.drain()` in `_restart_worker` | **The defect.** Fixed at the source, in `drain()`; no call-site edit |
+| `intraday_options/supervisor.py:878`, `positional_options/supervisor.py:466` — `cancel_join_thread` at shutdown | Correct as-is, and not a reuse. It is the precedent this fix follows |
+| `_control_queues[strategy_id]` — created at admit, reused across a respawn, re-handed to the new child (`supervisor.py:584`) | **Not affected.** Opposite direction: worker → supervisor. A stale message reaches the *supervisor*, which drains it into the hub each poll; nothing stale can reach the respawned worker, which is the property at issue |
+| `_drain_control_queues` / `_drain_feed_health_events`, both supervisors | Not affected — supervisor-side reads of upstream queues, not a worker's inbound channel, and not reused across a respawn |
+| `positional_options/supervisor.py` worker respawn | **No respawn path exists** — no `_restart_worker`, no liveness check. Nothing to fix, and it inherits the corrected `drain()` if one is ever added |
+
+### Verification
+
+| Command | Result |
+|---|---|
+| `.venv/bin/python -m pytest` | **3655 passed, 18 skipped** in 262.21s |
+| `TZ=UTC .venv/bin/python -m pytest` | **3655 passed, 18 skipped** in 256.71s |
+| `TZ=America/New_York .venv/bin/python -m pytest` | **3655 passed, 18 skipped** in 259.72s |
+| 30 consecutive runs of `tests/unit/test_supervisor_worker_liveness.py` | 21 passed, every run |
+| `.venv/bin/ruff check .` | **All checks passed!** |
+| `.venv/bin/mypy` | **Success: no issues found in 246 source files** |
+
+All three timezone runs are **identical** — same count, no failure in any of them, and
+nothing left to explain. 3650 → 3655 is the five tests added here. `ruff format` is out
+of scope for this change, as briefed, and is unchanged at its 168-file baseline.
+
+The two pre-existing load-sensitive flakes recorded in the previous entry
+(`test_two_workers_receive_identical_bars`, and the 60 s `communicate()` timeout in
+`test_a_feed_that_cannot_be_closed_raises_an_alarm_an_operator_would_see`) did **not**
+recur in these three runs. They remain open and unfixed; a clean run is not evidence
+they are gone.
+
+### Not done here
+
+`runtimes/intraday_options/supervisor.py` is **unchanged** — the defect was entirely
+inside `drain()`, and fixing it at the source is what leaves both of its call sites,
+and any future one, correct without repetition. No test was weakened, skipped,
+deselected or deleted: five were added to
+`tests/unit/test_bounded_worker_queue_drain.py`, and the reported liveness test was
+left exactly as it was written. No live gate was flipped, no production
+`EgressIpProvider` was added or chosen, no `mode: live` reached any committed YAML,
+and `OPERATIONAL LIVE ACTIVATION ELIGIBLE` remains **NO — BLOCKED**.

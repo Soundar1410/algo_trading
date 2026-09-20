@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import queue
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -151,6 +152,21 @@ class QueueStats:
         return self.dropped > 0
 
 
+def _abandon(raw: Any) -> None:
+    """Let go of a queue whose remaining contents must never be delivered.
+
+    ``cancel_join_thread()`` first, so the feeder is not waited on: it may be
+    holding more than the pipe can take, and joining it would block forever
+    with no reader left (~65 KB, measured — see :meth:`BoundedWorkerQueue.
+    drain`). Then ``close()``. Both are absent on a plain ``queue.Queue``,
+    which has no feeder thread and nothing to release, so both are optional.
+    """
+    for method in ("cancel_join_thread", "close"):
+        call = getattr(raw, method, None)
+        if call is not None:
+            call()
+
+
 @dataclass
 class BoundedWorkerQueue:
     """One worker's inbound channel, bounded and drop-oldest on overflow."""
@@ -160,6 +176,11 @@ class BoundedWorkerQueue:
     #: Injected so tests can use a plain queue.Queue and the supervisor a real
     #: multiprocessing.Queue, without the hub knowing which it holds.
     _queue: Any = None
+    #: How to build a *replacement* underlying queue of this one's own kind —
+    #: see :meth:`drain`, which cannot empty a multiprocessing queue reliably
+    #: and so builds a new one instead. Defaulted alongside ``_queue`` in
+    #: ``__post_init__`` so the two can never disagree about the kind.
+    _queue_factory: Callable[[], Any] | None = None
     published: int = field(default=0, init=False)
     dropped: int = field(default=0, init=False)
     last_published_at: datetime | None = field(default=None, init=False)
@@ -167,17 +188,25 @@ class BoundedWorkerQueue:
     def __post_init__(self) -> None:
         if self.max_depth <= 0:
             raise ValueError("max_depth must be positive")
-        if self._queue is None:
+        if self._queue_factory is None:
             # Workers are always created from the spawn context.  A queue built
             # from Linux's default fork context cannot be pickled into a spawned
             # child (``SemLock created in a fork context``), even though the same
             # code happens to work on macOS where spawn is already the default.
-            self._queue = mp.get_context("spawn").Queue(maxsize=self.max_depth)
+            context = mp.get_context("spawn")
+            self._queue_factory = lambda: context.Queue(maxsize=self.max_depth)
+        if self._queue is None:
+            self._queue = self._queue_factory()
 
     @classmethod
     def in_process(cls, name: str, max_depth: int = DEFAULT_MAX_DEPTH) -> BoundedWorkerQueue:
         """A same-process queue, for unit tests that need no child process."""
-        return cls(name=name, max_depth=max_depth, _queue=queue.Queue(maxsize=max_depth))
+        return cls(
+            name=name,
+            max_depth=max_depth,
+            _queue=queue.Queue(maxsize=max_depth),
+            _queue_factory=lambda: queue.Queue(maxsize=max_depth),
+        )
 
     @property
     def raw(self) -> Any:
@@ -220,8 +249,8 @@ class BoundedWorkerQueue:
         return self._queue.get(timeout=timeout)
 
     def drain(self) -> int:
-        """Discard every currently-queued item without blocking. Returns how
-        many were discarded.
+        """Discard everything queued for this worker — **including whatever is
+        still in flight** — and return how many items could be counted.
 
         For a worker being respawned after a crash: whatever is still queued
         for it was addressed to a process that no longer exists, and by the
@@ -230,6 +259,44 @@ class BoundedWorkerQueue:
         real ticks. Deliberately does not touch :attr:`dropped`: a drain is a
         deliberate discard on the supervisor's own decision, not an overflow
         the feed callback path measured.
+
+        **Emptying a multiprocessing queue is not something a consumer can do**
+        (D92). ``put_nowait`` does not write to the pipe; it appends to an
+        in-process buffer and wakes a feeder thread that writes later, while
+        ``get_nowait`` reads the pipe. Looping ``get_nowait`` until
+        ``queue.Empty`` — which is what this did until D92 — therefore sees an
+        empty pipe and stops while the item is still in the feeder's hands, and
+        the item then arrives for the *respawned* worker. Measured: an item
+        published immediately before a drain survived it in **197 of 200**
+        trials. It showed up as a 1-in-10 flake in
+        ``test_supervisor_worker_liveness.py`` only because the death and
+        liveness check in between usually gave the feeder time to flush.
+
+        There is no way to close that window from here. ``qsize()`` raises
+        ``NotImplementedError`` on macOS (see :meth:`depth`), ``empty()`` races
+        identically, and ``join_thread()`` *hangs* when the pipe fills with no
+        reader — this repository measured that at ~65 KB of undelivered ticks
+        (``IntradayOptionsSupervisor._abandon_undelivered_events``), and a
+        restart path that can hang is precisely what must not be built. So the
+        queue is **replaced** rather than emptied: the new one is provably
+        empty because it is new, with no timing argument anywhere.
+
+        The old queue is then abandoned the way this project already abandons
+        undelivered market data at shutdown — ``cancel_join_thread()`` before
+        ``close()``, never ``join_thread()``. Losing those items *is* the
+        intent here, not a side effect.
+
+        Safe without locking because the hub is not publishing: the supervisor
+        calls ``hub.suspend_channel()`` before it restarts a worker
+        (``IntradayOptionsSupervisor._check_worker_liveness``), and resumes only
+        after the new process exists.
+
+        Returns:
+            The number of items this call could enumerate — exact for an
+            in-process queue, and a **lower bound** for a multiprocessing one,
+            whose in-flight items are discarded without ever being countable.
+            Nothing reads it in production; it exists for the tests and for a
+            log line.
         """
         discarded = 0
         while True:
@@ -238,6 +305,10 @@ class BoundedWorkerQueue:
             except queue.Empty:
                 break
             discarded += 1
+
+        assert self._queue_factory is not None  # set in __post_init__
+        old, self._queue = self._queue, self._queue_factory()
+        _abandon(old)
         return discarded
 
     def depth(self) -> int:
