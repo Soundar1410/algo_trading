@@ -2612,6 +2612,7 @@ guard. See deviation D6.
 | **D88** | **Three dashboard pages opened with a naive `date.today()`, so on any non-IST host every page showed the *previous* trading day for the whole 00:00–05:30 IST window** | Reported from the same external Linux run as D86/D87 (Python 3.11.15, `requirements.lock`, container clock in UTC, `feature-paper-auto-start` at `2cb5f38`): `tests/unit/test_dashboard_apptest.py::test_the_baskets_tab_shows_a_basket_and_its_legs` failing with `AssertionError: the Baskets tab rendered no leg table for a real basket/leg fixture`, and passing under `TZ=Asia/Kolkata`. **A real production bug, not a test artefact.** The fixture wrote its basket under `datetime.now(ist).date()` while `dashboards/Home.py:578`, `dashboards/intraday_options.py:1010` and `dashboards/system_health.py:250` each read `date.today()` — the *machine's* local date. IST and the host agree only on a machine set to IST; on a UTC host they are different days from 00:00 to 05:30 IST, so for the first 5.5 hours of every calendar day every page would have queried yesterday — yesterday's positions, P&L, orders and incidents — with nothing on screen to say so. That matters beyond the test suite: the SEBI static-IP requirement points controlled-live at a cloud VPS, which is UTC by default. Same bug class as `8bd41ae` (the UTC-vs-IST entry gate). In `intraday_options.py` the same value also seeds every "Yesterday"/"Last 7/30 trading days" preset through `_resolve_date_range`, so all four date presets were shifted with it. **Fixed** with one shared `dashboards/_shared.trading_date_today()` — `timeutils.local_date_in(timeutils.now_tz(tz_name))`, no new time helper, exactly the pair `dashboards/positional_options.py` had already been using privately and which now serves the whole package (its `_today_ist()` delegates to it, so there is one definition of "today", not two). `tz_name` defaults to `timeutils.DEFAULT_TZ` rather than loading YAML — a dashboard must degrade to a message, not raise `ConfigError` — and a test pins `config/global.yaml`'s `global.timezone` to that constant so the two cannot drift. **Fail-first, three ways, none reading the wall clock.** (1) The reported test itself, made deterministic: its fixture now writes under a frozen instant (2026-09-14 00:30 IST = 2026-09-13 19:00 UTC, deliberately in the *past* so no real clock can ever coincide with it) with `TZ=UTC` + `tzset()` and `common.utils.timeutils.now_tz` pinned — it then reproduced the reported `AssertionError` verbatim **on this IST Mac**, where it had always passed, and passes with the fix. (2) A new parametrised `test_every_page_scopes_its_queries_to_the_ist_trading_date` records what each of the three pages hands to `load_snapshot`: `Home.py`/`intraday_options.py`/`system_health.py` each queried `['2026-09-20']` (the host's answer) instead of `2026-09-14`. (3) A structural AST guard in `tests/unit/test_dashboard.py`, parametrised over every module under `dashboards/` like the existing broker/feed/`subprocess` guards, rejecting `date.today()`/`datetime.today()`/`utcnow()`/zero-argument `datetime.now()` — it named exactly the three reported files and no others, and covers the *next* page for free. **Audit, independent of the report:** every `date.today()`/`datetime.now()`/`.now()`/`.today()`/`utcnow`/`time.localtime`/`fromtimestamp(`/bare `astimezone()`/`datetime.combine(` in `common/`, `runtimes/`, `dashboards/`, `scripts/`, `orchestration/`, `strategies/`. Three bugs, all fixed; `orchestration/auto_start/gate.py:118`'s `moment.astimezone()` reads the host offset **deliberately** (that is the mismatch it exists to detect — see D89); `Home.py:299`'s `datetime.now(_IST)` is aware and correct; the five `fromtimestamp(..., tz=…)` calls all pass an explicit tz; both `datetime.combine(` calls pass a tz; `pyotp.TOTP(secret).now()` is TOTP's own RFC counter. `dashboards/pages/`, `dashboards/data/` and `dashboards/intraday_stocks.py`: zero hits. No further production case exists. |
 | **D89** | **`test_a_matching_offset_counts_even_when_the_zone_name_differs` read the *real* host offset, so it asserted nothing on an IST Mac and failed on every other host** | Reported failure (UTC Linux): `assert gate.system_timezone_matches("Asia/Kolkata", at=_at(9, 0))` → `False`. Reproduced here in one command — `TZ=UTC .venv/bin/python -m pytest tests/unit/test_auto_start_gate.py` → 1 failed, 16 passed, at `tests/unit/test_auto_start_gate.py:136`. Root cause: the test patched `gate.system_timezone_name()` to `"Asia/Calcutta"` to force the decision onto its *offset* fallback, and `gate.py:118` then read the offset from `moment.astimezone()` — the machine. It passed only because this Mac is set to IST, which is the one value that makes the assertion true; its own module docstring already promised the opposite ("every case here is decided against an explicit, timezone-aware `now` rather than the real clock"). **The gate's production behaviour is correct and unchanged** — refusing to auto-start when the Mac's clock is not the configured zone is the whole point, since `launchd`'s `StartCalendarInterval` fires in the Mac's local zone. **Fix: an injectable seam, not a process-global `TZ` override.** The one host read moved into `gate.system_utcoffset(moment)`, which `system_timezone_matches` now calls; the test substitutes it exactly as it already substitutes `system_timezone_name`. Chosen over `TZ` + `time.tzset()` because that mutates process-global state every other module in the same interpreter shares, is POSIX-only, and needs teardown care — whereas this makes both host-derived inputs to a two-input decision reachable the same way, which is what the test needed and never had. Behaviour is byte-identical; no decision changes. Two further cases added while the seam was there, both previously unpinned: a genuinely different host zone must fail *both* checks (without it, a `system_timezone_matches` that ignored the offset entirely would satisfy the original test), and a `utcoffset()` of `None` must not count as agreement. **Audit of the rest of the file:** no other hidden dependency — every other case either passes `check_system_timezone=False` or patches `system_timezone_matches` wholesale, and `test_the_env_TZ_wins_when_set` sets `TZ` itself and only reads `os.environ`. Confirmed by the reproduction above naming one failure, not five. The file now passes identically under `TZ=UTC`, `TZ=America/New_York` and `TZ=Asia/Kolkata` (19 passed each). |
 | **D90** | **The two duplicate-worker end-to-end tests handed the holder an empty queue, so it released its lock 0.5 s after starting — when the contender lost that race the test passed a *second live worker for the same strategy*** | Reported: `test_duplicate_worker_startup_is_refused` and `test_a_live_mode_contender_is_still_refused_as_a_duplicate` (`tests/end_to_end/test_walking_skeleton.py`) failing in 2 of 6 Linux runs of the file alone. Root cause, confirmed in the source rather than inferred: the fixture path's loop is `candle_queue.get(timeout=_QUEUE_POLL_SECONDS)` with `_QUEUE_POLL_SECONDS = 0.5` (`runtimes/intraday_options/worker.py:130`, `:713`), and `queue.Empty` is its clean end-of-tape exit — so a holder given an empty `mp.Queue` gives its lock up half a second after it starts, while a `spawn` start routinely costs more than that. Both tests waited only for the holder's PID file and then *assumed* it still held the lock. **Not a production defect, and checked as one before concluding that:** the 0.5 s idle exit belongs to the Phase 1 fixture signal path (CLAUDE.md's test-only deterministic path); every real strategy runs `config.engine`/`config.multi_leg_engine`, which never reach this loop. No production file was changed. **Fail-first, by forcing the interleaving** — a throwaway copy of both tests with a single added 1.0 s delay before the contender starts (deleted immediately; `git status` clean afterwards) reproduced both reported symptoms on this Mac: the paper variant gave `assert 0 == 3` (`0 = get(timeout=5)`) — the contender had run to completion as a duplicate and exited *successfully*, which is the defect stated as plainly as it can be — and the live variant logged `acquired process lock identity=intraday_options.skelfix pid=2793` followed by the same line for `pid=2794`, then `ValidationError: strategy 'skelfix' is mode: live but sets no live_quantity_lots`, put nothing on its result queue, and failed with `queue.Empty`, matching the external report line for line. **Fixed** by removing the clock from the test rather than widening a margin: a picklable `_HeldFeed` whose `get()` ignores its timeout and blocks on a `spawn`-context `Event` (never a default-context primitive across a spawn boundary — D86) until the test releases it, then returns the `None` sentinel the worker already understands, so the lock is surrendered through the worker's own ordinary exit (holder exit code still `0`, PID file still removed). `holder.is_alive()` is now asserted both before the contender starts and after it exits, so "the holder still held the lock" is proven rather than assumed. The live contender was also given the **complete** live contract — the report named `live_quantity_lots`, but `ResolvedConfig._live_requires_a_complete_preflight_contract` (`common/config/models.py:464`) also requires `expected_static_ip`, `egress_ip_provider`, `max_preflight_age_seconds`, a rule for all four `RateLimitCallClass` values and all five `account_risk` fields — so the duplicate lock is now the only thing that can refuse it. **Every live gate stays false** (`global_live_trading_enabled`, `runtime_live_execution_allowed`, `strategy_live_approved`, `live_preflight_passed`), asserted in the test itself: a valid live *config* is not an approved live *run*, and `build_broker` still fails closed if the lock were ever to miss. **Proof:** a deliberate 3.0 s gap (6× the window that broke the old test) now passes, and 20 consecutive runs of the whole file passed 17/17 tests each. |
+| **D91** | **The launchd installer's tests stubbed one of `_preconditions`' two host facts and not the other, so 16 of them could only pass on a Mac already set to IST** | Found while verifying D88–D90 and fixed on a follow-up instruction, the launchd installer tests having been out of scope in the original report. Under `TZ=UTC` and `TZ=America/New_York` alike, 16 tests in `tests/unit/test_install_launch_agents.py` failed on assertions with nothing to do with timezones — `AssertionError: assert 'bootout' in []` and its neighbours — because `scripts/install_launch_agents.py::_preconditions` had already refused the install and returned before issuing a single `launchctl` command: `Refusing to install: this Mac's timezone is UTC, but auto_start expects Asia/Kolkata. launchd fires StartCalendarInterval in the Mac's local zone, so the 09:00 trigger would not be at the configured start time.` **Pre-existing and proven so, not assumed:** the working tree was stashed, the file re-run at `2cb5f38` under `TZ=UTC`, and the failing sets compared name by name — identical, 16 and 16 — so none of it was caused by D88–D90. Root cause is one omission with a precedent sitting three lines above it: `_preconditions` reads exactly two properties of the *host* — a legacy Trading_Automation system, and a clock matching the configured trading zone — and the test file's autouse `_no_legacy` fixture stubbed the first while nothing stubbed the second. Every test that reaches past the refusal list therefore depended silently on the developer's Mac being set to `Asia/Kolkata`. **The installer's behaviour is correct and unchanged** — refusing to make a mismatched Mac trade by itself is the entire reason the check exists — so the fix is a second autouse fixture, `_matching_system_timezone`, modelled on `_no_legacy` and patching `ila.system_timezone_matches` to `True`: "assume a correctly-configured Mac", which is what those tests were always written to mean. `test_install_refuses_on_a_system_timezone_mismatch` patches the same name in its own body, after the fixture, so the mismatch case still wins and is still pinned. **That pin was verified non-vacuous rather than trusted:** the production precondition was temporarily short-circuited, the refusal test failed as it must, and the file was restored byte-identical (`git diff` empty) and the test passed again — the same technique D86 used in reverse. The file now passes 36/36 identically under `TZ=UTC`, `TZ=America/New_York` and `TZ=Asia/Kolkata`. This is the fourth instance of the D89 class and the one that closes it: the full suite is now timezone-independent end to end. |
 
 #### D22 in detail: the rebuilt premium-candle mapping
 
@@ -13072,14 +13073,16 @@ gate, runtime or operational database was touched.
 
 ---
 
-## Maintenance: three defects from an external Linux run (20 September 2026)
+## Maintenance: four host-dependency defects (20 September 2026)
 
-Not a phase. Reported from a container running Python 3.11.15 against
+Not a phase. Three were reported from a container running Python 3.11.15 against
 `requirements.lock`, on `feature-paper-auto-start` at `2cb5f38`, with the clock in
-UTC. Two of the three are invisible on this Mac by construction — its clock is IST
-— and the third is a race this Mac's process scheduling happens to win. Decisions
-table: **D88**, **D89**, **D90**. No live gate, no production `EgressIpProvider`,
-no `mode: live` YAML, no runtime or operational database touched.
+UTC; the fourth was found while verifying them and fixed on a follow-up instruction.
+Two of the reported three are invisible on this Mac by construction — its clock is
+IST — and the third is a race this Mac's process scheduling happens to win.
+Decisions table: **D88**, **D89**, **D90**, **D91**. No live gate, no production
+`EgressIpProvider`, no `mode: live` YAML, no runtime or operational database
+touched.
 
 ### 1. The real bug: dashboards read the host's date, not the trading date (D88)
 
@@ -13296,27 +13299,22 @@ lock were ever to miss.
 **Proof.** A deliberate 3.0 s gap — 6× the window that broke the old test — passes.
 20 consecutive runs of the whole file: 17 passed, every run.
 
-### Verification
+### 4. The launchd installer's tests, found while verifying the other three (D91)
 
-| Command | Result |
-|---|---|
-| `.venv/bin/python -m pytest` | **3650 passed, 18 skipped** in 259.62s |
-| `TZ=UTC .venv/bin/python -m pytest` | 16 failed, 3634 passed, 18 skipped in 256.28s |
-| `TZ=America/New_York .venv/bin/python -m pytest` | 16 failed, 3634 passed, 18 skipped in 258.67s |
-| `.venv/bin/ruff check .` | **All checks passed!** |
-| `.venv/bin/mypy` | **Success: no issues found in 246 source files** |
-| `.venv/bin/ruff format --check .` | 168 files would be reformatted, 346 already formatted — see below |
+Not in the original report — the launchd plist/installer tests were explicitly out
+of scope there — but surfaced by this session's own `TZ=UTC` and
+`TZ=America/New_York` runs and fixed on a follow-up instruction. **The fourth
+instance of the D89 class, and the one that closes it.**
 
-**The 16 failures under both non-IST timezones are the same 16 tests, all in
-`tests/unit/test_install_launch_agents.py`, and they are pre-existing.** Proven,
-not assumed: the working tree was stashed, the file re-run at `2cb5f38` under
-`TZ=UTC`, and the failing set compared name by name — **identical, 16 and 16**. They
-are not caused by this work and none of them is one of the three defects above.
+Sixteen tests in `tests/unit/test_install_launch_agents.py` failed identically under
+both non-IST zones, on assertions with nothing to do with timezones:
 
-Their cause is a fourth instance of the D89 class, recorded here rather than fixed
-because the reporting session put the launchd plist/installer tests explicitly out
-of scope. The installer runs the real `auto_start` timezone preflight and correctly
-refuses on a mismatched machine —
+```
+tests/unit/test_install_launch_agents.py::test_a_first_time_install_succeeds_when_nothing_is_loaded
+AssertionError: assert 'bootout' in []
+```
+
+The captured stdout says why:
 
 ```
 Refusing to install:
@@ -13325,9 +13323,80 @@ Refusing to install:
     at the configured start time.
 ```
 
-— and the tests never stub that check, so they can only pass on a machine already
-set to IST. Production behaviour is correct; the fix is test-side and is exactly the
-shape of D89. **Open, by scope decision, not overlooked.**
+`scripts/install_launch_agents.py::_preconditions` had refused and returned before
+issuing a single `launchctl` command, so every test asserting on the command
+sequence saw an empty list.
+
+**Pre-existing, proven rather than assumed.** The working tree was stashed, the file
+re-run at `2cb5f38` under `TZ=UTC`, and the failing sets compared name by name —
+identical, 16 and 16. None of it was caused by D88–D90.
+
+**The omission had its own precedent three lines above it.** `_preconditions` reads
+exactly two properties of the *host*: a legacy Trading_Automation system, and a
+clock matching the configured trading zone. The test file's autouse `_no_legacy`
+fixture stubbed the first. Nothing stubbed the second, so every test that reaches
+past the refusal list depended silently on the developer's Mac being set to
+`Asia/Kolkata`.
+
+**The installer's behaviour is correct and was not changed** — refusing to make a
+mismatched Mac trade by itself is the entire reason the check exists. The fix is a
+second autouse fixture modelled on the first:
+
+```python
+@pytest.fixture(autouse=True)
+def _matching_system_timezone(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ila, "system_timezone_matches", lambda tz: True)
+```
+
+"Assume a correctly-configured Mac", which is what those sixteen tests were always
+written to mean. `test_install_refuses_on_a_system_timezone_mismatch` patches the
+same name in its own body, after the fixture, so the mismatch case still wins and
+is still pinned.
+
+**That pin was verified non-vacuous rather than trusted** — a stub that silences a
+check is worth nothing if the test guarding the check no longer fails when the check
+goes away. The production precondition was temporarily short-circuited; the refusal
+test failed, as it must; `scripts/install_launch_agents.py` was restored
+byte-identical (`git diff --stat` empty) and the test passed again. The same
+technique D86 used, applied in reverse.
+
+The file now passes **36/36 identically under `TZ=UTC`, `TZ=America/New_York` and
+`TZ=Asia/Kolkata`**.
+
+### Verification
+
+| Command | Before D91 | After D91 |
+|---|---|---|
+| `.venv/bin/python -m pytest` | 3650 passed, 18 skipped | **3650 passed, 18 skipped** (256.67s) |
+| `TZ=UTC .venv/bin/python -m pytest` | 16 failed, 3634 passed | **3650 passed, 18 skipped** (255.92s) |
+| `TZ=America/New_York .venv/bin/python -m pytest` | 16 failed, 3634 passed | **3650 passed, 18 skipped** (261.28s) — see the flakes below |
+| `.venv/bin/ruff check .` | | **All checks passed!** |
+| `.venv/bin/mypy` | | **Success: no issues found in 246 source files** |
+| `.venv/bin/ruff format --check .` | | 168 files would be reformatted, 346 already formatted — see below |
+
+**The suite is now timezone-independent**: identical under IST, UTC and
+America/New_York, with no remaining failure attributable to the host's clock.
+
+**Two pre-existing, load-sensitive flakes were found while proving that, and are
+recorded rather than hidden.** Six full `TZ=America/New_York` runs were made; four
+were clean and two each failed a *different* single test:
+
+| Test | Failure | Nature |
+|---|---|---|
+| `tests/end_to_end/test_supervisor.py::test_two_workers_receive_identical_bars` | `sqlite3.OperationalError: database is locked` in `repository.apply_fill`, surfacing as `assert {0, 1} == {0}` | two spawned workers contending for one SQLite file past the 5 s `busy_timeout` |
+| `tests/end_to_end/test_supervisor_signal.py::test_a_feed_that_cannot_be_closed_raises_an_alarm_an_operator_would_see` | `subprocess.TimeoutExpired` on a 60 s `communicate()` after SIGTERM | a real child process not shutting down inside the fixed timeout; that run took 333 s against a 261 s baseline, so the machine was loaded |
+
+Neither is a timezone dependency and neither is caused by this work: `git diff
+2cb5f38 HEAD --name-only` touches `dashboards/`, `orchestration/auto_start/gate.py`
+and four test files, none of which is on either test's code path. Both are
+timing/contention flakes in real-process end-to-end tests, visible only because this
+session ran the whole suite six times back to back.
+
+**Not fixed here, and deliberately not swept up**: they are outside the four defects
+this session was asked to close, and the first of them deserves a look on its own
+merits rather than a widened timeout — `apply_fill` losing a write to a locked
+database is a question about how two real workers share one operational database,
+not only about a test. Raised, not closed.
 
 `ruff format --check` is unchanged by this work, verified by comparison rather than
 asserted: this repository has never been `ruff format` clean (168 files, recorded in
@@ -13343,10 +13412,26 @@ extra file is the new test, and it is on the formatted side.
 
 No production file changed except `dashboards/_shared.py` and the three page
 entrypoints (D88) and the `system_utcoffset` extraction in
-`orchestration/auto_start/gate.py` (D89, behaviour-identical). No test was weakened,
-skipped, deselected or deleted — three tests were added to
-`tests/unit/test_auto_start_gate.py`, four to `tests/unit/test_dashboard_apptest.py`,
-one parametrised guard to `tests/unit/test_dashboard.py`, and a new
-`tests/unit/test_dashboard_trading_date.py`. No live gate was flipped, no production
-`EgressIpProvider` was added or chosen, no `mode: live` reached any committed YAML,
-and `OPERATIONAL LIVE ACTIVATION ELIGIBLE` remains **NO — BLOCKED**.
+`orchestration/auto_start/gate.py` (D89, behaviour-identical). D90 and D91 are
+entirely test-side: `runtimes/intraday_options/worker.py` and
+`scripts/install_launch_agents.py` are both unchanged from `2cb5f38`, the latter
+verified byte-identical after being temporarily short-circuited for D91's
+non-vacuity proof.
+
+No test was weakened, skipped, deselected or deleted — every change adds coverage or
+removes a dependency on the machine the suite happens to run on. Three tests added
+to `tests/unit/test_auto_start_gate.py`, four to
+`tests/unit/test_dashboard_apptest.py`, one parametrised guard to
+`tests/unit/test_dashboard.py`, one autouse fixture to
+`tests/unit/test_install_launch_agents.py`, and a new
+`tests/unit/test_dashboard_trading_date.py`.
+
+**Still out of scope, and still unverifiable here:** the remainder of the
+originally-reported launchd plist/installer failures that are genuinely macOS-only —
+they need a real `launchctl` and a real `/etc/localtime` layout, so a Mac cannot
+reproduce them and this session never saw them. Only the 16 that were a *timezone*
+dependency are closed (D91).
+
+No live gate was flipped, no production `EgressIpProvider` was added or chosen, no
+`mode: live` reached any committed YAML, and `OPERATIONAL LIVE ACTIVATION ELIGIBLE`
+remains **NO — BLOCKED**.

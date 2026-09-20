@@ -88,6 +88,38 @@ def _no_legacy(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ila, "legacy_system_status", lambda: _Clear())
 
 
+@pytest.fixture(autouse=True)
+def _matching_system_timezone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The second machine fact ``_preconditions`` reads, stubbed like the first.
+
+    ``_preconditions`` refuses an install on either of two properties of the
+    *host*: a legacy Trading_Automation system (stubbed clear by
+    :func:`_no_legacy` above) and a clock that is not the configured trading
+    zone. Only the first was ever stubbed, so every test below that reaches
+    past the refusal list silently depended on the developer's Mac being set
+    to Asia/Kolkata. On any other host — the reporting Linux container in UTC,
+    or this Mac under ``TZ=America/New_York`` — the installer correctly
+    refused, printed
+
+        this Mac's timezone is UTC, but auto_start expects Asia/Kolkata.
+        launchd fires StartCalendarInterval in the Mac's local zone, so the
+        09:00 trigger would not be at the configured start time.
+
+    and returned before issuing a single ``launchctl`` command, so 16 tests
+    failed on assertions like ``assert 'bootout' in []`` that have nothing to
+    do with timezones (D91).
+
+    The installer's behaviour is right and is not changed — refusing to make a
+    mismatched Mac trade by itself is the whole reason the check exists, and
+    :func:`test_install_refuses_on_a_system_timezone_mismatch` pins that it
+    still happens. This fixture only says "assume a correctly-configured Mac"
+    for the tests whose subject is `launchctl` sequencing, which is what they
+    were always written to mean. That test patches the same name in its own
+    body, after this fixture, so its mismatch still wins.
+    """
+    monkeypatch.setattr(ila, "system_timezone_matches", lambda tz: True)
+
+
 def _args(**overrides):
     import argparse
 
