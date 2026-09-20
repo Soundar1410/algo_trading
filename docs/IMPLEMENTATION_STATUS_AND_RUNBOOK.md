@@ -2611,6 +2611,7 @@ guard. See deviation D6.
 | **D87** | **Hard-coded fixture expiries versus a real-clock `nearest_expiry()` — one reported test, and the same defect behind all 65 "pre-existing" failures and the "separate `multiprocessing` deadlock" this runbook had already accepted as unrelated** | Reported: `tests/unit/test_engine_worker_contract_resolution.py::test_the_selector_and_the_resolver_agree_on_the_expiry` failing since 12 August 2026 with `ScripMasterError: Every listed NIFTY expiry is before <today>`. **That one was already fixed too**, in `3de9602` (13 August 2026): the test pins `common.market_data.scrip_master.now_ist` to 2026-08-01 09:30 IST and `_seed_cache()` imports `now_ist` from that same module namespace so cache and resolver share one frozen "today". Its docstring said the fixture's newest expiry was 2026-08-04; the newest *option* expiry is 2026-08-11 (2026-08-04 is the newest FUTIDX) — corrected, with the reason 2026-08-01 is the right pin recorded (it precedes all three OPTIDX expiries, so the resolver still has a real choice and the "no expiry configured → resolver picks one → selector agrees" path is genuinely exercised). **The audit is where the value was.** The same class of bomb was live in six more places, and was the root cause of the 65 failures and the hang recorded in the 31 August and 8 September entries. The mechanism: `runtimes/positional_options/worker.py:285` builds a bare `DhanOptionChainResolver(scrip_master)` purely to read `lot_size`, and that calls `nearest_expiry()` with **no** date, so it resolves against the **real** wall clock — inside a *spawned* worker, where no `monkeypatch` in the pytest process can reach it — while the strategy's own `nearest_expiry(on=entry_local_date)` correctly uses the simulated 2026-08-19. Masters listing only a 2026-08-26 (or 2026-08-24) expiry therefore read as stale to one caller and fine to the other, from 27 August onward. Fixed by listing a second, never-traded sentinel series **computed from the clock, never written down** — a literal future date only resets the bomb, which is exactly what `_positional_multi_strategy_fixtures.py`'s own `_FIXTURE_EXPIRY = "2030-12-25"` (with a comment admitting it) would have done on 2030-12-26. Shared helper `staleness_sentinel_rows()` in `_weekly_delta_neutral_fixtures.py`, used by `test_weekly_delta_neutral_{entry,restart,lot_size,expiry_day}.py`; duplicated deliberately in `tests/unit/test_dashboard_positional_real_data.py`, because pytest puts only a test file's own directory on `sys.path`, so a unit test cannot import an integration helper. The sentinel is strictly later than the traded expiry, so every dated lookup — including the Monday-shift test's whole subject, that nearest-after-2026-08-19 is 2026-08-24 — is unchanged, and its security ids are deliberately distinct so a lookup that wrongly reached it fails loudly instead of passing. **The "deadlock" was never a deadlock.** `test_positional_runtime_weekly_staged_entry.py` was recorded on 31 August as "a separate, real `multiprocessing` deadlock (confirmed via `lsof`: no network activity, blocked on IPC pipes, zero CPU for over an hour)" and deselected ever since. It was the same stale master: the spawned worker died during construction and the parent blocked forever on a worker that would never report. It now passes in **4.26 s**. **Result: 65 pre-existing failures + 1 indefinite hang → 3 failures, no hang**, full suite 3619 passed / 3 failed / 18 skipped. **Audit verdicts for every other real-clock read in `tests/`** (101 across 46 files): safe. `test_scrip_master.py` passes explicit `on=`/`today=` everywhere (its one bare call is inside a `now_ist` patch); `test_dhan_adapter.py`'s `datetime.now(UTC)` feeds the epoch/ISO branches of `reconstruct_exchange_time`, which ignore `received_at`; `OffsetClock(offset=… - now_ist())` in the positional and weekly suites is relative by construction; `test_rolling_strangle_otm1_dashboard.py` writes and reads the same `date.today()`; `tests/smoke/test_live_feed_smoke.py` is opt-in behind `ALGO_LIVE_SMOKE=1` and reading the real clock is correct there; `_seed_cache`'s three other callers pass an explicit `expiry=`, which `DhanOptionChainResolver.__init__` honours without calling `nearest_expiry()` at all. **Two further defects, both unmasked by the fix above and both closed:** the last 3 failures, all in `test_dashboard_positional_real_data.py`, had been hidden behind the `ScripMasterError` and were *two* stacked defects, neither a time bomb. (1) Alone among its four sibling suites this file never pinned `volatility_gate: {method: displacement}`, so the post-2026-09 `method: realized` default could never fill its 60-sample window from a handful of scripted ticks and no cycle ever entered; pinned, the cycle and all four legs are genuinely written (verified directly against the database). (2) `discover_strategy_options()` admits a strategy only via a config entry or a healthy heartbeat — its docstring records the deliberate removal of the old "left a trace in the trade tables" third condition, which is exactly what this fixture had relied on — so the picker was empty and the page rendered "Select a strategy above to see its cycles." Closed by having the fixture `record_heartbeat(health_state="RUNNING_PAPER")` after the engine run, which is what a real paper worker does; `config_root=None` is deliberate here (this module's subject is real data read through `run_bounded`, not config discovery), so the heartbeat is the branch that has to exist. Date-independent by construction: `_HEALTHY_STATES` matches on the `health_state` column alone and never compares a beat's age against the clock, so this introduces no new bomb. **Final: 0 failures, 0 hangs.** |
 | **D88** | **Three dashboard pages opened with a naive `date.today()`, so on any non-IST host every page showed the *previous* trading day for the whole 00:00–05:30 IST window** | Reported from the same external Linux run as D86/D87 (Python 3.11.15, `requirements.lock`, container clock in UTC, `feature-paper-auto-start` at `2cb5f38`): `tests/unit/test_dashboard_apptest.py::test_the_baskets_tab_shows_a_basket_and_its_legs` failing with `AssertionError: the Baskets tab rendered no leg table for a real basket/leg fixture`, and passing under `TZ=Asia/Kolkata`. **A real production bug, not a test artefact.** The fixture wrote its basket under `datetime.now(ist).date()` while `dashboards/Home.py:578`, `dashboards/intraday_options.py:1010` and `dashboards/system_health.py:250` each read `date.today()` — the *machine's* local date. IST and the host agree only on a machine set to IST; on a UTC host they are different days from 00:00 to 05:30 IST, so for the first 5.5 hours of every calendar day every page would have queried yesterday — yesterday's positions, P&L, orders and incidents — with nothing on screen to say so. That matters beyond the test suite: the SEBI static-IP requirement points controlled-live at a cloud VPS, which is UTC by default. Same bug class as `8bd41ae` (the UTC-vs-IST entry gate). In `intraday_options.py` the same value also seeds every "Yesterday"/"Last 7/30 trading days" preset through `_resolve_date_range`, so all four date presets were shifted with it. **Fixed** with one shared `dashboards/_shared.trading_date_today()` — `timeutils.local_date_in(timeutils.now_tz(tz_name))`, no new time helper, exactly the pair `dashboards/positional_options.py` had already been using privately and which now serves the whole package (its `_today_ist()` delegates to it, so there is one definition of "today", not two). `tz_name` defaults to `timeutils.DEFAULT_TZ` rather than loading YAML — a dashboard must degrade to a message, not raise `ConfigError` — and a test pins `config/global.yaml`'s `global.timezone` to that constant so the two cannot drift. **Fail-first, three ways, none reading the wall clock.** (1) The reported test itself, made deterministic: its fixture now writes under a frozen instant (2026-09-14 00:30 IST = 2026-09-13 19:00 UTC, deliberately in the *past* so no real clock can ever coincide with it) with `TZ=UTC` + `tzset()` and `common.utils.timeutils.now_tz` pinned — it then reproduced the reported `AssertionError` verbatim **on this IST Mac**, where it had always passed, and passes with the fix. (2) A new parametrised `test_every_page_scopes_its_queries_to_the_ist_trading_date` records what each of the three pages hands to `load_snapshot`: `Home.py`/`intraday_options.py`/`system_health.py` each queried `['2026-09-20']` (the host's answer) instead of `2026-09-14`. (3) A structural AST guard in `tests/unit/test_dashboard.py`, parametrised over every module under `dashboards/` like the existing broker/feed/`subprocess` guards, rejecting `date.today()`/`datetime.today()`/`utcnow()`/zero-argument `datetime.now()` — it named exactly the three reported files and no others, and covers the *next* page for free. **Audit, independent of the report:** every `date.today()`/`datetime.now()`/`.now()`/`.today()`/`utcnow`/`time.localtime`/`fromtimestamp(`/bare `astimezone()`/`datetime.combine(` in `common/`, `runtimes/`, `dashboards/`, `scripts/`, `orchestration/`, `strategies/`. Three bugs, all fixed; `orchestration/auto_start/gate.py:118`'s `moment.astimezone()` reads the host offset **deliberately** (that is the mismatch it exists to detect — see D89); `Home.py:299`'s `datetime.now(_IST)` is aware and correct; the five `fromtimestamp(..., tz=…)` calls all pass an explicit tz; both `datetime.combine(` calls pass a tz; `pyotp.TOTP(secret).now()` is TOTP's own RFC counter. `dashboards/pages/`, `dashboards/data/` and `dashboards/intraday_stocks.py`: zero hits. No further production case exists. |
 | **D89** | **`test_a_matching_offset_counts_even_when_the_zone_name_differs` read the *real* host offset, so it asserted nothing on an IST Mac and failed on every other host** | Reported failure (UTC Linux): `assert gate.system_timezone_matches("Asia/Kolkata", at=_at(9, 0))` → `False`. Reproduced here in one command — `TZ=UTC .venv/bin/python -m pytest tests/unit/test_auto_start_gate.py` → 1 failed, 16 passed, at `tests/unit/test_auto_start_gate.py:136`. Root cause: the test patched `gate.system_timezone_name()` to `"Asia/Calcutta"` to force the decision onto its *offset* fallback, and `gate.py:118` then read the offset from `moment.astimezone()` — the machine. It passed only because this Mac is set to IST, which is the one value that makes the assertion true; its own module docstring already promised the opposite ("every case here is decided against an explicit, timezone-aware `now` rather than the real clock"). **The gate's production behaviour is correct and unchanged** — refusing to auto-start when the Mac's clock is not the configured zone is the whole point, since `launchd`'s `StartCalendarInterval` fires in the Mac's local zone. **Fix: an injectable seam, not a process-global `TZ` override.** The one host read moved into `gate.system_utcoffset(moment)`, which `system_timezone_matches` now calls; the test substitutes it exactly as it already substitutes `system_timezone_name`. Chosen over `TZ` + `time.tzset()` because that mutates process-global state every other module in the same interpreter shares, is POSIX-only, and needs teardown care — whereas this makes both host-derived inputs to a two-input decision reachable the same way, which is what the test needed and never had. Behaviour is byte-identical; no decision changes. Two further cases added while the seam was there, both previously unpinned: a genuinely different host zone must fail *both* checks (without it, a `system_timezone_matches` that ignored the offset entirely would satisfy the original test), and a `utcoffset()` of `None` must not count as agreement. **Audit of the rest of the file:** no other hidden dependency — every other case either passes `check_system_timezone=False` or patches `system_timezone_matches` wholesale, and `test_the_env_TZ_wins_when_set` sets `TZ` itself and only reads `os.environ`. Confirmed by the reproduction above naming one failure, not five. The file now passes identically under `TZ=UTC`, `TZ=America/New_York` and `TZ=Asia/Kolkata` (19 passed each). |
+| **D90** | **The two duplicate-worker end-to-end tests handed the holder an empty queue, so it released its lock 0.5 s after starting — when the contender lost that race the test passed a *second live worker for the same strategy*** | Reported: `test_duplicate_worker_startup_is_refused` and `test_a_live_mode_contender_is_still_refused_as_a_duplicate` (`tests/end_to_end/test_walking_skeleton.py`) failing in 2 of 6 Linux runs of the file alone. Root cause, confirmed in the source rather than inferred: the fixture path's loop is `candle_queue.get(timeout=_QUEUE_POLL_SECONDS)` with `_QUEUE_POLL_SECONDS = 0.5` (`runtimes/intraday_options/worker.py:130`, `:713`), and `queue.Empty` is its clean end-of-tape exit — so a holder given an empty `mp.Queue` gives its lock up half a second after it starts, while a `spawn` start routinely costs more than that. Both tests waited only for the holder's PID file and then *assumed* it still held the lock. **Not a production defect, and checked as one before concluding that:** the 0.5 s idle exit belongs to the Phase 1 fixture signal path (CLAUDE.md's test-only deterministic path); every real strategy runs `config.engine`/`config.multi_leg_engine`, which never reach this loop. No production file was changed. **Fail-first, by forcing the interleaving** — a throwaway copy of both tests with a single added 1.0 s delay before the contender starts (deleted immediately; `git status` clean afterwards) reproduced both reported symptoms on this Mac: the paper variant gave `assert 0 == 3` (`0 = get(timeout=5)`) — the contender had run to completion as a duplicate and exited *successfully*, which is the defect stated as plainly as it can be — and the live variant logged `acquired process lock identity=intraday_options.skelfix pid=2793` followed by the same line for `pid=2794`, then `ValidationError: strategy 'skelfix' is mode: live but sets no live_quantity_lots`, put nothing on its result queue, and failed with `queue.Empty`, matching the external report line for line. **Fixed** by removing the clock from the test rather than widening a margin: a picklable `_HeldFeed` whose `get()` ignores its timeout and blocks on a `spawn`-context `Event` (never a default-context primitive across a spawn boundary — D86) until the test releases it, then returns the `None` sentinel the worker already understands, so the lock is surrendered through the worker's own ordinary exit (holder exit code still `0`, PID file still removed). `holder.is_alive()` is now asserted both before the contender starts and after it exits, so "the holder still held the lock" is proven rather than assumed. The live contender was also given the **complete** live contract — the report named `live_quantity_lots`, but `ResolvedConfig._live_requires_a_complete_preflight_contract` (`common/config/models.py:464`) also requires `expected_static_ip`, `egress_ip_provider`, `max_preflight_age_seconds`, a rule for all four `RateLimitCallClass` values and all five `account_risk` fields — so the duplicate lock is now the only thing that can refuse it. **Every live gate stays false** (`global_live_trading_enabled`, `runtime_live_execution_allowed`, `strategy_live_approved`, `live_preflight_passed`), asserted in the test itself: a valid live *config* is not an approved live *run*, and `build_broker` still fails closed if the lock were ever to miss. **Proof:** a deliberate 3.0 s gap (6× the window that broke the old test) now passes, and 20 consecutive runs of the whole file passed 17/17 tests each. |
 
 #### D22 in detail: the rebuilt premium-candle mapping
 
@@ -13221,3 +13222,131 @@ itself and only reads `os.environ`; the reproduction above naming one failure an
 not five is the confirmation. The file now passes identically under `TZ=UTC`,
 `TZ=America/New_York` and `TZ=Asia/Kolkata` — 19 passed each.
 
+### 3. The duplicate-worker race (D90)
+
+`test_duplicate_worker_startup_is_refused` and
+`test_a_live_mode_contender_is_still_refused_as_a_duplicate`, 2 failures in 6 Linux
+runs of `tests/end_to_end/test_walking_skeleton.py` alone.
+
+Root cause, read out of the source rather than inferred. The fixture path's loop is
+
+```python
+item = candle_queue.get(timeout=_QUEUE_POLL_SECONDS)  # worker.py:713
+```
+
+with `_QUEUE_POLL_SECONDS = 0.5` (`worker.py:130`), and `queue.Empty` is its clean
+end-of-tape exit. Both tests handed the holder an **empty** `mp.Queue`, so the
+holder released its lock half a second after starting, while a `spawn` start
+routinely costs more than that. Both tests waited only for the holder's PID file and
+then *assumed* the lock was still held.
+
+**Checked as a production defect before being concluded not to be one.** The 0.5 s
+idle exit belongs to the Phase 1 fixture signal path — CLAUDE.md's test-only
+deterministic path. Every real strategy runs `config.engine` or
+`config.multi_leg_engine`, neither of which reaches this loop. **No production file
+was changed.**
+
+**Fail-first by forcing the interleaving.** A throwaway copy of both tests, with a
+single added 1.0 s delay before the contender starts, run on this Mac and deleted
+immediately afterwards (`git status` clean, nothing committed, no committed test
+weakened at any point). Both reported symptoms reproduced:
+
+```
+# paper variant
+>       assert contender_result.get(timeout=5) == EXIT_DUPLICATE
+E       assert 0 == 3
+E        +  where 0 = get(timeout=5)
+
+# live variant
+INFO  common.process.locks acquired process lock identity=intraday_options.skelfix pid=2793
+INFO  common.process.locks acquired process lock identity=intraday_options.skelfix pid=2794
+ValidationError: strategy 'skelfix' is mode: live but sets no live_quantity_lots
+_queue.Empty
+```
+
+The paper variant is the defect stated as plainly as it can be: `assert 0 == 3` — a
+second worker for the same strategy had run to completion and exited **successfully**,
+and the gate test passed it. The live variant matches the external report line for
+line: two different PIDs both acquiring the same lock, then a crash before anything
+reached the result queue.
+
+**The fix removes the clock from the test rather than widening a margin.** A
+picklable `_HeldFeed` whose `get()` ignores its timeout and blocks on an `Event`
+until the test releases it, then returns the `None` sentinel the worker already
+understands — so the lock is surrendered through the worker's own ordinary exit path
+(holder exit code still `0`, PID file still removed). The `Event` comes from the
+same `spawn` context as the processes; a default-context primitive crossing a spawn
+boundary is D86. `holder.is_alive()` is now asserted both immediately before the
+contender starts and again after it exits, so "the holder still held the lock" is
+proven rather than assumed.
+
+The live contender was also given the **complete** live contract. The report named
+`live_quantity_lots`, but `ResolvedConfig._live_requires_a_complete_preflight_contract`
+(`common/config/models.py:464`) also requires `expected_static_ip`,
+`egress_ip_provider`, `max_preflight_age_seconds`, a rule for all four
+`RateLimitCallClass` values and all five `account_risk` fields — so the old
+contender was an invalid config that could only ever be "refused" by winning a race.
+With the contract satisfied, the duplicate lock is the only thing left that can
+refuse it. **Not one live gate is opened**, and the test asserts that itself:
+`global_live_trading_enabled`, `runtime_live_execution_allowed`,
+`strategy_live_approved` and `live_preflight_passed` all stay false, so a valid live
+*config* is still not an approved live *run* and `build_broker` fails closed if the
+lock were ever to miss.
+
+**Proof.** A deliberate 3.0 s gap — 6× the window that broke the old test — passes.
+20 consecutive runs of the whole file: 17 passed, every run.
+
+### Verification
+
+| Command | Result |
+|---|---|
+| `.venv/bin/python -m pytest` | **3650 passed, 18 skipped** in 259.62s |
+| `TZ=UTC .venv/bin/python -m pytest` | 16 failed, 3634 passed, 18 skipped in 256.28s |
+| `TZ=America/New_York .venv/bin/python -m pytest` | 16 failed, 3634 passed, 18 skipped in 258.67s |
+| `.venv/bin/ruff check .` | **All checks passed!** |
+| `.venv/bin/mypy` | **Success: no issues found in 246 source files** |
+| `.venv/bin/ruff format --check .` | 168 files would be reformatted, 346 already formatted — see below |
+
+**The 16 failures under both non-IST timezones are the same 16 tests, all in
+`tests/unit/test_install_launch_agents.py`, and they are pre-existing.** Proven,
+not assumed: the working tree was stashed, the file re-run at `2cb5f38` under
+`TZ=UTC`, and the failing set compared name by name — **identical, 16 and 16**. They
+are not caused by this work and none of them is one of the three defects above.
+
+Their cause is a fourth instance of the D89 class, recorded here rather than fixed
+because the reporting session put the launchd plist/installer tests explicitly out
+of scope. The installer runs the real `auto_start` timezone preflight and correctly
+refuses on a mismatched machine —
+
+```
+Refusing to install:
+  - this Mac's timezone is UTC, but auto_start expects Asia/Kolkata. launchd fires
+    StartCalendarInterval in the Mac's local zone, so the 09:00 trigger would not be
+    at the configured start time.
+```
+
+— and the tests never stub that check, so they can only pass on a machine already
+set to IST. Production behaviour is correct; the fix is test-side and is exactly the
+shape of D89. **Open, by scope decision, not overlooked.**
+
+`ruff format --check` is unchanged by this work, verified by comparison rather than
+asserted: this repository has never been `ruff format` clean (168 files, recorded in
+the D87 entry), and the unformatted set at `2cb5f38` and in the working tree is the
+same 168 files. Every file touched here that was already unformatted at HEAD stayed
+exactly as it was — reformatting 168 files remains out of scope — and both the new
+`tests/unit/test_dashboard_trading_date.py` and the block added to
+`tests/unit/test_dashboard.py` are clean. The counts line up exactly: 168
+unformatted + 345 formatted = 513 files at HEAD, and 168 + 346 = 514 now — the one
+extra file is the new test, and it is on the formatted side.
+
+### Not done here
+
+No production file changed except `dashboards/_shared.py` and the three page
+entrypoints (D88) and the `system_utcoffset` extraction in
+`orchestration/auto_start/gate.py` (D89, behaviour-identical). No test was weakened,
+skipped, deselected or deleted — three tests were added to
+`tests/unit/test_auto_start_gate.py`, four to `tests/unit/test_dashboard_apptest.py`,
+one parametrised guard to `tests/unit/test_dashboard.py`, and a new
+`tests/unit/test_dashboard_trading_date.py`. No live gate was flipped, no production
+`EgressIpProvider` was added or chosen, no `mode: live` reached any committed YAML,
+and `OPERATIONAL LIVE ACTIVATION ELIGIBLE` remains **NO — BLOCKED**.

@@ -319,6 +319,46 @@ def _spawn_worker(config: WorkerConfig, feed_queue, result_queue) -> None:
     result_queue.put(outcome.exit_code)
 
 
+class _HeldFeed:
+    """A candle feed that keeps its worker alive until the test releases it.
+
+    The duplicate-refusal tests below need the first worker to *still hold the
+    lock* while the second one tries to start. Handing it an ordinary empty
+    queue does not achieve that, and the way it fails is silent: the fixture
+    path's loop is ``candle_queue.get(timeout=_QUEUE_POLL_SECONDS)`` with
+    ``_QUEUE_POLL_SECONDS = 0.5`` (``runtimes/intraday_options/worker.py``),
+    and ``queue.Empty`` is its clean end-of-tape exit — so a holder given an
+    empty queue releases its lock **half a second** after it starts. A `spawn`
+    context start costs more than that often enough on Linux that the reporting
+    run saw it in 2 of 6 attempts: holder pid 1886 acquired the lock, and
+    contender pid 1887 then logged ``acquired process lock
+    identity=intraday_options.skelfix`` too, because by the time it got there
+    the lock was free. The assertion that was supposed to catch a duplicate
+    instead read ``assert 0 == 3`` — a second worker for the same strategy had
+    run to completion and exited cleanly.
+
+    This removes the clock from the test entirely rather than widening a
+    margin. ``get`` ignores its timeout and blocks on an :class:`Event` until
+    :meth:`release` is called, then returns the ``None`` shutdown sentinel the
+    worker already understands, so the lock is given up through the worker's
+    own ordinary exit path — the holder's exit code is still ``0`` and it still
+    removes its PID file.
+
+    The ``Event`` must come from the caller's ``spawn`` context, never the
+    default one: a fork-context primitive crossing a spawn boundary is D86.
+    """
+
+    def __init__(self, release_event) -> None:
+        self._release = release_event
+
+    def get(self, timeout: float | None = None):
+        self._release.wait()
+        return None  # the shutdown sentinel: stop cleanly, release the lock
+
+    def release(self) -> None:
+        self._release.set()
+
+
 def test_duplicate_worker_startup_is_refused(worker_config, database_path):
     """Gate: 'duplicate worker startup is refused'.
 
@@ -331,13 +371,13 @@ def test_duplicate_worker_startup_is_refused(worker_config, database_path):
     database.close()
 
     context = mp.get_context("spawn")
-    holder_queue = context.Queue()
+    holder_feed = _HeldFeed(context.Event())
     holder_result = context.Queue()
     contender_queue = context.Queue()
     contender_result = context.Queue()
 
     holder = context.Process(
-        target=_spawn_worker, args=(worker_config, holder_queue, holder_result)
+        target=_spawn_worker, args=(worker_config, holder_feed, holder_result)
     )
     holder.start()
 
@@ -356,6 +396,10 @@ def test_duplicate_worker_startup_is_refused(worker_config, database_path):
     assert owner_pid == holder.pid
     assert owner_pid != os.getpid()
 
+    # The subject of the test, asserted rather than assumed: a holder that has
+    # already exited proves nothing about a duplicate (D90).
+    assert holder.is_alive(), "the holder exited before the contender could contend"
+
     contender = context.Process(
         target=_spawn_worker, args=(worker_config, contender_queue, contender_result)
     )
@@ -364,6 +408,7 @@ def test_duplicate_worker_startup_is_refused(worker_config, database_path):
 
     assert contender.pid != holder.pid, "the two workers must be separate processes"
     assert not contender.is_alive()
+    assert holder.is_alive(), "the holder must still have held the lock throughout"
     assert contender_result.get(timeout=5) == EXIT_DUPLICATE
 
     # The refused worker must not have written anything.
@@ -374,7 +419,7 @@ def test_duplicate_worker_startup_is_refused(worker_config, database_path):
     assert sessions == 1, "the refused worker opened a session it should never have opened"
 
     # Release the first worker and confirm the refusal left it unharmed.
-    holder_queue.put(None)
+    holder_feed.release()
     holder.join(timeout=30)
     assert holder_result.get(timeout=5) == 0
     assert not pid_file.exists(), "a cleanly exited worker must remove its PID file"
@@ -388,19 +433,35 @@ def test_a_live_mode_contender_is_still_refused_as_a_duplicate(worker_config, da
     proven here with real spawned processes, mirroring
     ``test_duplicate_worker_startup_is_refused`` above but with the contender's
     *mode* varied instead of using the identical config twice.
+
+    The contender's live configuration is deliberately **complete and valid**
+    (D90). ``replace(worker_config, execution_mode=LIVE)`` alone predates
+    ``ResolvedConfig._live_requires_a_complete_preflight_contract``, so this
+    contender used to be an invalid config that could not survive
+    ``_run_locked`` at all: when it lost the race for the lock it was refused
+    (the test passed), and when it won it died in ``resolved_config_from_worker``
+    with ``ValidationError: strategy 'skelfix' is mode: live but sets no
+    live_quantity_lots``, put nothing on its result queue, and the test failed
+    with ``queue.Empty`` — a validation error dressed up as a lock test. With
+    the contract satisfied, the duplicate lock is the only thing left that can
+    refuse it.
+
+    Every live **gate** stays false, so this remains fail-closed: if the lock
+    ever failed to refuse, ``build_broker`` would deny a live broker (and the
+    assertions below would fail) rather than a real one being constructed.
     """
     database = Database(database_path)
     MigrationRunner(database).run_pending()
     database.close()
 
     context = mp.get_context("spawn")
-    holder_queue = context.Queue()
+    holder_feed = _HeldFeed(context.Event())
     holder_result = context.Queue()
     contender_queue = context.Queue()
     contender_result = context.Queue()
 
     holder = context.Process(
-        target=_spawn_worker, args=(worker_config, holder_queue, holder_result)
+        target=_spawn_worker, args=(worker_config, holder_feed, holder_result)
     )
     holder.start()
 
@@ -411,8 +472,37 @@ def test_a_live_mode_contender_is_still_refused_as_a_duplicate(worker_config, da
         holder.join(timeout=0.1)
         waited += 0.1
     assert pid_file.exists(), "first worker never acquired its lock"
+    assert holder.is_alive(), "the holder exited before the contender could contend"
 
-    live_contender_config = replace(worker_config, execution_mode=ExecutionMode.LIVE)
+    live_contender_config = replace(
+        worker_config,
+        execution_mode=ExecutionMode.LIVE,
+        # The complete live contract — everything ResolvedConfig demands the
+        # moment a strategy says `mode: live`, and nothing more. Values mirror
+        # tests/unit/test_live_runtime.py's own valid-live example.
+        live_quantity_lots=1,
+        live_expected_static_ip="203.0.113.10",
+        live_egress_ip_provider="tests.fake:provider",
+        live_max_preflight_age_seconds=60,
+        live_rate_limit_rules=(
+            ("new_order", 5, 1),
+            ("modify", 5, 1),
+            ("cancel", 5, 1),
+            ("read", 50, 1),
+        ),
+        live_max_daily_loss=5_000.0,
+        live_max_open_positions=1,
+        live_max_open_legs=1,
+        live_max_deployed_capital=100_000.0,
+        live_max_mtm_age_seconds=60,
+    )
+    # Not one live gate is opened: a valid live *config* is not an approved
+    # live *run*, and this test must never be the thing that makes one possible.
+    assert not live_contender_config.global_live_trading_enabled
+    assert not live_contender_config.runtime_live_execution_allowed
+    assert not live_contender_config.strategy_live_approved
+    assert not live_contender_config.live_preflight_passed
+
     contender = context.Process(
         target=_spawn_worker,
         args=(live_contender_config, contender_queue, contender_result),
@@ -421,6 +511,7 @@ def test_a_live_mode_contender_is_still_refused_as_a_duplicate(worker_config, da
     contender.join(timeout=30)
 
     assert not contender.is_alive()
+    assert holder.is_alive(), "the holder must still have held the lock throughout"
     assert contender_result.get(timeout=5) == EXIT_DUPLICATE
 
     # The live-mode contender never even reached the live gate in build_broker
@@ -431,7 +522,7 @@ def test_a_live_mode_contender_is_still_refused_as_a_duplicate(worker_config, da
     ).fetchone()[0]
     assert sessions == 1, "the refused live-mode contender opened a session it should never have"
 
-    holder_queue.put(None)
+    holder_feed.release()
     holder.join(timeout=30)
     assert holder_result.get(timeout=5) == 0
 
