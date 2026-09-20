@@ -2900,7 +2900,39 @@ Do not build a universal engine.
 - Paper/live records and P&L separated in the shared group database.
 - Duplicate-worker prevention.
 - Paper workers allowed while live gates remain globally disabled.
-- Add positional options and intraday stocks one at a time; keep positional stocks a placeholder.
+- Add positional options and intraday stocks one at a time. Positional stocks is no
+  longer a placeholder — see "Positional stocks" below for its scoped shape.
+
+#### Positional stocks — scoped, paper only
+
+Superseding the "keep positional stocks a placeholder" bullet above (20 September
+2026, deviation D93). The placeholder held while nothing consumed the group; it now
+has one approved consumer.
+
+- Runtime id `positional_stocks`; database `data/operational/positional_stocks.db`;
+  reports under `data/reports/positional_stocks/`.
+- Engine kind: the already-reserved `stock_portfolio_engine`. **No new `EngineKind`
+  value** — cadence is not an engine shape, and "Do not build a universal engine"
+  (above) applies.
+- **Execution shape: a run-to-completion weekly batch job, in two modes.** `fetch`
+  refreshes the local cache and writes a preview report; `decide` reads only that
+  cache and makes **no Dhan call of any kind**. Each mode takes its **own process
+  lock** so two runs cannot overlap, then exits. There is **no supervisor, no worker
+  and no market feed** — this is the first group in this document that is not a
+  long-lived supervisor with workers under it.
+- **Scheduling is this group's own.** Two dedicated LaunchAgents — a fetch/preview
+  job and an offline decision job — run it. It is deliberately **not** registered in
+  `scripts/_runtimes.py::RUNTIMES` and does not go through
+  `orchestration.auto_start`; no shared auto-start code changes for it. The
+  supervisor/worker process table and the one-feed-connection-per-runtime
+  allocation above therefore do not apply to this group at all.
+- **Paper only.** Live execution is out of scope for this group; every live gate
+  stays fail-closed, and enabling it operationally needs separate approval.
+- Persistence: new `stock_`-prefixed tables in additive migrations. The positional
+  *options* cycle tables (`0010`–`0015`) are not altered and not reused — they permit
+  one open cycle per strategy and key identity on an option expiry.
+- One approved strategy: `wsr1_weekly_stochrsi`. Authoritative specification:
+  `strategies/positional_stocks/wsr1_weekly_stochrsi/WSR1_WEEKLY_STOCH_RSI_SPEC.md`.
 
 #### Phase 6 — Paper recovery and expiry handling
 

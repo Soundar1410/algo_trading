@@ -28,6 +28,28 @@
   room. See docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md for both root causes and
   the cutover sequencing (rename only with a flat book and the supervisor
   stopped — recovery filters strictly by the current `strategy_id`).
+- New runtime `positional_stocks` (approved 20 September 2026, Phase 0 only).
+  One strategy, `wsr1_weekly_stochrsi`, engine kind `stock_portfolio_engine`
+  (the already-reserved `EngineKind` value — do **not** add a new one). It is a
+  **run-to-completion weekly batch job** in two modes (`fetch`, `decide`): no tick
+  feed, no supervisor, no worker. It takes its **own process lock**, and `decide`
+  makes no Dhan call at all. **It is scheduled by its own two LaunchAgents, has no
+  `scripts/_runtimes.py::RUNTIMES` entry, and must never be routed through
+  `orchestration.auto_start`** — do not add a registry entry and do not modify
+  shared auto-start code for it. Both plists ship **generated but uninstalled**;
+  nothing runs on a schedule until the operator installs and enables them.
+  **PAPER ONLY**, and shipped `enabled: false` at both the runtime and strategy
+  layer. Authoritative spec: `strategies/positional_stocks/wsr1_weekly_stochrsi/
+  WSR1_WEEKLY_STOCH_RSI_SPEC.md`; architecture doc section "Positional stocks —
+  scoped, paper only". **The approval covers Phase 0 (documents) only** — each
+  later phase in that spec's section 15 needs its own approval before any code,
+  config, migration or test is written.
+- `config/runtimes/<id>.yaml` and `config/strategies/<id>/*.yaml` for a new runtime
+  must land in the **same commit**. `common/config/loader.py`'s
+  `resolve_runtime_strategies` scans all of `config/strategies/**` and raises for a
+  strategy whose runtime file is missing — every supervisor calls it, so a
+  strategy-file-only commit stops `intraday_options` and `positional_options` from
+  starting at all. Verified 20 September 2026, not hypothetical.
 - Additional real strategies require separate approval per strategy. Live
   order placement stays fail-closed until Phase 10.
 - Reuse Trading_Automation engines/policies read-only. Port their regression tests BEFORE changing internals. Never create a runtime dependency on that repo. Never copy its secrets, DBs, tokens, or logs.
