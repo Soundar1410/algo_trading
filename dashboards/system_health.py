@@ -34,7 +34,12 @@ for _parent in Path(__file__).resolve().parents:
             sys.path.insert(0, str(_parent))
         break
 
-from dashboards._shared import SnapshotUnavailable, load_snapshot, run_bounded  # noqa: E402
+from dashboards._shared import (  # noqa: E402
+    SnapshotUnavailable,
+    load_snapshot,
+    run_bounded,
+    trading_date_today,
+)
 from dashboards.data.account import (  # noqa: E402
     ConfigUnavailable,
     LiveGateMatrix,
@@ -234,8 +239,6 @@ def render(streamlit: Any, result: SystemHealthView | SnapshotUnavailable) -> No
 
 
 def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
-    import datetime as _dt
-
     import streamlit as st
 
     from common.config import load_paths, load_settings
@@ -247,7 +250,7 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
     settings = load_settings()
     runtime_id = "intraday_options"
     database_path = paths.database_path(runtime_id)
-    trading_date = _dt.date.today().isoformat()
+    trading_date = trading_date_today().isoformat()
 
     if "sh_auto_refresh" not in st.session_state:
         st.session_state["sh_auto_refresh"] = True

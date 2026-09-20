@@ -39,7 +39,12 @@ for _parent in Path(__file__).resolve().parents:
             sys.path.insert(0, str(_parent))
         break
 
-from dashboards._shared import SnapshotUnavailable, load_snapshot, run_bounded  # noqa: E402
+from dashboards._shared import (  # noqa: E402
+    SnapshotUnavailable,
+    load_snapshot,
+    run_bounded,
+    trading_date_today,
+)
 from dashboards.data.intraday_options import load_errors  # noqa: E402
 from dashboards.data.positional import (  # noqa: E402
     NOT_CONFIGURED,
@@ -528,9 +533,10 @@ def _resolve_display_cycle(
 
 
 def _today_ist() -> str:
-    from common.utils.timeutils import local_date_in, now_ist
-
-    return local_date_in(now_ist()).isoformat()
+    """This page's trading date. Was the only page that already resolved it
+    in IST; since D88 the whole package shares that one definition rather
+    than keeping two spellings of it."""
+    return trading_date_today().isoformat()
 
 
 def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`

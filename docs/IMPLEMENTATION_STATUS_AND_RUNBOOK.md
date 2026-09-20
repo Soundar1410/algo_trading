@@ -2609,6 +2609,7 @@ guard. See deviation D6.
 | **D85** | **`legacy_guard.py`'s launchd check collapsed "confirmed not loaded" and "`launchctl` unavailable/errored/timed out" into the same `False`, directly contradicting the "Fail-closed" comment already sitting at its own call site** | Also raised independently and verified, not assumed correct or wrong going in. `runtimes/intraday_options/__main__.py`'s call site carried (and still carries) the comment "Fail-closed — a legacy system that cannot be determined either way is not 'not detected'" directly above `if legacy_status.active:` — but `_launchd_label_loaded`'s `except (OSError, subprocess.TimeoutExpired)` branch returned the same `False` that a confirmed-`returncode != 0` result did, and `LegacySystemStatus.active` was `launchd_label_loaded or process_running`, a plain boolean OR with no way to distinguish the two. `tests/unit/test_legacy_guard.py::test_launchctl_unavailable_is_reported_not_raised` even pinned the collapsed value directly (`launchd_label_loaded is False`) as expected behaviour — the contradiction was built-in and tested as if it were correct. Fixed with a new `LaunchdLabelState(StrEnum)` (`ACTIVE`/`INACTIVE`/`UNKNOWN`, the same pattern as `common/health/heartbeat.py::HealthState`) replacing the boolean: `LegacySystemStatus.active` is now `launchd_state is not INACTIVE or process_running` — `ACTIVE` and `UNKNOWN` both refuse, only a confirmed `INACTIVE` plus no independently-detected process allows a start. A new `undetermined` property (`UNKNOWN` and no process found) lets both call sites (`runtimes/intraday_options/__main__.py`, `scripts/validate_environment.py::_check_legacy_system`) give the operator a "state could not be determined... resolve why launchctl could not be queried" message distinct from a confirmed "appears active... unload it first" one, and stop `validate_environment` printing "OK: legacy Trading_Automation system not detected" for a check that was never actually able to run. Fail-first, and stronger than a per-test assertion failure: run against the unmodified module, every test file that imports the new `LaunchdLabelState` symbol — `test_legacy_guard.py`, `test_intraday_options_main.py`, and a new `tests/unit/test_validate_environment.py` (the call site had no dedicated test file before this) — fails to even collect (`ImportError: cannot import name 'LaunchdLabelState'`), confirmed directly by stashing the source changes and re-running with the test changes in place. The fix is structurally required before any of these tests can execute at all, not just to make one assertion pass. The existing mount-root/process-scan matching tests (`test_this_repositorys_own_process_does_not_match` and neighbours) and the plist-label real-machine tests are untouched — this fix is scoped to the launchd signal only, per the original verification finding. Not a reopening of any existing "known limitation" either — like D84, this was never previously recorded as an open gap; both defects existed since D81/D82 first built these modules in this same Phase 8 and are closed within it, never having reached a released phase boundary as documented limitations. |
 | **D86** | **`BoundedWorkerQueue` built its multiprocessing queue from the *default* start-method context, so every queue handed to a `spawn`ed worker was a fork-context queue on Linux — 22 end-to-end tests failed there while all of them passed on macOS** | Reported from an external Linux run (Python 3.11.15, `requirements.lock`): `RuntimeError: A SemLock created in a fork context is being shared with a process in a spawn context.`, 16 failures in `tests/end_to_end/test_supervisor.py`, 5 in `test_supervisor_signal.py`, 1 in `test_mode_separation.py`. Root cause: `common/feed/queues.py` used a bare `MPQueue(maxsize=self.max_depth)`, which takes the platform default — `fork` on Linux, `spawn` on macOS — while both supervisors create workers with `mp.get_context("spawn")` (`runtimes/intraday_options/supervisor.py`, `runtimes/positional_options/supervisor.py`), and their control queues already used the spawn context explicitly. **The production fix was already in the tree**: commit `176d0c4` (13 August 2026) replaced that line with `mp.get_context("spawn").Queue(maxsize=self.max_depth)`; `git merge-base --is-ancestor 176d0c4 HEAD` confirms it, and the line/column numbers in the external report match the *pre-fix* file byte for byte, so that run was made against a checkout older than 13 August. What was genuinely missing was a regression test: the `get_context("spawn")` call reads as redundant on macOS, so a one-line revert would re-open the defect with every local test still green. Added `tests/unit/test_bounded_worker_queue_start_method.py`, which drives `_bounded_worker_queue_start_method_child.py` in a fresh interpreter (`set_start_method` is process-global and irreversible, so it must not run inside pytest — the same isolation `test_notification_guard_spawn.py` already uses), forces `fork`, builds a `BoundedWorkerQueue` through the production path, and hands its raw queue to a `get_context("spawn").Process`. **Fail-first proven, not assumed** (the D76 standard): because HEAD is already correct, the proof was run the other way — line 175 was reverted to `mp.Queue(...)`, the new test then failed on macOS with the exact reported `RuntimeError` raised from `synchronize.py:107 __getstate__` during `child.start()`; the line was restored (`git diff HEAD` empty, byte-identical) and the test passed again. **Audit, zero further cases:** every multiprocessing primitive constructed anywhere in `runtimes/`, `common/`, `scripts/`, `ui/` already uses an explicit spawn context — `queues.py:175`, `intraday_options/supervisor.py:526` and `:563`, `positional_options/supervisor.py:309` and `:382` — and no `Event`/`Lock`/`Value`/`Manager`/`Pipe` is constructed in the runtime tree at all. No production file changed. |
 | **D87** | **Hard-coded fixture expiries versus a real-clock `nearest_expiry()` — one reported test, and the same defect behind all 65 "pre-existing" failures and the "separate `multiprocessing` deadlock" this runbook had already accepted as unrelated** | Reported: `tests/unit/test_engine_worker_contract_resolution.py::test_the_selector_and_the_resolver_agree_on_the_expiry` failing since 12 August 2026 with `ScripMasterError: Every listed NIFTY expiry is before <today>`. **That one was already fixed too**, in `3de9602` (13 August 2026): the test pins `common.market_data.scrip_master.now_ist` to 2026-08-01 09:30 IST and `_seed_cache()` imports `now_ist` from that same module namespace so cache and resolver share one frozen "today". Its docstring said the fixture's newest expiry was 2026-08-04; the newest *option* expiry is 2026-08-11 (2026-08-04 is the newest FUTIDX) — corrected, with the reason 2026-08-01 is the right pin recorded (it precedes all three OPTIDX expiries, so the resolver still has a real choice and the "no expiry configured → resolver picks one → selector agrees" path is genuinely exercised). **The audit is where the value was.** The same class of bomb was live in six more places, and was the root cause of the 65 failures and the hang recorded in the 31 August and 8 September entries. The mechanism: `runtimes/positional_options/worker.py:285` builds a bare `DhanOptionChainResolver(scrip_master)` purely to read `lot_size`, and that calls `nearest_expiry()` with **no** date, so it resolves against the **real** wall clock — inside a *spawned* worker, where no `monkeypatch` in the pytest process can reach it — while the strategy's own `nearest_expiry(on=entry_local_date)` correctly uses the simulated 2026-08-19. Masters listing only a 2026-08-26 (or 2026-08-24) expiry therefore read as stale to one caller and fine to the other, from 27 August onward. Fixed by listing a second, never-traded sentinel series **computed from the clock, never written down** — a literal future date only resets the bomb, which is exactly what `_positional_multi_strategy_fixtures.py`'s own `_FIXTURE_EXPIRY = "2030-12-25"` (with a comment admitting it) would have done on 2030-12-26. Shared helper `staleness_sentinel_rows()` in `_weekly_delta_neutral_fixtures.py`, used by `test_weekly_delta_neutral_{entry,restart,lot_size,expiry_day}.py`; duplicated deliberately in `tests/unit/test_dashboard_positional_real_data.py`, because pytest puts only a test file's own directory on `sys.path`, so a unit test cannot import an integration helper. The sentinel is strictly later than the traded expiry, so every dated lookup — including the Monday-shift test's whole subject, that nearest-after-2026-08-19 is 2026-08-24 — is unchanged, and its security ids are deliberately distinct so a lookup that wrongly reached it fails loudly instead of passing. **The "deadlock" was never a deadlock.** `test_positional_runtime_weekly_staged_entry.py` was recorded on 31 August as "a separate, real `multiprocessing` deadlock (confirmed via `lsof`: no network activity, blocked on IPC pipes, zero CPU for over an hour)" and deselected ever since. It was the same stale master: the spawned worker died during construction and the parent blocked forever on a worker that would never report. It now passes in **4.26 s**. **Result: 65 pre-existing failures + 1 indefinite hang → 3 failures, no hang**, full suite 3619 passed / 3 failed / 18 skipped. **Audit verdicts for every other real-clock read in `tests/`** (101 across 46 files): safe. `test_scrip_master.py` passes explicit `on=`/`today=` everywhere (its one bare call is inside a `now_ist` patch); `test_dhan_adapter.py`'s `datetime.now(UTC)` feeds the epoch/ISO branches of `reconstruct_exchange_time`, which ignore `received_at`; `OffsetClock(offset=… - now_ist())` in the positional and weekly suites is relative by construction; `test_rolling_strangle_otm1_dashboard.py` writes and reads the same `date.today()`; `tests/smoke/test_live_feed_smoke.py` is opt-in behind `ALGO_LIVE_SMOKE=1` and reading the real clock is correct there; `_seed_cache`'s three other callers pass an explicit `expiry=`, which `DhanOptionChainResolver.__init__` honours without calling `nearest_expiry()` at all. **Two further defects, both unmasked by the fix above and both closed:** the last 3 failures, all in `test_dashboard_positional_real_data.py`, had been hidden behind the `ScripMasterError` and were *two* stacked defects, neither a time bomb. (1) Alone among its four sibling suites this file never pinned `volatility_gate: {method: displacement}`, so the post-2026-09 `method: realized` default could never fill its 60-sample window from a handful of scripted ticks and no cycle ever entered; pinned, the cycle and all four legs are genuinely written (verified directly against the database). (2) `discover_strategy_options()` admits a strategy only via a config entry or a healthy heartbeat — its docstring records the deliberate removal of the old "left a trace in the trade tables" third condition, which is exactly what this fixture had relied on — so the picker was empty and the page rendered "Select a strategy above to see its cycles." Closed by having the fixture `record_heartbeat(health_state="RUNNING_PAPER")` after the engine run, which is what a real paper worker does; `config_root=None` is deliberate here (this module's subject is real data read through `run_bounded`, not config discovery), so the heartbeat is the branch that has to exist. Date-independent by construction: `_HEALTHY_STATES` matches on the `health_state` column alone and never compares a beat's age against the clock, so this introduces no new bomb. **Final: 0 failures, 0 hangs.** |
+| **D88** | **Three dashboard pages opened with a naive `date.today()`, so on any non-IST host every page showed the *previous* trading day for the whole 00:00–05:30 IST window** | Reported from the same external Linux run as D86/D87 (Python 3.11.15, `requirements.lock`, container clock in UTC, `feature-paper-auto-start` at `2cb5f38`): `tests/unit/test_dashboard_apptest.py::test_the_baskets_tab_shows_a_basket_and_its_legs` failing with `AssertionError: the Baskets tab rendered no leg table for a real basket/leg fixture`, and passing under `TZ=Asia/Kolkata`. **A real production bug, not a test artefact.** The fixture wrote its basket under `datetime.now(ist).date()` while `dashboards/Home.py:578`, `dashboards/intraday_options.py:1010` and `dashboards/system_health.py:250` each read `date.today()` — the *machine's* local date. IST and the host agree only on a machine set to IST; on a UTC host they are different days from 00:00 to 05:30 IST, so for the first 5.5 hours of every calendar day every page would have queried yesterday — yesterday's positions, P&L, orders and incidents — with nothing on screen to say so. That matters beyond the test suite: the SEBI static-IP requirement points controlled-live at a cloud VPS, which is UTC by default. Same bug class as `8bd41ae` (the UTC-vs-IST entry gate). In `intraday_options.py` the same value also seeds every "Yesterday"/"Last 7/30 trading days" preset through `_resolve_date_range`, so all four date presets were shifted with it. **Fixed** with one shared `dashboards/_shared.trading_date_today()` — `timeutils.local_date_in(timeutils.now_tz(tz_name))`, no new time helper, exactly the pair `dashboards/positional_options.py` had already been using privately and which now serves the whole package (its `_today_ist()` delegates to it, so there is one definition of "today", not two). `tz_name` defaults to `timeutils.DEFAULT_TZ` rather than loading YAML — a dashboard must degrade to a message, not raise `ConfigError` — and a test pins `config/global.yaml`'s `global.timezone` to that constant so the two cannot drift. **Fail-first, three ways, none reading the wall clock.** (1) The reported test itself, made deterministic: its fixture now writes under a frozen instant (2026-09-14 00:30 IST = 2026-09-13 19:00 UTC, deliberately in the *past* so no real clock can ever coincide with it) with `TZ=UTC` + `tzset()` and `common.utils.timeutils.now_tz` pinned — it then reproduced the reported `AssertionError` verbatim **on this IST Mac**, where it had always passed, and passes with the fix. (2) A new parametrised `test_every_page_scopes_its_queries_to_the_ist_trading_date` records what each of the three pages hands to `load_snapshot`: `Home.py`/`intraday_options.py`/`system_health.py` each queried `['2026-09-20']` (the host's answer) instead of `2026-09-14`. (3) A structural AST guard in `tests/unit/test_dashboard.py`, parametrised over every module under `dashboards/` like the existing broker/feed/`subprocess` guards, rejecting `date.today()`/`datetime.today()`/`utcnow()`/zero-argument `datetime.now()` — it named exactly the three reported files and no others, and covers the *next* page for free. **Audit, independent of the report:** every `date.today()`/`datetime.now()`/`.now()`/`.today()`/`utcnow`/`time.localtime`/`fromtimestamp(`/bare `astimezone()`/`datetime.combine(` in `common/`, `runtimes/`, `dashboards/`, `scripts/`, `orchestration/`, `strategies/`. Three bugs, all fixed; `orchestration/auto_start/gate.py:118`'s `moment.astimezone()` reads the host offset **deliberately** (that is the mismatch it exists to detect — see D89); `Home.py:299`'s `datetime.now(_IST)` is aware and correct; the five `fromtimestamp(..., tz=…)` calls all pass an explicit tz; both `datetime.combine(` calls pass a tz; `pyotp.TOTP(secret).now()` is TOTP's own RFC counter. `dashboards/pages/`, `dashboards/data/` and `dashboards/intraday_stocks.py`: zero hits. No further production case exists. |
 
 #### D22 in detail: the rebuilt premium-candle mapping
 
@@ -13066,3 +13067,109 @@ reverted and restored byte-identically during the fail-first proof and is
 unchanged from `HEAD`. `nearest_expiry()` raising on a stale master is correct,
 deliberate D35 behaviour and was not touched; every fix is test-side. No live
 gate, runtime or operational database was touched.
+
+---
+
+## Maintenance: three defects from an external Linux run (20 September 2026)
+
+Not a phase. Reported from a container running Python 3.11.15 against
+`requirements.lock`, on `feature-paper-auto-start` at `2cb5f38`, with the clock in
+UTC. Two of the three are invisible on this Mac by construction — its clock is IST
+— and the third is a race this Mac's process scheduling happens to win. Decisions
+table: **D88**, **D89**, **D90**. No live gate, no production `EgressIpProvider`,
+no `mode: live` YAML, no runtime or operational database touched.
+
+### 1. The real bug: dashboards read the host's date, not the trading date (D88)
+
+```
+tests/unit/test_dashboard_apptest.py::test_the_baskets_tab_shows_a_basket_and_its_legs
+AssertionError: the Baskets tab rendered no leg table for a real basket/leg fixture
+```
+
+Passes under `TZ=Asia/Kolkata`; fails under UTC. The fixture wrote its basket under
+`datetime.now(ist).date()`; the page read `date.today()`.
+
+Three production call sites, all in a page's `main()`:
+
+| | |
+|---|---|
+| `dashboards/Home.py:578` | `trading_date = date.today().isoformat()` |
+| `dashboards/intraday_options.py:1010` | `today = date.today()` |
+| `dashboards/system_health.py:250` | `trading_date = _dt.date.today().isoformat()` |
+
+`date.today()` is the **machine's** local date. It equals the IST trading date only
+on a machine set to IST. On a UTC host the two are different days from 00:00 to
+05:30 IST, so for the first 5.5 hours of every calendar day every page would have
+shown the previous session — positions, P&L, orders, incidents — with nothing on
+screen saying so. The SEBI static-IP requirement points controlled-live at a cloud
+VPS, and a cloud VPS is UTC by default. This is the same bug class as `8bd41ae`, the
+UTC-vs-IST entry gate.
+
+In `intraday_options.py` that one value also seeds `_resolve_date_range`, so
+"Today", "Yesterday", "Last 7 trading days" and "Last 30 trading days" were all
+shifted with it.
+
+**The audit came before the fix**, over `common/`, `runtimes/`, `dashboards/`,
+`scripts/`, `orchestration/` and `strategies/`, for `date.today()`,
+`datetime.now()`, `.now()`, `.today()`, `utcnow`, `time.localtime`,
+`fromtimestamp(`, a bare `astimezone()` and `datetime.combine(`:
+
+| Hit | Verdict |
+|---|---|
+| The three call sites above | **bug — fixed** |
+| `dashboards/positional_options.py:530` `_today_ist()` | already correct (`local_date_in(now_ist())`) — the pattern generalised |
+| `orchestration/auto_start/gate.py:118` `moment.astimezone()` | **correct by design**: it reads the host offset on purpose, to detect a mismatched machine (D89) |
+| `dashboards/Home.py:299` `datetime.now(_IST)` | aware, correct |
+| `live_rate_limiter.py:41`, `retention/logs.py:77`, `market_data/dhan.py:306`, `market_data/option_chain.py:304`, `warmup/historical.py:114` | safe — every `fromtimestamp` passes an explicit `tz` |
+| `market_data/dhan.py:327`, `utils/timeutils.py:57` `datetime.combine(` | safe — explicit tz |
+| `authentication/totp.py:49` `pyotp.TOTP(secret).now()` | TOTP's own RFC counter, not a wall-clock read |
+| `dashboards/pages/`, `dashboards/data/`, `dashboards/intraday_stocks.py` | zero hits |
+
+Exactly the three reported sites. No further production case exists.
+
+**The fix** is one shared helper, `dashboards/_shared.trading_date_today()`:
+
+```python
+def trading_date_today(tz_name: str = timeutils.DEFAULT_TZ) -> date:
+    return timeutils.local_date_in(timeutils.now_tz(tz_name), tz_name)
+```
+
+No second time helper: that is `common.utils.timeutils`'s existing pair, which
+`dashboards/positional_options.py` had already been using privately — its
+`_today_ist()` now delegates here, so the package has one definition of "today"
+rather than two. `timeutils` is reached through the module rather than by name so a
+test can pin the clock at this single seam.
+
+`tz_name` defaults to `timeutils.DEFAULT_TZ` rather than loading `global.timezone`
+from YAML. A dashboard's contract is to degrade to a message, never to raise, and a
+`ConfigError` reaching a date computation on five pages buys nothing while the two
+values agree — so `tests/unit/test_dashboard_trading_date.py` asserts
+`config/global.yaml`'s `global.timezone == DEFAULT_TZ` instead, and the parameter is
+the one place a future non-IST configuration gets wired in.
+
+**Fail-first (D76), three ways, none of which reads the wall clock.** Every one was
+run against the unmodified pages first and the output recorded.
+
+*Frozen instant:* 2026-09-14 00:30 IST = 2026-09-13 19:00 UTC — inside the window
+the bug lived in, and deliberately in the **past**, because a frozen date that
+happened to equal the real one would let a page reading the host clock pass by
+coincidence. The wall clock only ever moves away from it, so these tests say the
+same thing on any host on any day.
+
+1. **The reported test itself, made deterministic.** Its fixture now writes under
+   the frozen date, with `TZ=UTC` + `tzset()` and `common.utils.timeutils.now_tz`
+   pinned. Against the unfixed pages it reproduced the reported failure verbatim
+   **on this IST Mac**, where it had always passed:
+   `AssertionError: the Baskets tab rendered no leg table for a real basket/leg fixture`.
+2. **Per page.** `test_every_page_scopes_its_queries_to_the_ist_trading_date`
+   records what each page hands to `load_snapshot`. Unfixed, all three answered
+   `['2026-09-20']` — the host's date — where `2026-09-14` was the trading date.
+   One behavioural proof per fixed call site: a fix to one line says nothing about
+   the other two.
+3. **Structural.** An AST guard in `tests/unit/test_dashboard.py`, parametrised over
+   every module under `dashboards/` exactly like the existing broker/feed/
+   `subprocess` guards, rejecting `date.today()`, `datetime.today()`, `utcnow()` and
+   a zero-argument `datetime.now()` — a call *with* a tzinfo argument stays legal.
+   It named the three reported files and nothing else, and covers the next page and
+   the next read-model module for free.
+

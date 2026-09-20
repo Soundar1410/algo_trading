@@ -60,7 +60,12 @@ for _parent in Path(__file__).resolve().parents:
             sys.path.insert(0, str(_parent))
         break
 
-from dashboards._shared import SnapshotUnavailable, load_snapshot, run_bounded  # noqa: E402
+from dashboards._shared import (  # noqa: E402
+    SnapshotUnavailable,
+    load_snapshot,
+    run_bounded,
+    trading_date_today,
+)
 from dashboards.data import positional as positional_data  # noqa: E402
 from dashboards.data import stocks as stocks_data  # noqa: E402
 from dashboards.data.account import (  # noqa: E402
@@ -575,7 +580,7 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
             st.rerun()
 
     paths = load_paths()
-    trading_date = date.today().isoformat()
+    trading_date = trading_date_today().isoformat()
 
     @st.fragment(
         run_every=(

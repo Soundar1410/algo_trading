@@ -129,6 +129,56 @@ def test_no_dashboard_module_imports_subprocess_or_os_system(path: Path):
     assert "subprocess" not in imported, f"{path.name} imports subprocess"
 
 
+def _host_clock_reads(path: Path) -> list[str]:
+    """Every call in ``path`` that answers "what time is it?" from the *host*.
+
+    ``date.today()``, ``datetime.today()``, ``datetime.utcnow()`` and a
+    zero-argument ``datetime.now()`` all resolve against the machine's own
+    local zone (or, for ``utcnow``, a naive UTC) — never the exchange's. A
+    call with an explicit tzinfo argument (``datetime.now(_IST)``, which
+    ``Home.py`` uses legitimately) is a different thing and is allowed.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        attr = node.func.attr
+        if attr in {"today", "utcnow"} or (attr == "now" and not node.args and not node.keywords):
+            found.append(f"{ast.unparse(node)} (line {node.lineno})")
+    return found
+
+
+@pytest.mark.parametrize(
+    "path", PAGE_MODULE_FILES, ids=lambda p: str(p.relative_to(DASHBOARDS_DIR))
+)
+def test_no_dashboard_module_reads_the_host_local_date(path: Path):
+    """Regression (D88): a dashboard's "today" is the **IST trading date**,
+    never the host's.
+
+    ``dashboards/Home.py``, ``dashboards/intraday_options.py`` and
+    ``dashboards/system_health.py`` each opened their page with a naive
+    ``date.today()``. On any non-IST host — a UTC cloud VPS, which the SEBI
+    static-IP requirement points this project at — every page therefore showed
+    the *previous* trading day between 00:00 and 05:30 IST: the whole first
+    5.5 hours of every calendar day. It was found on a Linux container in UTC,
+    where ``test_dashboard_apptest.py``'s Baskets test reported "the Baskets
+    tab rendered no leg table for a real basket/leg fixture" because the
+    fixture wrote under the IST date and the page queried the host's.
+
+    A behavioural test per page proves the three fixed call sites
+    (``test_dashboard_apptest.py``). This one is the cheap structural guard
+    that also covers the *next* page and the next read-model module, where no
+    behavioural test exists yet — the same argument the import guards above
+    are made on. Use ``dashboards._shared.trading_date_today()``.
+    """
+    reads = _host_clock_reads(path)
+    assert not reads, (
+        f"{path.relative_to(DASHBOARDS_DIR)} reads the host clock: {', '.join(reads)}. "
+        "Use dashboards._shared.trading_date_today() — see D88."
+    )
+
+
 def test_the_dashboards_directory_is_what_we_think_it_is():
     """Guards the parametrisation above: an empty/short glob would pass
     everything trivially, the same guard test_scripts_are_read_only.py uses

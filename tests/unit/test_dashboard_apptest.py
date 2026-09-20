@@ -15,7 +15,12 @@ never resolve to this repository's real ``data/operational/`` database.
 
 from __future__ import annotations
 
+import os
+import time as _time
+from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 from streamlit.testing.v1 import AppTest
@@ -24,6 +29,65 @@ from common.persistence import Database, MigrationRunner
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DASHBOARDS_DIR = REPO_ROOT / "dashboards"
+
+# ============================================= the IST trading date (D88)
+#: A pre-dawn IST instant, deliberately in the **past**.
+#:
+#: 00:30 IST on 2026-09-14 is 19:00 UTC on 2026-09-13 — the IST date and the
+#: host's date are different days, which is the whole 00:00 to 05:30 IST window
+#: in which the reported bug showed. Past, not "today", because a frozen date
+#: that happened to equal the real one would let a page reading the *host*
+#: clock pass by coincidence: the wall clock only ever moves away from this
+#: instant, so these tests say the same thing on any host on any day.
+FROZEN_UTC = datetime(2026, 9, 13, 19, 0, tzinfo=UTC)
+FROZEN_IST_DATE = "2026-09-14"
+#: What the host would answer at that instant with its clock set to UTC.
+FROZEN_HOST_DATE = "2026-09-13"
+
+
+def _frozen_now_tz(tz_name: str = "Asia/Kolkata") -> datetime:
+    return FROZEN_UTC.astimezone(ZoneInfo(tz_name))
+
+
+@pytest.fixture
+def frozen_pre_dawn_ist(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
+    """Pin every dashboard "now" to :data:`FROZEN_UTC`, host clock in UTC.
+
+    Two halves, and both are needed to make the bug deterministic rather than
+    a coincidence of when the suite happens to run:
+
+    * ``common.utils.timeutils.now_tz`` is pinned, which is the *only* clock
+      ``dashboards._shared.trading_date_today()`` reads (it calls it through
+      the module, so a patch here reaches it — the same seam
+      ``tests/unit/test_scrip_master.py`` uses on that module's ``now_ist``).
+      ``AppTest`` re-executes a page's source on every ``run()``, but its
+      ``import`` statements resolve out of ``sys.modules``, so the patch
+      survives into the page.
+    * ``TZ`` is forced to UTC (with ``tzset()``, without which libc keeps the
+      zone it already parsed), so a page reading the *host* clock gets a
+      genuinely different answer, exactly as it did on the Linux container
+      this was reported from.
+    """
+    previous_tz = os.environ.get("TZ")
+    os.environ["TZ"] = "UTC"
+    if hasattr(_time, "tzset"):
+        _time.tzset()
+
+    from common.utils import timeutils
+
+    monkeypatch.setattr(timeutils, "now_tz", _frozen_now_tz)
+    try:
+        yield FROZEN_IST_DATE
+    finally:
+        # Restored here rather than via monkeypatch.setenv: this fixture's
+        # teardown runs *before* monkeypatch's own undo, so tzset() would
+        # otherwise re-parse the UTC that had not been put back yet.
+        if previous_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous_tz
+        if hasattr(_time, "tzset"):
+            _time.tzset()
 
 
 def _write(path: Path, content: str) -> None:
@@ -272,10 +336,16 @@ def test_no_page_writes_to_the_database(project_root: Path, page: str):
 
 @pytest.fixture
 def project_root_with_a_straddle_920_basket(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, frozen_pre_dawn_ist: str
 ) -> Path:
     """One straddle_920 basket with an open CE leg and a closed (adjusted)
-    PE leg — enough to exercise the Baskets tab's drill-down for real."""
+    PE leg — enough to exercise the Baskets tab's drill-down for real.
+
+    Written under the **frozen IST trading date**, not ``datetime.now(ist)``:
+    this fixture used the real clock until D88, which is precisely how the
+    page-side bug hid on an IST developer machine. See
+    :func:`frozen_pre_dawn_ist`.
+    """
     _write(
         tmp_path / "config" / "global.yaml",
         "global:\n  live_trading_enabled: false\n  timezone: Asia/Kolkata\n"
@@ -292,9 +362,6 @@ def project_root_with_a_straddle_920_basket(
         "enabled: true\nmode: paper\nlive_approved: false\nengine: multi_leg_engine\n",
     )
 
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-
     from common.config.models import ExecutionMode
     from common.execution import ExecutionRepository
 
@@ -302,8 +369,7 @@ def project_root_with_a_straddle_920_basket(
     database = Database(database_path)
     MigrationRunner(database).run_pending()
     repository = ExecutionRepository(database)
-    ist = ZoneInfo("Asia/Kolkata")
-    trading_date = datetime.now(ist).date().isoformat()
+    trading_date = frozen_pre_dawn_ist
     basket_id = f"straddle_920:{trading_date}"
 
     repository.upsert_strategy_basket(
@@ -399,6 +465,47 @@ def test_the_baskets_tab_shows_a_basket_and_its_legs(
     assert tables, "the Baskets tab rendered no leg table for a real basket/leg fixture"
     rendered_roles = {row["Role"] for table in tables for row in table.value.to_dict("records")}
     assert rendered_roles == {"CE", "PE"}
+
+
+@pytest.mark.parametrize("page", ["Home.py", "intraday_options.py", "system_health.py"])
+def test_every_page_scopes_its_queries_to_the_ist_trading_date(
+    project_root: Path, frozen_pre_dawn_ist: str, monkeypatch: pytest.MonkeyPatch, page: str
+):
+    """Regression (D88): the three pages that opened with ``date.today()``.
+
+    The Baskets test above proves the fix end to end for
+    ``intraday_options.py``, but each of the three call sites is its own line
+    of code and a fix to one says nothing about the others — so each page is
+    checked directly, at the point where the date actually reaches a query.
+    Every one of them funnels its trading date into
+    ``dashboards._shared.load_snapshot``, so recording what that receives
+    reads the page's real answer without needing three different date-scoped
+    fixtures.
+
+    Against the unfixed pages, with the clock frozen and ``TZ=UTC``, this
+    records the host's answer instead of the exchange's.
+    """
+    import dashboards._shared as shared
+
+    seen: list[str] = []
+    real_load_snapshot = shared.load_snapshot
+
+    def _recording(database_path, runtime_id, trading_date):  # type: ignore[no-untyped-def]
+        seen.append(trading_date)
+        return real_load_snapshot(database_path, runtime_id, trading_date)
+
+    monkeypatch.setattr(shared, "load_snapshot", _recording)
+
+    at = AppTest.from_file(str(DASHBOARDS_DIR / page), default_timeout=30)
+    at.run()
+
+    assert list(at.exception) == []
+    assert seen, f"{page} never queried a trading date at all"
+    assert set(seen) == {FROZEN_IST_DATE}, (
+        f"{page} queried {sorted(set(seen))}; at {FROZEN_UTC.isoformat()} the IST "
+        f"trading date is {FROZEN_IST_DATE} and only the host's local date is "
+        f"{FROZEN_HOST_DATE}"
+    )
 
 
 # ==================================================== pure filter helpers

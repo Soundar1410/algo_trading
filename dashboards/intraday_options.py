@@ -70,7 +70,12 @@ for _parent in Path(__file__).resolve().parents:
             sys.path.insert(0, str(_parent))
         break
 
-from dashboards._shared import SnapshotUnavailable, load_snapshot, run_bounded  # noqa: E402
+from dashboards._shared import (  # noqa: E402
+    SnapshotUnavailable,
+    load_snapshot,
+    run_bounded,
+    trading_date_today,
+)
 from dashboards.data.calendar_stats import (  # noqa: E402
     TRADING_DAY_CAVEAT,
     n_trading_days_back,
@@ -1007,7 +1012,9 @@ def main() -> None:  # pragma: no cover - exercised manually via `streamlit run`
     paths = load_paths()
     runtime_id = "intraday_options"
     database_path = paths.database_path(runtime_id)
-    today = date.today()
+    # IST, never the host's local date (D88) — this also fixes every
+    # "Yesterday"/"Last N trading days" preset, which counts back from here.
+    today = trading_date_today()
     trading_date = today.isoformat()
 
     result = load_snapshot(database_path, runtime_id, trading_date)

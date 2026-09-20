@@ -1,10 +1,11 @@
 """Read-only database access shared by every dashboard page.
 
-Centralises exactly one thing: what a page shows when its database is
-missing, locked, or has pending migrations — a message, never a traceback.
-Every page module in this package imports only this module, :mod:`common.
-health.snapshot` and :func:`common.persistence.connect_readonly`. No page
-imports a broker, a feed, or a write connection — enforced by
+Centralises two things: what a page shows when its database is missing,
+locked, or has pending migrations — a message, never a traceback — and what
+"today" means to a dashboard (:func:`trading_date_today`). Every page module
+in this package imports only this module, :mod:`common.health.snapshot`,
+:func:`common.persistence.connect_readonly` and :mod:`common.utils.timeutils`.
+No page imports a broker, a feed, or a write connection — enforced by
 ``tests/unit/test_dashboard.py``.
 """
 
@@ -13,13 +14,48 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import TypeVar
 
 from common.health import HealthSnapshot, read_snapshot
 from common.persistence import DatabaseError, connect_readonly
+from common.utils import timeutils
 
 T = TypeVar("T")
+
+
+def trading_date_today(tz_name: str = timeutils.DEFAULT_TZ) -> date:
+    """Today's trading date in the exchange's timezone — never the host's.
+
+    Every page scopes its queries to a trading date, and until D88 three of
+    them took it from a naive ``date.today()``. That is the machine's local
+    date, which is the right answer only on a machine set to IST. On a UTC
+    host — a cloud VPS, which is where the SEBI static-IP requirement points
+    this project — the two disagree for the first 5.5 hours of every calendar
+    day, so from 00:00 to 05:30 IST every page quietly showed the *previous*
+    trading day: yesterday's positions, yesterday's P&L, yesterday's
+    incidents, with nothing on screen to say so. The same bug class as
+    ``8bd41ae`` (the UTC-vs-IST entry gate).
+
+    No new time helper is introduced: this is
+    :func:`common.utils.timeutils.now_tz` plus
+    :func:`common.utils.timeutils.local_date_in`, which is exactly the pair
+    ``dashboards/positional_options.py`` had already been using on its own
+    and which now lives in one place for the whole package. They are reached
+    through the module rather than imported by name so a test can pin the
+    clock at this single seam — see
+    ``tests/unit/test_dashboard_trading_date.py``.
+
+    ``tz_name`` defaults to :data:`common.utils.timeutils.DEFAULT_TZ`, which
+    ``config/global.yaml``'s ``global.timezone`` matches (asserted by that
+    same test module). Deliberately not read from YAML here: a dashboard's
+    contract is to degrade to a message rather than raise, and a
+    ``ConfigError`` reaching a date computation on five pages would buy
+    nothing while the two values agree. The parameter is the one place a
+    future non-IST configuration would be wired in.
+    """
+    return timeutils.local_date_in(timeutils.now_tz(tz_name), tz_name)
 
 
 @dataclass(frozen=True)
