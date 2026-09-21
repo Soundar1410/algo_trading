@@ -18,12 +18,34 @@ market hours". Resolution here is a dict lookup with **no per-trade API call**.
 ``OptionChainService`` keeps its real job — live per-strike quotes and greeks —
 and is untouched by this module.
 
-What was left behind
---------------------
-The reference's ``EquityScripMaster`` (the NSE cash/derivative universe used by
-its equity scanner) is **not** ported. Intraday stocks are Phase 5 and nothing
-here consumes it; porting it now would add an unexercised parser, the same
-judgement Phase 3 Part 2a made about the five unported indicators.
+What was left behind, and what Phase 1 brought over (D34)
+---------------------------------------------------------
+The reference's ``EquityScripMaster`` was originally **not** ported: intraday
+stocks were Phase 5, nothing here consumed it, and porting it would have added
+an unexercised parser — the same judgement Phase 3 Part 2a made about the five
+unported indicators.
+
+``wsr1_weekly_stochrsi`` (``positional_stocks``, Phase 1) is that consumer, so
+**the cash-equity half is now ported** as :class:`EquityScripMaster`, together
+with :func:`resolve_index` for the NIFTY 50 spot id the same strategy needs.
+D34's own test is what decides the boundary, so it also decides what stays out:
+
+* the reference's **F&O half** — ``fno_lot_size``, ``fno_equities`` and the
+  ``FUTSTK``/``OPTSTK`` underlying extraction — is still not ported. This
+  strategy trades NSE cash equity only and never asks what has a derivative;
+* the reference let a **blank** ``SEM_SERIES`` through (``series and series !=
+  "EQ"``). Spec section 5 says "NSE, series EQ", so this tightens to a strict
+  equality. Verified against the 2026-09-21 master: the strict filter yields
+  2,690 distinct symbols with **no duplicate**, and resolves all 200 NIFTY 200
+  constituents including ``BAJAJ-AUTO`` and ``M&M``.
+
+Equity rows are ``SEM_INSTRUMENT_NAME=EQUITY`` on ``SEM_SEGMENT=E``; the spot
+index rows are ``SEM_INSTRUMENT_NAME=INDEX`` on ``SEM_SEGMENT=I``, which is the
+``IDX_I`` feed segment. NIFTY 50 is one unambiguous row on the 2026-09-21
+master (``SEM_TRADING_SYMBOL=NIFTY``, ``SEM_CUSTOM_SYMBOL=Nifty 50``,
+security id ``13``) — and ``13`` is what :data:`INDEX_REGISTRY` already
+carries, which a test asserts as agreement rather than this module
+hard-coding it.
 
 Adaptations from the reference, each deliberate
 -----------------------------------------------
@@ -49,7 +71,7 @@ import csv
 import io
 import os
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -476,3 +498,201 @@ class ScripMaster:
                 if row is not None:
                     rows.append(row)
         return rows
+
+
+# ---------------------------------------------------------------- cash equities
+#: NSE cash-equity rows carry this instrument name. ``SEM_SERIES`` then
+#: separates the tradable ``EQ`` series from ``BE``/``SM``/``SG``/``GS`` and the
+#: rest, which this strategy's universe never contains.
+_EQUITY_INSTRUMENT = "EQUITY"
+_EQUITY_SERIES = "EQ"
+
+#: Spot index rows (``SEM_SEGMENT`` ``I``), as opposed to ``OPTIDX``/``FUTIDX``.
+_INDEX_INSTRUMENT = "INDEX"
+
+#: Feed segment for NSE cash equity, matching :data:`SEGMENT_CODES`.
+NSE_EQUITY_SEGMENT = "NSE_EQ"
+#: Feed segment for a spot index.
+INDEX_SEGMENT = "IDX_I"
+
+
+@dataclass(frozen=True)
+class EquityRow:
+    """One NSE cash-equity instrument as the master describes it."""
+
+    security_id: str
+    symbol: str
+    company_name: str | None = None
+    exchange_segment: str = NSE_EQUITY_SEGMENT
+    #: Minimum price increment in rupees, converted from the master's paise —
+    #: and **advisory only** here, for the same reason :class:`OptionRow`'s is.
+    #: The equity rows are exactly where :data:`TICK_SIZE_PAISE_PER_RUPEE`'s
+    #: docstring records the column as untrustworthy: RELIANCE carries
+    #: ``10.0000``, which does not divide to the ₹0.05 it actually trades in.
+    tick_size: float | None = None
+
+
+@dataclass(frozen=True)
+class IndexRow:
+    """One spot index — the id and segment needed to fetch its own history."""
+
+    security_id: str
+    symbol: str
+    name: str
+    exchange_segment: str = INDEX_SEGMENT
+
+
+def _normalise_symbol(value: str | None) -> str:
+    """Upper-case and strip, without destroying valid punctuation.
+
+    ``BAJAJ-AUTO`` and ``M&M`` are real NSE symbols, so nothing here strips a
+    hyphen or an ampersand — the reference learned the same lesson.
+    """
+    return (value or "").strip().upper()
+
+
+class EquityScripMaster:
+    """Indexes NSE cash equities (series ``EQ``) from Dhan's master CSV.
+
+    Parsing is separated from downloading exactly as :class:`ScripMaster` does,
+    so every default test exercises the parser with no network, and
+    :meth:`load` reuses the same day-stamped :class:`ScripMasterCache`.
+
+    Unlike the reference this is ported from, it knows nothing about stock
+    derivatives — see the module docstring for why that half stayed behind.
+    """
+
+    def __init__(self, *, exchange: str = "NSE") -> None:
+        self._exchange = exchange.upper()
+        self._by_symbol: dict[str, EquityRow] = {}
+
+    # ---------------------------------------------------------------- loading
+    def load_from_text(self, text: str) -> EquityScripMaster:
+        """Parse master CSV text. The only parsing entry point.
+
+        Individually unusable rows are skipped rather than fatal, matching
+        :meth:`ScripMaster.load_from_text`: one bad row in a multi-megabyte
+        daily file must not cost the whole run. An empty *result* does raise —
+        that means the filters matched nothing, which is a configuration error
+        wearing a data error's clothes.
+        """
+        self._by_symbol.clear()
+        skipped = 0
+
+        for row in csv.DictReader(io.StringIO(text)):
+            if (row.get("SEM_INSTRUMENT_NAME") or "").upper() != _EQUITY_INSTRUMENT:
+                continue
+            if (row.get("SEM_EXM_EXCH_ID") or "").upper() != self._exchange:
+                continue
+            # Strict equality, not the reference's "blank or EQ" — spec
+            # section 5 says series EQ, and BE/SM/SG rows are not this
+            # universe's instruments.
+            if (row.get("SEM_SERIES") or "").upper() != _EQUITY_SERIES:
+                continue
+
+            symbol = _normalise_symbol(row.get("SEM_TRADING_SYMBOL"))
+            security_id = str(row.get("SEM_SMST_SECURITY_ID") or "").strip()
+            if not symbol or not security_id:
+                skipped += 1
+                continue
+
+            self._by_symbol[symbol] = EquityRow(
+                security_id=security_id,
+                symbol=symbol,
+                company_name=(row.get("SEM_CUSTOM_SYMBOL") or "").strip() or None,
+                tick_size=_tick_size_in_rupees(row.get("SEM_TICK_SIZE")),
+            )
+
+        if not self._by_symbol:
+            raise ScripMasterError(
+                f"No {self._exchange} cash-equity rows (series {_EQUITY_SERIES}) found in the "
+                "scrip master."
+            )
+        if skipped:
+            _log.warning("scrip master: skipped %d unusable cash-equity row(s)", skipped)
+        _log.info("equity scrip master loaded: %d %s symbols", len(self._by_symbol), self._exchange)
+        return self
+
+    def load(self, *, cache: ScripMasterCache) -> EquityScripMaster:
+        """Load today's master through ``cache``, fetching only on a miss."""
+        return self.load_from_text(cache.text())
+
+    # ---------------------------------------------------------------- queries
+    def get(self, symbol: str) -> EquityRow | None:
+        """Resolve one cash symbol, case-insensitively. ``None`` if absent.
+
+        ``None`` rather than a raise is what lets spec section 5's rule hold —
+        "a symbol that cannot be resolved is skipped and reported; it never
+        blocks the rest of the run".
+        """
+        return self._by_symbol.get(_normalise_symbol(symbol))
+
+    def resolve_all(self, symbols: Iterable[str]) -> tuple[dict[str, EquityRow], list[str]]:
+        """Resolve many symbols at once: ``(resolved, unresolved)``.
+
+        The caller gets both halves in one pass so the unresolved ones can be
+        reported rather than silently missing from the resolved map.
+        """
+        resolved: dict[str, EquityRow] = {}
+        unresolved: list[str] = []
+        for symbol in symbols:
+            row = self.get(symbol)
+            if row is None:
+                unresolved.append(_normalise_symbol(symbol))
+            else:
+                resolved[row.symbol] = row
+        return resolved, unresolved
+
+    @property
+    def symbols(self) -> tuple[str, ...]:
+        return tuple(sorted(self._by_symbol))
+
+    def __len__(self) -> int:
+        return len(self._by_symbol)
+
+
+def resolve_index(text: str, name: str, *, exchange: str = "NSE") -> IndexRow:
+    """Resolve a spot index by trading symbol or custom symbol, e.g. ``"NIFTY 50"``.
+
+    Matching is exact (case- and whitespace-insensitive) on either column, never
+    a prefix: ``"NIFTY"`` must not be satisfied by ``NIFTY 100``, and a
+    ``startswith`` would make exactly that mistake. Verified against the
+    2026-09-21 master, where ``NIFTY`` / ``Nifty 50`` is one unambiguous row
+    among 190 ``INDEX`` rows whose trading and custom symbols are each unique.
+
+    Raises:
+        ScripMasterError: no row matched, or — impossibly, but not silently —
+            more than one did.
+    """
+    wanted = _normalise_symbol(name)
+    matches: list[IndexRow] = []
+    for row in csv.DictReader(io.StringIO(text)):
+        if (row.get("SEM_INSTRUMENT_NAME") or "").upper() != _INDEX_INSTRUMENT:
+            continue
+        if (row.get("SEM_EXM_EXCH_ID") or "").upper() != exchange.upper():
+            continue
+        trading = _normalise_symbol(row.get("SEM_TRADING_SYMBOL"))
+        custom = _normalise_symbol(row.get("SEM_CUSTOM_SYMBOL"))
+        if wanted not in (trading, custom):
+            continue
+        security_id = str(row.get("SEM_SMST_SECURITY_ID") or "").strip()
+        if not security_id:
+            continue
+        matches.append(
+            IndexRow(
+                security_id=security_id,
+                symbol=trading,
+                name=(row.get("SEM_CUSTOM_SYMBOL") or "").strip() or trading,
+            )
+        )
+
+    if not matches:
+        raise ScripMasterError(
+            f"No {exchange.upper()} spot-index row matches {name!r} in the scrip master."
+        )
+    if len({row.security_id for row in matches}) > 1:
+        raise ScripMasterError(
+            f"{name!r} matches {len(matches)} different {exchange.upper()} index rows "
+            f"(security ids {sorted({r.security_id for r in matches})}). Refusing to guess."
+        )
+    return matches[0]
