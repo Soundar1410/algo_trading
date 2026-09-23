@@ -18,21 +18,29 @@ Calendar facts used below, all 2026 unless stated:
 
 from __future__ import annotations
 
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from strategies.positional_stocks.wsr1_weekly_stochrsi.models import DailyBar
+from strategies.positional_stocks.wsr1_weekly_stochrsi.trading_calendar import TradingCalendar
 from strategies.positional_stocks.wsr1_weekly_stochrsi.weekly_bars import (
     build_weekly_bars,
     friday_of,
     is_week_complete,
     iso_key,
     last_session_of_week,
+    week_release_moment,
 )
 
 IST = ZoneInfo("Asia/Kolkata")
+
+#: The real committed holiday list, not a fixture. The release rule is only
+#: worth testing against the calendar the platform actually runs on.
+CONFIG_ROOT = Path(__file__).resolve().parents[2] / "config"
+CALENDAR = TradingCalendar.from_config(CONFIG_ROOT)
 
 
 def _ist(day: date, at: time = time(18, 0)) -> datetime:
@@ -50,6 +58,15 @@ _W38 = [
     _bar(date(2026, 9, 16), open_=106.0, high=110.0, low=98.0, close=99.0),
     _bar(date(2026, 9, 17), open_=99.0, high=105.0, low=97.0, close=104.0),
     _bar(date(2026, 9, 18), open_=104.0, high=112.0, low=103.0, close=111.0),
+]
+
+#: Mon 21 Sep .. Fri 25 Sep 2026 -- the following week (W39), unremarkable.
+_W39 = [
+    _bar(date(2026, 9, 21), open_=111.0, high=115.0, low=110.0, close=114.0),
+    _bar(date(2026, 9, 22), open_=114.0, high=118.0, low=113.0, close=117.0),
+    _bar(date(2026, 9, 23), open_=117.0, high=120.0, low=112.0, close=113.0),
+    _bar(date(2026, 9, 24), open_=113.0, high=119.0, low=111.0, close=118.0),
+    _bar(date(2026, 9, 25), open_=118.0, high=124.0, low=117.0, close=123.0),
 ]
 
 
@@ -76,7 +93,7 @@ def test_friday_of_handles_the_year_straddling_week() -> None:
 
 # ------------------------------------------------------------- aggregation
 def test_a_five_session_week_aggregates_open_high_low_close() -> None:
-    bars = build_weekly_bars(_W38, as_of=_ist(date(2026, 9, 21)))
+    bars = build_weekly_bars(_W38, as_of=_ist(date(2026, 9, 21)), calendar=CALENDAR)
 
     assert len(bars) == 1
     week = bars[0]
@@ -95,7 +112,7 @@ def test_week_ending_is_the_last_session_not_the_friday() -> None:
     ``week_ending`` dates, which is why ``iso_key`` is the identity."""
     short_week = _W38[:3]  # Mon .. Wed, Thu and Fri not traded
 
-    week = build_weekly_bars(short_week, as_of=_ist(date(2026, 9, 21)))[0]
+    week = build_weekly_bars(short_week, as_of=_ist(date(2026, 9, 21)), calendar=CALENDAR)[0]
 
     assert week.week_ending == date(2026, 9, 16)
     assert friday_of(week.week_ending) == date(2026, 9, 18)
@@ -103,7 +120,7 @@ def test_week_ending_is_the_last_session_not_the_friday() -> None:
 
 
 def test_a_holiday_week_of_four_sessions_still_produces_a_bar() -> None:
-    week = build_weekly_bars(_W38[1:], as_of=_ist(date(2026, 9, 21)))[0]
+    week = build_weekly_bars(_W38[1:], as_of=_ist(date(2026, 9, 21)), calendar=CALENDAR)[0]
 
     assert week.sessions == 4
     assert week.open == 103.0, "the first session that traded"
@@ -111,7 +128,7 @@ def test_a_holiday_week_of_four_sessions_still_produces_a_bar() -> None:
 
 
 def test_a_single_session_week_produces_a_bar_whose_ohlc_is_that_session() -> None:
-    week = build_weekly_bars([_W38[2]], as_of=_ist(date(2026, 9, 21)))[0]
+    week = build_weekly_bars([_W38[2]], as_of=_ist(date(2026, 9, 21)), calendar=CALENDAR)[0]
 
     assert week.sessions == 1
     assert (week.open, week.high, week.low, week.close) == (106.0, 110.0, 98.0, 99.0)
@@ -122,13 +139,15 @@ def test_a_week_with_no_sessions_simply_has_no_bar() -> None:
     bars, and an invented one would shift every lookback by a week."""
     two_weeks = [*_W38, _bar(date(2026, 10, 5), open_=1.0, high=2.0, low=1.0, close=2.0)]
 
-    bars = build_weekly_bars(two_weeks, as_of=_ist(date(2026, 10, 12)))
+    bars = build_weekly_bars(two_weeks, as_of=_ist(date(2026, 10, 12)), calendar=CALENDAR)
 
     assert [bar.iso_key for bar in bars] == [(2026, 38), (2026, 41)]
 
 
 def test_sessions_may_arrive_in_any_order() -> None:
-    week = build_weekly_bars(list(reversed(_W38)), as_of=_ist(date(2026, 9, 21)))[0]
+    week = build_weekly_bars(
+        list(reversed(_W38)), as_of=_ist(date(2026, 9, 21)), calendar=CALENDAR
+    )[0]
 
     assert week.open == 100.0
     assert week.close == 111.0
@@ -141,7 +160,7 @@ def test_bars_are_returned_oldest_first_across_the_year_boundary() -> None:
         _bar(date(2027, 1, 4), open_=11.5, high=13.0, low=11.0, close=12.5),
     ]
 
-    bars = build_weekly_bars(sessions, as_of=_ist(date(2027, 1, 11)))
+    bars = build_weekly_bars(sessions, as_of=_ist(date(2027, 1, 11)), calendar=CALENDAR)
 
     assert [bar.iso_key for bar in bars] == [(2026, 53), (2027, 1)]
     assert bars[0].sessions == 2, "30 Dec and 1 Jan are the same ISO week"
@@ -149,7 +168,7 @@ def test_bars_are_returned_oldest_first_across_the_year_boundary() -> None:
 
 
 def test_an_empty_series_produces_no_bars() -> None:
-    assert build_weekly_bars([], as_of=_ist(date(2026, 9, 21))) == []
+    assert build_weekly_bars([], as_of=_ist(date(2026, 9, 21)), calendar=CALENDAR) == []
 
 
 # ------------------------------------------------------- the completed-week rule
@@ -166,8 +185,12 @@ def test_an_empty_series_produces_no_bars() -> None:
         (_ist(date(2026, 9, 21), time(8, 30)), True),  # Monday decision run
     ],
 )
-def test_week_38_is_released_exactly_at_friday_1530_ist(as_of: datetime, complete: bool) -> None:
-    assert is_week_complete(date(2026, 9, 16), as_of) is complete
+def test_week_38_is_released_exactly_at_its_expected_session_1530_ist(
+    as_of: datetime, complete: bool
+) -> None:
+    """W38's expected last session is Friday 18 Sep — 14 Sep is the listed
+    holiday, not the 18th — so for this week the moment is the Friday's."""
+    assert is_week_complete(date(2026, 9, 16), as_of, calendar=CALENDAR) is complete
 
 
 def test_the_monday_decision_run_never_sees_its_own_week() -> None:
@@ -175,30 +198,98 @@ def test_the_monday_decision_run_never_sees_its_own_week() -> None:
     just ended. The week it is standing in must not appear."""
     current_week = [_bar(date(2026, 9, 21), open_=111.0, high=113.0, low=110.0, close=112.0)]
 
-    bars = build_weekly_bars([*_W38, *current_week], as_of=_ist(date(2026, 9, 21), time(8, 30)))
+    bars = build_weekly_bars(
+        [*_W38, *current_week], as_of=_ist(date(2026, 9, 21), time(8, 30)), calendar=CALENDAR
+    )
 
     assert [bar.iso_key for bar in bars] == [(2026, 38)]
 
 
 def test_a_midweek_run_releases_nothing_from_the_current_week() -> None:
-    bars = build_weekly_bars(_W38[:3], as_of=_ist(date(2026, 9, 16), time(20, 0)))
+    bars = build_weekly_bars(
+        _W38[:3], as_of=_ist(date(2026, 9, 16), time(20, 0)), calendar=CALENDAR
+    )
 
     assert bars == [], "Wednesday cannot prove Thursday and Friday will not trade"
 
 
-def test_a_week_whose_last_session_was_wednesday_is_still_held_until_friday() -> None:
-    """Thursday and Friday both closed. The data cannot distinguish that from a
-    truncated download, so the bar waits for the calendar — a delay of at most
-    a weekend, always in the fail-closed direction."""
+def test_a_week_whose_data_stops_on_wednesday_is_still_held_until_its_expected_session(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The data cannot distinguish "Thursday and Friday were closed" from a
+    truncated download, so the bar waits for the calendar. Once the calendar
+    releases it, the bar is built and flagged rather than withheld forever."""
     short_week = _W38[:3]
 
-    assert build_weekly_bars(short_week, as_of=_ist(date(2026, 9, 17), time(20, 0))) == []
-    assert len(build_weekly_bars(short_week, as_of=_ist(date(2026, 9, 18), time(15, 30)))) == 1
+    assert (
+        build_weekly_bars(short_week, as_of=_ist(date(2026, 9, 17), time(20, 0)), calendar=CALENDAR)
+        == []
+    )
+
+    with caplog.at_level("WARNING"):
+        bars = build_weekly_bars(
+            short_week, as_of=_ist(date(2026, 9, 18), time(15, 30)), calendar=CALENDAR
+        )
+
+    assert len(bars) == 1
+    assert bars[0].is_truncated is True
+    assert bars[0].week_ending == date(2026, 9, 16)
+    assert bars[0].expected_last_session == date(2026, 9, 18)
+    assert "2026-09-18" in caplog.text
+
+
+# ----------------------------------------- the calendar decides, not the data
+#
+# Spec 6.2 v1.2b. Phase 1 released a week at Friday 15:30 regardless of the
+# holiday list, and took the week's last session from NIFTY's own data. The
+# first is merely late; the second is the defect the Phase 1 review found.
+
+
+def test_a_holiday_friday_week_is_released_on_its_thursday() -> None:
+    """Good Friday 2026-04-03. Waiting for Friday 15:30 would hold a finished
+    week back for a session that was never scheduled."""
+    assert CALENDAR.expected_last_session((2026, 14)) == date(2026, 4, 2)
+
+    moment = week_release_moment(date(2026, 3, 30), calendar=CALENDAR)
+    assert moment == _ist(date(2026, 4, 2), time(15, 30))
+
+    assert is_week_complete(date(2026, 3, 30), moment, calendar=CALENDAR) is True
+    assert (
+        is_week_complete(date(2026, 3, 30), moment - timedelta(seconds=1), calendar=CALENDAR)
+        is False
+    )
+
+
+def test_a_holiday_friday_week_ending_on_thursday_is_not_truncated() -> None:
+    """The counterpart: Thursday *is* this week's last session, so a bar ending
+    there is complete, not short."""
+    week = [
+        _bar(date(2026, 3, 30), open_=100.0, high=104.0, low=99.0, close=103.0),
+        _bar(date(2026, 3, 31), open_=103.0, high=107.0, low=102.0, close=106.0),
+        _bar(date(2026, 4, 1), open_=106.0, high=110.0, low=98.0, close=99.0),
+        _bar(date(2026, 4, 2), open_=99.0, high=105.0, low=97.0, close=104.0),
+    ]
+
+    bar = build_weekly_bars(week, as_of=_ist(date(2026, 4, 6)), calendar=CALENDAR)[0]
+
+    assert bar.week_ending == date(2026, 4, 2)
+    assert bar.expected_last_session == date(2026, 4, 2)
+    assert bar.is_truncated is False
+
+
+def test_a_truncated_week_is_flagged_rather_than_dropped() -> None:
+    """A symbol that did not trade on one past Friday keeps its bar. Dropping
+    it would leave a hole in the middle of a 260-week history that StochRSI(14)
+    would compute straight through without noticing."""
+    bars = build_weekly_bars([*_W38[:4], *_W39], as_of=_ist(date(2026, 9, 28)), calendar=CALENDAR)
+
+    assert [bar.iso_key for bar in bars] == [(2026, 38), (2026, 39)]
+    assert [bar.is_truncated for bar in bars] == [True, False]
 
 
 def test_a_naive_as_of_is_refused_by_name() -> None:
     with pytest.raises(ValueError, match="timezone-aware"):
-        build_weekly_bars(_W38, as_of=datetime(2026, 9, 21, 8, 30))
+        build_weekly_bars(_W38, as_of=datetime(2026, 9, 21, 8, 30), calendar=CALENDAR)
 
 
 def test_the_release_rule_is_unaffected_by_the_host_timezone() -> None:
@@ -209,15 +300,20 @@ def test_the_release_rule_is_unaffected_by_the_host_timezone() -> None:
 
     for zone in ("UTC", "America/New_York", "Asia/Tokyo"):
         same_instant = moment_ist.astimezone(ZoneInfo(zone))
-        assert is_week_complete(date(2026, 9, 16), same_instant) is True
-        assert len(build_weekly_bars(_W38, as_of=same_instant)) == 1
+        assert is_week_complete(date(2026, 9, 16), same_instant, calendar=CALENDAR) is True
+        assert len(build_weekly_bars(_W38, as_of=same_instant, calendar=CALENDAR)) == 1
 
 
 def test_one_second_before_the_release_no_zone_reports_it_complete() -> None:
     moment_ist = _ist(date(2026, 9, 18), time(15, 29, 59))
 
     for zone in ("UTC", "America/New_York", "Asia/Tokyo"):
-        assert is_week_complete(date(2026, 9, 16), moment_ist.astimezone(ZoneInfo(zone))) is False
+        assert (
+            is_week_complete(
+                date(2026, 9, 16), moment_ist.astimezone(ZoneInfo(zone)), calendar=CALENDAR
+            )
+            is False
+        )
 
 
 # --------------------------------------------------- weekend special sessions
@@ -234,7 +330,7 @@ def test_a_saturday_special_session_is_included_when_present() -> None:
     """
     saturday = _bar(date(2026, 9, 19), open_=111.0, high=120.0, low=111.0, close=118.0)
 
-    week = build_weekly_bars([*_W38, saturday], as_of=_ist(date(2026, 9, 21)))[0]
+    week = build_weekly_bars([*_W38, saturday], as_of=_ist(date(2026, 9, 21)), calendar=CALENDAR)[0]
 
     assert week.sessions == 6
     assert week.week_ending == date(2026, 9, 19), "the Saturday is the week's last session"
@@ -248,7 +344,7 @@ def test_a_sunday_session_also_stays_in_the_same_iso_week() -> None:
     its own week, not the first of the next."""
     sunday = _bar(date(2026, 9, 20), open_=111.0, high=115.0, low=110.0, close=114.0)
 
-    bars = build_weekly_bars([*_W38, sunday], as_of=_ist(date(2026, 9, 21)))
+    bars = build_weekly_bars([*_W38, sunday], as_of=_ist(date(2026, 9, 21)), calendar=CALENDAR)
 
     assert len(bars) == 1
     assert bars[0].iso_key == (2026, 38)

@@ -80,6 +80,15 @@ class WeeklyBar:
     Friday — spec section 3 defines it that way, and in a holiday week the two
     differ. ``sessions`` carries how many sessions the week actually had, so a
     short week stays visible to anything that cares.
+
+    ``expected_last_session`` is what the *calendar* says the week should have
+    ended on (spec 6.2 v1.2b), and it is here because the two answers
+    disagreeing is the defect the Phase 1 review found. When Dhan has not yet
+    published Friday's candle, a week built from the sessions that happen to be
+    present ends on Thursday and looks perfectly well-formed. Carrying the
+    calendar's answer next to the data's makes that condition a value
+    (:attr:`is_truncated`) rather than something a later phase has to remember
+    to re-derive.
     """
 
     week_ending: date
@@ -89,6 +98,8 @@ class WeeklyBar:
     high: float
     low: float
     close: float
+    #: The calendar's answer for this week — see :attr:`is_truncated`.
+    expected_last_session: date
     volume: float = 0.0
     sessions: int = 0
 
@@ -108,6 +119,22 @@ class WeeklyBar:
         different dates when one of them did not trade on the week's last day.
         """
         return (self.iso_year, self.iso_week)
+
+    @property
+    def is_truncated(self) -> bool:
+        """The week is missing the session the calendar expected it to end on.
+
+        Either the vendor has not published it yet, or the exchange closed on a
+        day the holiday list does not carry, or this symbol alone did not trade
+        that session. All three are reportable and none of them is safe to
+        decide on — spec 6.2 stops the run when the *index* is in this state
+        and skips the symbol when only it is.
+
+        A truncated bar is still built. Dropping it would leave a hole in the
+        middle of a 260-week history that StochRSI(14) would compute straight
+        through without noticing, which is a worse failure than a visible flag.
+        """
+        return self.week_ending < self.expected_last_session
 
 
 class QualityStatus(Enum):

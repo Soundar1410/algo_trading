@@ -34,16 +34,22 @@ from strategies.positional_stocks.wsr1_weekly_stochrsi.daily_cache import (
     DailyBarCache,
     MergeStatus,
     UnsafeSymbolError,
+    assess_index_publication,
     assess_staleness,
     check_symbol,
     merge_tail,
-    reference_last_session,
     refetch_from,
 )
 from strategies.positional_stocks.wsr1_weekly_stochrsi.models import DailyBar
+from strategies.positional_stocks.wsr1_weekly_stochrsi.trading_calendar import TradingCalendar
 
 IST = ZoneInfo("Asia/Kolkata")
 FETCHED_AT = datetime(2026, 9, 18, 18, 0, tzinfo=IST)
+
+#: The real committed calendar. These tests assert against the holiday list the
+#: platform actually runs on, not a fixture — a spec 6.2 case that passes only
+#: against invented holidays proves nothing about next Friday.
+CONFIG_ROOT = Path(__file__).resolve().parents[2] / "config"
 
 
 def _series(start: date, count: int, *, close: float = 100.0, step: float = 1.0) -> list[DailyBar]:
@@ -467,23 +473,110 @@ def test_verdicts_come_back_in_symbol_order() -> None:
     assert [v.symbol for v in verdicts] == ["ABB", "M&M", "ZEEL"]
 
 
-def test_the_required_session_comes_from_the_index_series() -> None:
-    """NIFTY 50 trades every session the exchange holds, so its own last bar in
-    a week *is* that week's last session — derived from data rather than from a
-    holiday calendar nobody in this project maintains."""
-    index = _series(date(2026, 9, 14), 5)
+# ----------------------------------------------- the index publication gate
+#
+# Phase 1 asked NIFTY 50's own data what the week's last session was
+# (``reference_last_session``, now deleted). The Phase 1 review proved that
+# unsafe: 21 Sep 2026 was a trading day, yet Dhan had not published its candle
+# by 22:20 IST. The expected session now comes from the calendar and the index
+# is checked against it. These tests are spec 6.2 v1.2b's four cases.
 
-    assert reference_last_session(index, (2026, 38)) == date(2026, 9, 18)
-    assert reference_last_session(index, (2026, 39)) is None
+
+def test_the_index_having_the_expected_session_is_what_publishes_a_week() -> None:
+    index = _series(date(2026, 9, 14), 5)  # Mon..Fri, W38
+
+    verdict = assess_index_publication(index, week=(2026, 38), expected_session=date(2026, 9, 18))
+
+    assert verdict.is_published is True
+    assert verdict.last_session == date(2026, 9, 18)
+    assert verdict.reason == ""
 
 
-def test_a_holiday_shortened_week_sets_a_correspondingly_earlier_requirement() -> None:
-    """Friday 18 Sep closed: the index's own last session is Thursday, so a
-    symbol reaching Thursday is current rather than being called stale for
-    missing a session that never happened."""
-    index = _series(date(2026, 9, 14), 4)  # Mon..Thu
-    required = reference_last_session(index, (2026, 38))
-    assert required == date(2026, 9, 17)
+def test_a_missing_friday_candle_fails_closed_instead_of_making_thursday_the_week() -> None:
+    """The exact defect. Dhan has not published Friday 18 Sep, so the index
+    reaches Thursday. Phase 1 concluded "Thursday is the week's last session,
+    everything is current". The calendar says Friday, so this is *unpublished*
+    and the run stops."""
+    index = _series(date(2026, 9, 14), 4)  # Mon..Thu only
 
-    verdict = assess_staleness({"RELIANCE": index}, required_session=required)[0]
-    assert verdict.is_current is True
+    verdict = assess_index_publication(index, week=(2026, 38), expected_session=date(2026, 9, 18))
+
+    assert verdict.is_published is False
+    assert verdict.last_session == date(2026, 9, 17)
+    assert "2026-09-18" in verdict.reason
+    assert "not published it yet" in verdict.reason
+
+
+def test_a_week_the_index_has_no_sessions_for_at_all_is_unpublished() -> None:
+    verdict = assess_index_publication(
+        _series(date(2026, 9, 14), 5), week=(2026, 39), expected_session=date(2026, 9, 25)
+    )
+
+    assert verdict.is_published is False
+    assert verdict.last_session is None
+    assert "none at all" in verdict.reason
+
+
+def test_a_holiday_friday_week_is_published_by_its_thursday() -> None:
+    """Good Friday 2026-04-03. The calendar expects Thursday 04-02, so a series
+    reaching Thursday is current — not stale for missing a session that was
+    never scheduled."""
+    calendar = TradingCalendar.from_config(CONFIG_ROOT)
+    expected = calendar.expected_last_session((2026, 14))
+    assert expected == date(2026, 4, 2)
+
+    index = _series(date(2026, 3, 30), 4)  # Mon..Thu; Friday is the holiday
+
+    verdict = assess_index_publication(
+        index, week=(2026, 14), expected_session=expected, calendar=calendar
+    )
+    assert verdict.is_published is True
+
+    symbol = assess_staleness({"RELIANCE": index}, required_session=expected)[0]
+    assert symbol.is_current is True
+
+
+def test_an_unlisted_weekday_closure_fails_closed_and_is_reported() -> None:
+    """The calendar has no entry for Friday 2026-09-25, so it is expected. If
+    the exchange in fact closed that day, no amount of waiting produces it —
+    the run fails closed and says so, and the operator adds the date."""
+    calendar = TradingCalendar.from_config(CONFIG_ROOT)
+    expected = calendar.expected_last_session((2026, 39))
+    assert expected == date(2026, 9, 25)
+
+    index = _series(date(2026, 9, 21), 4)  # Mon..Thu; Friday never happened
+
+    verdict = assess_index_publication(
+        index, week=(2026, 39), expected_session=expected, calendar=calendar
+    )
+
+    assert verdict.is_published is False
+    assert "the verified holiday list does not carry" in verdict.reason
+
+
+def test_a_session_on_a_listed_holiday_is_reported_and_moves_nothing() -> None:
+    """The Diwali Muhurat session, Sunday 2026-11-08, is inside ISO week 45.
+    It is reported, and the expected last session stays Friday 11-06."""
+    calendar = TradingCalendar.from_config(CONFIG_ROOT)
+    expected = calendar.expected_last_session((2026, 45))
+    assert expected == date(2026, 11, 6)
+
+    index = [
+        *_series(date(2026, 11, 2), 5),  # Mon..Fri
+        DailyBar(
+            session=date(2026, 11, 8),  # Sunday Muhurat
+            open=100.0,
+            high=102.0,
+            low=98.0,
+            close=101.0,
+            volume=500.0,
+        ),
+    ]
+
+    verdict = assess_index_publication(
+        index, week=(2026, 45), expected_session=expected, calendar=calendar
+    )
+
+    assert verdict.is_published is True
+    assert verdict.expected_session == date(2026, 11, 6)
+    assert verdict.unlisted_sessions == (date(2026, 11, 8),)

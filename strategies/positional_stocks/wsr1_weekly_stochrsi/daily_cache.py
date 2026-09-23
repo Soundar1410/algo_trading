@@ -48,12 +48,16 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from enum import Enum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from common.logging import get_logger
 from common.utils.timeutils import DEFAULT_TZ
 
 from .models import BarError, DailyBar
-from .weekly_bars import iso_key, last_session_of_week
+from .weekly_bars import iso_key
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle: trading_calendar imports iso_key
+    from .trading_calendar import TradingCalendar
 
 _log = get_logger(__name__)
 
@@ -388,15 +392,70 @@ class StalenessVerdict:
         )
 
 
-def reference_last_session(index_daily: Sequence[DailyBar], week: tuple[int, int]) -> date | None:
-    """Week ``week``'s last session, taken from the index series.
+@dataclass(frozen=True, slots=True)
+class IndexPublicationVerdict:
+    """Has the index series published the week's expected last session?
 
-    NIFTY 50 trades every session the exchange holds, so its own last bar in a
-    week *is* that week's last session. Deriving it from the data rather than
-    from a holiday calendar is what keeps this working across exchange holidays
-    nobody encoded — including the ones this project has no list of.
+    This replaces Phase 1's ``reference_last_session``, which asked NIFTY 50's
+    own data what the week's last session was. That is the defect the Phase 1
+    review found: on a Friday when Dhan has not yet published the candle, the
+    data answers "Thursday", every series in the universe agrees, and a
+    Monday-Thursday bar is decided on. The expected session now comes from
+    :meth:`~.trading_calendar.TradingCalendar.expected_last_session` and the
+    index is checked *against* it rather than asked to supply it.
+
+    ``unlisted_sessions`` carries sessions the exchange held on days the
+    calendar calls non-trading — the Muhurat session, a budget Saturday. Spec
+    6.2 requires them reported; they never move the expected session.
     """
-    return last_session_of_week(index_daily, week)
+
+    week: tuple[int, int]
+    expected_session: date
+    last_session: date | None
+    unlisted_sessions: tuple[date, ...] = ()
+
+    @property
+    def is_published(self) -> bool:
+        return self.last_session is not None and self.last_session >= self.expected_session
+
+    @property
+    def reason(self) -> str:
+        if self.is_published:
+            return ""
+        iso_year, iso_week = self.week
+        had = "none at all" if self.last_session is None else self.last_session.isoformat()
+        return (
+            f"NIFTY 50 has no session on {self.expected_session.isoformat()}, the last "
+            f"session the calendar expects for {iso_year}-W{iso_week:02d} (latest present: "
+            f"{had}). Either Dhan has not published it yet or the exchange closed on a day "
+            "the verified holiday list does not carry. The week is NOT built from the "
+            "sessions that are present; the run fails closed and the next attempt retries."
+        )
+
+
+def assess_index_publication(
+    index_daily: Sequence[DailyBar],
+    *,
+    week: tuple[int, int],
+    expected_session: date,
+    calendar: TradingCalendar | None = None,
+) -> IndexPublicationVerdict:
+    """Spec 6.2's index gate. **If this is not published, the whole run stops.**
+
+    A stale symbol is skipped and reported; a stale *index* stops everything,
+    because the regime is then unknown and every entry decision depends on it.
+
+    ``calendar`` is optional only because the unlisted-session list it produces
+    is for the report, not for the verdict.
+    """
+    in_week = [bar.session for bar in index_daily if iso_key(bar.session) == week]
+    unlisted = tuple(calendar.unlisted_sessions(in_week, week)) if calendar else ()
+    return IndexPublicationVerdict(
+        week=week,
+        expected_session=expected_session,
+        last_session=max(in_week) if in_week else None,
+        unlisted_sessions=unlisted,
+    )
 
 
 def assess_staleness(
