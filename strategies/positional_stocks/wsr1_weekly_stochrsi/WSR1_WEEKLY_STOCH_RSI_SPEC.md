@@ -5,7 +5,7 @@
 **Engine kind:** `stock_portfolio_engine` (the existing, reserved `EngineKind.STOCK_PORTFOLIO_ENGINE`; no new enum value)
 **Execution shape:** a run-to-completion weekly job — no tick feed, no long-lived worker, no intraday decisions
 **Initial mode:** paper only
-**Status:** implementation specification v1.2a — Phase 0 decisions folded in, internal contradictions swept; ready for the Phase 0 docs commit
+**Status:** implementation specification v1.2b — Phase 1 review: calendar-based staleness, provisional fetch times, keyed gap acknowledgements
 **Scheduling:** two of its own LaunchAgents (a fetch/preview job and an offline decision job). **Not** registered with `auto_start`, and no change to shared auto-start code
 **Rule source:** "Weekly Stoch RSI V1 Trading Plan" (operator's V1 rulebook, 20 Sep 2026), including its resolved ambiguities and the first-cross / K < 50 fix
 **Target branch:** new `strategy-wsr1-weekly-stochrsi`, cut from `feature-paper-auto-start` at `701e030`
@@ -38,6 +38,14 @@ Numbers in brackets are the Phase 0 question numbers.
 | 8 | Paper costs stay at 12 / 11 bps + ₹15 until the operator verifies them; they affect reported P&L only, never a decision [9] | Phases 1–3 are not blocked by them |
 | 9 | **Operator action, blocking Phase 1:** confirm the Dhan Data API subscription is active for `/v2/charts/historical` [10] | Phase 1 cannot fetch without it |
 | 10 | Two defects found in shared code are **recorded as findings only, not fixed**: `token_cache.py`'s `expiry_time` is stored without a timezone marker while `created_at` has one; `runtimes/positional_options/__init__.py`'s docstring still says "placeholder package" | Both are outside this feature; changing shared auth code needs its own approval |
+
+### Changes in v1.2b (21 Sep 2026 — Phase 1 review)
+
+| # | Change | Reason |
+|---|---|---|
+| 1 | **Staleness reference comes from the verified holiday calendar, not from NIFTY's data (section 6.2)** | 21 Sep 2026 was a trading day (NSE's September list has only 14 Sep as a holiday), yet Dhan had not published its daily candle by 22:20 IST. With a data-derived reference, a Friday candle missing at fetch time makes Thursday the "last session", every series passes, and a Monday–Thursday bar is used as the week. Reproduced against the Phase 1 modules |
+| 2 | Fetch times in 10.3 are **provisional** until a publication-lag probe establishes when Dhan publishes a session's daily candle, including a Friday's on a weekend | The schedule assumed same-evening publication; that assumption is now known to be unsafe |
+| 3 | Gap acknowledgements keyed per (symbol, session, ratio); a monthly full refetch (section 6.1) | MOTHERSON showed Dhan's back-adjustment can stop partway: its 1:2 bonus (ex-date 18 Jul 2025, per raw NSE data) was applied back only to 30 Apr 2024, plus one stray adjusted bar on 16 Aug 2023. The 10-session overlap check cannot see older history change |
 
 ---
 
@@ -267,10 +275,19 @@ Every exit fills at the next session's open. A position is **closed** when its s
     - If Dhan history is adjusted → record the evidence in the runbook.
     - If it is not → STOP and report. Do not build an adjustment engine without approval.
 - Any symbol whose adjusted series shows an unexplained overnight gap of 30% or more is flagged and skipped for new entries until the operator acknowledges it.
+    - **An acknowledgement is keyed to (symbol, gap session, ratio), never to the symbol alone (v1.2b).** A new unexplained gap re-blocks an acknowledged symbol.
+    - **Monthly full refetch (v1.2b):** the first fetch of each calendar month refetches every symbol's full history instead of the tail. The overlap check sees only the last 10 sessions, so it cannot detect Dhan restating older history — for example correcting, or newly breaking, a partial back-adjustment like MOTHERSON's.
 
 ### 6.2 Staleness
 
 A run for week W requires every used series to contain W's last session. Series that don't are skipped and reported. If NIFTY 50 is stale, the whole run stops (regime unknown). **Fail closed.**
+
+**W's last session comes from the calendar, never from the data (v1.2b).** It is the last weekday (Monday–Friday) of the ISO week that is not in the verified NSE holiday list in `config/global.yaml` (`holidays`), read through the existing session/calendar code rather than a second copy.
+
+- NIFTY 50 must contain that expected session. If it does not, the data is **not yet published** (or the calendar is wrong): the fetch reports it and fails closed, and the job's next scheduled attempt retries. A week is never built from the sessions that happen to be present.
+- Deriving W's last session from NIFTY's own data is **forbidden**: when Dhan has not yet published Friday's candle, NIFTY's last session is Thursday, every series looks current, and a Monday–Thursday bar is silently used as the week (reproduced in the Phase 1 review).
+- A session present in the data on a date the calendar lists as a holiday (for example the Diwali Muhurat session, 8 Nov 2026, a Sunday) is included in its ISO week and reported. It does not change the expected last session.
+- The holiday list is annual. Without a 2027 list, every 2027 holiday Friday is "expected" and that week fails closed — the safe direction.
 
 ### 6.3 `universe.csv` (operator-maintained, committed)
 
@@ -367,7 +384,7 @@ python -m runtimes.positional_stocks.weekly_run --mode decide [--as-of auto|YYYY
 
 | Job | Times (IST) | Mode | Notes |
 |---|---|---|---|
-| Fetch + preview | **Friday 18:00**, retried **Saturday 10:00** and **Sunday 10:00** | `--mode fetch` | Idempotent: if the cache already covers the completed week and its preview report exists, it exits immediately. Market closed and the intraday runtimes stopped, so nothing else is drawing on Dhan's 5 req/s Data-API budget |
+| Fetch + preview | **Friday 18:00**, retried **Saturday 10:00** and **Sunday 10:00** — **provisional (v1.2b):** Dhan had not published Monday 21 Sep 2026's daily candle by 22:20 IST that day, so Friday 18:00 may find Friday missing. The times are fixed in Phase 5 from the publication-lag probe; until then the calendar rule in 6.2 makes an early fetch fail closed, never silently wrong | `--mode fetch` | Idempotent: if the cache already covers the completed week and its preview report exists, it exits immediately. Market closed and the intraday runtimes stopped, so nothing else is drawing on Dhan's 5 req/s Data-API budget |
 | Decision | **Monday 08:30** | `--mode decide` | Offline. If the cache does not cover the completed week, it makes **no trades**, reports the reason and alerts. The operator may re-run either mode by hand |
 
 Between the two, the operator reads the preview report and fills `quality_gate.csv` for the candidates it lists. That weekend window is the point of splitting the job in two: a candidate with no valid quality row is refused (section 4.2), and the preview is what makes it reachable in time.
