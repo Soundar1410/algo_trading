@@ -5,7 +5,7 @@
 **Engine kind:** `stock_portfolio_engine` (the existing, reserved `EngineKind.STOCK_PORTFOLIO_ENGINE`; no new enum value)
 **Execution shape:** a run-to-completion weekly job — no tick feed, no long-lived worker, no intraday decisions
 **Initial mode:** paper only
-**Status:** implementation specification v1.2d — full-history fetch (EMA200 depends on it); TradingView parity readings recorded
+**Status:** implementation specification v1.2f — Phase 3 rule decisions (brakes, repeat signal, re-entry, week counting)
 **Scheduling:** two of its own LaunchAgents (a fetch/preview job and an offline decision job). **Not** registered with `auto_start`, and no change to shared auto-start code
 **Rule source:** "Weekly Stoch RSI V1 Trading Plan" (operator's V1 rulebook, 20 Sep 2026), including its resolved ambiguities and the first-cross / K < 50 fix
 **Target branch:** new `strategy-wsr1-weekly-stochrsi`, cut from `feature-paper-auto-start` at `701e030`
@@ -60,6 +60,30 @@ Numbers in brackets are the Phase 0 question numbers.
 | # | Change | Reason |
 |---|---|---|
 | 1 | **Fetch full available history, not 260 weeks (section 6.1)** | The Phase 2 pre-check found ETERNAL's EMA200 at 206.60 vs TradingView's 209.70: the cache held 260 weeks, so the SMA seed averaged a different window. Reproduced independently: last-260-bars 206.60, full history 209.70. The same window moves EMA200 by 1.5–2.5% for long-listed stocks (RELIANCE, INFY, LT), which would change add decisions |
+
+### Changes in v1.2e (24 Sep 2026 — Phase 2 review)
+
+| # | Change | Reason |
+|---|---|---|
+| 1 | **Gap blocking limited to the most recent 520 weekly bars (section 6.1)** | The full-history gap scan flagged 262 moves in 43 symbols; all but MOTHERSON's are more than five years old. Old breaks barely move any indicator; blocking on them would shut out RELIANCE and HDFCBANK |
+| 2 | The V1 plan's golden-case text committed as `WSR1_V1_GOLDEN_CASES.md` (section 14) | Phase 3's tests are written from the plan's own tables, which were not in the repository |
+| 3 | Section 6.1's 260-bar comparison labelled as independent data, not parity | Dhan's full history gives RELIANCE's EMA200 as 1295.07; the review's data gives 1313.91. Only a TradingView reading can settle it |
+| 4 | 6-month performance counts 26 ISO weeks, not 26 bars (section 4.4) | A stock with a missing week (a suspension) would otherwise compare a longer window than NIFTY's, and RS would mix two different periods |
+
+### Changes in v1.2f (24 Sep 2026 — Phase 3 plan answers)
+
+| # | Decision | Section |
+|---|---|---|
+| 1 | Repeat signal compares the **most recent** earlier trigger (the V1 plan's wording) | 4.6 item 8 |
+| 2 | Brake 1: 4-decision-week pause, then entries resume; re-fires only after equity recovers above 90% of peak | 4.12 |
+| 3 | Brake 2: clearing resets the peak to equity at the clearance date | 4.12 |
+| 4 | Undefined NIFTY EMA40 → regime Unknown → no entries; undefined K/D in the arm or cross window → no trigger | 4.3, 4.5 |
+| 5 | Decided exits free slots, sector, group and committed amount for the same week's entries; sale proceeds not counted as cash until filled | 4.13 |
+| 6 | Re-entry after a profit needs a fresh arm **and** trigger after the exit fill week; P&L is net of costs | 4.11 |
+| 7 | Weeks counted in ISO weeks: time exit decided at F + 52, fills F + 53; cooling-off entries from X + 26 | 4.10, 4.11 |
+| 8 | PASS → EVENT_RISK on a held position disables T3; expired FAIL still exits; governance event on a held symbol is recorded as FAIL (operator procedure) | 4.2 |
+| 9 | A removed symbol's `on_exit` comes from its last-seen row, persisted by the runtime | 6.3 |
+| 10 | "Close ≥ P1 clears the touch" (4.9 item 4) is a deliberate spec rule the V1 plan did not state; the spec's behaviour stands | 4.9 |
 
 ---
 
@@ -133,7 +157,9 @@ The gate is judged by the operator and recorded in `quality_gate.csv` (section 6
 - A symbol may be entered only with a row whose `status` is `PASS` or `EVENT_RISK` and whose `valid_until` is on or after the execution date.
 - Missing, expired or `FAIL` → no entry and no add. The report lists it under "needs quality check". **Fail closed.**
 - `EVENT_RISK` → allocation × 0.5 and max 1 add (T3 disabled).
-- A held position whose row turns `FAIL` → thesis exit (section 4.10).
+- A held position entered as `PASS` whose row later becomes `EVENT_RISK` keeps its sizing, but T3 is disabled from then on (v1.2f).
+- A held position whose row turns `FAIL` → thesis exit (section 4.10). An **expired** `FAIL` row is still a thesis exit (fail closed); an expired `PASS` or `EVENT_RISK` row on a held position blocks adds but does not exit (v1.2f).
+- **Operator procedure (v1.2f):** a new company- or promoter-group-level governance event on a **held** symbol is recorded as `FAIL`, which exits it. After the position is closed the operator may change the row to `EVENT_RISK`. One status per symbol cannot express "exit if held, event-risk if not"; this procedure does.
 
 The operator's criteria, for reference only (not coded): PAT > 0 in each of 3 years; 3-year sales and profit CAGR > 0; 3-year average ROCE ≥ 12% (banks/NBFCs: ROE ≥ 12% and GNPA % not above 4 quarters ago); D/E ≤ 1 or interest cover ≥ 3× (not for banks/NBFCs); operating cash flow > 0 in ≥ 4 of 5 years (not for banks/NBFCs); pledge ≤ 10% and not rising; FII + DII not down > 3 pp in 2 quarters; NOT (profit and revenue both down YoY in each of the last 2 quarters); no company fraud allegation, regulatory enforcement, auditor resignation or qualified opinion in 12 months. Event-risk: such an event 12–36 months ago, or at promoter-group level within 36 months.
 
@@ -142,6 +168,7 @@ The operator's criteria, for reference only (not coded): PAT > 0 in each of 3 ye
 - NIFTY 50 weekly bars; 40-week EMA of close.
 - **Red** = close < EMA40 AND EMA40 < its value 4 weekly bars earlier. Otherwise **Normal**.
 - Red: max 1 new entry this week, and only `nifty100` symbols. Normal: max 2 new entries.
+- **Unknown** (v1.2f): NIFTY 50's EMA40, or its value 4 bars earlier, is undefined → no new entries (fail closed). An undefined input must never read as "not Red".
 - The regime affects new entries only. Adds and exits are unaffected.
 
 ### 4.4 Indicators (exact formulas — must match TradingView, section 7)
@@ -155,7 +182,7 @@ The operator's criteria, for reference only (not coded): PAT > 0 in each of 3 ye
 | EMA(n) for n = 10, 40, 50, 200 | α = 2/(n + 1). **Seeded with the SMA of the first n closes** — the first EMA value exists at bar n; earlier bars are undefined. **Verified against TradingView (v1.2c):** ETERNAL (270 weekly bars), week ending 18 Sep 2026, EMA200 = 209.70 on TradingView; SMA seed gives 209.70, first-value seed gives 223.24. For young stocks the seed changes EMA200 by several percent, so this is not negligible |
 | ATR(14) | Wilder RMA of weekly true range, seeded as RSI; ATR% = ATR ÷ close of the same week |
 | 52-week high | Max weekly high over the last 52 bars, including the current one |
-| 6-month performance | close ÷ close 26 bars earlier − 1, for the stock and for NIFTY 50 |
+| 6-month performance | close ÷ the close of the ISO week **26 weeks earlier** − 1, for the stock and for NIFTY 50 (v1.2e: by calendar week, not by bar count). Undefined if the series has no bar for that earlier week |
 | RS | stock 6M performance − NIFTY 6M performance (percentage points) |
 
 ### 4.5 Arm and trigger
@@ -169,7 +196,7 @@ TRIGGER  = ARMED
            AND K(this week) < 50
 ```
 
-A cross in the arm week itself counts. Values are weekly closes only.
+A cross in the arm week itself counts. Values are weekly closes only. **An undefined K or D anywhere in the arming window or the cross check → no trigger, reported (v1.2f).**
 
 ### 4.6 Entry filters (all required)
 
@@ -180,7 +207,7 @@ A cross in the arm week itself counts. Values are weekly closes only.
 5. Universe rules of 4.1 pass; quality row valid (4.2).
 6. No row in `results_calendar.csv` for this symbol falling Monday–Friday of the execution week. If the calendar has no row for the symbol, proceed and flag "results date unknown" (paper mode only; a live mode must fail closed — section 12).
 7. Sector limit and promoter-group limit have room (4.12).
-8. **Repeat signal:** if an earlier TRIGGER for this symbol (traded or not) occurred within the last 26 weekly bars and its week's close is higher than this week's close, this week's close must also be above the prior week's high.
+8. **Repeat signal:** if the **most recent** earlier TRIGGER for this symbol (traded or not) occurred within the last 26 weekly bars and its week's close is higher than this week's close, this week's close must also be above the prior week's high. (v1.2f: the most recent earlier trigger, as the V1 plan says — not any earlier trigger.)
 
 ### 4.7 Ranking and entry count
 
@@ -222,7 +249,7 @@ For each position not yet half-sold, evaluate in this order; the first match dec
 
 1. **Thesis exit:** the quality row is `FAIL` (or the symbol left the universe file with `on_exit: exit` — section 6.3) → sell all.
 2. **Stop:** weekly close < Stop → sell all.
-3. **Time exit:** 52 weeks since the T1 fill week with no partial sale → sell all.
+3. **Time exit:** 52 weeks since the T1 fill week with no partial sale → sell all. Counted in ISO weeks (v1.2f): with T1 filled in week F, the exit is decided at the close of week F + 52 and fills in week F + 53. The trail time (below) and the cooling-off (4.11) count the same way.
 4. **Partial:** K > 90 AND D > 90 → sell `floor(shares ÷ 2)` (once per trade). From then on: no adds, unfilled tranches cancelled, Stop replaced by the trail.
 5. **Add** check (4.9).
 
@@ -236,8 +263,8 @@ Every exit fills at the next session's open. A position is **closed** when its s
 
 ### 4.11 Re-entry
 
-- Closed with total net P&L ≥ 0 → eligible again on the next fresh TRIGGER.
-- Closed with total net P&L < 0 → 26-week cooling-off from the exit fill week; after it, entry also requires `close > EMA50` (RS alone is not enough).
+- Closed with total net P&L ≥ 0 → eligible again on the next **fresh arm and trigger**: both the arming close (K < 20 and D < 20) and the cross must fall in decision weeks after the exit fill week (v1.2f, as the V1 plan says). An arm left over from while the stock was held does not count.
+- Closed with total net P&L < 0 → 26-week cooling-off from the exit fill week X (entry decisions allowed from week X + 26); after it, entry also requires a fresh arm and trigger as above **and** `close > EMA50` (RS alone is not enough). P&L is **net of costs**: a trade slightly positive before costs but negative after them is a loss.
 - One open position per symbol.
 
 ### 4.12 Portfolio limits (paper book values — all in configuration)
@@ -251,8 +278,8 @@ Every exit fills at the next session's open. A position is **closed** when its s
 | Untouchable buffer | 0% | 20% |
 | Max per sector | 2 open positions | 2 |
 | Max per promoter group | 1 open position | 1 |
-| Drawdown brake 1 | Equity ≤ 90% of peak → no new entries for 4 weeks | Same |
-| Drawdown brake 2 | Equity ≤ 80% of peak → no new entries until the operator clears `brake_2_cleared_on` in config | Same |
+| Drawdown brake 1 | Equity ≤ 90% of peak → no new entries for the next 4 decision weeks. After the pause, entries resume even if equity is still ≤ 90%; brake 1 can fire again only after equity has closed above 90% of peak at least once (v1.2f). A deeper fall is brake 2's job | Same |
+| Drawdown brake 2 | Equity ≤ 80% of peak → no new entries until the operator clears `brake_2_cleared_on` in config. **Clearing resets the peak** to the equity at the clearance date (v1.2f); otherwise it would re-trigger at once | Same |
 
 - **Committed** = A for each open position until its partial sale; afterwards the cost of the shares still held. EVENT_RISK positions commit T1 + T2 only.
 - **Equity** = cash + Σ(shares × weekly close), measured at each weekly run. The peak is the running maximum of that series.
@@ -263,7 +290,7 @@ Every exit fills at the next session's open. A position is **closed** when its s
 1. Execute pending orders from the previous decision week at this week's first-session open (section 8).
 2. Mark to market at this week's close; update equity, peak and brake state.
 3. Evaluate exits and adds for open positions (4.10, 4.9).
-4. Evaluate new entries (4.5–4.8) with the slots, cash and limits left after step 3's decisions.
+4. Evaluate new entries (4.5–4.8) with the slots, cash and limits left after step 3's decisions. (v1.2f) A decided SELL_ALL frees its slot, sector, group and committed amount for this week's entries; a decided SELL_HALF recomputes committed as the cost of the shares that will remain. **Sale proceeds are not counted as cash until filled**, and each planned buy reserves its amount plus buy costs.
 5. Persist decisions as pending orders for the next session; write the report.
 
 ---
@@ -282,7 +309,7 @@ Every exit fills at the next session's open. A position is **closed** when its s
 
 - Source: Dhan `POST /v2/charts/historical` (daily candles since inception), through `common/market_data/dhan_historical.py` extended with a `fetch_daily()` method in the existing client's style (httpx, bounded retries, error classification).
 - **Fetch each symbol's full available daily history (v1.2d)** — request from 2000-01-01; Dhan returns from its earliest record (from listing for younger stocks). Cache on disk; afterwards refetch only the tail, with the overlap check below.
-    - **Why not 260 weeks:** EMA200 is SMA-seeded (section 4.4), so a 260-week window leaves only 60 bars of smoothing after the seed and the value depends on where the window starts. Measured at week ending 18 Sep 2026: 260 bars vs full history gives ETERNAL 206.60 vs 209.70 (TradingView 209.70), RELIANCE 1338.50 vs 1313.91, INFY 1468.65 vs 1433.36, LT 3267.62 vs 3335.11 — errors of 1.5–2.5% in the value that gates every add. K, D, EMA50 and ATR are unaffected.
+    - **Why not 260 weeks:** EMA200 is SMA-seeded (section 4.4), so a 260-week window leaves only 60 bars of smoothing after the seed and the value depends on where the window starts. Measured at week ending 18 Sep 2026 on the review's independent data (not Dhan's): 260 bars vs full history gives ETERNAL 206.60 vs 209.70 (TradingView 209.70), RELIANCE 1338.50 vs 1313.91, INFY 1468.65 vs 1433.36, LT 3267.62 vs 3335.11. These full-history values are not parity readings — only ETERNAL's EMA200 is (section 7); Dhan's full history gives RELIANCE 1295.07, pending a TradingView reading — errors of 1.5–2.5% in the value that gates every add. K, D, EMA50 and ATR are unaffected.
     - **No chunking is needed:** one call for RELIANCE over 2000-01-01 → 2026-09-22 returned 6,145 sessions back to 2002-01-01 (D94).
     - The gap scan (≥ 30% flag, ≥ 15% report) runs over the full history. Gaps older than about five years barely move any indicator, but they are reported.
 - **Only the `fetch` mode touches the network.** Its cache is keyed by **symbol**, never by instrument id or by run date, so the `decide` mode can read it without resolving anything or authenticating (section 10.3).
@@ -293,6 +320,7 @@ Every exit fills at the next session's open. A position is **closed** when its s
     - If it is not → STOP and report. Do not build an adjustment engine without approval.
 - Any symbol whose adjusted series shows an unexplained overnight gap of 30% or more is flagged and skipped for new entries until the operator acknowledges it.
     - **An acknowledgement is keyed to (symbol, gap session, ratio), never to the symbol alone (v1.2b).** A new unexplained gap re-blocks an acknowledged symbol.
+    - **Only gaps in the most recent 520 weekly bars (~10 years) block (v1.2e).** Older gaps are reported, never blocking. A price break of factor r that is N weeks old moves EMA200 by about |1 − r| × 0.99005^N: a 1:1 bonus (r = 0.5) left unadjusted 520 weeks ago moves it by ~0.3%, inside parity tolerance, and every other indicator here looks back far less. Applied to full history without a window, the rule would block 43 symbols — RELIANCE and HDFCBANK among them — over breaks 15–20 years old.
     - **Monthly full refetch (v1.2b):** the first fetch of each calendar month refetches every symbol's full history instead of the tail. The overlap check sees only the last 10 sessions, so it cannot detect Dhan restating older history — for example correcting, or newly breaking, a partial back-adjustment like MOTHERSON's.
 
 ### 6.2 Staleness
@@ -312,7 +340,7 @@ Columns: `symbol, isin, company, industry, nifty100 (true/false), group (promote
 
 - `industry` is NSE's Industry column from the NIFTY 200 constituent file and is the sector used for limits.
 - `group` blank = its own group.
-- When NIFTY 200 is reconstituted (end of March / September), the operator updates the file. A held symbol removed from the file follows `on_exit` (default `hold`: exits as normal, no further adds).
+- When NIFTY 200 is reconstituted (end of March / September), the operator updates the file. A held symbol removed from the file follows `on_exit` (default `hold`: exits as normal, no further adds). The `on_exit` used is the one from the symbol's **last-seen row**, which the runtime persists (v1.2f).
 
 ### 6.4 `quality_gate.csv` (operator-maintained, committed)
 
@@ -528,6 +556,9 @@ Golden cases, taken from the operator's V1 plan (all must pass exactly):
 | Odd shares at the partial sale | 73 held → sell 36 |
 | Entry table | Every YES/NO row of the V1 plan's section 7, including the K = D, midweek-cross, window-expired, K = 28 and K ≥ 50 cases |
 | Exit table | Every row of the V1 plan's section 8 |
+| Averaging scenarios and the ₹10L example | Every row of the V1 plan's sections 5 and 6 that the spec's rules decide (the paper book's limits replace the plan's 8 / 80%) |
+
+The V1 plan's sections 1 and 5–8 are committed beside this spec as `WSR1_V1_GOLDEN_CASES.md` (v1.2e), with the known intentional differences listed at its top. The spec wins on any conflict; any other difference is a finding to report.
 
 Also:
 
