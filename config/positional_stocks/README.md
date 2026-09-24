@@ -75,3 +75,24 @@ with no row is flagged "results date unknown" and still proceeds; a live mode
 must fail closed instead, which `load_results_calendar(required=True)` does.
 Several rows per symbol are expected across a year; only an exact repeat of the
 same symbol and date is rejected.
+
+## `gap_acknowledgements.csv` (spec 6.1)
+
+`symbol, gap_session, ratio, acknowledged_on, note`
+
+A close-to-close move of **30% or more** in a symbol's daily history is an
+unexplained gap. Usually it is a corporate action Dhan failed to back-adjust
+(MOTHERSON, runbook D94). It blocks new entries in that symbol until you
+acknowledge it here. A move of 15–30% is only reported.
+
+- **Keyed, not blanket.** A row covers exactly one gap: the symbol, the session
+  the gap closed on, and the ratio (close ÷ previous close, matched to 4
+  decimals). A new gap, or Dhan restating the same session to a different
+  ratio, blocks again.
+- **Only recent gaps block.** Only gaps in the most recent 520 weekly bars
+  (about 10 years) block. Older ones are reported, never blocking (spec 6.1
+  v1.2e).
+- Shipped **header-only**. Nothing is acknowledged by default, and MOTHERSON
+  stays blocked (operator decision, 23 September 2026). The loader fails
+  closed on a malformed row, an ambiguous date, or the same gap acknowledged
+  twice.
