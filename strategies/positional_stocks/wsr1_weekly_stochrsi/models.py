@@ -228,6 +228,22 @@ class ResultsRow:
     results_date: date
 
 
+@dataclass(frozen=True, slots=True)
+class GapAcknowledgement:
+    """One row of ``gap_acknowledgements.csv`` (spec 6.1 v1.2b).
+
+    Keyed to (symbol, gap session, ratio) — never to the symbol alone — so a
+    new unexplained gap, or Dhan restating the same session to a different
+    ratio, blocks again. ``ratio`` is close / previous close, to 4 decimals.
+    """
+
+    symbol: str
+    gap_session: date
+    ratio: Decimal
+    acknowledged_on: date
+    note: str = ""
+
+
 # ===========================================================================
 # Phase 3 — the rules core's inputs and outputs (spec sections 4, 9, 12)
 # ===========================================================================

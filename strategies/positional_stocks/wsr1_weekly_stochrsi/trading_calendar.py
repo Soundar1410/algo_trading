@@ -161,6 +161,40 @@ class TradingCalendar:
             )
         return candidate
 
+    def first_session(self, week: tuple[int, int]) -> date:
+        """The first weekday of ISO week ``week`` that is not a listed holiday.
+
+        Spec 4.9 v1.2g: a buy that filled on this session was "at the week's
+        open"; any later fill in the week was not. Tuesday, when Monday is a
+        holiday.
+
+        Raises:
+            CalendarError: the week contains no trading weekday at all.
+        """
+        iso_year, iso_week = week
+        for weekday in range(1, _SATURDAY):
+            day = date.fromisocalendar(iso_year, iso_week, weekday)
+            if self.is_trading_day(day):
+                return day
+        raise CalendarError(
+            f"ISO week {iso_year}-W{iso_week:02d} has no trading weekday: every "
+            "Monday-to-Friday is a listed holiday."
+        )
+
+    def next_session_after(self, day: date) -> date:
+        """The first trading day strictly after ``day`` — where an order decided
+        at ``day``'s close executes (spec 3).
+
+        Raises:
+            CalendarError: no trading day within the next three weeks, which
+                only a corrupted holiday list could produce.
+        """
+        for offset in range(1, 22):
+            candidate = day + timedelta(days=offset)
+            if self.is_trading_day(candidate):
+                return candidate
+        raise CalendarError(f"no trading day within three weeks after {day.isoformat()}")
+
     def unlisted_sessions(self, sessions: Iterable[date], week: tuple[int, int]) -> list[date]:
         """Sessions inside ``week`` that fall on a non-trading day, ascending.
 

@@ -51,6 +51,16 @@ ALLOWED_IMPORTS: dict[str, set[str]] = {
         ".models",
     },
     "iso_weeks.py": {"__future__", "datetime"},
+    "gaps.py": {
+        "__future__",
+        "collections.abc",
+        "dataclasses",
+        "datetime",
+        "decimal",
+        "itertools",
+        ".iso_weeks",
+        ".models",
+    },
     "models.py": {"__future__", "dataclasses", "datetime", "decimal", "enum", ".iso_weeks"},
 }
 

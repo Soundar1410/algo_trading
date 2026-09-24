@@ -1,4 +1,4 @@
-"""Loaders for the three operator-maintained CSVs (spec 6.3, 6.4, 6.5).
+"""Loaders for the operator-maintained CSVs (spec 6.1, 6.3, 6.4, 6.5).
 
 All three are **fail-closed**. These files are the only place a human decision
 enters an otherwise deterministic strategy, and every way they can be wrong —
@@ -26,11 +26,20 @@ import io
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import date
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 
 from common.logging import get_logger
 
-from .models import OnExit, QualityRow, QualityStatus, ResultsRow, UniverseRow
+from .gaps import RATIO_PLACES
+from .models import (
+    GapAcknowledgement,
+    OnExit,
+    QualityRow,
+    QualityStatus,
+    ResultsRow,
+    UniverseRow,
+)
 
 _log = get_logger(__name__)
 
@@ -46,6 +55,7 @@ UNIVERSE_COLUMNS = (
 )
 QUALITY_COLUMNS = ("symbol", "status", "checked_on", "valid_until", "notes")
 RESULTS_COLUMNS = ("symbol", "results_date")
+GAP_ACK_COLUMNS = ("symbol", "gap_session", "ratio", "acknowledged_on", "note")
 
 _TRUE = frozenset({"true", "yes", "y", "1"})
 _FALSE = frozenset({"false", "no", "n", "0", ""})
@@ -264,6 +274,52 @@ def load_results_calendar(
         rows=tuple(rows),
         _dates={symbol: tuple(sorted(days)) for symbol, days in dates.items()},
     )
+
+
+def load_gap_acknowledgements(path: Path | str) -> tuple[GapAcknowledgement, ...]:
+    """Parse ``gap_acknowledgements.csv`` (spec 6.1). Header-only is valid.
+
+    Fail closed: a missing file raises like every other operator input, and a
+    malformed row stops the run — a wrongly parsed acknowledgement would let a
+    blocked symbol trade. ``ratio`` is close / previous close; it is rounded
+    to 4 decimals, the precision gaps are matched on.
+
+    Raises:
+        InputFileError: missing file, wrong header, a bad value, or the same
+            (symbol, gap_session) acknowledged twice.
+    """
+    location = Path(path)
+    rows: list[GapAcknowledgement] = []
+    seen: set[tuple[str, date]] = set()
+    for line, record in _records(location, GAP_ACK_COLUMNS, "gap acknowledgements"):
+        symbol = _required(record, "symbol", location, line).upper()
+        session = _required_date(record.get("gap_session"), "gap_session", location, line)
+        if (symbol, session) in seen:
+            raise InputFileError(
+                f"{location} line {line}: {symbol} {session} is acknowledged twice."
+            )
+        seen.add((symbol, session))
+        raw_ratio = _required(record, "ratio", location, line)
+        try:
+            ratio = Decimal(raw_ratio)
+        except InvalidOperation:
+            raise InputFileError(
+                f"{location} line {line}: ratio is {raw_ratio!r}; expected a number."
+            ) from None
+        if not ratio.is_finite() or ratio <= 0:
+            raise InputFileError(f"{location} line {line}: ratio must be positive.")
+        rows.append(
+            GapAcknowledgement(
+                symbol=symbol,
+                gap_session=session,
+                ratio=ratio.quantize(RATIO_PLACES, rounding=ROUND_HALF_UP),
+                acknowledged_on=_required_date(
+                    record.get("acknowledged_on"), "acknowledged_on", location, line
+                ),
+                note=(record.get("note") or "").strip(),
+            )
+        )
+    return tuple(rows)
 
 
 # ------------------------------------------------------------------- parsing
