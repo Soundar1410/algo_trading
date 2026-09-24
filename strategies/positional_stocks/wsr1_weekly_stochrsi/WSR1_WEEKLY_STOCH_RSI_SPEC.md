@@ -5,7 +5,7 @@
 **Engine kind:** `stock_portfolio_engine` (the existing, reserved `EngineKind.STOCK_PORTFOLIO_ENGINE`; no new enum value)
 **Execution shape:** a run-to-completion weekly job — no tick feed, no long-lived worker, no intraday decisions
 **Initial mode:** paper only
-**Status:** implementation specification v1.2b — Phase 1 review: calendar-based staleness, provisional fetch times, keyed gap acknowledgements
+**Status:** implementation specification v1.2d — full-history fetch (EMA200 depends on it); TradingView parity readings recorded
 **Scheduling:** two of its own LaunchAgents (a fetch/preview job and an offline decision job). **Not** registered with `auto_start`, and no change to shared auto-start code
 **Rule source:** "Weekly Stoch RSI V1 Trading Plan" (operator's V1 rulebook, 20 Sep 2026), including its resolved ambiguities and the first-cross / K < 50 fix
 **Target branch:** new `strategy-wsr1-weekly-stochrsi`, cut from `feature-paper-auto-start` at `701e030`
@@ -46,6 +46,20 @@ Numbers in brackets are the Phase 0 question numbers.
 | 1 | **Staleness reference comes from the verified holiday calendar, not from NIFTY's data (section 6.2)** | 21 Sep 2026 was a trading day (NSE's September list has only 14 Sep as a holiday), yet Dhan had not published its daily candle by 22:20 IST. With a data-derived reference, a Friday candle missing at fetch time makes Thursday the "last session", every series passes, and a Monday–Thursday bar is used as the week. Reproduced against the Phase 1 modules |
 | 2 | Fetch times in 10.3 are **provisional** until a publication-lag probe establishes when Dhan publishes a session's daily candle, including a Friday's on a weekend | The schedule assumed same-evening publication; that assumption is now known to be unsafe |
 | 3 | Gap acknowledgements keyed per (symbol, session, ratio); a monthly full refetch (section 6.1) | MOTHERSON showed Dhan's back-adjustment can stop partway: its 1:2 bonus (ex-date 18 Jul 2025, per raw NSE data) was applied back only to 30 Apr 2024, plus one stray adjusted bar on 16 Aug 2023. The 10-session overlap check cannot see older history change |
+
+### Changes in v1.2c (23 Sep 2026 — TradingView parity readings)
+
+| # | Change | Reason |
+|---|---|---|
+| 1 | **EMA is seeded with the SMA of the first n closes** (section 4.4), not the first value | ETERNAL's EMA200 on TradingView is 209.70; SMA seed gives 209.70, first-value seed 223.24. It matters for recently listed stocks, where EMA200 gates adds |
+| 2 | Six parity readings recorded in section 7, with the operator's TradingView settings | Phase 2's acceptance data |
+| 3 | ISO (Monday–Sunday) weekly grouping confirmed as TradingView's, including weekend special sessions (section 7) | Sat–Fri grouping moves RELIANCE's K by 1.1 because of the Sunday 1 Feb 2026 Budget session |
+
+### Changes in v1.2d (24 Sep 2026 — Phase 2 pre-check)
+
+| # | Change | Reason |
+|---|---|---|
+| 1 | **Fetch full available history, not 260 weeks (section 6.1)** | The Phase 2 pre-check found ETERNAL's EMA200 at 206.60 vs TradingView's 209.70: the cache held 260 weeks, so the SMA seed averaged a different window. Reproduced independently: last-260-bars 206.60, full history 209.70. The same window moves EMA200 by 1.5–2.5% for long-listed stocks (RELIANCE, INFY, LT), which would change add decisions |
 
 ---
 
@@ -138,7 +152,7 @@ The operator's criteria, for reference only (not coded): PAT > 0 in each of 3 ye
 | Stoch of RSI | `100 × (RSI − min14(RSI)) / (max14(RSI) − min14(RSI))`. If max = min, the value is undefined → the symbol is skipped that week and flagged |
 | K | SMA(3) of the Stoch series |
 | D | SMA(3) of K |
-| EMA(n) for n = 10, 40, 50, 200 | α = 2/(n + 1), seeded as TradingView's `ta.ema` (its documented reference implementation seeds with the first value). Confirm in the Phase 2 parity test; with ≥ 200 bars of warm-up the seed's effect is negligible |
+| EMA(n) for n = 10, 40, 50, 200 | α = 2/(n + 1). **Seeded with the SMA of the first n closes** — the first EMA value exists at bar n; earlier bars are undefined. **Verified against TradingView (v1.2c):** ETERNAL (270 weekly bars), week ending 18 Sep 2026, EMA200 = 209.70 on TradingView; SMA seed gives 209.70, first-value seed gives 223.24. For young stocks the seed changes EMA200 by several percent, so this is not negligible |
 | ATR(14) | Wilder RMA of weekly true range, seeded as RSI; ATR% = ATR ÷ close of the same week |
 | 52-week high | Max weekly high over the last 52 bars, including the current one |
 | 6-month performance | close ÷ close 26 bars earlier − 1, for the stock and for NIFTY 50 |
@@ -267,7 +281,10 @@ Every exit fills at the next session's open. A position is **closed** when its s
 ### 6.1 Daily history
 
 - Source: Dhan `POST /v2/charts/historical` (daily candles since inception), through `common/market_data/dhan_historical.py` extended with a `fetch_daily()` method in the existing client's style (httpx, bounded retries, error classification).
-- Fetch at least 260 weeks of daily candles per symbol per run (cache on disk; refetch only the missing tail).
+- **Fetch each symbol's full available daily history (v1.2d)** — request from 2000-01-01; Dhan returns from its earliest record (from listing for younger stocks). Cache on disk; afterwards refetch only the tail, with the overlap check below.
+    - **Why not 260 weeks:** EMA200 is SMA-seeded (section 4.4), so a 260-week window leaves only 60 bars of smoothing after the seed and the value depends on where the window starts. Measured at week ending 18 Sep 2026: 260 bars vs full history gives ETERNAL 206.60 vs 209.70 (TradingView 209.70), RELIANCE 1338.50 vs 1313.91, INFY 1468.65 vs 1433.36, LT 3267.62 vs 3335.11 — errors of 1.5–2.5% in the value that gates every add. K, D, EMA50 and ATR are unaffected.
+    - **No chunking is needed:** one call for RELIANCE over 2000-01-01 → 2026-09-22 returned 6,145 sessions back to 2002-01-01 (D94).
+    - The gap scan (≥ 30% flag, ≥ 15% report) runs over the full history. Gaps older than about five years barely move any indicator, but they are reported.
 - **Only the `fetch` mode touches the network.** Its cache is keyed by **symbol**, never by instrument id or by run date, so the `decide` mode can read it without resolving anything or authenticating (section 10.3).
 - **Throttle:** at most 3 requests per second, leaving headroom under Dhan's documented Data-API limit of 5 per second and 100,000 per day (external figure, not yet verified against this account).
 - **Per-run deadline:** 20 minutes for `fetch`, 5 minutes for `decide`. On expiry the run fails closed and reports; it never decides on a partially refreshed universe. The existing client has per-call timeouts but no overall deadline, so this is enforced by the run, not by the client.
@@ -313,6 +330,18 @@ Columns: `symbol, results_date`.
 - Unit tests pin every formula in 4.4 against hand-computed fixtures.
 - **Acceptance against TradingView:** the operator supplies K / D / EMA50 / ATR readings from TradingView for at least 5 symbols at one weekly close. Each must match within ±0.5 (K, D) and ±0.5% (EMA, ATR).
 - The first reference value is already known: **ADANIENSOL, week ending 18 Sep 2026: K 4.64, D 4.51** (TradingView, 1W, Stoch RSI 3/3/14/14, close).
+- **Parity readings (v1.2c)** — TradingView, 1W, NSE, "Adjust data for dividends" OFF, the bar TradingView labels "Tue 15 Sep '26" (week ending 18 Sep 2026; Mon 14 Sep was a holiday):
+
+| symbol | close | K | D | EMA50 | EMA200 | ATR14 |
+|---|---|---|---|---|---|---|
+| ADANIENSOL | 1436.10 | 4.64 | 4.51 | 1285.70 | — | 116.00 |
+| RELIANCE | 1226.40 | 34.68 | 49.60 | 1353.80 | — | 55.60 |
+| HDFCBANK | 731.00 | 16.53 | 14.86 | 817.94 | — | 33.56 |
+| INFY | 1051.40 | 58.64 | 70.51 | 1270.60 | — | 76.06 |
+| LT | 3885.00 | 25.83 | 40.62 | 3909.70 | — | 168.23 |
+| ETERNAL | 326.85 | 90.14 | 93.05 | 280.88 | 209.70 | 19.27 |
+
+- **Pre-check on independent data (review, not Dhan):** the section 4.4 formulas over ISO (Monday–Sunday) weeks reproduce every value above exactly, or within 0.01% for EMA50. Grouping weeks as Saturday–Friday instead moves RELIANCE's K by 1.1 — outside tolerance — because of the Sunday 1 Feb 2026 Budget session, which TradingView counts in its Monday–Sunday week. **So a parity failure on Dhan's data points at the data (a missing or misdated weekend session, an adjustment gap), not the formulas.**
 
 ---
 
