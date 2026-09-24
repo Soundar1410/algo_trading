@@ -5,7 +5,7 @@
 **Engine kind:** `stock_portfolio_engine` (the existing, reserved `EngineKind.STOCK_PORTFOLIO_ENGINE`; no new enum value)
 **Execution shape:** a run-to-completion weekly job — no tick feed, no long-lived worker, no intraday decisions
 **Initial mode:** paper only
-**Status:** implementation specification v1.2f — Phase 3 rule decisions (brakes, repeat signal, re-entry, week counting)
+**Status:** implementation specification v1.2g — Phase 3 review fixes (pending orders, boundaries, brakes, 1-share partial)
 **Scheduling:** two of its own LaunchAgents (a fetch/preview job and an offline decision job). **Not** registered with `auto_start`, and no change to shared auto-start code
 **Rule source:** "Weekly Stoch RSI V1 Trading Plan" (operator's V1 rulebook, 20 Sep 2026), including its resolved ambiguities and the first-cross / K < 50 fix
 **Target branch:** new `strategy-wsr1-weekly-stochrsi`, cut from `feature-paper-auto-start` at `701e030`
@@ -84,6 +84,19 @@ Numbers in brackets are the Phase 0 question numbers.
 | 8 | PASS → EVENT_RISK on a held position disables T3; expired FAIL still exits; governance event on a held symbol is recorded as FAIL (operator procedure) | 4.2 |
 | 9 | A removed symbol's `on_exit` comes from its last-seen row, persisted by the runtime | 6.3 |
 | 10 | "Close ≥ P1 clears the touch" (4.9 item 4) is a deliberate spec rule the V1 plan did not state; the spec's behaviour stands | 4.9 |
+
+### Changes in v1.2g (24 Sep 2026 — Phase 3 review)
+
+| # | Decision | Section |
+|---|---|---|
+| 1 | **Unfilled BUY orders hold their slot, sector, group, committed amount and cash** until filled or cancelled | 4.12 |
+| 2 | EVENT_RISK after T3 has filled keeps the full A committed; T3 is disabled only while unfilled | 4.12 |
+| 3 | Undefined K/D blocks a trigger only in bars the check reads (the 8-close window plus the bar before j0) | 4.5 |
+| 4 | Repeat-signal lookback is the 25 bars before this one; a trigger exactly 26 bars back is outside | 4.6 item 8 |
+| 5 | Clearing brake 2 also ends a running brake-1 pause; brake 1's firing week is the first of its 4 | 4.12 |
+| 6 | A 1-share position's partial sale sells 0 and still switches the position to the trail | 4.10 |
+| 7 | A buy that filled after its week's first session starts the touch window the following week | 4.9 |
+| 8 | Accepted as implemented: clearing brake 2 resets the peak at the first weekly run on or after the date; cost of remaining shares = average cost × shares; undefined RS ranks last | 4.7, 4.12 |
 
 ---
 
@@ -196,7 +209,7 @@ TRIGGER  = ARMED
            AND K(this week) < 50
 ```
 
-A cross in the arm week itself counts. Values are weekly closes only. **An undefined K or D anywhere in the arming window or the cross check → no trigger, reported (v1.2f).**
+A cross in the arm week itself counts. Values are weekly closes only. **An undefined K or D in any bar the check actually reads → no trigger, reported (v1.2f).** Those bars are the arming window (this close and the previous 7) plus the bar before j0, which the no-earlier-cross check needs (v1.2g: a bar outside that set never blocks).
 
 ### 4.6 Entry filters (all required)
 
@@ -207,7 +220,7 @@ A cross in the arm week itself counts. Values are weekly closes only. **An undef
 5. Universe rules of 4.1 pass; quality row valid (4.2).
 6. No row in `results_calendar.csv` for this symbol falling Monday–Friday of the execution week. If the calendar has no row for the symbol, proceed and flag "results date unknown" (paper mode only; a live mode must fail closed — section 12).
 7. Sector limit and promoter-group limit have room (4.12).
-8. **Repeat signal:** if the **most recent** earlier TRIGGER for this symbol (traded or not) occurred within the last 26 weekly bars and its week's close is higher than this week's close, this week's close must also be above the prior week's high. (v1.2f: the most recent earlier trigger, as the V1 plan says — not any earlier trigger.)
+8. **Repeat signal:** if the **most recent** earlier TRIGGER for this symbol (traded or not) occurred within the last 26 weekly bars and its week's close is higher than this week's close, this week's close must also be above the prior week's high. (v1.2f: the most recent earlier trigger, as the V1 plan says — not any earlier trigger.) "Within the last 26 weekly bars" means the 25 bars before this one (i − 25 … i − 1); a trigger exactly 26 bars back is outside, matching the 26-week cooling-off count (v1.2g).
 
 ### 4.7 Ranking and entry count
 
@@ -235,7 +248,7 @@ Levels are fixed at the T1 fill and never recalculated. If `floor(...)` gives 0 
 An add of the next tranche is decided for a week only when ALL hold:
 
 1. The position has no partial sale yet, and tranches used < max (3, or 2 for EVENT_RISK).
-2. **Touch:** some weekly low ≤ the next level (L1 for T2, L2 for T3), in any week from the previous buy's fill week onward.
+2. **Touch:** some weekly low ≤ the next level (L1 for T2, L2 for T3), in any week from the previous buy's fill week onward. (v1.2g) The previous buy's fill week counts only if that buy filled at the week's **first session**; if it filled later in the week (the symbol did not trade Monday), the touch window starts the following week, because a weekly low cannot show whether it came before or after the fill.
 3. **Reversal:** this week's close > the prior week's high, and this week is later than the previous buy's fill week (the touch week may be this same week).
 4. This week's close > Stop AND > EMA200 AND < P1. If the close is ≥ P1, the add is skipped and its touch is cleared; the level must be touched again.
 5. The quality row is still valid; no results in the execution week (4.6 item 6).
@@ -250,7 +263,7 @@ For each position not yet half-sold, evaluate in this order; the first match dec
 1. **Thesis exit:** the quality row is `FAIL` (or the symbol left the universe file with `on_exit: exit` — section 6.3) → sell all.
 2. **Stop:** weekly close < Stop → sell all.
 3. **Time exit:** 52 weeks since the T1 fill week with no partial sale → sell all. Counted in ISO weeks (v1.2f): with T1 filled in week F, the exit is decided at the close of week F + 52 and fills in week F + 53. The trail time (below) and the cooling-off (4.11) count the same way.
-4. **Partial:** K > 90 AND D > 90 → sell `floor(shares ÷ 2)` (once per trade). From then on: no adds, unfilled tranches cancelled, Stop replaced by the trail.
+4. **Partial:** K > 90 AND D > 90 → sell `floor(shares ÷ 2)` (once per trade). From then on: no adds, unfilled tranches cancelled, Stop replaced by the trail. (v1.2g) If `floor(shares ÷ 2)` is 0 (a 1-share position), the partial event still happens with nothing sold: the position becomes half-sold, adds stop and the 10W EMA trail replaces the stop. The report flags it.
 5. **Add** check (4.9).
 
 For each half-sold position:
@@ -278,12 +291,14 @@ Every exit fills at the next session's open. A position is **closed** when its s
 | Untouchable buffer | 0% | 20% |
 | Max per sector | 2 open positions | 2 |
 | Max per promoter group | 1 open position | 1 |
-| Drawdown brake 1 | Equity ≤ 90% of peak → no new entries for the next 4 decision weeks. After the pause, entries resume even if equity is still ≤ 90%; brake 1 can fire again only after equity has closed above 90% of peak at least once (v1.2f). A deeper fall is brake 2's job | Same |
-| Drawdown brake 2 | Equity ≤ 80% of peak → no new entries until the operator clears `brake_2_cleared_on` in config. **Clearing resets the peak** to the equity at the clearance date (v1.2f); otherwise it would re-trigger at once | Same |
+| Drawdown brake 1 | Equity ≤ 90% of peak → no new entries for 4 decision weeks, the firing week counting as the first (v1.2g). After the pause, entries resume even if equity is still ≤ 90%; brake 1 can fire again only after equity has closed above 90% of peak at least once (v1.2f). A deeper fall is brake 2's job | Same |
+| Drawdown brake 2 | Equity ≤ 80% of peak → no new entries until the operator clears `brake_2_cleared_on` in config. **Clearing resets the peak** to the equity at the first weekly run on or after the clearance date (v1.2f), and **also ends any running brake-1 pause** (v1.2g) — the operator's review is the decision to resume | Same |
 
 - **Committed** = A for each open position until its partial sale; afterwards the cost of the shares still held. EVENT_RISK positions commit T1 + T2 only.
 - **Equity** = cash + Σ(shares × weekly close), measured at each weekly run. The peak is the running maximum of that series.
 - Cash may not go negative. An entry or add that would breach the committed cap or cash is skipped and reported.
+- **Pending orders count (v1.2g).** A BUY order still unfilled after step 1 (the symbol did not trade, or its data is missing) holds its slot, sector, promoter group, committed amount and cash (amount plus buy costs) exactly as if filled, until it fills or is cancelled.
+- **Committed with EVENT_RISK (v1.2g):** a position whose row turns EVENT_RISK after T3 has filled still commits its full A; T3 is disabled only while it is unfilled.
 
 ### 4.13 Order of evaluation within one weekly run
 
