@@ -433,3 +433,33 @@ def test_close_not_above_ema50_passes_on_rs_alone() -> None:
     assert _taken(_entry(tape))
     flat = kd_tape(_TRIGGER, ema50=1100.0)
     assert not _entry(flat)[1]
+
+
+# ============ v1.2g fix 3: undefined K/D blocks only in the bars read
+def test_undefined_kd_before_the_window_does_not_block_when_j0_is_later() -> None:
+    """K/D undefined 8 bars back (the bar before the window). j0 is 2 bars back,
+    so the no-earlier-cross check reads from 3 bars back: nothing undefined is
+    read, and this is a valid trigger."""
+    tail: list[tuple[float | None, float | None]] = [(None, None)] + [(50, 50)] * 5
+    tail += [(15, 18), (20, 22), (28, 25)]
+    assert len(tail) == 9
+    assert _taken(_entry(kd_tape(tail)))
+
+
+def test_undefined_kd_in_the_bar_before_j0_blocks() -> None:
+    """j0 is the window's first bar (7 back), so the cross check needs the bar
+    before it (8 back), which is undefined: no trigger, flagged."""
+    tail: list[tuple[float | None, float | None]] = [(None, None), (15, 18)]
+    tail += [(22, 25)] * 6 + [(30, 27)]
+    assert len(tail) == 9
+    funnel, bought = _entry(kd_tape(tail))
+    assert not bought
+    assert funnel.stage is FunnelStage.UNDEFINED
+
+
+def test_undefined_kd_inside_the_window_still_blocks() -> None:
+    tail: list[tuple[float | None, float | None]] = [(15, 18), (None, None)]
+    tail += [(20, 22)] * 5 + [(28, 25)]
+    funnel, bought = _entry(kd_tape(tail))
+    assert not bought
+    assert funnel.stage is FunnelStage.UNDEFINED

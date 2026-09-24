@@ -198,18 +198,27 @@ def trigger(series: IndicatorSeries, i: int, params: RulesParameters) -> Trigger
     ARMED: K < 20 AND D < 20 on this close or any of the previous 7. ``j0`` is
     the latest such close. TRIGGER: armed, K > D now and K <= D last week, no
     such cross in any bar from ``j0`` to last week (a cross in the arm week
-    itself counts), and K < 50. Any undefined K or D from the bar before the
-    window through ``i`` means no trigger (v1.2f).
+    itself counts), and K < 50. An undefined K or D in a bar the check reads —
+    the 8-close window, or the bar before ``j0`` — means no trigger (v1.2f);
+    a bar outside that set never blocks (v1.2g).
     """
     k, d = series.k, series.d
     low = i - (params.arm_window_weeks - 1)
-    if low < 1:
+    if low < 0:
         return TriggerVerdict(False, False, "not enough history for the arm window", undefined=True)
-    span = range(low - 1, i + 1)
-    if any(k[j] is None or d[j] is None for j in span):
+
+    def undefined(span: range) -> TriggerVerdict | None:
+        if not any(k[j] is None or d[j] is None for j in span):
+            return None
         flat = any(series.kd_blocked_by_flat_range(j) for j in span)
         why = "flat stoch range" if flat else "K/D undefined"
         return TriggerVerdict(False, False, f"{why} in the arm/cross window", undefined=True)
+
+    # v1.2g: only bars the check reads can block — the 8-close window here,
+    # and the bar before j0 (for the no-earlier-cross check) once j0 is known.
+    blocked = undefined(range(low, i + 1))
+    if blocked is not None:
+        return blocked
 
     def value(values: tuple[float | None, ...], j: int) -> float:
         v = values[j]
@@ -227,6 +236,11 @@ def trigger(series: IndicatorSeries, i: int, params: RulesParameters) -> Trigger
     if not oversold:
         return TriggerVerdict(False, False, "not armed: no K and D < 20 in the last 8 closes")
     j0 = oversold[-1]
+    if j0 == 0:
+        return TriggerVerdict(False, False, "not enough history before the oversold close", 0, True)
+    blocked = undefined(range(j0 - 1, j0))
+    if blocked is not None:
+        return blocked
     if not crossed(i):
         if value(k, i) == value(d, i):
             why = "armed; K = D at the close (needs K > D)"
