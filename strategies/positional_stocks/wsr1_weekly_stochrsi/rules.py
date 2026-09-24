@@ -761,11 +761,13 @@ def _mul(value: float | None, factor: float) -> float | None:
 def _repeat_refusal(series: IndicatorSeries, i: int, params: RulesParameters) -> str | None:
     """Spec 4.6 item 8 (v1.2f): compare the MOST RECENT earlier trigger.
 
-    Only the latest trigger within the last 26 bars counts, traded or not. If
+    Only the latest trigger in bars i-25 .. i-1 counts, traded or not. If
     its close is above this week's, this week's close must also be above the
     prior week's high.
     """
-    for j in range(i - 1, max(i - params.repeat_lookback_weeks, 0) - 1, -1):
+    # v1.2g: "within the last 26 bars" is i-25 .. i-1; a trigger exactly 26
+    # bars back is outside, as the 26-week cooling-off counts.
+    for j in range(i - 1, max(i - params.repeat_lookback_weeks, -1), -1):
         if not trigger(series, j, params).triggered:
             continue
         lower = series.bars[j].close > series.bars[i].close

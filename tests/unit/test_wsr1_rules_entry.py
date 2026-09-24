@@ -463,3 +463,29 @@ def test_undefined_kd_inside_the_window_still_blocks() -> None:
     funnel, bought = _entry(kd_tape(tail))
     assert not bought
     assert funnel.stage is FunnelStage.UNDEFINED
+
+
+# ============= v1.2g fix 4: the repeat lookback is bars i-25 .. i-1
+def _earlier_trigger_back(bars_back: int) -> Tape:
+    """One earlier trigger ``bars_back`` bars before the decision bar, closing
+    at 1100 (above this week's 1000); the prior week's high is 1010."""
+    # The episode's trigger is its third bar; the final trigger is the last bar.
+    filler = bars_back - len(_EPISODE)
+    tail = _EPISODE + [(30, 35)] * filler + _FINAL
+    assert len(tail) - 1 - 2 == bars_back
+    series_close: dict[int, float | None] = {-(bars_back + 1): 1100.0, -2: 990.0, -1: 1000.0}
+    return kd_tape(tail, close=series_close, high={-2: 1010.0})
+
+
+def test_repeat_trigger_25_bars_back_is_inside_the_lookback() -> None:
+    tape = _earlier_trigger_back(25)
+    assert trigger(tape.series(), N - 1 - 25, PARAMS).triggered
+    funnel, bought = _entry(tape)
+    assert not bought
+    assert "repeat signal" in funnel.reason
+
+
+def test_repeat_trigger_26_bars_back_is_outside_the_lookback() -> None:
+    tape = _earlier_trigger_back(26)
+    assert trigger(tape.series(), N - 1 - 26, PARAMS).triggered
+    assert _taken(_entry(tape))
