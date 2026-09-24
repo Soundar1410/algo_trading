@@ -28,6 +28,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from strategies.positional_stocks.wsr1_weekly_stochrsi.daily_cache import (
+    FULL_HISTORY_FROM,
     MAX_OVERLAP_DRIFT,
     OVERLAP_SESSIONS,
     SCHEMA_VERSION,
@@ -91,6 +92,17 @@ def _rescaled(bars: list[DailyBar], factor: float) -> list[DailyBar]:
 
 def _cache(tmp_path: Path) -> DailyBarCache:
     return DailyBarCache(tmp_path / "daily")
+
+
+# ------------------------------------------------------------ fetch window
+def test_a_full_history_fetch_starts_in_2000() -> None:
+    """Spec 6.1 v1.2d: full available history, not 260 weeks.
+
+    EMA200 is SMA-seeded, so a 260-week window made it depend on where the
+    window started — ETERNAL 206.60 against TradingView's 209.70. Dhan answers
+    from its earliest record, so 2000-01-01 reaches every listing.
+    """
+    assert date(2000, 1, 1) == FULL_HISTORY_FROM
 
 
 # ------------------------------------------------------------- symbol safety

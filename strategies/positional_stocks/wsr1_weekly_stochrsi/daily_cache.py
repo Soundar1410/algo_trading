@@ -76,6 +76,14 @@ OVERLAP_SESSIONS = 10
 #: a restatement, not rounding.
 MAX_OVERLAP_DRIFT = 0.005
 
+#: Where a full-history fetch starts (spec 6.1 v1.2d). Dhan answers from its
+#: earliest record — the listing date for a younger stock — and one call covers
+#: it: RELIANCE over 2000-01-01 -> 2026-09-22 returned 6,145 sessions (D94).
+#: Not 260 weeks: EMA200 is SMA-seeded, so a short window makes its value depend
+#: on where the window starts (ETERNAL 206.60 from 260 bars, 209.70 from full
+#: history and on TradingView).
+FULL_HISTORY_FROM = date(2000, 1, 1)
+
 #: NSE symbols are upper-case alphanumerics plus these three punctuation marks
 #: (``M&M``, ``BAJAJ-AUTO``, ``NIFTY.NS``-style suffixes). Anything else is
 #: refused rather than sanitised: silently mangling a symbol into a filename

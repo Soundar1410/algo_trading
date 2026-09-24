@@ -53,7 +53,8 @@ endpoint rather than assumed:
    An off-by-one here would fail every staleness check closed (spec 6.2).
 3. **No per-request range cap was found.** One call for RELIANCE over
    2000-01-01 -> 2026-09-22 returned 6,145 sessions back to 2002-01-01, so the
-   260 weeks this strategy needs never requires chunking.
+   full history ``wsr1_weekly_stochrsi`` fetches (spec 6.1 v1.2d) needs no
+   chunking.
 
 **Retry is single-process and single-call scoped, deliberately narrow.** A
 bounded number of attempts with short backoff for *this worker's own* fetch —
