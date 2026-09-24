@@ -5,7 +5,7 @@
 **Engine kind:** `stock_portfolio_engine` (the existing, reserved `EngineKind.STOCK_PORTFOLIO_ENGINE`; no new enum value)
 **Execution shape:** a run-to-completion weekly job — no tick feed, no long-lived worker, no intraday decisions
 **Initial mode:** paper only
-**Status:** implementation specification v1.2g — Phase 3 review fixes (pending orders, boundaries, brakes, 1-share partial)
+**Status:** implementation specification v1.2i — own migration set for positional_stocks (live paper databases untouched)
 **Scheduling:** two of its own LaunchAgents (a fetch/preview job and an offline decision job). **Not** registered with `auto_start`, and no change to shared auto-start code
 **Rule source:** "Weekly Stoch RSI V1 Trading Plan" (operator's V1 rulebook, 20 Sep 2026), including its resolved ambiguities and the first-cross / K < 50 fix
 **Target branch:** new `strategy-wsr1-weekly-stochrsi`, cut from `feature-paper-auto-start` at `701e030`
@@ -18,7 +18,7 @@
 | 2 | Execution shape stated explicitly: run-to-completion job, no tick feed | Decisions use weekly closes only; paper fills use the official daily open (section 8). A long-lived, tick-driven worker adds failure surface with no decision value |
 | 3 | Launch mechanism reopened — **settled in v1.2, section 10.3** | `orchestration.auto_start` fires on trading days only and has no per-runtime schedule; a Saturday job needs either its own LaunchAgent or a different decision time |
 | 4 | All new tables prefixed `stock_` (section 9) | `positions`, `fills` and `signals` already exist from the 0001-era migrations, and the shared `MigrationRunner` applies every migration to every runtime database, so `CREATE TABLE IF NOT EXISTS positions` would silently keep the options-shaped table |
-| 5 | Persistence decided: new `positional_stocks.db`, new tables in migrations 0016+, options cycle tables untouched | `strategy_cycles` cannot hold several open equity positions per strategy (`idx_one_open_cycle`), and its expiry key has no equity meaning |
+| 5 | Persistence decided: new `positional_stocks.db`, new tables (own migration set since v1.2i), options cycle tables untouched | `strategy_cycles` cannot hold several open equity positions per strategy (`idx_one_open_cycle`), and its expiry key has no equity meaning |
 | 6 | Runtime YAML and strategy YAML must land in the same commit (section 13) | `common/config/loader.py` `resolve_runtime_strategies` raises for a strategy whose runtime file is missing — it would break the two existing runtimes at startup |
 | 7 | Indicators implemented from the section 4.4 formulas; any library used only as a test cross-check (section 7) | `pandas_ta_classic`'s RMA seeds one bar earlier than TradingView's `ta.rma`; harmless after warm-up, but the formulas, not a library, are the contract |
 
@@ -97,6 +97,22 @@ Numbers in brackets are the Phase 0 question numbers.
 | 6 | A 1-share position's partial sale sells 0 and still switches the position to the trail | 4.10 |
 | 7 | A buy that filled after its week's first session starts the touch window the following week | 4.9 |
 | 8 | Accepted as implemented: clearing brake 2 resets the peak at the first weekly run on or after the date; cost of remaining shares = average cost × shares; undefined RS ranks last | 4.7, 4.12 |
+
+### Changes in v1.2h (24 Sep 2026 — Phase 3b review)
+
+| # | Decision | Section |
+|---|---|---|
+| 1 | An unfilled SELL keeps its position counted as held; a transient one-over-limit book after an unfilled exit is accepted and reported | 4.12 |
+| 2 | The rules reject an inconsistent book (a filled order passed as pending); the runtime must clear filled orders before deciding | 4.12, 4.13 |
+| 3 | Phase 4 split into **4a** (persistence and paper accounting) and **4b** (the weekly run), each with its own review stop; the Phase 4 items accumulated in Phases 1–3 are assigned to one or the other | 15 |
+
+### Changes in v1.2i (24 Sep 2026 — Phase 4a plan review)
+
+| # | Decision | Section |
+|---|---|---|
+| 1 | **`positional_stocks.db` uses its own migration directory**; nothing is added to the shared `common/persistence/migrations/versions/` | 9 |
+| 2 | Reason: the paper runtimes run from this working tree and migrate at every start; `verify_checksums()` would refuse to start both of them if a shared stock migration were later edited or missing | 9 |
+| 3 | Phases 4a and 4b add new files only: no existing module that the two paper runtimes import is modified | 13 |
 
 ---
 
@@ -298,6 +314,8 @@ Every exit fills at the next session's open. A position is **closed** when its s
 - **Equity** = cash + Σ(shares × weekly close), measured at each weekly run. The peak is the running maximum of that series.
 - Cash may not go negative. An entry or add that would breach the committed cap or cash is skipped and reported.
 - **Pending orders count (v1.2g).** A BUY order still unfilled after step 1 (the symbol did not trade, or its data is missing) holds its slot, sector, promoter group, committed amount and cash (amount plus buy costs) exactly as if filled, until it fills or is cancelled.
+- **Pending sells (v1.2h).** An unfilled SELL keeps its position counted as held — slot, sector, group and committed — until it fills. A decided SELL_ALL frees its slot in the decision week (4.13), so a sale that then fails to fill (the symbol did not trade) can leave the book one position over a limit until it fills. That is accepted and reported; no entry is taken while the book is over a limit.
+- **Book consistency (v1.2h).** The runtime must never pass a filled order as pending. The rules reject an inconsistent book outright: a pending BUY_T1 for a symbol already held, or a pending add or sell for a position that is not held.
 - **Committed with EVENT_RISK (v1.2g):** a position whose row turns EVENT_RISK after T3 has filled still commits its full A; T3 is disabled only while it is unfilled.
 
 ### 4.13 Order of evaluation within one weekly run
@@ -406,10 +424,12 @@ Columns: `symbol, results_date`.
 - Database: `data/operational/positional_stocks.db`, created by the existing `Database` / `MigrationRunner`, with **additive, replay-safe migrations** (`CREATE ... IF NOT EXISTS`), following the repository pattern.
 - **Do not alter the options cycle tables** (`strategy_cycles` has options-only semantics, such as `resolved_expiry_date NOT NULL`).
 - **Decision (v1.1): new equity tables, not a generalised cycle model.** `strategy_cycles` allows at most one open cycle per strategy (`idx_one_open_cycle`), keys identity on an expiry, and restricts `strategy_cycle_legs.leg_role` to option roles; widening any of these means rebuilding tables `weekly_delta_neutral` depends on. Phase 0 confirms this against the code and records it as a D-entry.
-- **Naming rule: every new table is prefixed `stock_`.** The shared `MigrationRunner` applies every file in `common/persistence/migrations/versions/` to every runtime database, so:
-    - `positional_stocks.db` also receives migrations 0001–0015, including the existing `positions`, `fills` and `signals` tables;
-    - an unprefixed `CREATE TABLE IF NOT EXISTS positions` would silently keep the options-shaped table and the equity code would write to the wrong schema;
-    - the new 0016+ tables will also appear (empty) in `intraday_options.db` and `positional_options.db`. That is the existing model and is accepted; the prefix keeps them unambiguous.
+- **Own migration set (v1.2i, supersedes the shared-directory plan).** `positional_stocks.db` is migrated from its **own** directory, `runtimes/positional_stocks/migrations/`, passed to the existing `MigrationRunner` through its `versions_dir` argument. **Nothing is added to `common/persistence/migrations/versions/`.** Reasons:
+    - The two paper runtimes run from the same working tree and call `run_pending()` at every start, so a shared migration reaches their live databases the next morning.
+    - `verify_checksums()` then refuses to start a runtime if an applied migration file is later **edited** (likely while this feature is still under review) or **missing** (after switching the tree back to a branch without it). Either would stop both paper runtimes.
+    - A separate set keeps the live databases byte-identical and makes every stock migration disposable until Phase 5.
+- **`positional_stocks.db` is disposable until Phase 5** (paper, no real history yet): if a stock migration is edited during development, delete that database rather than work around the checksum check.
+- **Naming rule: every new table is still prefixed `stock_`** — no longer needed to avoid a collision, but it keeps the schema unambiguous in queries and backups.
 - Minimum entities:
     - **stock_weekly_runs:** strategy_id, week_ending, status, input fingerprints (universe, quality, calendar, config), started/finished.
     - **stock_signals:** per week and symbol — stage reached (armed / trigger / filters / ranked / taken), reason.
@@ -553,6 +573,7 @@ config/positional_stocks/{universe,quality_gate,results_calendar}.csv
 - Package `__init__.py` files are created by the first phase that adds Python code to a folder. Phase 0 creates only the folder holding this document.
 - **Weekly bars stay out of `common/warmup/` and `common/candles/`.** `parse_timeframe_minutes` rejects `1W` and `1d`, and the whole warm-up stack is bucketed by intraday minutes within one session. The weekly bar builder lives with this strategy's data layer; the minutes vocabulary is not extended.
 - Reports live in `data/reports/positional_stocks/`; the database lives in `data/operational/positional_stocks.db`.
+- **The paper runtimes run from this working tree (v1.2i).** Until this feature is merged, any change to a module that `intraday_options` or `positional_options` imports reaches live paper trading at the next start. Phases 4a and 4b therefore add new files only; Phase 5's shared changes (`orchestration/launchd`, the installer) get their own review for that reason.
 
 ---
 
@@ -596,7 +617,8 @@ Also:
 | 1 | `fetch_daily()`, equity scrip resolution (closes D34), weekly bar builder, symbol-keyed cache, CSV loaders, per-run deadline and throttle, token remaining-life assertion | 200 symbols + NIFTY 50 resolve and fetch; corporate-action evidence recorded, **or STOP** (Reliance 1:1 Oct 2024, HDFC Bank 1:1 Aug 2025) | Indicators, rules, persistence, any runtime |
 | 2 | `indicators.py` + parity tests | Hand-computed fixtures exact; TradingView readings for ≥ 5 symbols within ±0.5 (K, D) and ±0.5% (EMA, ATR); ADANIENSOL 18 Sep 2026 K 4.64 / D 4.51 | Anything reading a database |
 | 3 | `rules.py` + golden tests | Every section 14 golden case and every YES/NO row passes; a guard test proves `rules.py` imports no engine, runtime, broker, database or clock | I/O of any kind |
-| 4 | Runtime: `weekly_run.py` with both modes, migrations 0016+ (all `stock_`-prefixed), repository module, report writer, Telegram, catch-up | Idempotency, catch-up, crash-resume, offline-decide, cold-cache and 12-week replay tests pass, under `TZ=UTC` and `TZ=America/New_York`; first real preview report reviewed by the operator | Scheduling, plists, dashboard |
+| 4a | **Persistence and paper accounting:** the runtime's own migration set in `runtimes/positional_stocks/migrations/` (all `stock_`-prefixed; nothing added to the shared directory, v1.2i), repository module, paper fill model (section 8: official open, costs, not-traded → next session + flag, `at_week_open` from the calendar for every buy), applying fills through the rules' fill function, clearing filled orders before deciding (v1.2h), carrying unfilled orders' sizing/sector/group across runs, persisting `half_sold_week` and each symbol's last-seen universe row, equity/peak/brake persistence, gap acknowledgements keyed per (symbol, session, ratio) with the 520-bar block window, idempotency per (strategy_id, week_ending), crash-safe transactions | Idempotency (same week twice = no change), crash-mid-run resume, fill-model and cost tests, a multi-week book simulated end to end through persistence, under `TZ=UTC` and `TZ=America/New_York` | CLI, fetching, report, Telegram, scheduling |
+| 4b | **The weekly run:** `weekly_run.py` with `--mode fetch` and `--mode decide`, `--dry-run`, `--force-refetch` (limitation 40), catch-up, the offline-decide rules of 10.3, deadlines and throttle, the monthly full refetch, report writer (section 11, including the "partial sold 0" flag, held symbols with no bar this week, truncated-week warnings only for calendar-covered weeks), Telegram summary, journal CSV, `validate_environment` and paper-safety at start, a process lock | Offline-decide (Dhan client, scrip master and `AuthBootstrap` monkeypatched to raise), cold-cache, catch-up (3 missed weeks = 3 runs), a 12-week replay smoke on the real local cache, **first real preview report reviewed by the operator** | Scheduling, plists, dashboard |
 | 5 | `config/runtimes/positional_stocks.yaml` **and** the strategy YAML in one commit; two `PlistSpec`s with `wait_policy="elapsed"` and their generated plists; installer handling so nothing is enabled silently; runbook; sweep of the stale "placeholder" lines in the architecture doc | Operator installs and enables the two agents | Dashboard page (needs its own approval); any `auto_start` / `RUNTIMES` change |
 
 ## 16. Decisions and remaining operator actions
