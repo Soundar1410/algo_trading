@@ -543,8 +543,17 @@ def review_position(
     if _gt(k, params.overbought) and _gt(d, params.overbought):
         half = position.shares_held // 2
         if half == 0:
-            reason = "partial due (K and D > 90) but half of 1 share rounds to 0"
-            return _review(position, reason, flags=("partial rounds to 0",)), position
+            # v1.2g: the partial event still happens with nothing sold — no
+            # more adds, the trail replaces the stop — its clock starting the
+            # week a real SELL_HALF would have filled.
+            switched = replace(
+                position,
+                state=PositionState.HALF_SOLD,
+                half_sold_week=shift(ctx.week, 1),
+                touch_week=None,
+            )
+            reason = "partial with 1 share: nothing sold, switched to the 10W EMA trail"
+            return _review(switched, reason, flags=("partial sold 0",)), switched
         order = _order(
             OrderAction.SELL_HALF,
             position,

@@ -34,6 +34,7 @@ from _wsr1_rules_fixtures import (
     quality,
     symbol_week,
     universe_row,
+    week,
 )
 
 from strategies.positional_stocks.wsr1_weekly_stochrsi.models import (
@@ -685,3 +686,54 @@ def test_a_filled_t3_counts_even_if_the_flag_was_set() -> None:
     flagged = replace(_fully_averaged(), t3_disabled=True)
     assert flagged.committed == D("100000.00")
     assert flagged.next_level is None
+
+
+# ========== v1.2g: a 1-share partial sells 0 and switches to the trail
+def _one_share(fill_week: int = 150) -> Position:
+    # T1 of 40,000 at 30,000 buys floor(1.33) = 1 share; stop 21,000.
+    position = open_position("ONE", atr_pct=0.06, p1=30000.0, fill_week=fill_week)
+    assert position.shares_held == 1
+    return position
+
+
+def test_one_share_partial_sells_nothing_and_switches_to_the_trail() -> None:
+    review, updated = _review(_one_share(), _tape(n=180, close=31000.0, k=95.0, d=92.0))
+    assert review.order is None
+    assert "partial with 1 share" in review.reason
+    assert "partial sold 0" in review.flags
+    assert updated.state is PositionState.HALF_SOLD
+    # The trail clock starts the week a real SELL_HALF would have filled.
+    assert updated.partial_week == week(180)
+    assert updated.shares_held == 1
+    assert updated.next_level is None  # no more adds
+    assert updated.committed == D("30000.00")  # the cost of the share held
+
+
+def test_after_a_one_share_partial_the_trail_replaces_the_stop() -> None:
+    _, half = _review(_one_share(), _tape(n=180, close=31000.0, k=95.0, d=92.0))
+    below_stop = _tape(n=182, close=20000.0, ema10=19000.0)
+    review, _ = _review(half, below_stop)
+    assert review.order is None and "trailing" in review.reason
+    below_trail, _ = _review(half, _tape(n=182, close=31000.0, ema10=32000.0))
+    assert below_trail.order is not None
+    assert below_trail.order.action is OrderAction.SELL_ALL
+    assert below_trail.order.quantity == 1
+
+
+def test_one_and_two_share_positions_reach_the_trail_time_exit_together() -> None:
+    """Both are decided in week 179. The 2-share position's SELL_HALF fills in
+    week 180; the 1-share position is switched with its clock at week 180 too.
+    Both exit on trail time at the close of week 180 + 52 = 232, not before."""
+    overbought = _tape(n=180, close=31000.0, k=95.0, d=92.0)
+    _, one = _review(_one_share(), overbought)
+    two = open_position("TWO", atr_pct=0.06, p1=20000.0, fill_week=150)
+    assert two.shares_held == 2
+    order, _ = _review(two, overbought)
+    assert order.order is not None and order.order.quantity == 1
+    two = fill(two, OrderAction.SELL_HALF, price=31000.0, week_index=180, quantity=1)
+    assert one.partial_week == two.partial_week == week(180)
+    for position in (one, two):
+        hold, _ = _review(position, _tape(n=232, close=31000.0, ema10=30000.0))
+        assert hold.order is None
+        sell, _ = _review(position, _tape(n=233, close=31000.0, ema10=30000.0))
+        assert sell.order is not None and "trail time" in sell.reason

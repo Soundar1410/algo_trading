@@ -460,6 +460,10 @@ class Position:
     #: v1.2f: a PASS entry whose row later turned EVENT_RISK keeps its sizing,
     #: but T3 is disabled from then on.
     t3_disabled: bool = False
+    #: v1.2g: set only when a partial sale was due on a 1-share position, which
+    #: sells nothing but still switches to the trail. It is the week a real
+    #: SELL_HALF would have filled, so the trail-time clock matches any other.
+    half_sold_week: WeekKey | None = None
 
     def __post_init__(self) -> None:
         if not self.buys or self.buys[0].tranche != 1:
@@ -470,6 +474,10 @@ class Position:
             raise ValueError(f"{self.position_id}: more shares sold than bought")
         if (self.state is PositionState.CLOSED) != (self.shares_held == 0):
             raise ValueError(f"{self.position_id}: CLOSED exactly when no shares are held")
+        if self.state is PositionState.HALF_SOLD and self.partial_week is None:
+            raise ValueError(f"{self.position_id}: HALF_SOLD needs a partial sale")
+        if self.state is PositionState.OPEN and self.half_sold_week is not None:
+            raise ValueError(f"{self.position_id}: an OPEN position has no half_sold_week")
 
     # ------------------------------------------------------------ shares
     @property
@@ -510,7 +518,9 @@ class Position:
 
     @property
     def partial_week(self) -> WeekKey | None:
-        return next((s.week for s in self.sales if s.action is OrderAction.SELL_HALF), None)
+        """The SELL_HALF fill week, or ``half_sold_week`` after a 0-share partial."""
+        sold = next((s.week for s in self.sales if s.action is OrderAction.SELL_HALF), None)
+        return sold if sold is not None else self.half_sold_week
 
     @property
     def exit_week(self) -> WeekKey | None:

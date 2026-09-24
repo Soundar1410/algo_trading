@@ -152,3 +152,13 @@ def test_last_closed_is_the_latest_exit() -> None:
     last = book.last_closed("X")
     assert last is not None and last.position_id == "b"
     assert book.last_closed("Z") is None
+
+
+def test_half_sold_needs_a_partial_sale_or_a_zero_share_switch() -> None:
+    """v1.2g: HALF_SOLD comes from a SELL_HALF fill or a 1-share switch."""
+    with pytest.raises(ValueError, match="HALF_SOLD"):
+        _position(state=PositionState.HALF_SOLD)
+    switched = _position(state=PositionState.HALF_SOLD, half_sold_week=(2026, 3))
+    assert switched.partial_week == (2026, 3)
+    with pytest.raises(ValueError, match="OPEN"):
+        _position(half_sold_week=(2026, 3))
