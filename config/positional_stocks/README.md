@@ -50,6 +50,22 @@ The operator fills this between the Friday fetch/preview run and the Monday
 decision run, for the candidates the preview report lists. That weekend window
 is why spec 10.3 splits the job in two.
 
+**Operator procedure: a governance event on a held stock (spec 4.2, v1.2f).**
+When a new company-level or promoter-group-level governance event hits a symbol
+you **hold**, set its row to `FAIL`. That is the only way to trigger the thesis
+exit: the rules sell the whole position at the next open. Once the position is
+closed you may change the row to `EVENT_RISK`, if that is the right status for
+a stock you do not hold. The file has one status per symbol, so it cannot say
+"exit if held, event-risk if not" (the V1 plan's rule); this procedure does.
+
+What the rules do with each status on a **held** position:
+
+- `FAIL`: thesis exit, even if the row has **expired**.
+- `EVENT_RISK` on a position entered as `PASS`: the position keeps its sizing,
+  but its third tranche (T3) is disabled from then on.
+- An expired `PASS` or `EVENT_RISK` row, or no row at all: no further adds, but
+  no exit.
+
 ## `results_calendar.csv` (spec 6.5)
 
 `symbol, results_date`
