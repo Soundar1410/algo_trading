@@ -486,7 +486,11 @@ class Position:
 
     @property
     def max_tranches(self) -> int:
-        return 2 if self.t3_disabled else self.sizing.max_tranches
+        """3, or 2 for EVENT_RISK. A disabled T3 counts only while unfilled
+        (v1.2g): once T3 has filled, the position commits its full A."""
+        if self.t3_disabled and self.tranches_used < 3:
+            return 2
+        return self.sizing.max_tranches
 
     @property
     def next_level(self) -> Decimal | None:

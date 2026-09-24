@@ -487,6 +487,7 @@ def review_position(
         and row.status is QualityStatus.EVENT_RISK
         and not position.sizing.event_risk
         and not position.t3_disabled
+        and position.tranches_used < 3  # v1.2g: only while T3 is unfilled
     ):
         position = replace(position, t3_disabled=True)
 

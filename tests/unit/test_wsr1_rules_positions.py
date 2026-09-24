@@ -665,3 +665,23 @@ def test_a_sale_needs_a_held_position_and_the_right_quantity() -> None:
 def test_decimal_money_keeps_rupee_levels_exact() -> None:
     # 1000 x (1 - 0.108) is 891.9999... in float; the level is exactly 892.00.
     assert _held(atr_pct=0.072).l1 == Decimal("892.00")
+
+
+# ================= v1.2g fix 2: EVENT_RISK after T3 has filled keeps A
+def test_event_risk_after_t3_filled_keeps_the_full_a_committed() -> None:
+    position = _fully_averaged()
+    review, updated = _review(
+        position, _tape(close=900.0), quality_row=quality("X", QualityStatus.EVENT_RISK)
+    )
+    assert review.order is None
+    assert not updated.t3_disabled
+    assert updated.committed == D("100000.00")
+
+
+def test_a_filled_t3_counts_even_if_the_flag_was_set() -> None:
+    """Defensive: a stored flag must not shrink committed once T3 has filled."""
+    from dataclasses import replace
+
+    flagged = replace(_fully_averaged(), t3_disabled=True)
+    assert flagged.committed == D("100000.00")
+    assert flagged.next_level is None
