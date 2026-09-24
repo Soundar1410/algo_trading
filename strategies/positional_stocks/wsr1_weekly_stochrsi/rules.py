@@ -779,7 +779,9 @@ def decide_week(
     ranks and takes new entries with what step 3 left: a decided SELL_ALL frees
     its slot, sector, group and committed amount; a decided SELL_HALF counts the
     cost of the shares that remain; sale proceeds are not cash until filled;
-    every planned buy reserves its amount plus buy costs (v1.2f).
+    every planned buy reserves its amount plus buy costs (v1.2f). A BUY order
+    still unfilled after step 1 holds its cash and, for a BUY_T1, its slot,
+    sector, group and committed amount, exactly as if filled (v1.2g).
     """
     for length in (params.regime_ema, params.ema_trend, params.add_ema, params.trail_ema):
         if length not in EMA_LENGTHS:
@@ -798,6 +800,14 @@ def decide_week(
     # Step 3.
     cash_available = book.cash - params.buffer
     pending_symbols = {order.symbol for order in book.pending}
+    # v1.2g: a BUY still unfilled after step 1 holds its cash (amount plus buy
+    # costs) exactly as if filled; a pending BUY_T1 also holds a slot, sector,
+    # group and committed amount (below, step 4).
+    for pending in book.pending:
+        if pending.action.is_buy:
+            assert pending.amount is not None
+            cash_available -= _reserve(pending.amount, params)
+    pending_entries = [o for o in book.pending if o.action is OrderAction.BUY_T1]
     orders: list[PendingOrder] = []
     reviews: list[PositionReview] = []
     positions: list[Position] = []
@@ -868,6 +878,13 @@ def decide_week(
     sectors = Counter(p.sector for p, _ in remaining)
     groups = Counter(p.group for p, _ in remaining)
     open_count = len(remaining)
+    for entry in pending_entries:
+        assert entry.sizing is not None and entry.sector is not None and entry.group is not None
+        usable = entry.sizing.tranche_amounts[: entry.sizing.max_tranches]
+        committed += sum(usable, Decimal("0"))
+        sectors[entry.sector] += 1
+        groups[entry.group] += 1
+        open_count += 1
     taken = 0
     for c in candidates:
         commitment = sum(c.sizing.tranche_amounts[: c.sizing.max_tranches], Decimal("0"))

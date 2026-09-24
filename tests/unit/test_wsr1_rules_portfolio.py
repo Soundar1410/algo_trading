@@ -36,6 +36,7 @@ from strategies.positional_stocks.wsr1_weekly_stochrsi.models import (
     BrakeState,
     FunnelStage,
     OrderAction,
+    PendingOrder,
     Position,
     RulesParameters,
 )
@@ -44,6 +45,7 @@ from strategies.positional_stocks.wsr1_weekly_stochrsi.rules import (
     decide_week,
     entries_blocked_by_brakes,
     mark_to_market,
+    sizing,
     update_brakes,
 )
 
@@ -385,3 +387,93 @@ def test_the_peak_is_the_running_maximum_of_equity() -> None:
         state = update_brakes(state, D(equity), week(i + 100), friday(i + 100), PARAMS0)
     assert state.peak == D("1100000")
     assert not state.brake2_active and state.brake1_until is None
+
+
+# ============ v1.2g fix 1: unfilled BUY orders hold capacity as if filled
+def _pending_t1(symbol: str, *, group: str, sector: str) -> PendingOrder:
+    size = sizing(0.06, False, PARAMS0)
+    return PendingOrder(
+        OrderAction.BUY_T1,
+        symbol,
+        week(T - 1),
+        friday(T - 1),
+        "entry",
+        amount=size.tranche_amounts[0],
+        sizing=size,
+        sector=sector,
+        group=group,
+    )
+
+
+def test_pending_buy_t1_holds_its_promoter_group() -> None:
+    pending = _pending_t1("ADA1", group="ADANI", sector="Power")
+    second = SymbolWeek(
+        "ADA2",
+        kd_tape(_TRIGGER).series(),
+        universe_row("ADA2", "Ports", group="ADANI"),
+        symbol_week("ADA2", kd_tape(_TRIGGER).series()).quality,
+        (),
+        3e8,
+    )
+    decision = decide_week(
+        ctx(T), book(pending=(pending,)), {"ADA2": second}, index_series(), PARAMS0
+    )
+    assert decision.orders == ()
+    assert decision.funnel[0].reason == "promoter group full: ADANI"
+
+
+def test_pending_buy_t1_holds_its_cash() -> None:
+    # Cash covers exactly one T1 (40,000 + 12 bps); the pending one takes it.
+    pending = _pending_t1("P", group="P", sector="S-p")
+    decision = decide_week(
+        ctx(T),
+        book(cash=D("40048"), pending=(pending,)),
+        {"S": symbol_week("S", kd_tape(_TRIGGER).series())},
+        index_series(),
+        RulesParameters(),
+    )
+    assert decision.orders == ()
+    assert decision.funnel[0].reason == "not enough cash"
+
+
+def test_nine_held_and_one_pending_fill_all_ten_slots() -> None:
+    positions = [
+        open_position(f"H{i}", atr_pct=0.06, p1=1000.0, fill_week=200, sector=f"S{i}")
+        for i in range(9)
+    ]
+    symbols = {p.symbol: symbol_week(p.symbol, Tape().series()) for p in positions}
+    symbols["NEW"] = symbol_week("NEW", kd_tape(_TRIGGER).series(), industry="S-new")
+    pending = _pending_t1("P", group="P", sector="S-p")
+    decision = decide_week(
+        ctx(T),
+        book(*positions, cash=D("640000"), pending=(pending,)),
+        symbols,
+        index_series(),
+        PARAMS0,
+    )
+    (new,) = [e for e in decision.funnel if e.symbol == "NEW"]
+    assert new.stage is FunnelStage.NOT_TAKEN
+    assert "no free position slot" in new.reason
+
+
+def test_pending_add_reserves_its_cash() -> None:
+    held = open_position("H", atr_pct=0.06, p1=1000.0, fill_week=200, sector="S-h")
+    add = PendingOrder(
+        OrderAction.BUY_T2,
+        "H",
+        week(T - 1),
+        friday(T - 1),
+        "add",
+        position_id=held.position_id,
+        amount=D("30000.00"),
+    )
+    symbols = {
+        "H": symbol_week("H", Tape().series()),
+        "S": symbol_week("S", kd_tape(_TRIGGER).series(), industry="S-new"),
+    }
+    # 60,000 covers the new T1 (40,000) but not after the pending add's 30,000.
+    decision = decide_week(
+        ctx(T), book(held, cash=D("60000"), pending=(add,)), symbols, index_series(), PARAMS0
+    )
+    (s,) = [e for e in decision.funnel if e.symbol == "S"]
+    assert s.reason == "not enough cash"
