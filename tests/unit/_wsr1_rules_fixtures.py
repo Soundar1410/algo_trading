@@ -214,8 +214,10 @@ def open_position(
     sector: str = "Finance",
     event_risk: bool = False,
     params: RulesParameters = PARAMS0,
+    at_week_open: bool = True,
 ) -> Position:
-    """A position opened by a real BUY_T1 fill on the Monday after ``fill_week - 1``."""
+    """A position opened by a real BUY_T1 fill in week ``fill_week``: at its
+    Monday open, or — ``at_week_open=False`` — mid-week, on the Wednesday."""
     size = sizing(atr_pct, event_risk, params)
     order = PendingOrder(
         OrderAction.BUY_T1,
@@ -228,8 +230,9 @@ def open_position(
         sector=sector,
         group=symbol,
     )
+    session = monday_after(fill_week - 1) + timedelta(days=0 if at_week_open else 2)
     outcome = apply_fill(
-        order, None, session=monday_after(fill_week - 1), open_price=p1, params=params
+        order, None, session=session, open_price=p1, params=params, at_week_open=at_week_open
     )
     assert outcome.position is not None
     return outcome.position
@@ -243,8 +246,10 @@ def fill(
     week_index: int,
     quantity: int | None = None,
     params: RulesParameters = PARAMS0,
+    at_week_open: bool = True,
 ) -> Position:
-    """Apply an add or a sale to ``position`` at ``price`` on the Monday of week ``week_index``."""
+    """Apply an add or a sale at ``price`` in week ``week_index`` (Monday open,
+    or the Wednesday when ``at_week_open=False``)."""
     amount = position.sizing.tranche_amounts[action.tranche - 1] if action.is_buy else None
     order = PendingOrder(
         action,
@@ -256,8 +261,9 @@ def fill(
         amount=amount,
         quantity=quantity,
     )
+    session = monday_after(week_index - 1) + timedelta(days=0 if at_week_open else 2)
     outcome = apply_fill(
-        order, position, session=monday_after(week_index - 1), open_price=price, params=params
+        order, position, session=session, open_price=price, params=params, at_week_open=at_week_open
     )
     assert outcome.position is not None and outcome.skipped is None
     return outcome.position

@@ -384,12 +384,20 @@ class Sizing:
 
 @dataclass(frozen=True, slots=True)
 class BuyFill:
-    """One filled tranche. ``fees`` are the modelled buy costs (spec 8)."""
+    """One filled tranche. ``fees`` are the modelled buy costs (spec 8).
+
+    ``at_week_open`` records whether the fill was at its week's **first
+    session** (v1.2g, spec 4.9). If it was not — the symbol did not trade
+    Monday — the next level's touch window starts the following week, because
+    a weekly low cannot show whether it came before or after the fill. It has
+    no default: the runtime must say, from the calendar.
+    """
 
     tranche: int
     session: date
     price: Decimal
     shares: int
+    at_week_open: bool
     fees: Decimal = Decimal("0")
 
     def __post_init__(self) -> None:

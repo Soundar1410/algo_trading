@@ -46,7 +46,7 @@ def _position(**kw: object) -> Position:
         "l1": D("900.00"),
         "l2": D("800.00"),
         "stop": D("700.00"),
-        "buys": (BuyFill(1, MON, D("1000.00"), 40),),
+        "buys": (BuyFill(1, MON, D("1000.00"), 40, at_week_open=True),),
     }
     base.update(kw)
     return Position(**base)  # type: ignore[arg-type]
@@ -79,9 +79,14 @@ def test_order_action_tranches() -> None:
 
 def test_a_position_starts_with_t1_and_fills_tranches_in_order() -> None:
     with pytest.raises(ValueError, match="T1"):
-        _position(buys=(BuyFill(2, MON, D("900"), 10),))
+        _position(buys=(BuyFill(2, MON, D("900"), 10, at_week_open=True),))
     with pytest.raises(ValueError, match="in order"):
-        _position(buys=(BuyFill(1, MON, D("1000"), 40), BuyFill(3, MON, D("800"), 10)))
+        _position(
+            buys=(
+                BuyFill(1, MON, D("1000"), 40, at_week_open=True),
+                BuyFill(3, MON, D("800"), 10, at_week_open=True),
+            )
+        )
 
 
 def test_closed_exactly_when_no_shares_are_held() -> None:
@@ -108,7 +113,7 @@ def test_committed_is_a_until_the_partial_sale_then_cost_of_shares_held() -> Non
 
 def test_net_pnl_counts_every_fee() -> None:
     position = _position(
-        buys=(BuyFill(1, MON, D("1000.00"), 40, fees=D("48.00")),),
+        buys=(BuyFill(1, MON, D("1000.00"), 40, at_week_open=True, fees=D("48.00")),),
         sales=(SaleFill(OrderAction.SELL_ALL, MON, D("1001.00"), 40, fees=D("59.04")),),
         state=PositionState.CLOSED,
     )

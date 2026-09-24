@@ -113,7 +113,12 @@ def _run(
         bar = START + i
         if pending is not None:
             outcome = apply_fill(
-                pending, position, session=monday_after(bar - 1), open_price=wk.open, params=params
+                pending,
+                position,
+                session=monday_after(bar - 1),
+                open_price=wk.open,
+                params=params,
+                at_week_open=True,
             )
             fills.append(outcome)
             assert outcome.position is not None
@@ -151,8 +156,12 @@ def _review(
     )
 
 
-def _held(p1: float = 1000.0, *, fill_week: int = 200, atr_pct: float = 0.06) -> Position:
-    return open_position("X", atr_pct=atr_pct, p1=p1, fill_week=fill_week)
+def _held(
+    p1: float = 1000.0, *, fill_week: int = 200, atr_pct: float = 0.06, at_week_open: bool = True
+) -> Position:
+    return open_position(
+        "X", atr_pct=atr_pct, p1=p1, fill_week=fill_week, at_week_open=at_week_open
+    )
 
 
 def _sell_all(position: Position, price: float, week_index: int) -> Position:
@@ -252,7 +261,9 @@ def test_zero_shares_skips_the_order() -> None:
         sector="S",
         group="X",
     )
-    outcome = apply_fill(order, None, session=date(2026, 1, 5), open_price=50000.0, params=PARAMS0)
+    outcome = apply_fill(
+        order, None, session=date(2026, 1, 5), open_price=50000.0, params=PARAMS0, at_week_open=True
+    )
     assert outcome.position is None and outcome.skipped is not None
     assert outcome.cash_delta == 0
 
@@ -737,3 +748,30 @@ def test_one_and_two_share_positions_reach_the_trail_time_exit_together() -> Non
         assert hold.order is None
         sell, _ = _review(position, _tape(n=233, close=31000.0, ema10=30000.0))
         assert sell.order is not None and "trail time" in sell.reason
+
+
+# ==== v1.2g spec 4.9: a mid-week fill starts the touch window next week
+def test_a_touch_in_the_week_of_a_mid_week_fill_does_not_count() -> None:
+    """T1 filled on the Wednesday of week 205: that week's low (<= L1 900) may
+    have come before the fill, so it is not a touch. The next week's is."""
+    position = _held(fill_week=205, at_week_open=False)
+    assert position.buys[0].session.weekday() == 2
+    _, after_fill_week = _review(position, _tape(n=206, close=950.0, low={-1: 880.0}))
+    assert after_fill_week.touch_week is None
+    _, next_week = _review(after_fill_week, _tape(n=207, close=950.0, low={-1: 880.0}))
+    assert next_week.touch_week == week(206)
+
+
+def test_a_touch_in_the_week_of_an_open_fill_counts() -> None:
+    position = _held(fill_week=205, at_week_open=True)
+    _, updated = _review(position, _tape(n=206, close=950.0, low={-1: 880.0}))
+    assert updated.touch_week == week(205)
+
+
+def test_the_t3_touch_window_follows_the_t2_fill_the_same_way() -> None:
+    t2_midweek = fill(_held(), OrderAction.BUY_T2, price=930.0, week_index=205, at_week_open=False)
+    _, same_week = _review(t2_midweek, _tape(n=206, close=850.0, low={-1: 790.0}))
+    assert same_week.touch_week is None  # low <= L2 800, but possibly before the fill
+    t2_open = fill(_held(), OrderAction.BUY_T2, price=930.0, week_index=205)
+    _, counted = _review(t2_open, _tape(n=206, close=850.0, low={-1: 790.0}))
+    assert counted.touch_week == week(205)

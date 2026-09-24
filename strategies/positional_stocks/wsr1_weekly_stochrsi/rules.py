@@ -317,12 +317,15 @@ def apply_fill(
     session: date,
     open_price: float | Decimal,
     params: RulesParameters,
+    at_week_open: bool,
 ) -> FillOutcome:
     """Fill ``order`` at ``open_price`` on ``session`` — pure.
 
     Buys take ``floor(amount / price)`` shares; zero shares skips the order
     (spec 4.8). The T1 fill fixes P1, L1, L2 and Stop. An add consumes its
-    touch. A ``SELL_HALF`` makes the position HALF_SOLD — no more adds, the
+    touch. ``at_week_open`` says whether ``session`` was its week's first
+    session; the runtime knows from the calendar, the rules cannot (4.9
+    v1.2g). A ``SELL_HALF`` makes the position HALF_SOLD — no more adds, the
     remaining tranches cancelled, the trail replacing the stop — and a
     ``SELL_ALL`` closes it and yields the :class:`ClosedTrade` for re-entry.
 
@@ -341,7 +344,9 @@ def apply_fill(
             return FillOutcome(
                 order, position, Decimal("0"), skipped="0 shares at this price; skipped"
             )
-        fill = BuyFill(action.tranche, session, price, shares, _buy_fees(price * shares, params))
+        fill = BuyFill(
+            action.tranche, session, price, shares, at_week_open, _buy_fees(price * shares, params)
+        )
         cash_delta = -(fill.value + fill.fees)
         if action is OrderAction.BUY_T1:
             if position is not None:
@@ -585,9 +590,13 @@ def _review_add(
         return _review(position, "hold: no further add", flags=flags), position
 
     # Touch memory: the first week, from the previous buy's fill week on,
-    # whose low reached the level. A close >= P1 clears it (4.9 item 4).
+    # whose low reached the level. A close >= P1 clears it (4.9 item 4). If
+    # that buy filled after its week's first session, the window starts the
+    # following week: the fill week's low may predate the fill (v1.2g).
     touch = position.touch_week
-    if touch is None and money(bar.low) <= level:
+    opens = 0 if position.buys[-1].at_week_open else 1
+    in_window = weeks_between(position.last_buy_week, ctx.week) >= opens
+    if touch is None and in_window and money(bar.low) <= level:
         touch = ctx.week
     if close >= position.p1:
         cleared = touch is not None
