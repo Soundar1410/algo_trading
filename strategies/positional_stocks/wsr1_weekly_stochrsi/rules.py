@@ -924,6 +924,22 @@ def decide_week(
         sectors[entry.sector] += 1
         groups[entry.group] += 1
         open_count += 1
+
+    # v1.2h: an exit that did not fill can leave the book over a limit. That is
+    # accepted and reported; the checks below take no entry while it lasts.
+    warnings: list[str] = []
+    if open_count > params.max_positions:
+        warnings.append(
+            f"{open_count} positions held, over the limit of {params.max_positions}, "
+            "until an unfilled exit fills"
+        )
+    for label, counts, limit in (
+        ("sector", sectors, params.max_per_sector),
+        ("promoter group", groups, params.max_per_group),
+    ):
+        for name, count in sorted(counts.items()):
+            if count > limit:
+                warnings.append(f"{label} {name}: {count} held, over the limit of {limit}")
     taken = 0
     for c in candidates:
         commitment = sum(c.sizing.tranche_amounts[: c.sizing.max_tranches], Decimal("0"))
@@ -978,4 +994,5 @@ def decide_week(
         reviews=tuple(reviews),
         funnel=tuple(funnel),
         entries_blocked=blocked,
+        warnings=tuple(warnings),
     )

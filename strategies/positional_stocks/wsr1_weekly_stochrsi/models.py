@@ -648,7 +648,8 @@ class Book:
     ``positions`` holds every position not yet CLOSED; ``closed`` every
     finished trade, for re-entry (4.11). ``pending`` lists orders still
     unfilled after step 1 (a symbol that did not trade), which the rules never
-    stack a second order on.
+    stack a second order on. A book whose pending orders contradict its
+    positions is refused (v1.2h).
     """
 
     cash: Decimal
@@ -663,6 +664,18 @@ class Book:
             raise ValueError("one open position per symbol (spec 4.11)")
         if any(p.state is PositionState.CLOSED for p in self.positions):
             raise ValueError("a CLOSED position belongs in `closed`, not `positions`")
+        # v1.2h: a filled order must never be passed as pending. Either shape
+        # below double-counts capacity (a held entry counted twice) or refers
+        # to nothing, so the book is refused outright.
+        held_ids = {p.position_id for p in self.positions}
+        for order in self.pending:
+            if order.action is OrderAction.BUY_T1:
+                if order.symbol in symbols:
+                    raise ValueError(f"pending BUY_T1 for held symbol {order.symbol}")
+            elif order.position_id not in held_ids:
+                raise ValueError(
+                    f"pending {order.action.value} for {order.position_id}, which is not held"
+                )
 
     def last_closed(self, symbol: str) -> ClosedTrade | None:
         trades = [t for t in self.closed if t.symbol == symbol]
@@ -706,3 +719,6 @@ class WeekDecision:
     funnel: tuple[FunnelEntry, ...]
     #: Why no entry could be taken this week at all, if that is the case.
     entries_blocked: str | None = None
+    #: Conditions to report that are not decisions — e.g. a book left over a
+    #: limit by an exit that did not fill (v1.2h).
+    warnings: tuple[str, ...] = ()

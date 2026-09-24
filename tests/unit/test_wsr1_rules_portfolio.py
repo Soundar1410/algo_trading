@@ -16,6 +16,7 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 
+import pytest
 from _wsr1_rules_fixtures import (
     PARAMS0,
     D,
@@ -495,3 +496,60 @@ def test_clearing_brake_2_also_ends_a_running_brake_1_pause() -> None:
     assert entries_blocked_by_brakes(cleared, week(110)) is None
     # The peak was reset to 790,000, so this week is no drawdown at all.
     assert cleared.peak == D("790000")
+
+
+# ======================= v1.2h: book consistency and over-limit books
+def test_the_book_rejects_a_pending_entry_for_a_held_symbol() -> None:
+    held = open_position("H", atr_pct=0.06, p1=1000.0, fill_week=200, sector="S-h")
+    with pytest.raises(ValueError, match="pending BUY_T1 for held"):
+        book(held, pending=(_pending_t1("H", group="H", sector="S-h"),))
+
+
+@pytest.mark.parametrize(
+    "action", [OrderAction.BUY_T2, OrderAction.SELL_HALF, OrderAction.SELL_ALL]
+)
+def test_the_book_rejects_a_pending_add_or_sell_for_a_position_not_held(
+    action: OrderAction,
+) -> None:
+    orphan = PendingOrder(
+        action,
+        "GONE",
+        week(T - 1),
+        friday(T - 1),
+        "stale",
+        position_id="GONE-2025W01",
+        amount=D("30000") if action.is_buy else None,
+        quantity=None if action.is_buy else 10,
+    )
+    with pytest.raises(ValueError, match="not held"):
+        book(pending=(orphan,))
+
+
+def test_a_book_over_the_slot_limit_is_reported_and_takes_no_entry() -> None:
+    """v1.2h: an exit that failed to fill can leave 11 positions held; that is
+    accepted, reported, and no entry is taken while over the limit."""
+    positions = [
+        open_position(f"H{i}", atr_pct=0.06, p1=1000.0, fill_week=200, sector=f"S{i}")
+        for i in range(11)
+    ]
+    exiting = PendingOrder(
+        OrderAction.SELL_ALL,
+        "H0",
+        week(T - 1),
+        friday(T - 1),
+        "stop",
+        position_id=positions[0].position_id,
+        quantity=positions[0].shares_held,
+    )
+    symbols = {p.symbol: symbol_week(p.symbol, Tape().series()) for p in positions}
+    symbols["NEW"] = symbol_week("NEW", kd_tape(_TRIGGER).series(), industry="S-new")
+    decision = decide_week(
+        ctx(T),
+        book(*positions, cash=D("560000"), pending=(exiting,)),
+        symbols,
+        index_series(),
+        PARAMS0,
+    )
+    assert any("11 positions held, over the limit of 10" in w for w in decision.warnings)
+    (new,) = [e for e in decision.funnel if e.symbol == "NEW"]
+    assert new.stage is FunnelStage.NOT_TAKEN
