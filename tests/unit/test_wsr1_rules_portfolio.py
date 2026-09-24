@@ -477,3 +477,21 @@ def test_pending_add_reserves_its_cash() -> None:
     )
     (s,) = [e for e in decision.funnel if e.symbol == "S"]
     assert s.reason == "not enough cash"
+
+
+# ================= v1.2g fix 5: clearing brake 2 ends a brake-1 pause
+def test_clearing_brake_2_also_ends_a_running_brake_1_pause() -> None:
+    both = BrakeState(
+        peak=PEAK,
+        brake1_until=week(112),
+        brake1_can_fire=False,
+        brake2_fired_on=friday(109),
+    )
+    assert entries_blocked_by_brakes(both, week(110)) is not None
+    params = RulesParameters(brake_2_cleared_on=friday(110))
+    cleared = update_brakes(both, D("790000"), week(110), friday(110), params)
+    assert not cleared.brake2_active
+    assert cleared.brake1_until is None
+    assert entries_blocked_by_brakes(cleared, week(110)) is None
+    # The peak was reset to 790,000, so this week is no drawdown at all.
+    assert cleared.peak == D("790000")

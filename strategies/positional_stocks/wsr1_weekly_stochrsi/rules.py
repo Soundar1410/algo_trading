@@ -404,7 +404,8 @@ def update_brakes(
 
     * Brake 2 (equity <= 80% of peak) holds until ``brake_2_cleared_on`` is set
       to a date on or after it fired and on or before this week; clearing
-      **resets the peak** to this week's equity, or it would re-fire at once.
+      **resets the peak** to this week's equity, or it would re-fire at once,
+      and ends any running brake-1 pause (v1.2g).
     * Brake 1 (equity <= 90% of peak) pauses entries for 4 decision weeks,
       counting this one. It fires again only after equity has closed above
       90% of peak at least once — so a long drawdown pauses entries once, and
@@ -412,10 +413,14 @@ def update_brakes(
     """
     peak = previous.peak
     fired_on = previous.brake2_fired_on
+    until = previous.brake1_until
     cleared_on = params.brake_2_cleared_on
     if fired_on is not None and cleared_on is not None and fired_on <= cleared_on <= week_ending:
+        # The operator's review is the decision to resume: it also ends any
+        # running brake-1 pause (v1.2g).
         fired_on = None
         peak = equity
+        until = None
     peak = equity if peak is None else max(peak, equity)
 
     ratio = equity / peak if peak > 0 else Decimal("0")
@@ -424,7 +429,6 @@ def update_brakes(
 
     threshold = 1 - params.dd1_pct / 100
     can_fire = previous.brake1_can_fire or ratio > threshold
-    until = previous.brake1_until
     if ratio <= threshold and can_fire:
         until = shift(week, params.dd1_pause_weeks - 1)
         can_fire = False
