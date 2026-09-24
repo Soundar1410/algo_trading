@@ -81,7 +81,7 @@ def test_the_spec_lengths_are_the_defaults() -> None:
     assert indicators.ATR_LENGTH == 14
     assert indicators.EMA_LENGTHS == (10, 40, 50, 200)
     assert indicators.HIGH_LOOKBACK_BARS == 52
-    assert indicators.PERFORMANCE_LOOKBACK_BARS == 26
+    assert indicators.PERFORMANCE_LOOKBACK_WEEKS == 26
 
 
 # ---------------------------------------------------------------------- SMA
@@ -259,15 +259,51 @@ def test_the_52_week_high_needs_52_bars() -> None:
 
 # ------------------------------------------------------ performance and RS
 def test_performance_over_the_lookback() -> None:
-    # lookback 2: 125/100 - 1 = 0.25; 99/110 - 1 = -0.1
-    assert performance([100.0, 110.0, 125.0, 99.0], 2) == _approx([None, None, 0.25, -0.1])
+    # 2 weeks: 125/100 - 1 = 0.25; 99/110 - 1 = -0.1
+    bars = [_bar(i, close=c) for i, c in enumerate([100.0, 110.0, 125.0, 99.0])]
+    assert performance(bars, 2) == _approx([None, None, 0.25, -0.1])
 
 
-def test_six_month_performance_is_26_bars() -> None:
-    closes = [100.0] * 26 + [150.0]
-    values = performance(closes)
+def test_six_month_performance_is_26_iso_weeks() -> None:
+    bars = _bars([100.0] * 26 + [150.0])
+    values = performance(bars)
     assert values[25] is None
     assert values[26] == 0.5
+
+
+def test_performance_counts_iso_weeks_not_bars() -> None:
+    # Spec 4.4 v1.2e. Week 2 is missing (a suspension). The bar in week 3
+    # compares with week 1 (130/110 - 1), not with the bar two positions back
+    # (week 0), which is what a bar count would do.
+    bars = [_bar(i, close=c) for i, c in [(0, 100.0), (1, 110.0), (3, 132.0), (4, 150.0)]]
+    values = performance(bars, 2)
+    assert values[2] == pytest.approx(132.0 / 110.0 - 1.0, abs=EXACT)
+    # Week 4 compares with week 2, which has no bar: undefined.
+    assert values[3] is None
+
+
+def test_performance_crosses_a_53_week_iso_year() -> None:
+    # 2026 has an ISO week 53 (28 Dec 2026 - 3 Jan 2027). Two weeks before
+    # 2027-W01 is 2026-W52, with W53 in between.
+    fridays = [date(2026, 12, 18), date(2026, 12, 25), date(2027, 1, 1), date(2027, 1, 8)]
+    closes = [100.0, 104.0, 108.0, 120.0]
+    bars = [
+        WeeklyBar(
+            week_ending=friday,
+            iso_year=iso_key(friday)[0],
+            iso_week=iso_key(friday)[1],
+            open=close,
+            high=close,
+            low=close,
+            close=close,
+            expected_last_session=friday,
+            sessions=5,
+        )
+        for friday, close in zip(fridays, closes, strict=True)
+    ]
+    assert [bar.iso_key for bar in bars] == [(2026, 51), (2026, 52), (2026, 53), (2027, 1)]
+    # 2027-W01 vs 2026-W52: 120/104 - 1
+    assert performance(bars, 2)[3] == pytest.approx(120.0 / 104.0 - 1.0, abs=EXACT)
 
 
 def test_relative_strength_is_percentage_points_matched_by_iso_week() -> None:
@@ -283,6 +319,16 @@ def test_relative_strength_is_undefined_for_a_week_the_index_lacks() -> None:
     stock = [_bar(i, close=c) for i, c in enumerate([100.0, 110.0, 125.0])]
     index = [_bar(i, close=c) for i, c in enumerate([200.0, 210.0])]
     assert relative_strength(stock, index, 2) == [None, None, None]
+
+
+def test_relative_strength_compares_the_same_calendar_window() -> None:
+    # The stock missed week 2; the index did not. Both 2-week performances at
+    # week 3 are measured from week 1: stock 121/110 - 1 = 0.10, index
+    # 240/200 - 1 = 0.20 -> -10 pp. A bar count would have measured the stock
+    # from week 0 instead.
+    stock = [_bar(i, close=c) for i, c in [(0, 100.0), (1, 110.0), (3, 121.0)]]
+    index = [_bar(i, close=c) for i, c in [(0, 190.0), (1, 200.0), (2, 220.0), (3, 240.0)]]
+    assert relative_strength(stock, index, 2) == _approx([None, None, -10.0])
 
 
 # ------------------------------------------------------------------ compute
@@ -343,7 +389,14 @@ def test_indicators_module_is_pure() -> None:
             imported.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
             imported.add("." * node.level + (node.module or ""))
-    assert imported == {"__future__", "collections.abc", "dataclasses", "itertools", ".models"}
+    assert imported == {
+        "__future__",
+        "collections.abc",
+        "dataclasses",
+        "itertools",
+        ".iso_weeks",
+        ".models",
+    }
     source = path.read_text(encoding="utf-8")
     for call in ("open(", "now(", "time.", "datetime"):
         assert call not in source.split('"""', 2)[2], call

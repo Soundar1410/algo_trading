@@ -21,7 +21,8 @@ EMA(n)                 ``ta.ema``: alpha = 2/(n+1), **seeded with the SMA of the
 ATR(14)                ``ta.atr``: Wilder RMA of true range, SMA-seeded; the first
                        bar's true range is its high - low
 52-week high           max high over the last 52 bars, including the current one
-6-month performance    close / close 26 bars earlier - 1
+6-month performance    close / the close of the ISO week 26 weeks earlier - 1
+                       (spec v1.2e); undefined if that week has no bar
 RS                     stock 6M performance - index 6M performance, in percentage
                        points
 =====================  ============================================================
@@ -55,6 +56,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import pairwise
 
+from .iso_weeks import shift
 from .models import WeeklyBar
 
 #: Spec 4.4 lengths.
@@ -65,7 +67,7 @@ D_SMOOTHING = 3
 ATR_LENGTH = 14
 EMA_LENGTHS = (10, 40, 50, 200)
 HIGH_LOOKBACK_BARS = 52
-PERFORMANCE_LOOKBACK_BARS = 26
+PERFORMANCE_LOOKBACK_WEEKS = 26
 
 #: How many stoch values one D value depends on: D averages 3 K values, and
 #: each K averages 3 stoch values, so D at bar i reads stoch[i-4 .. i].
@@ -211,19 +213,27 @@ def highest_high(bars: Sequence[WeeklyBar], length: int = HIGH_LOOKBACK_BARS) ->
     return out
 
 
-def performance(closes: Sequence[float], lookback: int = PERFORMANCE_LOOKBACK_BARS) -> Series:
-    """``close / close[lookback bars earlier] - 1`` as a fraction."""
-    _check_length(lookback)
-    out: Series = [None] * len(closes)
-    for i in range(lookback, len(closes)):
-        out[i] = closes[i] / closes[i - lookback] - 1.0
+def performance(bars: Sequence[WeeklyBar], weeks: int = PERFORMANCE_LOOKBACK_WEEKS) -> Series:
+    """``close / close of the ISO week `weeks` earlier - 1``, as a fraction.
+
+    Counted in **ISO weeks, not bars** (spec 4.4 v1.2e). A stock with a missing
+    week — a suspension — would otherwise compare a longer window than the
+    index, and RS would subtract two different periods. When the series has no
+    bar for the earlier week, the value is undefined.
+    """
+    _check_length(weeks)
+    closes = {bar.iso_key: bar.close for bar in bars}
+    out: Series = []
+    for bar in bars:
+        earlier = closes.get(shift(bar.iso_key, -weeks))
+        out.append(None if earlier is None else bar.close / earlier - 1.0)
     return out
 
 
 def relative_strength(
     stock: Sequence[WeeklyBar],
     index: Sequence[WeeklyBar],
-    lookback: int = PERFORMANCE_LOOKBACK_BARS,
+    weeks: int = PERFORMANCE_LOOKBACK_WEEKS,
 ) -> Series:
     """Stock 6M performance minus the index's, in **percentage points**, per stock bar.
 
@@ -237,12 +247,12 @@ def relative_strength(
     index_performance = dict(
         zip(
             (bar.iso_key for bar in index),
-            performance([bar.close for bar in index], lookback),
+            performance(index, weeks),
             strict=True,
         )
     )
     out: Series = []
-    for bar, own in zip(stock, performance([bar.close for bar in stock], lookback), strict=True):
+    for bar, own in zip(stock, performance(stock, weeks), strict=True):
         benchmark = index_performance.get(bar.iso_key)
         out.append(None if own is None or benchmark is None else 100.0 * (own - benchmark))
     return out
@@ -306,7 +316,7 @@ def compute(bars: Sequence[WeeklyBar]) -> IndicatorSeries:
         atr=tuple(atr_values),
         atr_pct=tuple(ratio(atr_values, closes)),
         high_52w=tuple(highest_high(ordered)),
-        performance_6m=tuple(performance(closes)),
+        performance_6m=tuple(performance(ordered)),
     )
 
 
