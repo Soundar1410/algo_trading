@@ -376,6 +376,22 @@ def stuck_exit_row(
     return None
 
 
+def price_correction_row(
+    position: Position,
+    rows: Iterable[CorporateActionRow],
+    factor: Decimal,
+    *,
+    through: date,
+    gap_based: bool,
+) -> CorporateActionRow | None:
+    """Spec 4.14 items 2 and 8 (v1.2m): an eligible PRICE_CORRECTION row
+    matching the freeze factor under item 8's rule. A correction changes no
+    units: once one matches, the position is marked at the close and a
+    stuck-freeze exit fills at the open (factor 1)."""
+    corrections = [r for r in rows if r.kind is CorporateActionKind.PRICE_CORRECTION]
+    return stuck_exit_row(position, corrections, factor, through=through, gap_based=gap_based)
+
+
 def rescale_levels(level: Decimal, adjustments: Iterable[ShareAdjustment]) -> Decimal:
     """P1, L1, L2 or Stop in current units: every applied action's price
     factor, rounded to the paisa once."""

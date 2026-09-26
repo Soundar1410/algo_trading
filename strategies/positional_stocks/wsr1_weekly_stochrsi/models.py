@@ -572,6 +572,13 @@ class Freeze:
     runs: int = 1
     gap_based: bool = False
     mixed_units: bool = False
+    #: Item 7: each unacknowledged gap as (session, ratio to 4 dp) — exactly
+    #: what a ``gap_acknowledgements.csv`` line needs.
+    gaps: tuple[tuple[date, Decimal], ...] = ()
+    #: v1.2m: an eligible PRICE_CORRECTION row matches the freeze, so the
+    #: position is marked at the close (``factor`` is 1) — a correction
+    #: changes no units.
+    price_corrected: bool = False
 
     @property
     def escalated(self) -> bool:

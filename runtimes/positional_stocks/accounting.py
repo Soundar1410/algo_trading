@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import date
 from decimal import Decimal
 
@@ -57,6 +57,7 @@ from strategies.positional_stocks.wsr1_weekly_stochrsi.corporate_actions import 
     eligible_rows,
     freeze_factor,
     gap_detail,
+    price_correction_row,
     resolve,
     stuck_exit_row,
     unadjusted_gaps,
@@ -65,12 +66,14 @@ from strategies.positional_stocks.wsr1_weekly_stochrsi.corporate_actions import 
 from strategies.positional_stocks.wsr1_weekly_stochrsi.gaps import (
     block_window_start,
     blocking_gaps,
+    is_acknowledged,
     scan,
 )
 from strategies.positional_stocks.wsr1_weekly_stochrsi.indicators import IndicatorSeries
 from strategies.positional_stocks.wsr1_weekly_stochrsi.iso_weeks import shift
 from strategies.positional_stocks.wsr1_weekly_stochrsi.models import (
     ClosedTrade,
+    CorporateActionKind,
     CorporateActionRow,
     DailyBar,
     Freeze,
@@ -136,6 +139,23 @@ class WeekOutcome:
     #: Spec 4.14: positions frozen this week, and rescales applied this week.
     frozen: tuple[Freeze, ...] = ()
     rescaled: tuple[Rescale, ...] = ()
+    #: Spec 11 v1.2m: every corporate-action event of the week, in order.
+    events: tuple[CorporateActionEvent, ...] = ()
+    #: Spec 4.14 item 7 v1.2m: freezes that lifted with neither an
+    #: acknowledgement nor a rescale — for the operator to check.
+    silent_lifts: tuple[CorporateActionEvent, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class CorporateActionEvent:
+    """One corporate-action event for the report (spec 11 v1.2m)."""
+
+    #: rescale, reissued, one_share_partial, d101_close, stuck_exit_queued,
+    #: stuck_exit_filled, stuck_exit_skipped, waiting, silent_lift.
+    kind: str
+    symbol: str
+    position_id: str
+    detail: str
 
 
 def run_decision_week(
@@ -233,6 +253,13 @@ def run_decision_week(
             if outcome.closed is not None and outcome.closed.is_loss:
                 until = shift(outcome.closed.exit_week, params.cooling_off_weeks)
                 repository.save_cooling_off(conn, outcome.closed, until)
+            if result.order.price_factor is not None:
+                found.event(
+                    "stuck_exit_filled",
+                    position,
+                    f"{STUCK_EXIT}: SELL_ALL {result.order.quantity} filled on "
+                    f"{result.plan.session} at open / {result.order.price_factor:.4f}",
+                )
 
         # v1.2l: the checks again, for every position that got a fill this
         # run — a position opened today is checked before any decision. And a
@@ -253,6 +280,9 @@ def run_decision_week(
         ]
         _check_positions(repository, conn, refill, daily, inputs, params, found)
         current = repository.positions(conn)
+        silent = _silent_lifts(repository, current, daily, inputs, found)
+        for lift in silent:
+            found.notes.append(f"{lift.symbol}: freeze lifted silently — {lift.detail}")
 
         # Spec 8 v1.2j: the weeks between a late buy and this one were decided
         # without it; rebuild its touch memory over them. Not while frozen.
@@ -295,6 +325,8 @@ def run_decision_week(
         resumed=status == "STARTED",
         frozen=tuple(frozen.values()),
         rescaled=tuple(found.rescaled),
+        events=tuple(found.events),
+        silent_lifts=tuple(silent),
     )
 
 
@@ -350,6 +382,7 @@ def _check_positions(
                 details.append(restatement.detail)
             elif eligible_rows(position, rows, ctx.week_ending):
                 details.append(WAITING_FOR_RESTATEMENT)
+                found.event("waiting", position, WAITING_FOR_RESTATEMENT)
             if unit.mixed:
                 factors = ", ".join(f"{u:.4f}" for u in unit.per_fill)
                 details.append(f"mixed units: buy-fill unit factors {factors}")
@@ -364,6 +397,7 @@ def _check_positions(
                     detail="; ".join(details),
                     gap_based=True,
                     mixed_units=unit.mixed,
+                    gaps=tuple((gap.session, gap.ratio) for gap in gaps),
                 ),
                 found,
                 inputs,
@@ -375,7 +409,7 @@ def _check_positions(
                     f"{position.symbol}: no cached bar for any fill session; "
                     "corporate-action check impossible this run"
                 )
-            _skip_lifted_exit(repository, conn, position, ctx)
+            _skip_lifted_exit(repository, conn, position, ctx, found)
             continue
         result = resolve(position, restatement, rows, bars)
         if isinstance(result, str):
@@ -388,11 +422,19 @@ def _check_positions(
             _freeze(repository, conn, position, freeze, found, inputs)
             continue
         found.rescaled.append(result)
+        found.rescaled_ids.add(position.position_id)
+        found.event(
+            "rescale",
+            position,
+            f"{result.row.kind.value} {result.row.ratio} ex {result.row.ex_session}: "
+            f"{result.shares_before} -> {result.shares_after} shares, "
+            f"cash {result.adjustment.cash}",
+        )
         if position.shares_held + result.adjustment.shares_delta == 0:
-            _close_in_lieu(repository, conn, position, result, found.notes, ctx, params)
+            _close_in_lieu(repository, conn, position, result, found, ctx, params)
             continue
         repository.save_corporate_action(conn, position, result, ctx.week)
-        _reissue_sells(repository, conn, position.position_id, ctx)
+        _reissue_sells(repository, conn, position.position_id, ctx, found)
 
 
 @dataclass
@@ -402,6 +444,13 @@ class _Checks:
     frozen: dict[str, Freeze]
     rescaled: list[Rescale]
     notes: list[str]
+    events: list[CorporateActionEvent] = field(default_factory=list)
+    rescaled_ids: set[str] = field(default_factory=set)
+
+    def event(self, kind: str, position: Position, detail: str) -> None:
+        self.events.append(
+            CorporateActionEvent(kind, position.symbol, position.position_id, detail)
+        )
 
 
 #: A template: every Freeze is built from it with ``replace``.
@@ -409,7 +458,11 @@ _NO_FREEZE = Freeze(position_id="", factor=Decimal("1"), detail="")
 
 
 def _skip_lifted_exit(
-    repository: StockRepository, conn: sqlite3.Connection, position: Position, ctx: WeekContext
+    repository: StockRepository,
+    conn: sqlite3.Connection,
+    position: Position,
+    ctx: WeekContext,
+    found: _Checks,
 ) -> None:
     """Spec 4.14 item 8 (v1.2l): a queued stuck-freeze exit whose freeze was
     lifted — neither frozen nor rescaled this run, e.g. the operator
@@ -420,6 +473,7 @@ def _skip_lifted_exit(
             repository.resolve_order(
                 conn, order, state="SKIPPED", week=ctx.week, resolution=FREEZE_LIFTED
             )
+            found.event("stuck_exit_skipped", position, f"queued exit SKIPPED: {FREEZE_LIFTED}")
 
 
 def _freeze(
@@ -445,6 +499,29 @@ def _freeze(
     ctx = inputs.ctx
     runs = 1 + repository.frozen_streak(position.position_id, ctx.week)
     freeze = replace(freeze, runs=runs)
+    # The factor item 8 matches rows against: the freeze's own, before v1.2m's
+    # price-correction rule below sets the mark to the close.
+    match_factor = freeze.factor
+    correction = (
+        None
+        if freeze.mixed_units
+        else price_correction_row(
+            position,
+            inputs.corporate_actions,
+            match_factor,
+            through=ctx.week_ending,
+            gap_based=freeze.gap_based,
+        )
+    )
+    if correction is not None:
+        # v1.2m: a PRICE_CORRECTION changes no units — marked at the close.
+        freeze = replace(
+            freeze,
+            factor=Decimal("1"),
+            price_corrected=True,
+            detail=f"{freeze.detail}; PRICE_CORRECTION {correction.ratio} ex "
+            f"{correction.ex_session} matches: marked at the close",
+        )
     found.frozen[position.position_id] = freeze
     if runs < STUCK_AFTER_RUNS or freeze.mixed_units:
         return
@@ -454,12 +531,17 @@ def _freeze(
     row = stuck_exit_row(
         position,
         inputs.corporate_actions,
-        freeze.factor,
+        match_factor,
         through=ctx.week_ending,
         gap_based=freeze.gap_based,
     )
     if row is None:
         return  # nothing eligible explains it: stays frozen and escalated
+    # The exit fills at open / the row's price factor — or at the open
+    # itself for a PRICE_CORRECTION, which changes no units (v1.2m).
+    exit_factor = (
+        Decimal("1") if row.kind is CorporateActionKind.PRICE_CORRECTION else row.price_factor
+    )
     exit_order = PendingOrder(
         action=OrderAction.SELL_ALL,
         symbol=position.symbol,
@@ -468,7 +550,7 @@ def _freeze(
         reason=STUCK_EXIT,
         position_id=position.position_id,
         quantity=position.shares_held,
-        price_factor=row.price_factor,
+        price_factor=exit_factor,
     )
     exit_id = repository.save_order(conn, exit_order)
     for order in pending:
@@ -484,11 +566,13 @@ def _freeze(
                 week=ctx.week,
                 resolution=f"superseded by {exit_id}",
             )
-    found.notes.append(
-        f"{position.symbol}: {STUCK_EXIT} — {row.kind.value} {row.ratio} ex {row.ex_session} "
-        f"matches the freeze factor {freeze.factor:.4f} but cannot be applied; SELL_ALL "
-        f"{position.shares_held} queued for {ctx.execution_date} at open / {row.price_factor:.4f}"
+    detail = (
+        f"{STUCK_EXIT} — {row.kind.value} {row.ratio} ex {row.ex_session} matches the freeze "
+        f"factor {match_factor:.4f} but cannot be applied; SELL_ALL {position.shares_held} "
+        f"queued for {ctx.execution_date} at open / {exit_factor:.4f}"
     )
+    found.notes.append(f"{position.symbol}: {detail}")
+    found.event("stuck_exit_queued", position, detail)
 
 
 def _close_in_lieu(
@@ -496,7 +580,7 @@ def _close_in_lieu(
     conn: sqlite3.Connection,
     position: Position,
     rescale: Rescale,
-    notes: list[str],
+    found: _Checks,
     ctx: WeekContext,
     params: RulesParameters,
 ) -> None:
@@ -521,15 +605,20 @@ def _close_in_lieu(
     trade = ClosedTrade(closed.symbol, closed.position_id, closed.exit_week, closed.net_pnl)
     if trade.is_loss:
         repository.save_cooling_off(conn, trade, shift(trade.exit_week, params.cooling_off_weeks))
-    notes.append(
-        f"{position.symbol}: {rescale.row.kind.value} {rescale.row.ratio} floors "
-        f"{rescale.shares_before} shares to 0 — closed on cash in lieu "
-        f"{rescale.adjustment.cash}, net {closed.net_pnl}"
+    detail = (
+        f"{rescale.row.kind.value} {rescale.row.ratio} floors {rescale.shares_before} shares "
+        f"to 0 — closed on cash in lieu {rescale.adjustment.cash}, net {closed.net_pnl}"
     )
+    found.notes.append(f"{position.symbol}: {detail}")
+    found.event("d101_close", position, detail)
 
 
 def _reissue_sells(
-    repository: StockRepository, conn: sqlite3.Connection, position_id: str, ctx: WeekContext
+    repository: StockRepository,
+    conn: sqlite3.Connection,
+    position_id: str,
+    ctx: WeekContext,
+    found: _Checks,
 ) -> None:
     """Spec 4.14 item 6: the exit was decided on valid data and must still
     happen, in the new units. The re-issued sell keeps the original
@@ -558,6 +647,7 @@ def _reissue_sells(
             repository.resolve_order(
                 conn, order, state="SUPERSEDED", week=ctx.week, resolution=ONE_SHARE_PARTIAL
             )
+            found.event("one_share_partial", position, ONE_SHARE_PARTIAL)
             continue
         replacement = PendingOrder(
             action=order.action,
@@ -576,6 +666,55 @@ def _reissue_sells(
             week=ctx.week,
             resolution=f"superseded by {replacement_id}",
         )
+        found.event(
+            "reissued",
+            position,
+            f"{order.action.value} {order.quantity} re-issued as {quantity} in the new units "
+            f"from {order.execute_on_or_after}",
+        )
+
+
+def _silent_lifts(
+    repository: StockRepository,
+    positions: Mapping[str, Position],
+    daily: Mapping[str, Sequence[DailyBar]],
+    inputs: WeekInputs,
+    found: _Checks,
+) -> list[CorporateActionEvent]:
+    """Spec 4.14 item 7 (v1.2m): a freeze that lifted with neither an
+    acknowledgement nor a rescale — frozen last run, not frozen now, no
+    rescale this run, and no acknowledgement covering any gap of 15% or more
+    after the first fill. A partial restatement whose boundary gap is below
+    15% can do that; the operator checks the position against the exchange's
+    record. Reported only: the lift logic is unchanged."""
+    ctx = inputs.ctx
+    lifts: list[CorporateActionEvent] = []
+    for position in sorted(positions.values(), key=lambda p: p.symbol):
+        pid = position.position_id
+        if (
+            position.state is PositionState.CLOSED
+            or pid in found.frozen
+            or pid in found.rescaled_ids
+            or repository.frozen_streak(pid, ctx.week) == 0
+        ):
+            continue
+        first = position.buys[0].session
+        acknowledged = any(
+            gap.session > first and is_acknowledged(gap, inputs.acknowledgements)
+            for gap in scan(position.symbol, daily.get(position.symbol, ()))
+        )
+        if acknowledged:
+            continue
+        lifts.append(
+            CorporateActionEvent(
+                "silent_lift",
+                position.symbol,
+                pid,
+                "frozen last run, not frozen now, with neither an acknowledgement nor a "
+                "rescale — check the position against the exchange's corporate-action record",
+            )
+        )
+    return lifts
 
 
 def _complete(
