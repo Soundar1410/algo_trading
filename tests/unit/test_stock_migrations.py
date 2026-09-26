@@ -13,6 +13,7 @@ separation from both sides:
 
 from __future__ import annotations
 
+import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -105,3 +106,38 @@ def test_every_stock_table_is_prefixed_and_carries_strategy_id(tmp_path: Path) -
         assert table.startswith("stock_")
         columns = {row["name"] for row in database.connect().execute(f"PRAGMA table_info({table})")}
         assert "strategy_id" in columns, table
+
+
+# ---------------------------------------- v1.2k: the widened CHECKs (D100)
+def _corporate_action(database: Database, kind: str, shares_after: int, ex_session: str) -> None:
+    conn = database.connect()
+    conn.execute(
+        "INSERT OR IGNORE INTO stock_positions (position_id, strategy_id, symbol, sector, grp, "
+        "state, spacing, allocation, t1_amount, t2_amount, t3_amount, event_risk, p1, l1, l2, "
+        "stop, updated_week) VALUES ('A-2026W01', 's', 'A', 'X', 'A', 'OPEN', '0.1', '100000', "
+        "'40000', '30000', '30000', 0, '1000', '900', '800', '700', '2026-W01')"
+    )
+    conn.execute(
+        "INSERT INTO stock_corporate_actions (strategy_id, position_id, symbol, ex_session, kind, "
+        "ratio, detected_factor, applies_to, shares_before, shares_after, reference_close, cash, "
+        "confirmed_on, applied_week) VALUES ('s', 'A-2026W01', 'A', ?, ?, '0.1', '10', "
+        "'[\"BUY_T1\"]', 1, ?, '1000', '0', '2026-09-26', '2026-W40')",
+        (ex_session, kind, shares_after),
+    )
+    conn.commit()
+
+
+def test_a_fresh_database_accepts_price_correction_and_a_zero_share_rescale(
+    tmp_path: Path,
+) -> None:
+    database = open_stock_database(tmp_path / "positional_stocks.db")
+    _corporate_action(database, "PRICE_CORRECTION", 1, "2026-02-02")
+    _corporate_action(database, "BONUS_SPLIT", 0, "2026-03-02")  # D101: consolidation to 0
+    kinds = database.connect().execute("SELECT kind, shares_after FROM stock_corporate_actions")
+    assert sorted(tuple(row) for row in kinds) == [("BONUS_SPLIT", 0), ("PRICE_CORRECTION", 1)]
+
+
+def test_an_unknown_kind_is_still_rejected(tmp_path: Path) -> None:
+    database = open_stock_database(tmp_path / "positional_stocks.db")
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+        _corporate_action(database, "SPINOFF", 1, "2026-02-02")

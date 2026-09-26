@@ -86,7 +86,10 @@ CREATE TABLE IF NOT EXISTS stock_pending_orders (
     state                TEXT NOT NULL DEFAULT 'PENDING'
         CHECK (state IN ('PENDING', 'FILLED', 'SKIPPED', 'SUPERSEDED')),
     resolved_week        TEXT,
-    resolution           TEXT
+    resolution           TEXT,
+    -- D102: a stuck-freeze exit fills at open / price_factor, in the
+    -- position's own units. NULL for every other order.
+    price_factor         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_stock_pending_orders_state
     ON stock_pending_orders (strategy_id, state);
@@ -206,12 +209,15 @@ CREATE TABLE IF NOT EXISTS stock_corporate_actions (
     position_id      TEXT NOT NULL REFERENCES stock_positions (position_id),
     symbol           TEXT NOT NULL,
     ex_session       TEXT NOT NULL,
-    kind             TEXT NOT NULL CHECK (kind IN ('BONUS_SPLIT', 'DEMERGER')),
+    kind             TEXT NOT NULL
+        CHECK (kind IN ('BONUS_SPLIT', 'DEMERGER', 'PRICE_CORRECTION')),
     ratio            TEXT NOT NULL,
     detected_factor  TEXT NOT NULL,
     applies_to       TEXT NOT NULL,
     shares_before    INTEGER NOT NULL CHECK (shares_before > 0),
-    shares_after     INTEGER NOT NULL CHECK (shares_after > 0),
+    -- 0 when a consolidation floors the holding away (D101): the position
+    -- closes on cash in lieu.
+    shares_after     INTEGER NOT NULL CHECK (shares_after >= 0),
     reference_close  TEXT NOT NULL,
     cash             TEXT NOT NULL,
     confirmed_on     TEXT NOT NULL,

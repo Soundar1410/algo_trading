@@ -96,6 +96,13 @@ acknowledge it here. A move of 15–30% is only reported.
   stays blocked (operator decision, 23 September 2026). The loader fails
   closed on a malformed row, an ambiguous date, or the same gap acknowledged
   twice.
+- **Held positions (spec 4.14 item 7, v1.2k).** For a symbol already held, a
+  gap of **15%** or more (either direction) after its first fill freezes the
+  position until it is acknowledged here or Dhan back-adjusts it (see
+  `corporate_actions.csv`). Acknowledge only a **real price move**. Never
+  acknowledge a gap you know is a bonus, split or consolidation: that resumes
+  decisions on mismatched units (a false stop). Add a `corporate_actions.csv`
+  row instead.
 
 ## `corporate_actions.csv` (spec 4.14)
 
@@ -103,43 +110,81 @@ acknowledge it here. A move of 15–30% is only reported.
 
 Dhan back-adjusts history for bonuses, splits and (sometimes) demergers. A
 held position, though, keeps its fill prices, P1, L1, L2, Stop and share count
-in the units of its fills. Every decision run compares each fill of each open
-position with the cached open of that session. When they differ by more than
-0.5%, the history was restated and the position is **frozen**:
-- no exit, add or partial decision is made for it;
-- it still counts toward every limit;
-- it is marked at close ÷ f in its own units, so equity and the brakes see no
-  false drop;
-- it is flagged in the report.
+in the units of its fills. Every decision run checks each open position two
+ways, and **freezes** it when either finds a problem:
+
+- **Restated history (item 1).** Each fill is compared with the cached open of
+  its session. More than 0.5% apart means Dhan restated the history, by a
+  factor f.
+- **Unadjusted action (item 7, v1.2k).** An unacknowledged close-to-close gap
+  of 15% or more, in either direction, on a session after the position's
+  first fill. This is a bonus, split or consolidation Dhan has **not yet**
+  back-adjusted, or a real move you have not acknowledged. A gap on or before
+  the T1 fill session never counts.
+
+A frozen position:
+- gets no exit, add or partial decision;
+- has its pending orders held;
+- still counts toward every limit;
+- is marked at close ÷ f (or ÷ the gap ratio) in its own units, so equity and
+  the brakes see no false drop;
+- is flagged in the report.
 
 After more than 2 weekly runs frozen it is escalated as an operator action.
 Confirm the action here, within 2 weekly runs of the flag:
 
 | `kind` | `ratio` | Examples |
 |---|---|---|
-| `BONUS_SPLIT` | new shares per old share (> 1) | 1:1 bonus → `2`; 1:2 bonus → `1.5`; 1:10 split → `10` |
+| `BONUS_SPLIT` | new shares per old share (positive, not 1) | 1:1 bonus → `2`; 1:2 bonus → `1.5`; 1:10 split → `10`; **10:1 consolidation → `0.1`** |
 | `DEMERGER` | the price factor Dhan applied (between 0 and 1) | `0.90` |
+| `PRICE_CORRECTION` | the price factor (positive, not 1) | `0.99` (a Dhan data correction) |
 
-- **`DEMERGER` covers any price-only restatement**, for example a special
-  dividend Dhan adjusts for. The share count is unchanged and the value
-  removed is credited as cash.
+- **`DEMERGER` vs `PRICE_CORRECTION`.** `DEMERGER` covers price-only
+  restatements that carry value, for example a special dividend Dhan adjusts
+  for: the value removed is credited as cash. `PRICE_CORRECTION` covers those
+  that do not, such as a Dhan data correction, and **no cash is credited**.
+  Confirming a data correction as `DEMERGER` would credit cash that never
+  existed.
 - `ex_session` is the first session in the new units. A row is applied only
-  if its factor matches the detected one within 0.5% (BONUS_SPLIT: 1 ÷ ratio;
-  DEMERGER: ratio). Every fill before `ex_session` must be restated and every
-  fill on or after it must not be. Otherwise the position stays frozen and the
-  mismatch is reported.
+  when **Dhan has restated the history**, and only if its factor matches the
+  detected one within 0.5% (BONUS_SPLIT: 1 ÷ ratio; the others: ratio). Every
+  fill before `ex_session` must be restated and every fill on or after it must
+  not be. Otherwise the position stays frozen and the mismatch is reported.
+  You may add the row before Dhan restates: until then the report says "CSV
+  row present; waiting for Dhan restatement".
 - **What a rescale does:**
   - BONUS_SPLIT: shares × ratio, floored, with the fraction paid as cash at the
-    adjusted pre-ex close. Prices and levels ÷ ratio; rupee cost unchanged.
+    adjusted pre-ex close. Prices and levels ÷ ratio; rupee cost unchanged. A
+    consolidation that floors the holding to **0 shares** pays it all as cash
+    in lieu and closes the position as a normal exit at that price, dated to
+    the ex session's week, with no sell costs (D101).
   - DEMERGER: prices and levels × ratio; shares unchanged. The credit is
     shares × actual pre-ex close × (1 − ratio).
-  - Either way, a pending sell decided before the restatement is re-issued in
-    the new units for the next session.
+  - PRICE_CORRECTION: as DEMERGER, with no credit.
+  - A pending sell decided before the restatement is re-issued in the new
+    units. It keeps its original execution session, so it fills at that
+    session's restated open, flagged `late_fill` (v1.2k).
   - The rescale is stored as its own record and the original fills are never
     edited. A trade's P&L includes the cash the action paid.
+- **Stuck freeze (D102).** Dhan's back-adjustment can be missing, or partial:
+  MOTHERSON's 1:2 bonus was adjusted back only to 30 Apr 2024. Then a row can
+  never apply, and the position would stay frozen forever, holding a slot
+  with no stop able to fire. So after 3 or more consecutive frozen runs, if a
+  row here matches the freeze factor within 0.5% but cannot be applied, the
+  position is exited:
+  - a SELL_ALL of its stored shares at the next session's open ÷ the factor
+    (its own units), with normal sell costs;
+  - reason "exit: corporate action not adjusted by Dhan".
+
+  With no matching row, it stays frozen and escalated.
+- **Never acknowledge a gap you know is a bonus, split or consolidation.** An
+  entry in `gap_acknowledgements.csv` means "this was a real price move". It
+  lifts the freeze and resumes decisions on mismatched units, which gives a
+  false stop. Add a row here instead.
 - Shipped **header-only**. The loader fails closed on a missing file, a wrong
   header, an unknown kind, a ratio out of range, a bad date, or the same
   (symbol, ex_session) twice.
 - **Known limit:** two actions stacked on one open position (both unconfirmed
   at once) cannot be resolved by one row. The position stays frozen and
-  escalates.
+  escalates, and then exits under D102 only if a row explains the combined
+  factor.

@@ -21,11 +21,11 @@ from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 
-from _wsr1_rules_fixtures import friday
+from _wsr1_rules_fixtures import friday, week
 from test_stock_accounting import CALENDAR, PARAMS, World, _inputs, _repo
 
 from runtimes.positional_stocks.accounting import REISSUED, WeekOutcome, run_decision_week
-from runtimes.positional_stocks.repository import StockRepository
+from runtimes.positional_stocks.repository import StockRepository, week_text
 from strategies.positional_stocks.wsr1_weekly_stochrsi.models import (
     CorporateActionKind,
     CorporateActionRow,
@@ -48,10 +48,14 @@ class Restated(World):
 
     factor: float = 0.5
     ex_week: int = EX_WEEK
+    #: The first run whose cache is restated (default: the ex week's run).
+    restated_from: int | None = None
+    #: Sessions with no bar at all (the symbol did not trade that day).
+    missing: frozenset[date] = frozenset()
 
     def daily(self, i: int) -> list[DailyBar]:
-        bars = super().daily(i)
-        if i < self.ex_week:
+        bars = [b for b in super().daily(i) if b.session not in self.missing]
+        if i < (self.ex_week if self.restated_from is None else self.restated_from):
             return bars
         f = self.factor
         return [
@@ -249,42 +253,129 @@ def test_a_freeze_over_2_runs_escalates(tmp_path: Path) -> None:
 
 
 # ================================= a pending sell is re-issued in new units
-def test_a_stop_decided_before_a_bonus_is_reissued_in_the_new_units(tmp_path: Path) -> None:
+def _stop_world(**kw: object) -> Restated:
+    """211 closes 690 < stop 700: a SELL_ALL of 40 for 212's Monday, the ex
+    day. 210 closes 720, so 211's fall is -4%, not an item-7 gap (the drop
+    from 1,000 to 720 is on the T1 fill session itself, which never counts).
+    After the bonus the stock recovers to 720 (360): a fresh review would
+    hold, so a sale proves the original exit was carried, not re-decided."""
+    world = _bonus_world(**kw)
+    world.close.update({210: 720.0, 211: 690.0, 212: 360.0, 213: 360.0, 214: 360.0})
+    return world
+
+
+def test_a_stop_decided_before_a_bonus_is_reissued_at_its_original_session(
+    tmp_path: Path,
+) -> None:
     repo = _repo(tmp_path / "positional_stocks.db")
-    # 211 closes 690 < stop 700: SELL_ALL 40, for 212's Monday — the ex day.
-    # After the bonus the stock recovers to 720 (360): a fresh review would
-    # hold, so a sale proves the original exit was carried, not re-decided.
-    world = _bonus_world()
-    world.close.update({211: 690.0, 212: 360.0, 213: 360.0, 214: 360.0})
+    world = _stop_world()
     _through(repo, world, 211)
     (stop,) = repo.pending_orders()
     assert (stop.action, stop.quantity) == (OrderAction.SELL_ALL, 40)
+    assert stop.execute_on_or_after == EX_SESSION
 
     # 212: restated, unconfirmed -> frozen; the old-unit sell must not fill.
     frozen = _run(repo, world, 212)
     assert frozen.frozen and repo.pending_orders() == [stop]
     assert len(_fills(repo)) == 1
 
-    # 213: confirmed. The 40-share sell is SUPERSEDED by an 80-share one.
+    # 213: confirmed. The 40-share sell is SUPERSEDED by an 80-share one that
+    # keeps the original session (v1.2k) and so fills in this same run, at
+    # 212 Monday's open in the new units — a week late, and flagged so.
     confirmed = _run(repo, world, 213, (_bonus("2"),))
-    (reissued,) = repo.pending_orders()
-    assert (reissued.action, reissued.quantity) == (OrderAction.SELL_ALL, 80)
-    assert reissued.reason == f"{stop.reason}; {REISSUED}"
-    assert reissued.execute_on_or_after == friday(214) - timedelta(days=4)
     sells = repo.database.connect().execute(
-        "SELECT state, quantity, resolution FROM stock_pending_orders "
-        "WHERE action = 'SELL_ALL' ORDER BY decided_week"
+        "SELECT state, quantity, execute_on_or_after, reason, resolution "
+        "FROM stock_pending_orders WHERE action = 'SELL_ALL' ORDER BY decided_week"
     )
     old, new = (tuple(row) for row in sells)
-    assert old[:2] == ("SUPERSEDED", 40) and new[:2] == ("PENDING", 80)
-    assert str(old[2]).startswith("superseded by ")
-    assert confirmed.decision is not None
-    (review,) = confirmed.decision.reviews
-    assert review.order is None and review.reason == "an earlier order is still unfilled"
+    assert old[:2] == ("SUPERSEDED", 40) and str(old[4]).startswith("superseded by ")
+    assert new[:3] == ("FILLED", 80, EX_SESSION.isoformat())
+    assert new[3] == f"{stop.reason}; {REISSUED}"
+    (position,) = repo.positions().values()
+    assert position.state is PositionState.CLOSED
+    sale = position.sales[-1]
+    assert (sale.session, sale.shares, sale.price) == (EX_SESSION, 80, D("360.00"))
+    flags = (
+        repo.database.connect()
+        .execute(
+            "SELECT late_fill, not_traded_on_execution_session FROM stock_fills "
+            "WHERE action = 'SELL_ALL'"
+        )
+        .fetchone()
+    )
+    assert tuple(flags) == (1, 0)
+    assert confirmed.decision is not None and confirmed.decision.orders == ()
+    assert repo.pending_orders() == []
 
-    # 214: the re-issued exit fills at the next open, all 80 shares.
-    _run(repo, world, 214, (_bonus("2"),))
+
+def test_a_reissued_sell_whose_original_monday_did_not_trade_fills_on_tuesday(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path / "positional_stocks.db")
+    world = _stop_world(missing=frozenset({EX_SESSION}))
+    _through(repo, world, 212)
+    _run(repo, world, 213, (_bonus("2"),))
+    (position,) = repo.positions().values()
+    sale = position.sales[-1]
+    assert (sale.session, sale.shares) == (EX_SESSION + timedelta(days=1), 80)
+    flags = (
+        repo.database.connect()
+        .execute(
+            "SELECT late_fill, not_traded_on_execution_session FROM stock_fills "
+            "WHERE action = 'SELL_ALL'"
+        )
+        .fetchone()
+    )
+    assert tuple(flags) == (1, 1)
+
+
+def test_a_reissued_sell_half_is_half_the_rescaled_shares_at_the_original_session(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path / "positional_stocks.db")
+    # 41 shares at 975; K/D 95/92 at 211 -> SELL_HALF 20 for 212's Monday.
+    world = _bonus_world(factor=1 / 1.5, pre=1000.0, t1_open=975.0)
+    world.k[211], world.d[211] = 95.0, 92.0
+    world.ema10.update({212: 600.0, 213: 600.0})  # the trail, in the new units
+    _through(repo, world, 211)
+    (half,) = repo.pending_orders()
+    assert (half.action, half.quantity) == (OrderAction.SELL_HALF, 20)
+    _run(repo, world, 212)
+    _run(repo, world, 213, (_bonus("1.5"),))
+    (position,) = repo.positions().values()
+    sale = position.sales[-1]
+    # 41 x 1.5 = 61.5 -> 61 shares; floor(61 / 2) = 30, at 212 Monday's open.
+    assert (sale.action, sale.session, sale.shares) == (OrderAction.SELL_HALF, EX_SESSION, 30)
+    assert position.state is PositionState.HALF_SOLD and position.shares_held == 31
+
+
+# =============================== a consolidation that floors to 0 (D101)
+def test_a_consolidation_to_zero_shares_closes_on_cash_in_lieu(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "positional_stocks.db")
+    # T1 40,000 at 30,000 buys 1 share; a 10:1 consolidation ex 212.
+    world = _bonus_world(factor=10.0, pre=30000.0, t1_open=30000.0)
+    _through(repo, world, 211)
+    (position,) = repo.positions().values()
+    assert position.shares_held == 1
+    cash, fees = repo.cash(), position.fees
+
+    outcome = _run(repo, world, 212, (_bonus("0.1"),))
     (position,) = repo.positions().values()
     assert position.state is PositionState.CLOSED and position.shares_held == 0
-    assert position.sales[-1].shares == 80 and position.sales[-1].price == D("360.00")
-    assert repo.pending_orders() == []
+    # 0.1 share x the adjusted pre-ex close of 300,000; no sell costs.
+    assert repo.cash() == cash + D("30000.00")
+    assert position.net_pnl == D("30000.00") - D("30000.00") - fees
+    assert position.exit_week == week(212)  # dated to the ex session's week
+    cooling = repo.database.connect().execute("SELECT * FROM stock_cooling_off").fetchone()
+    assert (cooling["position_id"], cooling["exit_week"]) == (
+        position.position_id,
+        week_text(week(212)),
+    )
+    (record,) = repo.database.connect().execute(
+        "SELECT shares_before, shares_after, cash FROM stock_corporate_actions"
+    )
+    assert tuple(record) == (1, 0, "30000.00")
+    assert outcome.decision is not None
+    assert any("closed on cash in lieu" in w for w in outcome.decision.warnings)
+    # The book goes on: the next week runs, and the symbol is in cooling-off.
+    assert _run(repo, world, 213, (_bonus("0.1"),)).status == "COMPLETED"

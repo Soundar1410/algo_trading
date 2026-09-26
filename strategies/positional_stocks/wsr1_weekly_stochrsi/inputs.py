@@ -352,7 +352,8 @@ def load_corporate_actions(path: Path | str) -> tuple[CorporateActionRow, ...]:
             kind = CorporateActionKind(raw_kind.upper())
         except ValueError:
             raise InputFileError(
-                f"{location} line {line}: kind is {raw_kind!r}; expected BONUS_SPLIT or DEMERGER."
+                f"{location} line {line}: kind is {raw_kind!r}; expected BONUS_SPLIT, DEMERGER "
+                "or PRICE_CORRECTION."
             ) from None
         raw_ratio = _required(record, "ratio", location, line)
         try:

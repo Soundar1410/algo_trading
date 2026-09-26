@@ -17,6 +17,8 @@ the next weekly run, which is the first moment the candle exists (spec 8).
 * **Late candle (v1.2j).** A fill whose session is in an earlier week than the
   run's week — its candle was missing at the earlier run — is ``late_fill``;
   the caller replays the add-touch memory from that week before deciding.
+* **Stuck-freeze exit (D102).** An order carrying ``price_factor`` fills at
+  open / factor: the position's own units, the basis of its frozen mark.
 * **Sells before buys** at the same open, in a deterministic order.
 
 Pure apart from reading its arguments: no I/O, no clock.
@@ -27,6 +29,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal
 
 from strategies.positional_stocks.wsr1_weekly_stochrsi.iso_weeks import week_of
 from strategies.positional_stocks.wsr1_weekly_stochrsi.models import (
@@ -34,6 +37,7 @@ from strategies.positional_stocks.wsr1_weekly_stochrsi.models import (
     PendingOrder,
     Position,
     RulesParameters,
+    money,
 )
 from strategies.positional_stocks.wsr1_weekly_stochrsi.rules import FillOutcome, apply_fill
 from strategies.positional_stocks.wsr1_weekly_stochrsi.trading_calendar import TradingCalendar
@@ -119,11 +123,15 @@ def fill_orders(
             results.append(OrderFill(order, None, None))
             continue
         position = book.get(order.position_id) if order.position_id else None
+        # D102: a stuck-freeze exit fills in the position's own units.
+        open_price: float | Decimal = plan.open_price
+        if order.price_factor is not None:
+            open_price = money(Decimal(str(plan.open_price)) / order.price_factor)
         outcome = apply_fill(
             order,
             position,
             session=plan.session,
-            open_price=plan.open_price,
+            open_price=open_price,
             params=params,
             at_week_open=plan.at_week_open,
         )

@@ -362,8 +362,8 @@ class StockRepository:
         conn.execute(
             "INSERT INTO stock_pending_orders (order_id, strategy_id, symbol, action, "
             "decided_week, execute_on_or_after, reason, position_id, amount, quantity, spacing, "
-            "allocation, t1_amount, t2_amount, t3_amount, event_risk, sector, grp) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "allocation, t1_amount, t2_amount, t3_amount, event_risk, sector, grp, price_factor) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 identifier,
                 self._strategy_id,
@@ -385,6 +385,7 @@ class StockRepository:
                 None if sizing is None else int(sizing.event_risk),
                 order.sector,
                 order.group,
+                None if order.price_factor is None else str(order.price_factor),
             ),
         )
         return identifier
@@ -693,4 +694,5 @@ def _pending(row: sqlite3.Row) -> PendingOrder:
         sizing=_sizing(row) if has_sizing else None,
         sector=row["sector"],
         group=row["grp"],
+        price_factor=None if row["price_factor"] is None else Decimal(row["price_factor"]),
     )

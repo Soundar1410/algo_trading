@@ -28,7 +28,7 @@ row is written and week 217's new trigger is refused.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -47,6 +47,7 @@ from strategies.positional_stocks.wsr1_weekly_stochrsi.iso_weeks import shift
 from strategies.positional_stocks.wsr1_weekly_stochrsi.models import (
     DailyBar,
     FunnelStage,
+    GapAcknowledgement,
     OrderAction,
     PositionState,
     RulesParameters,
@@ -74,6 +75,9 @@ class World:
     monday_open: dict[int, float] = field(default_factory=dict)
     #: Weeks in which A has no daily bars at all (it did not trade).
     silent: set[int] = field(default_factory=set)
+    #: Gap acknowledgements for real moves (spec 4.14 item 7 v1.2k freezes a
+    #: held position on an unacknowledged close-to-close gap of 15% or more).
+    acknowledgements: tuple[GapAcknowledgement, ...] = ()
 
     def series(self, i: int) -> Tape:
         def upto(column: dict[int, float]) -> dict[int, float | None]:
@@ -112,7 +116,16 @@ class World:
 
 
 def _trade_world() -> World:
+    # The trail exit is a real -24% week (1,080 -> 820 at 215's Monday) and
+    # the stock recovers +22% (820 -> 1,000 at 216's). Both are genuine moves,
+    # acknowledged as an operator would; without that, item 7 (v1.2k) would
+    # freeze the position until they were.
+    acks = tuple(
+        GapAcknowledgement("A", friday(w) - timedelta(days=4), D(r), date(2026, 9, 26), "real move")
+        for w, r in ((215, "0.7593"), (216, "1.2195"))
+    )
     return World(
+        acknowledgements=acks,
         close={210: 900.0, 211: 950.0, 212: 960.0, 214: 1080.0, 215: 820.0},
         high={210: 940.0, 211: 960.0, 212: 970.0},
         low={210: 890.0},
@@ -133,6 +146,7 @@ def _inputs(world: World, i: int, symbols: tuple[str, ...] = ("A",)) -> WeekInpu
         index=index_series(n=i + 1),
         daily={s: world.daily(i) for s in symbols},
         universe_rows=rows,
+        acknowledgements=world.acknowledgements,
         fingerprint=f"fp-{i}",
     )
 

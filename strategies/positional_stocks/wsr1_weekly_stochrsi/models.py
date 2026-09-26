@@ -245,24 +245,29 @@ class GapAcknowledgement:
 
 
 class CorporateActionKind(Enum):
-    """Spec 4.14 v1.2j. ``DEMERGER`` covers any price-only restatement."""
+    """Spec 4.14. ``DEMERGER`` covers price-only restatements that carry value
+    (a special dividend Dhan adjusts for); ``PRICE_CORRECTION`` (v1.2k) those
+    that do not (a Dhan data correction): no cash is credited."""
 
     BONUS_SPLIT = "BONUS_SPLIT"
     DEMERGER = "DEMERGER"
+    PRICE_CORRECTION = "PRICE_CORRECTION"
 
 
 def _check_ratio(kind: CorporateActionKind, ratio: Decimal, label: str) -> None:
     if not ratio.is_finite():
         raise ValueError(f"{label}: ratio must be a finite number")
-    if kind is CorporateActionKind.BONUS_SPLIT and not ratio > 1:
-        raise ValueError(f"{label}: a BONUS_SPLIT ratio is new shares per old share, > 1")
+    if kind is not CorporateActionKind.DEMERGER and not (ratio > 0 and ratio != 1):
+        # v1.2k: BONUS_SPLIT below 1 is a consolidation (10:1 -> 0.1).
+        raise ValueError(f"{label}: a {kind.value} ratio must be positive and not 1")
     if kind is CorporateActionKind.DEMERGER and not 0 < ratio < 1:
         raise ValueError(f"{label}: a DEMERGER ratio is Dhan's price factor, between 0 and 1")
 
 
 def price_factor(kind: CorporateActionKind, ratio: Decimal) -> Decimal:
     """What the restatement multiplies a pre-ex price by: 1 / ratio for a
-    bonus or split, the ratio itself for a demerger."""
+    bonus, split or consolidation, the ratio itself for a demerger or a price
+    correction."""
     return 1 / ratio if kind is CorporateActionKind.BONUS_SPLIT else ratio
 
 
@@ -271,8 +276,9 @@ class CorporateActionRow:
     """One operator-confirmed row of ``corporate_actions.csv`` (spec 4.14).
 
     ``ratio`` is new shares per old share for ``BONUS_SPLIT`` (1:1 bonus -> 2,
-    1:2 bonus -> 1.5, 1:10 split -> 10), and the price factor Dhan applied for
-    ``DEMERGER`` (e.g. 0.90).
+    1:2 bonus -> 1.5, 1:10 split -> 10, 10:1 consolidation -> 0.1), and the
+    price factor Dhan applied for ``DEMERGER`` (e.g. 0.90) and
+    ``PRICE_CORRECTION`` (any positive value but 1).
     """
 
     symbol: str
@@ -526,10 +532,16 @@ class ShareAdjustment:
         _check_ratio(self.kind, self.ratio, f"adjustment {self.ex_session}")
         if OrderAction.BUY_T1 not in self.applies_to:
             raise ValueError("an adjustment applies to a position held before its ex session")
-        if self.shares_delta < 0 or self.cash < 0:
-            raise ValueError("an adjustment adds shares and cash, never removes them")
-        if self.kind is CorporateActionKind.DEMERGER and self.shares_delta != 0:
-            raise ValueError("a DEMERGER leaves the share count unchanged")
+        if self.cash < 0:
+            raise ValueError("an adjustment pays cash, never takes it")
+        if self.kind is CorporateActionKind.BONUS_SPLIT:
+            # A bonus or split adds shares; a consolidation (v1.2k) removes them.
+            if (self.shares_delta < 0) if self.ratio > 1 else (self.shares_delta > 0):
+                raise ValueError("a BONUS_SPLIT moves the share count with its ratio")
+        elif self.shares_delta != 0:
+            raise ValueError(f"a {self.kind.value} leaves the share count unchanged")
+        if self.kind is CorporateActionKind.PRICE_CORRECTION and self.cash != 0:
+            raise ValueError("a PRICE_CORRECTION credits no cash")
 
     @property
     def price_factor(self) -> Decimal:
@@ -674,7 +686,14 @@ class Position:
 
     @property
     def exit_week(self) -> WeekKey | None:
-        return self.sales[-1].week if self.state is PositionState.CLOSED else None
+        """The last sale's week — or, when a consolidation floored the holding
+        to 0 after the last sale (D101), its ex session's week."""
+        if self.state is not PositionState.CLOSED:
+            return None
+        zeroed = [a for a in self.adjustments if a.shares_delta < 0]
+        if zeroed and (not self.sales or zeroed[-1].ex_session > self.sales[-1].session):
+            return week_of(zeroed[-1].ex_session)
+        return self.sales[-1].week
 
     # ------------------------------------------------------------- money
     @property
@@ -749,8 +768,15 @@ class PendingOrder:
     sizing: Sizing | None = None
     sector: str | None = None
     group: str | None = None
+    #: D102: a stuck-freeze exit fills at open / price_factor — the position's
+    #: own units, the basis of its frozen mark. ``None`` for every other order.
+    price_factor: Decimal | None = None
 
     def __post_init__(self) -> None:
+        if self.price_factor is not None and (
+            self.action is not OrderAction.SELL_ALL or not self.price_factor > 0
+        ):
+            raise ValueError(f"{self.symbol}: only a SELL_ALL carries a positive price_factor")
         if self.action.is_buy:
             if self.amount is None or self.amount <= 0:
                 raise ValueError(f"{self.action.value} {self.symbol}: a buy needs an amount")

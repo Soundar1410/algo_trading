@@ -13,7 +13,14 @@ gap scan cannot see it — a correctly adjusted series has no gap.
   partial decision for it and mark it at ``close / f``).
 * :func:`resolve` turns an operator row of ``corporate_actions.csv`` that
   matches the detected factor into a :class:`Rescale`. ``DEMERGER`` covers
-  any price-only restatement (a special dividend Dhan adjusts for, say).
+  price-only restatements that carry value (a special dividend Dhan adjusts
+  for); ``PRICE_CORRECTION`` (v1.2k) those that do not — no cash.
+* :func:`unadjusted_gaps` (item 7, v1.2k) finds what detection cannot: an
+  action Dhan has **not** back-adjusted, which shows as a raw close-to-close
+  gap of 15% or more after the first fill. Unacknowledged, it freezes too.
+* :func:`stuck_exit_row` (D102): a freeze that has escalated, whose factor a
+  confirmed row explains but which Dhan never (or only partly) restated, is
+  closed rather than left holding a slot with no stop able to fire.
 
 No I/O, no clock: the runtime supplies the cached bars and the rows.
 """
@@ -25,11 +32,13 @@ from dataclasses import dataclass
 from datetime import date
 from decimal import ROUND_FLOOR, Decimal
 
+from .gaps import Gap, exact_move, is_acknowledged, scan
 from .models import (
     BuyFill,
     CorporateActionKind,
     CorporateActionRow,
     DailyBar,
+    GapAcknowledgement,
     OrderAction,
     Position,
     PositionState,
@@ -154,23 +163,13 @@ def resolve(
     """The rescale a confirmed row justifies, or why the position stays frozen.
 
     A row matches only when its factor agrees with the detected one within
-    0.5% (BONUS_SPLIT: 1 / ratio; DEMERGER: ratio), every fill before its ex
+    0.5% (BONUS_SPLIT: 1 / ratio; DEMERGER and PRICE_CORRECTION: ratio), every fill before its ex
     session was restated and every fill on or after it was not, it is later
     than any action already applied, and the cache has a session before it.
     """
     if not restatement.consistent:
         return restatement.detail
-    applied = max((a.ex_session for a in position.adjustments), default=date.min)
-    candidates = sorted(
-        (
-            row
-            for row in rows
-            if row.symbol == position.symbol
-            and row.ex_session > applied
-            and row.ex_session > position.buys[0].session
-        ),
-        key=lambda row: row.ex_session,
-    )
+    candidates = unapplied_rows(position, rows)
     if not candidates:
         return f"{restatement.detail}; no confirmed row in corporate_actions.csv"
     refusals: list[str] = []
@@ -219,8 +218,12 @@ def _rescale(
     if row.kind is CorporateActionKind.BONUS_SPLIT:
         exact = before * row.ratio
         after = int(exact.to_integral_value(rounding=ROUND_FLOOR))
-        # Cash in lieu of the fractional share, at the adjusted close.
+        # Cash in lieu of the fractional share, at the adjusted close. A
+        # consolidation that floors to 0 pays the whole holding (D101).
         cash = money((exact - after) * reference)
+    elif row.kind is CorporateActionKind.PRICE_CORRECTION:
+        # v1.2k: a data correction is not an economic event — no cash.
+        after, cash = before, Decimal("0.00")
     else:
         after = before
         # The value the demerger removed, at the actual pre-ex close (the
@@ -236,6 +239,73 @@ def _rescale(
         cash=cash,
     )
     return Rescale(row, adjustment, restatement.factor, before, after, reference)
+
+
+def unapplied_rows(
+    position: Position, rows: Iterable[CorporateActionRow]
+) -> list[CorporateActionRow]:
+    """Rows for the symbol that could still apply to this position: later than
+    its T1 fill and than any action already applied, oldest first."""
+    applied = max((a.ex_session for a in position.adjustments), default=date.min)
+    return sorted(
+        (
+            row
+            for row in rows
+            if row.symbol == position.symbol
+            and row.ex_session > applied
+            and row.ex_session > position.buys[0].session
+        ),
+        key=lambda row: row.ex_session,
+    )
+
+
+def unadjusted_gaps(
+    position: Position,
+    daily: Iterable[DailyBar],
+    acknowledgements: Iterable[GapAcknowledgement],
+) -> tuple[Gap, ...]:
+    """Spec 4.14 item 7 (v1.2k): unacknowledged close-to-close gaps of 15% or
+    more, either direction, on a session **after** the position's first fill.
+
+    A gap on or before the T1 fill session never counts: P1 and every level
+    come from the T1 fill price, so a position opened on the ex session is
+    already in the new units. The measure and the acknowledgement key are
+    section 6.1's (exact decimal ratio; symbol, session, ratio to 4 dp).
+    """
+    if position.state is PositionState.CLOSED:
+        return ()
+    first = position.buys[0].session
+    acks = tuple(acknowledgements)
+    return tuple(
+        gap
+        for gap in scan(position.symbol, daily)
+        if gap.session > first and not is_acknowledged(gap, acks)
+    )
+
+
+def gap_factor(gaps: Iterable[Gap]) -> Decimal:
+    """R: the product of the gaps' exact close ratios. A frozen position is
+    marked at close / R — its own units — for bars on and after the gaps."""
+    factor = Decimal("1")
+    for gap in gaps:
+        factor *= exact_move(gap.previous_close, gap.close) + 1
+    return factor
+
+
+def gap_detail(gaps: Iterable[Gap]) -> str:
+    return "; ".join(f"unadjusted gap {gap.session} ratio {gap.ratio}" for gap in gaps)
+
+
+def stuck_exit_row(
+    position: Position, rows: Iterable[CorporateActionRow], factor: Decimal
+) -> CorporateActionRow | None:
+    """D102: a confirmed row explaining the freeze ``factor`` within 0.5%
+    (BONUS_SPLIT: 1 / ratio; DEMERGER and PRICE_CORRECTION: ratio) that the
+    caller could not apply — the history was never, or only partly, restated."""
+    for row in unapplied_rows(position, rows):
+        if _close_to(factor, row.price_factor):
+            return row
+    return None
 
 
 def rescale_levels(level: Decimal, adjustments: Iterable[ShareAdjustment]) -> Decimal:
