@@ -5,7 +5,7 @@
 **Engine kind:** `stock_portfolio_engine` (the existing, reserved `EngineKind.STOCK_PORTFOLIO_ENGINE`; no new enum value)
 **Execution shape:** a run-to-completion weekly job — no tick feed, no long-lived worker, no intraday decisions
 **Initial mode:** paper only
-**Status:** implementation specification v1.2j — corporate actions on held positions; strict week order; late fills
+**Status:** implementation specification v1.2k — unadjusted actions freeze held positions; consolidations; price corrections
 **Scheduling:** two of its own LaunchAgents (a fetch/preview job and an offline decision job). **Not** registered with `auto_start`, and no change to shared auto-start code
 **Rule source:** "Weekly Stoch RSI V1 Trading Plan" (operator's V1 rulebook, 20 Sep 2026), including its resolved ambiguities and the first-cross / K < 50 fix
 **Target branch:** new `strategy-wsr1-weekly-stochrsi`, cut from `feature-paper-auto-start` at `701e030`
@@ -123,6 +123,15 @@ Numbers in brackets are the Phase 0 question numbers.
 | 3 | Late-arriving candles: `late_fill` flag and touch-memory replay from the fill week | 8 |
 | 4 | Gap thresholds compared on exact decimal ratios, not floats (a move of exactly 30% was missed) | 6.1 |
 | 5 | Section 9's `stock_fills` late/catch-up flag and `stock_equity` drawdown % columns are required | 9 |
+
+### Changes in v1.2k (26 Sep 2026 — Phase 4a-fix audit)
+
+| # | Decision | Section |
+|---|---|---|
+| 1 | **An unadjusted bonus/split on a held stock freezes it**: an unacknowledged gap of 15% or more (either direction) after its first fill session; resolved by a gap acknowledgement (real move) or by Dhan's later back-adjustment plus a CSV row | 4.14 item 7 |
+| 2 | BONUS_SPLIT accepts ratios below 1 (consolidations); a frozen position with f > 1 can now be resolved | 4.14 item 3 |
+| 3 | New kind PRICE_CORRECTION: price-only restatement with no cash credit (Dhan data corrections) | 4.14 item 3 |
+| 4 | A re-issued sell fills at its original execution session when cached (late_fill), not 1–2 weeks later | 4.14 item 6 |
 
 ---
 
@@ -347,19 +356,22 @@ Dhan back-adjusts history for bonuses, splits and (sometimes) demergers, but a h
     - it is marked to market at `stored shares × (close ÷ f)` — in its own units — so equity and the brakes see no false drop;
     - it is flagged in the report and in the Telegram summary. New entries are unaffected.
 3. **Confirm**: the operator adds a row to `config/positional_stocks/corporate_actions.csv`, with columns `symbol, ex_session, kind, ratio, confirmed_on, note`:
-    - `kind = BONUS_SPLIT`: `ratio` is new shares per old share (1:1 bonus → 2; 1:2 bonus → 1.5; 1:10 split → 10);
-    - `kind = DEMERGER`: `ratio` is the price factor Dhan applied (for example 0.90). Shares are unchanged.
-4. **Rescale** at the next run, only if the confirmed row matches the detected factor within 0.5% (BONUS_SPLIT: 1 ÷ ratio ≈ f; DEMERGER: ratio ≈ f); otherwise stay frozen and flag the mismatch:
+    - `kind = BONUS_SPLIT`: `ratio` is new shares per old share (1:1 bonus → 2; 1:2 bonus → 1.5; 1:10 split → 10; **a 10:1 consolidation → 0.1**, v1.2k). Any positive ratio other than 1;
+    - `kind = DEMERGER`: `ratio` is the price factor Dhan applied (for example 0.90). Shares are unchanged; the value removed is credited as cash.
+    - `kind = PRICE_CORRECTION` (v1.2k): `ratio` is the price factor (any positive value). Shares are unchanged and **no cash is credited** — for a Dhan data correction, which is not an economic event.
+4. **Rescale** at the next run, only if the confirmed row matches the detected factor within 0.5% (BONUS_SPLIT: 1 ÷ ratio ≈ f; DEMERGER and PRICE_CORRECTION: ratio ≈ f); otherwise stay frozen and flag the mismatch:
     - **BONUS_SPLIT:** shares × ratio, floored; the fractional share is credited as cash at the adjusted close ("cash in lieu"). P1, L1, L2, Stop and every stored fill price ÷ ratio. Total cost in ₹ is unchanged.
     - **DEMERGER:** P1, L1, L2, Stop and fill prices × ratio; shares unchanged. The value removed, `shares × pre-ex close × (1 − ratio)`, is credited as cash. This stands in for the demerged company's shares, which the paper book does not hold.
+    - **PRICE_CORRECTION (v1.2k):** as DEMERGER, but no cash is credited.
     - The rescale is stored as its own record (position, ex session, kind, ratio) and applied whenever positions are rebuilt from fills. Original fill rows are never edited.
 5. A frozen position whose freeze lasts more than 2 weekly runs is escalated in the report as an operator action.
-6. **Pending orders at rescale.** A pending SELL decided before the
-restatement is **re-issued in the new units** for the next session — SELL_ALL
-for all rescaled shares, SELL_HALF for floor(rescaled shares ÷ 2) — not
-dropped: the exit was decided on valid data and must still happen. Pending
-buys are amount-based and proceed unchanged. The kind `DEMERGER` covers any
-price-only restatement (a special dividend Dhan adjusts for, for example).
+6. **Pending orders at rescale.** A pending SELL decided before the restatement is **re-issued in the new units** — SELL_ALL for all rescaled shares, SELL_HALF for floor(rescaled shares ÷ 2) — not dropped: the exit was decided on valid data and must still happen. **It fills at its original execution session when that session's candle is cached (flagged `late_fill`), otherwise at the next session (v1.2k)** — the restated open of the original session is economically the same price, so waiting adds price risk for nothing. Pending buys are amount-based and proceed unchanged. The kind `DEMERGER` covers price-only restatements that carry value (a special dividend Dhan adjusts for, for example); `PRICE_CORRECTION` covers those that do not.
+7. **Unadjusted actions (v1.2k).** Detection in item 1 only sees history Dhan has restated. A bonus or split Dhan has **not yet** back-adjusted shows as a raw price drop instead, and would still cause a false stop, a false trail exit or a false add touch. So a **held** symbol with an **unacknowledged gap of 15% or more, in either direction** (the section 6.1 report level, not the 30% entry-block level; a consolidation shows as a raw jump), on a session **after its first fill session**, is frozen exactly as in item 2, marked at `close ÷ r` for bars on and after the gap session, where r is the gap's close ratio. A gap on or before the first fill session does not count: P1 and every level come from the T1 fill price, so a position opened on the ex session is already in the new units. It is resolved in one of three ways:
+    - the operator acknowledges the gap in `gap_acknowledgements.csv` (a real move): the freeze lifts and decisions resume;
+    - Dhan back-adjusts the history: the gap disappears, item 1 detects the restatement, and a `corporate_actions.csv` row confirms it (the row may be added in advance);
+    - otherwise it escalates as in item 5.
+   **Trade-off, accepted:** a genuine crash of 15% or more on a held stock waits for the operator's acknowledgement before its stop or trail can fire. With the fetch/preview run before the decision run, the operator resolves it in between and there is no delay; otherwise the exit is one week late. A genuine rise of 15% or more likewise pauses that position's partial, add and trail decisions until acknowledged.
+   **Known limitation:** a bonus smaller than about 1:6 (price factor above 0.85) is below the threshold; it is caught only once Dhan restates the history (item 1).
 
 ---
 
