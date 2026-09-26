@@ -45,6 +45,7 @@ from .models import (
     BuyFill,
     ClosedTrade,
     DailyBar,
+    EntrySnapshot,
     Freeze,
     FunnelEntry,
     FunnelStage,
@@ -61,6 +62,7 @@ from .models import (
     SaleFill,
     Sizing,
     UniverseRow,
+    WatchEntry,
     WeekDecision,
     WeeklyBar,
     money,
@@ -771,6 +773,39 @@ def screen(
     if not verdict.triggered:
         return FunnelEntry(symbol, FunnelStage.ARMED, verdict.reason, rs)
 
+    refusals, flags = _entry_refusals(inputs, i, verdict, rs, book, ctx, params)
+    if refusals:
+        return FunnelEntry(symbol, FunnelStage.FILTERED, "; ".join(refusals), rs, tuple(flags))
+    atr_pct = series.atr_pct[i]
+    row = inputs.universe_row
+    assert atr_pct is not None and row is not None and inputs.quality is not None
+    event_risk = inputs.quality.status is QualityStatus.EVENT_RISK
+    return _Candidate(
+        symbol=symbol,
+        rs=rs,
+        sizing=sizing(atr_pct, event_risk, params),
+        sector=row.industry,
+        group=row.effective_group,
+        nifty100=row.nifty100,
+        flags=tuple(flags),
+    )
+
+
+def _entry_refusals(
+    inputs: SymbolWeek,
+    i: int,
+    verdict: TriggerVerdict,
+    rs: float | None,
+    book: Book,
+    ctx: WeekContext,
+    params: RulesParameters,
+) -> tuple[list[str], list[str]]:
+    """Spec 4.6 and 4.11 for an armed symbol at bar ``i``: every refusal, and
+    the report flags. Shared by :func:`screen` (a triggered symbol) and
+    :func:`watchlist` (an armed one), so the two can never disagree about
+    what "filters pass" means."""
+    symbol = inputs.symbol
+    series = inputs.series
     bar = series.bars[i]
     flags: list[str] = []
     refusals: list[str] = []
@@ -823,19 +858,74 @@ def screen(
     repeat = _repeat_refusal(series, i, params)
     if repeat is not None:
         refusals.append(repeat)
+    return refusals, flags
 
-    if refusals:
-        return FunnelEntry(symbol, FunnelStage.FILTERED, "; ".join(refusals), rs, tuple(flags))
-    assert atr_pct is not None and row is not None and inputs.quality is not None
-    event_risk = inputs.quality.status is QualityStatus.EVENT_RISK
-    return _Candidate(
-        symbol=symbol,
-        rs=rs,
-        sizing=sizing(atr_pct, event_risk, params),
-        sector=row.industry,
-        group=row.effective_group,
-        nifty100=row.nifty100,
-        flags=tuple(flags),
+
+def watchlist(
+    symbols: Mapping[str, SymbolWeek],
+    index: IndicatorSeries,
+    book: Book,
+    ctx: WeekContext,
+    params: RulesParameters,
+) -> list[WatchEntry]:
+    """Spec 11's watchlist: symbols not held and with no pending order that
+    are armed but not triggered, with K <= D and K < 50 at this week's close,
+    and that would pass every entry filter — ranked by RS, highest first.
+    Pure; it decides nothing."""
+    held = {p.symbol for p in book.positions} | {o.symbol for o in book.pending}
+    out: list[WatchEntry] = []
+    for symbol in sorted(symbols):
+        if symbol in held:
+            continue
+        inputs = symbols[symbol]
+        series = inputs.series
+        i = _last_index(series, ctx.week)
+        if i is None:
+            continue
+        verdict = trigger(series, i, params)
+        k, d = series.k[i], series.d[i]
+        if not verdict.armed or verdict.triggered or verdict.undefined:
+            continue
+        if k is None or d is None or not (k <= d and k < params.max_k_at_cross):
+            continue
+        rs = relative_strength(series.bars, index.bars)[i]
+        refusals, _ = _entry_refusals(inputs, i, verdict, rs, book, ctx, params)
+        if not refusals:
+            out.append(WatchEntry(symbol, rs, k, d))
+    out.sort(key=lambda e: (e.rs is None, -(e.rs or 0.0), e.symbol))
+    return out
+
+
+def entry_snapshot(
+    series: IndicatorSeries,
+    index: IndicatorSeries,
+    week: WeekKey,
+    current_regime: Regime,
+    params: RulesParameters,
+) -> EntrySnapshot | None:
+    """What the journal records about a trigger (spec 11 v1.2m), taken at
+    the decision so a later restatement cannot change it. ``None`` when the
+    series has no bar for ``week``."""
+    i = _last_index(series, week)
+    if i is None:
+        return None
+    verdict = trigger(series, i, params)
+    j = _last_index(index, week)
+    arm = None if verdict.arm_index is None else series.bars[verdict.arm_index].iso_key
+    return EntrySnapshot(
+        regime=current_regime,
+        arm_week=arm,
+        trigger_week=week,
+        k=series.k[i],
+        d=series.d[i],
+        close=series.bars[i].close,
+        ema50=_ema(series, params.ema_trend, i),
+        perf6m_stock=series.performance_6m[i],
+        perf6m_index=None if j is None else index.performance_6m[j],
+        high_52w=series.high_52w[i],
+        atr=series.atr[i],
+        atr_pct=series.atr_pct[i],
+        rs=relative_strength(series.bars, index.bars)[i],
     )
 
 

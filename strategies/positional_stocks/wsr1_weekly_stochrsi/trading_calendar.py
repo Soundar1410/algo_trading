@@ -100,13 +100,23 @@ class TradingCalendar:
     because this module has an opinion about when the session opens.
     """
 
-    def __init__(self, session: MarketSession) -> None:
+    def __init__(self, session: MarketSession, covered_years: Iterable[int] = ()) -> None:
         self._session = session
+        self._covered_years = frozenset(covered_years)
 
     @classmethod
     def from_holidays(cls, holidays: Iterable[str]) -> TradingCalendar:
         """Build from ISO date strings — the shape ``SessionConfig`` takes."""
-        return cls(MarketSession(SessionConfig(holidays=tuple(holidays))))
+        listed = tuple(holidays)
+        years = {int(day[:4]) for day in listed}
+        return cls(MarketSession(SessionConfig(holidays=listed)), years)
+
+    def covers(self, day: date) -> bool:
+        """Is ``day``'s year in the verified holiday list? Outside it, every
+        holiday Friday is "expected" — the safe direction for a live week, but
+        a false truncation for an old one (spec 4b: truncated-week warnings
+        only for calendar-covered weeks)."""
+        return day.year in self._covered_years
 
     @classmethod
     def from_config(cls, config_root: Path) -> TradingCalendar:

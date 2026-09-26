@@ -143,8 +143,14 @@ def build_weekly_bars(
     as_of: datetime,
     calendar: TradingCalendar,
     tz_name: str = DEFAULT_TZ,
+    warn_uncovered: bool = True,
 ) -> list[WeeklyBar]:
     """Aggregate daily sessions into **released** weekly bars, oldest first.
+
+    ``warn_uncovered=False`` logs a truncated week only when the calendar's
+    holiday list covers its year (spec 15, 4b): before that, every holiday
+    Friday looks truncated, and a full-history series would log thousands.
+    The bars themselves are identical either way.
 
     Sessions may arrive in any order and are sorted here. An unreleased current
     week is dropped rather than returned partially built — spec section 3's
@@ -184,7 +190,7 @@ def build_weekly_bars(
         if as_of < combine(expected, SESSION_CLOSE_IST, tz_name):
             continue
         weekly = _aggregate(key, week, expected)
-        if weekly.is_truncated:
+        if weekly.is_truncated and (warn_uncovered or calendar.covers(expected)):
             _log.warning(
                 "weekly bar %d-W%02d ends %s but the calendar expects %s: "
                 "the session is unpublished, the exchange closed unlisted, or this "

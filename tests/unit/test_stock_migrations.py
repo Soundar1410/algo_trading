@@ -38,6 +38,7 @@ STOCK_TABLES = {
     "stock_signals",
     "stock_position_reviews",
     "stock_corporate_actions",
+    "stock_entry_signals",
 }
 
 

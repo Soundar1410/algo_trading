@@ -224,3 +224,25 @@ CREATE TABLE IF NOT EXISTS stock_corporate_actions (
     applied_week     TEXT NOT NULL,
     PRIMARY KEY (strategy_id, position_id, ex_session)
 );
+
+-- Spec 11 v1.2m: the trigger week's values the journal records, one row per
+-- BUY_T1 decided, taken at the decision so a later restatement cannot change
+-- them. Indicator values are REAL: they are floats in the rules too.
+CREATE TABLE IF NOT EXISTS stock_entry_signals (
+    strategy_id    TEXT NOT NULL,
+    order_id       TEXT PRIMARY KEY REFERENCES stock_pending_orders (order_id),
+    symbol         TEXT NOT NULL,
+    regime         TEXT NOT NULL CHECK (regime IN ('normal', 'red', 'unknown')),
+    arm_week       TEXT,
+    trigger_week   TEXT NOT NULL,
+    k_trigger      REAL,
+    d_trigger      REAL,
+    close_trigger  REAL NOT NULL,
+    ema50_1w       REAL,
+    perf6m_stock   REAL,
+    perf6m_nifty   REAL,
+    high_52w       REAL,
+    atr_1w         REAL,
+    atr_pct        REAL,
+    rs             REAL
+);

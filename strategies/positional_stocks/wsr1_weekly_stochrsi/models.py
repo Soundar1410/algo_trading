@@ -893,6 +893,36 @@ class FunnelEntry:
 
 
 @dataclass(frozen=True, slots=True)
+class WatchEntry:
+    """One watchlist line (spec 11): armed, K <= D, K < 50, filters pass."""
+
+    symbol: str
+    rs: float | None
+    k: float
+    d: float
+
+
+@dataclass(frozen=True, slots=True)
+class EntrySnapshot:
+    """The trigger week's values the journal records (spec 11 v1.2m), taken
+    at the decision — a later restatement must not rewrite them."""
+
+    regime: Regime
+    arm_week: WeekKey | None
+    trigger_week: WeekKey
+    k: float | None
+    d: float | None
+    close: float
+    ema50: float | None
+    perf6m_stock: float | None
+    perf6m_index: float | None
+    high_52w: float | None
+    atr: float | None
+    atr_pct: float | None
+    rs: float | None
+
+
+@dataclass(frozen=True, slots=True)
 class PositionReview:
     """What step 3 decided for one held position, and why."""
 

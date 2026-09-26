@@ -44,6 +44,7 @@ from strategies.positional_stocks.wsr1_weekly_stochrsi.models import (
     BuyFill,
     ClosedTrade,
     CorporateActionKind,
+    EntrySnapshot,
     FunnelEntry,
     OnExit,
     OrderAction,
@@ -477,6 +478,42 @@ class StockRepository:
                 week_text(week),
             ),
         )
+
+    def save_entry_signal(
+        self, conn: sqlite3.Connection, order: PendingOrder, snapshot: EntrySnapshot
+    ) -> None:
+        """The trigger week's values for a BUY_T1 just decided (spec 11)."""
+        conn.execute(
+            "INSERT OR REPLACE INTO stock_entry_signals (strategy_id, order_id, symbol, regime, "
+            "arm_week, trigger_week, k_trigger, d_trigger, close_trigger, ema50_1w, "
+            "perf6m_stock, perf6m_nifty, high_52w, atr_1w, atr_pct, rs) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                self._strategy_id,
+                order_id(self._strategy_id, order),
+                order.symbol,
+                snapshot.regime.value,
+                None if snapshot.arm_week is None else week_text(snapshot.arm_week),
+                week_text(snapshot.trigger_week),
+                snapshot.k,
+                snapshot.d,
+                snapshot.close,
+                snapshot.ema50,
+                snapshot.perf6m_stock,
+                snapshot.perf6m_index,
+                snapshot.high_52w,
+                snapshot.atr,
+                snapshot.atr_pct,
+                snapshot.rs,
+            ),
+        )
+
+    def entry_signals(self, conn: sqlite3.Connection | None = None) -> dict[str, sqlite3.Row]:
+        """Every stored trigger snapshot, by BUY_T1 order id."""
+        rows = (conn or self._db.connect()).execute(
+            "SELECT * FROM stock_entry_signals WHERE strategy_id = ?", (self._strategy_id,)
+        )
+        return {row["order_id"]: row for row in rows}
 
     def save_cooling_off(
         self, conn: sqlite3.Connection, trade: ClosedTrade, until_week: WeekKey

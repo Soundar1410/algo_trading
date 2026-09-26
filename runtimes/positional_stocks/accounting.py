@@ -90,6 +90,7 @@ from strategies.positional_stocks.wsr1_weekly_stochrsi.rules import (
     SymbolWeek,
     WeekContext,
     decide_week,
+    entry_snapshot,
     replay_touch_memory,
     traded_value,
     trigger,
@@ -307,6 +308,13 @@ def run_decision_week(
             repository.save_position(conn, position, ctx.week)
         for order in decision.orders:
             repository.save_order(conn, order)
+            if order.action is OrderAction.BUY_T1:
+                # Spec 11 v1.2m: the journal's trigger-week values, now.
+                snapshot = entry_snapshot(
+                    symbols[order.symbol].series, inputs.index, ctx.week, decision.regime, params
+                )
+                if snapshot is not None:
+                    repository.save_entry_signal(conn, order, snapshot)
         triggered = {
             symbol: _triggered(week_inputs.series, ctx, params)
             for symbol, week_inputs in symbols.items()
@@ -715,6 +723,16 @@ def _silent_lifts(
             )
         )
     return lifts
+
+
+def complete_symbols(
+    inputs: WeekInputs,
+    daily: Mapping[str, Sequence[DailyBar]],
+    last_seen: Mapping[str, UniverseRow],
+) -> dict[str, SymbolWeek]:
+    """The ``SymbolWeek`` of every symbol, completed from stored state — as the
+    rules saw them this week. For the report's watchlist and gap sections."""
+    return _complete(inputs, daily, last_seen)
 
 
 def _complete(
