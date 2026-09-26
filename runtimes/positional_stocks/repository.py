@@ -6,7 +6,12 @@ anything: :mod:`.accounting` runs the week, the rules decide, this module
 stores what they said.
 
 * **Cash is derived, never stored as a balance:** capital plus the sum of every
-  fill's ``cash_delta``, so it cannot drift from the fills that made it.
+  fill's ``cash_delta`` and every corporate action's cash (spec 4.14), so it
+  cannot drift from the records that made it.
+* **Corporate actions (spec 4.14 v1.2j)** are their own records, applied at
+  every rebuild: the position's shares and fills in current units through
+  ``Position.adjustments``, its P1, L1, L2 and Stop rescaled here. The fill
+  rows and the stored levels are never edited.
 * **A position is rebuilt from its fills** (tranches and sales) plus the row
   holding what fills cannot: sizing, fixed levels and the rules' bookkeeping
   (touch memory, T3 disabled, ``half_sold_week``). ``Position.__post_init__``
@@ -27,13 +32,18 @@ from datetime import UTC, date, datetime
 from decimal import ROUND_HALF_UP, Decimal
 
 from common.persistence import Database
-from strategies.positional_stocks.wsr1_weekly_stochrsi.iso_weeks import WeekKey
+from strategies.positional_stocks.wsr1_weekly_stochrsi.corporate_actions import (
+    Rescale,
+    rescale_levels,
+)
+from strategies.positional_stocks.wsr1_weekly_stochrsi.iso_weeks import WeekKey, shift
 from strategies.positional_stocks.wsr1_weekly_stochrsi.models import (
     PAISA,
     Book,
     BrakeState,
     BuyFill,
     ClosedTrade,
+    CorporateActionKind,
     FunnelEntry,
     OnExit,
     OrderAction,
@@ -42,10 +52,12 @@ from strategies.positional_stocks.wsr1_weekly_stochrsi.models import (
     PositionReview,
     PositionState,
     SaleFill,
+    ShareAdjustment,
     Sizing,
     UniverseRow,
     WeekDecision,
 )
+from strategies.positional_stocks.wsr1_weekly_stochrsi.rules import FROZEN_FLAG
 
 #: Timestamps excluded from :meth:`StockRepository.dump`, which compares state.
 _VOLATILE_COLUMNS = frozenset({"started_at", "finished_at"})
@@ -171,11 +183,59 @@ class StockRepository:
 
     # ------------------------------------------------------------- reads
     def cash(self, conn: sqlite3.Connection | None = None) -> Decimal:
-        """Capital plus every fill's cash change."""
-        rows = (conn or self._db.connect()).execute(
-            "SELECT cash_delta FROM stock_fills WHERE strategy_id = ?", (self._strategy_id,)
+        """Capital plus every fill's cash change and every corporate action's cash."""
+        connection = conn or self._db.connect()
+        rows = connection.execute(
+            "SELECT cash_delta AS cash FROM stock_fills WHERE strategy_id = ? "
+            "UNION ALL SELECT cash FROM stock_corporate_actions WHERE strategy_id = ?",
+            (self._strategy_id, self._strategy_id),
         )
-        return self._capital + sum((Decimal(row["cash_delta"]) for row in rows), Decimal("0"))
+        return self._capital + sum((Decimal(row["cash"]) for row in rows), Decimal("0"))
+
+    def adjustments(
+        self, conn: sqlite3.Connection | None = None
+    ) -> dict[str, tuple[ShareAdjustment, ...]]:
+        """Every applied corporate action, by position id, oldest first."""
+        out: dict[str, list[ShareAdjustment]] = {}
+        for row in (conn or self._db.connect()).execute(
+            "SELECT * FROM stock_corporate_actions WHERE strategy_id = ? "
+            "ORDER BY position_id, ex_session",
+            (self._strategy_id,),
+        ):
+            out.setdefault(row["position_id"], []).append(
+                ShareAdjustment(
+                    ex_session=date.fromisoformat(row["ex_session"]),
+                    kind=CorporateActionKind(row["kind"]),
+                    ratio=Decimal(row["ratio"]),
+                    applies_to=tuple(OrderAction(a) for a in json.loads(row["applies_to"])),
+                    shares_delta=int(row["shares_after"]) - int(row["shares_before"]),
+                    cash=Decimal(row["cash"]),
+                )
+            )
+        return {position_id: tuple(items) for position_id, items in out.items()}
+
+    def frozen_streak(self, position_id: str, week: WeekKey) -> int:
+        """How many decided weeks immediately before ``week`` reviewed this
+        position as frozen (spec 4.14 item 5)."""
+        rows = (
+            self._db.connect()
+            .execute(
+                "SELECT w.iso_week, r.flags FROM stock_position_reviews r "
+                "JOIN stock_weekly_runs w ON w.strategy_id = r.strategy_id "
+                "AND w.week_ending = r.week_ending "
+                "WHERE r.strategy_id = ? AND r.position_id = ? AND w.status = 'COMPLETED' "
+                "ORDER BY r.week_ending DESC",
+                (self._strategy_id, position_id),
+            )
+            .fetchall()
+        )
+        streak, expected = 0, shift(week, -1)
+        for row in rows:
+            if week_key(row["iso_week"]) != expected or FROZEN_FLAG not in json.loads(row["flags"]):
+                break
+            streak += 1
+            expected = shift(expected, -1)
+        return streak
 
     def positions(self, conn: sqlite3.Connection | None = None) -> dict[str, Position]:
         """Every position ever opened, by id (CLOSED ones included)."""
@@ -186,11 +246,15 @@ class StockRepository:
             (self._strategy_id,),
         ):
             fills.setdefault(row["position_id"], []).append(row)
+        adjustments = self.adjustments(connection)
         out: dict[str, Position] = {}
         for row in connection.execute(
             "SELECT * FROM stock_positions WHERE strategy_id = ?", (self._strategy_id,)
         ):
-            out[row["position_id"]] = _position(row, fills.get(row["position_id"], []))
+            position_id = row["position_id"]
+            out[position_id] = _position(
+                row, fills.get(position_id, []), adjustments.get(position_id, ())
+            )
         return out
 
     def pending_orders(self, conn: sqlite3.Connection | None = None) -> list[PendingOrder]:
@@ -386,6 +450,33 @@ class StockRepository:
             ),
         )
 
+    def save_corporate_action(
+        self, conn: sqlite3.Connection, position: Position, rescale: Rescale, week: WeekKey
+    ) -> None:
+        adjustment = rescale.adjustment
+        conn.execute(
+            "INSERT INTO stock_corporate_actions (strategy_id, position_id, symbol, ex_session, "
+            "kind, ratio, detected_factor, applies_to, shares_before, shares_after, "
+            "reference_close, cash, confirmed_on, applied_week) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                self._strategy_id,
+                position.position_id,
+                position.symbol,
+                adjustment.ex_session.isoformat(),
+                adjustment.kind.value,
+                str(adjustment.ratio),
+                str(rescale.detected_factor),
+                json.dumps([a.value for a in adjustment.applies_to]),
+                rescale.shares_before,
+                rescale.shares_after,
+                str(rescale.reference_close),
+                str(adjustment.cash),
+                rescale.row.confirmed_on.isoformat(),
+                week_text(week),
+            ),
+        )
+
     def save_cooling_off(
         self, conn: sqlite3.Connection, trade: ClosedTrade, until_week: WeekKey
     ) -> None:
@@ -539,7 +630,9 @@ def _sizing(row: sqlite3.Row) -> Sizing:
     )
 
 
-def _position(row: sqlite3.Row, fills: list[sqlite3.Row]) -> Position:
+def _position(
+    row: sqlite3.Row, fills: list[sqlite3.Row], adjustments: tuple[ShareAdjustment, ...] = ()
+) -> Position:
     buys = sorted(
         (
             BuyFill(
@@ -572,16 +665,17 @@ def _position(row: sqlite3.Row, fills: list[sqlite3.Row]) -> Position:
         sector=row["sector"],
         group=row["grp"],
         sizing=_sizing(row),
-        p1=Decimal(row["p1"]),
-        l1=Decimal(row["l1"]),
-        l2=Decimal(row["l2"]),
-        stop=Decimal(row["stop"]),
+        p1=rescale_levels(Decimal(row["p1"]), adjustments),
+        l1=rescale_levels(Decimal(row["l1"]), adjustments),
+        l2=rescale_levels(Decimal(row["l2"]), adjustments),
+        stop=rescale_levels(Decimal(row["stop"]), adjustments),
         buys=tuple(buys),
         sales=sales,
         state=PositionState(row["state"]),
         touch_week=_opt_week(row["touch_week"]),
         t3_disabled=bool(row["t3_disabled"]),
         half_sold_week=_opt_week(row["half_sold_week"]),
+        adjustments=adjustments,
     )
 
 

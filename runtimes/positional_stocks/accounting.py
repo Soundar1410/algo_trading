@@ -7,6 +7,13 @@ week, the indicator series, the operator rows and the cached daily bars.
 
 Order within the week, spec 4.13:
 
+0. **Corporate actions (4.14 v1.2j).** Every held position's fills are
+   compared with the cached opens of their sessions. A restatement with a
+   matching confirmed row in ``corporate_actions.csv`` is rescaled — stored
+   as its own record, and each pending sell of that position SUPERSEDED by
+   one re-issued in the new units for the next session. Without one the
+   position is **frozen**: its pending orders are not filled this run, and
+   the rules make no decision for it.
 1. Fill every PENDING order that has a session this week, through the rules'
    own ``apply_fill`` (:mod:`.paper_fills`), and **clear filled orders** before
    deciding (v1.2h). An order with no session yet stays PENDING, keeping its
@@ -33,10 +40,17 @@ the fills of step 1 included, because they were never committed either.
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import date
 
+from strategies.positional_stocks.wsr1_weekly_stochrsi.corporate_actions import (
+    Rescale,
+    detect,
+    resolve,
+    unverifiable,
+)
 from strategies.positional_stocks.wsr1_weekly_stochrsi.gaps import (
     block_window_start,
     blocking_gaps,
@@ -45,8 +59,12 @@ from strategies.positional_stocks.wsr1_weekly_stochrsi.gaps import (
 from strategies.positional_stocks.wsr1_weekly_stochrsi.indicators import IndicatorSeries
 from strategies.positional_stocks.wsr1_weekly_stochrsi.iso_weeks import shift
 from strategies.positional_stocks.wsr1_weekly_stochrsi.models import (
+    CorporateActionRow,
     DailyBar,
+    Freeze,
     GapAcknowledgement,
+    OrderAction,
+    PendingOrder,
     PositionState,
     RulesParameters,
     UniverseRow,
@@ -88,6 +106,8 @@ class WeekInputs:
     daily: Mapping[str, Sequence[DailyBar]]
     universe_rows: Sequence[UniverseRow]
     acknowledgements: Sequence[GapAcknowledgement] = ()
+    #: ``corporate_actions.csv`` (spec 4.14 v1.2j).
+    corporate_actions: Sequence[CorporateActionRow] = ()
     fingerprint: str = ""
 
 
@@ -100,6 +120,9 @@ class WeekOutcome:
     fills: tuple[OrderFill, ...] = ()
     #: This call redid a week an earlier run had STARTED but not finished.
     resumed: bool = False
+    #: Spec 4.14: positions frozen this week, and rescales applied this week.
+    frozen: tuple[Freeze, ...] = ()
+    rescaled: tuple[Rescale, ...] = ()
 
 
 def run_decision_week(
@@ -142,10 +165,17 @@ def run_decision_week(
     }
 
     with repository.database.transaction(immediate=True) as conn:
-        # Step 1: fills, then clear filled orders (v1.2h).
+        # Step 0: corporate actions (4.14 v1.2j), before anything fills.
+        frozen, rescaled, notes = _corporate_actions(
+            repository, conn, daily, inputs.corporate_actions, ctx
+        )
+
+        # Step 1: fills, then clear filled orders (v1.2h). A frozen
+        # position's orders wait: an old-unit sell must not fill at a
+        # restated price.
         positions = repository.positions(conn)
         fills, filled_positions = fill_orders(
-            repository.pending_orders(conn),
+            [o for o in repository.pending_orders(conn) if o.position_id not in frozen],
             positions,
             daily,
             through=ctx.week_ending,
@@ -197,7 +227,9 @@ def run_decision_week(
         # Steps 2-4: decide on the book as it now stands.
         book = repository.book(conn)
         symbols = _complete(inputs, daily, repository.last_seen_rows(conn))
-        decision = decide_week(ctx, book, symbols, inputs.index, params)
+        decision = decide_week(ctx, book, symbols, inputs.index, params, frozen=frozen)
+        if notes:
+            decision = replace(decision, warnings=(*decision.warnings, *notes))
 
         # Step 5: persist.
         for position in decision.positions:
@@ -215,8 +247,88 @@ def run_decision_week(
         repository.mark_completed(conn, ctx.week_ending)
 
     return WeekOutcome(
-        ctx.week_ending, "COMPLETED", decision, tuple(fills), resumed=status == "STARTED"
+        ctx.week_ending,
+        "COMPLETED",
+        decision,
+        tuple(fills),
+        resumed=status == "STARTED",
+        frozen=tuple(frozen.values()),
+        rescaled=tuple(rescaled),
     )
+
+
+#: Appended to a pending sell's reason when it is re-issued (spec 4.14 item 6).
+REISSUED = "re-issued after corporate-action rescale"
+
+
+def _corporate_actions(
+    repository: StockRepository,
+    conn: sqlite3.Connection,
+    daily: Mapping[str, Sequence[DailyBar]],
+    rows: Sequence[CorporateActionRow],
+    ctx: WeekContext,
+) -> tuple[dict[str, Freeze], list[Rescale], list[str]]:
+    """Spec 4.14 steps 1-4 and 6 for every held position.
+
+    Returns the frozen positions by id, the rescales applied, and report
+    notes (a position whose fills cannot be checked at all).
+    """
+    frozen: dict[str, Freeze] = {}
+    rescaled: list[Rescale] = []
+    notes: list[str] = []
+    held = [p for p in repository.positions(conn).values() if p.state is not PositionState.CLOSED]
+    for position in sorted(held, key=lambda p: p.symbol):
+        bars = daily.get(position.symbol, ())
+        restatement = detect(position, bars)
+        if restatement is None:
+            if unverifiable(position, bars):
+                notes.append(
+                    f"{position.symbol}: no cached bar for any fill session; "
+                    "corporate-action check impossible this run"
+                )
+            continue
+        result = resolve(position, restatement, rows, bars)
+        if isinstance(result, str):
+            runs = 1 + repository.frozen_streak(position.position_id, ctx.week)
+            frozen[position.position_id] = Freeze(
+                position.position_id, restatement.factor, result, runs
+            )
+            continue
+        repository.save_corporate_action(conn, position, result, ctx.week)
+        rescaled.append(result)
+        _reissue_sells(repository, conn, position.position_id, ctx)
+    return frozen, rescaled, notes
+
+
+def _reissue_sells(
+    repository: StockRepository, conn: sqlite3.Connection, position_id: str, ctx: WeekContext
+) -> None:
+    """Spec 4.14 item 6: the exit was decided on valid data and must still
+    happen — in the new units, at the next session. Pending buys are
+    amount-based and proceed unchanged."""
+    position = repository.positions(conn)[position_id]
+    for order in repository.pending_orders(conn):
+        if order.position_id != position_id or order.action.is_buy:
+            continue
+        held = position.shares_held
+        quantity = held if order.action is OrderAction.SELL_ALL else held // 2
+        replacement = PendingOrder(
+            action=order.action,
+            symbol=order.symbol,
+            decided_week=ctx.week,
+            execute_on_or_after=ctx.execution_date,
+            reason=f"{order.reason}; {REISSUED}",
+            position_id=position_id,
+            quantity=quantity,
+        )
+        replacement_id = repository.save_order(conn, replacement)
+        repository.resolve_order(
+            conn,
+            order,
+            state="SUPERSEDED",
+            week=ctx.week,
+            resolution=f"superseded by {replacement_id}",
+        )
 
 
 def _complete(

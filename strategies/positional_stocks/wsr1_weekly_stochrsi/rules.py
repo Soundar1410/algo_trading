@@ -45,6 +45,7 @@ from .models import (
     BuyFill,
     ClosedTrade,
     DailyBar,
+    Freeze,
     FunnelEntry,
     FunnelStage,
     OnExit,
@@ -616,6 +617,25 @@ def replay_touch_memory(position: Position, series: IndicatorSeries, before: Wee
     return replace(position, touch_week=touch)
 
 
+#: The review flag of a frozen position; the runtime counts consecutive runs by it.
+FROZEN_FLAG = "frozen"
+
+
+def _frozen_review(position: Position, freeze: Freeze) -> PositionReview:
+    """Spec 4.14 item 2: no exit, add or partial decision while frozen."""
+    reason = (
+        f"frozen: {freeze.detail}; no exit, add or partial until confirmed in corporate_actions.csv"
+    )
+    flags: tuple[str, ...] = (FROZEN_FLAG,)
+    if freeze.escalated:
+        flags = (
+            *flags,
+            f"operator action: frozen {freeze.runs} weekly runs — confirm the corporate "
+            "action in corporate_actions.csv",
+        )
+    return _review(position, reason, flags=flags)
+
+
 def _review_add(
     position: Position,
     inputs: SymbolWeek,
@@ -844,8 +864,15 @@ def decide_week(
     symbols: Mapping[str, SymbolWeek],
     index: IndicatorSeries,
     params: RulesParameters,
+    *,
+    frozen: Mapping[str, Freeze] | None = None,
 ) -> WeekDecision:
     """Spec 4.13 steps 2-4 for one decision week.
+
+    ``frozen`` maps position id to :class:`Freeze` — held positions whose
+    history was restated by an unconfirmed corporate action (spec 4.14
+    v1.2j). A frozen position gets no exit, add or partial decision, is marked
+    at ``close / f`` in its own units, and still counts toward every limit.
 
     Step 1 (fills) happened before this call, through :func:`apply_fill`.
     Step 2 marks the book at this week's closes and updates the brakes.
@@ -861,12 +888,20 @@ def decide_week(
         if length not in EMA_LENGTHS:
             raise ValueError(f"EMA {length} is not computed by indicators.compute")
 
+    frozen = frozen or {}
+
     # Step 2.
-    closes: dict[str, float] = {}
+    closes: dict[str, float | Decimal] = {}
     for position in book.positions:
         inputs = symbols.get(position.symbol)
         if inputs is not None and inputs.series.bars:
-            closes[position.symbol] = inputs.series.bars[-1].close
+            close = inputs.series.bars[-1].close
+            freeze = frozen.get(position.position_id)
+            # v1.2j: a frozen position is marked in its own units, so equity
+            # and the brakes see no false drop.
+            closes[position.symbol] = (
+                close if freeze is None else money(Decimal(str(close)) / freeze.factor)
+            )
     equity = mark_to_market(book, closes)
     brakes = update_brakes(book.brakes, equity, ctx.week, ctx.week_ending, params)
     current_regime = regime(index, ctx.week, params)
@@ -887,7 +922,17 @@ def decide_week(
     positions: list[Position] = []
     #: Positions still held after step 3's decisions, with what each commits.
     remaining: list[tuple[Position, Decimal]] = []
+    escalations: list[str] = []
     for position in sorted(book.positions, key=lambda p: p.symbol):
+        freeze = frozen.get(position.position_id)
+        if freeze is not None:
+            review = _frozen_review(position, freeze)
+            if freeze.escalated:
+                escalations.append(f"{position.symbol}: {review.flags[-1]}")
+            reviews.append(review)
+            positions.append(position)
+            remaining.append((position, position.committed))
+            continue
         if position.symbol in pending_symbols:
             reviews.append(
                 _review(position, "an earlier order is still unfilled", flags=("pending",))
@@ -962,7 +1007,7 @@ def decide_week(
 
     # v1.2h: an exit that did not fill can leave the book over a limit. That is
     # accepted and reported; the checks below take no entry while it lasts.
-    warnings: list[str] = []
+    warnings: list[str] = list(escalations)
     if open_count > params.max_positions:
         warnings.append(
             f"{open_count} positions held, over the limit of {params.max_positions}, "

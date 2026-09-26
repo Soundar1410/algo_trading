@@ -60,7 +60,9 @@ CREATE INDEX IF NOT EXISTS idx_stock_positions_symbol
 
 -- Every order the rules decided. A BUY_T1 carries its sizing, sector and group
 -- so an order that stays unfilled keeps holding its capacity across runs
--- (spec 4.12 v1.2g). PENDING -> FILLED or SKIPPED, once, in one transaction.
+-- (spec 4.12 v1.2g). PENDING -> FILLED or SKIPPED, once, in one transaction;
+-- or SUPERSEDED (spec 4.14 item 6 v1.2j): a pending sell in old units is
+-- replaced by one re-issued in the new units after a corporate-action rescale.
 CREATE TABLE IF NOT EXISTS stock_pending_orders (
     order_id             TEXT PRIMARY KEY,
     strategy_id          TEXT NOT NULL,
@@ -82,7 +84,7 @@ CREATE TABLE IF NOT EXISTS stock_pending_orders (
     sector               TEXT,
     grp                  TEXT,
     state                TEXT NOT NULL DEFAULT 'PENDING'
-        CHECK (state IN ('PENDING', 'FILLED', 'SKIPPED')),
+        CHECK (state IN ('PENDING', 'FILLED', 'SKIPPED', 'SUPERSEDED')),
     resolved_week        TEXT,
     resolution           TEXT
 );
@@ -192,4 +194,27 @@ CREATE TABLE IF NOT EXISTS stock_position_reviews (
     order_id     TEXT,
     flags        TEXT NOT NULL DEFAULT '[]',
     PRIMARY KEY (strategy_id, week_ending, position_id)
+);
+
+-- Spec 4.14 v1.2j: a confirmed corporate action applied to one held position.
+-- Its own record, applied whenever positions are rebuilt from their fills;
+-- the fill rows are never edited. `applies_to` is a JSON list of the actions
+-- (one fill each) that were in the old units. `cash` (cash in lieu, or a
+-- demerger's value) counts toward cash like a fill's cash_delta.
+CREATE TABLE IF NOT EXISTS stock_corporate_actions (
+    strategy_id      TEXT NOT NULL,
+    position_id      TEXT NOT NULL REFERENCES stock_positions (position_id),
+    symbol           TEXT NOT NULL,
+    ex_session       TEXT NOT NULL,
+    kind             TEXT NOT NULL CHECK (kind IN ('BONUS_SPLIT', 'DEMERGER')),
+    ratio            TEXT NOT NULL,
+    detected_factor  TEXT NOT NULL,
+    applies_to       TEXT NOT NULL,
+    shares_before    INTEGER NOT NULL CHECK (shares_before > 0),
+    shares_after     INTEGER NOT NULL CHECK (shares_after > 0),
+    reference_close  TEXT NOT NULL,
+    cash             TEXT NOT NULL,
+    confirmed_on     TEXT NOT NULL,
+    applied_week     TEXT NOT NULL,
+    PRIMARY KEY (strategy_id, position_id, ex_session)
 );

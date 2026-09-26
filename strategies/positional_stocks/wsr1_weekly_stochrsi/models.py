@@ -244,6 +244,52 @@ class GapAcknowledgement:
     note: str = ""
 
 
+class CorporateActionKind(Enum):
+    """Spec 4.14 v1.2j. ``DEMERGER`` covers any price-only restatement."""
+
+    BONUS_SPLIT = "BONUS_SPLIT"
+    DEMERGER = "DEMERGER"
+
+
+def _check_ratio(kind: CorporateActionKind, ratio: Decimal, label: str) -> None:
+    if not ratio.is_finite():
+        raise ValueError(f"{label}: ratio must be a finite number")
+    if kind is CorporateActionKind.BONUS_SPLIT and not ratio > 1:
+        raise ValueError(f"{label}: a BONUS_SPLIT ratio is new shares per old share, > 1")
+    if kind is CorporateActionKind.DEMERGER and not 0 < ratio < 1:
+        raise ValueError(f"{label}: a DEMERGER ratio is Dhan's price factor, between 0 and 1")
+
+
+def price_factor(kind: CorporateActionKind, ratio: Decimal) -> Decimal:
+    """What the restatement multiplies a pre-ex price by: 1 / ratio for a
+    bonus or split, the ratio itself for a demerger."""
+    return 1 / ratio if kind is CorporateActionKind.BONUS_SPLIT else ratio
+
+
+@dataclass(frozen=True, slots=True)
+class CorporateActionRow:
+    """One operator-confirmed row of ``corporate_actions.csv`` (spec 4.14).
+
+    ``ratio`` is new shares per old share for ``BONUS_SPLIT`` (1:1 bonus -> 2,
+    1:2 bonus -> 1.5, 1:10 split -> 10), and the price factor Dhan applied for
+    ``DEMERGER`` (e.g. 0.90).
+    """
+
+    symbol: str
+    ex_session: date
+    kind: CorporateActionKind
+    ratio: Decimal
+    confirmed_on: date
+    note: str = ""
+
+    def __post_init__(self) -> None:
+        _check_ratio(self.kind, self.ratio, f"{self.symbol} {self.ex_session}")
+
+    @property
+    def price_factor(self) -> Decimal:
+        return price_factor(self.kind, self.ratio)
+
+
 # ===========================================================================
 # Phase 3 — the rules core's inputs and outputs (spec sections 4, 9, 12)
 # ===========================================================================
@@ -457,6 +503,61 @@ class SaleFill:
 
 
 @dataclass(frozen=True, slots=True)
+class ShareAdjustment:
+    """A confirmed corporate action applied to one position (spec 4.14 v1.2j).
+
+    Stored as its own record and applied whenever the position is rebuilt;
+    the fill rows are never edited. ``applies_to`` names the fills (one per
+    action, at most) that were in the old units: their prices are multiplied
+    by :attr:`price_factor` and their share counts by :attr:`unit_factor`
+    when expressed in current units. ``shares_delta`` is the shares the
+    action added (a bonus's floor(H x ratio) - H); ``cash`` the cash it paid
+    (cash in lieu of a fractional share, or a demerger's value).
+    """
+
+    ex_session: date
+    kind: CorporateActionKind
+    ratio: Decimal
+    applies_to: tuple[OrderAction, ...]
+    shares_delta: int = 0
+    cash: Decimal = Decimal("0")
+
+    def __post_init__(self) -> None:
+        _check_ratio(self.kind, self.ratio, f"adjustment {self.ex_session}")
+        if OrderAction.BUY_T1 not in self.applies_to:
+            raise ValueError("an adjustment applies to a position held before its ex session")
+        if self.shares_delta < 0 or self.cash < 0:
+            raise ValueError("an adjustment adds shares and cash, never removes them")
+        if self.kind is CorporateActionKind.DEMERGER and self.shares_delta != 0:
+            raise ValueError("a DEMERGER leaves the share count unchanged")
+
+    @property
+    def price_factor(self) -> Decimal:
+        return price_factor(self.kind, self.ratio)
+
+    @property
+    def unit_factor(self) -> Decimal:
+        return self.ratio if self.kind is CorporateActionKind.BONUS_SPLIT else Decimal("1")
+
+
+@dataclass(frozen=True, slots=True)
+class Freeze:
+    """A held position whose history was restated and is not yet confirmed
+    (spec 4.14 v1.2j). ``factor`` is cached open / stored fill price; ``runs``
+    counts this run and the consecutive frozen runs before it."""
+
+    position_id: str
+    factor: Decimal
+    detail: str
+    runs: int = 1
+
+    @property
+    def escalated(self) -> bool:
+        """Spec 4.14 item 5: frozen for more than 2 weekly runs."""
+        return self.runs > 2
+
+
+@dataclass(frozen=True, slots=True)
 class Position:
     """One trade in one symbol, from its T1 fill until its last share is sold.
 
@@ -488,6 +589,9 @@ class Position:
     #: sells nothing but still switches to the trail. It is the week a real
     #: SELL_HALF would have filled, so the trail-time clock matches any other.
     half_sold_week: WeekKey | None = None
+    #: Spec 4.14 v1.2j: confirmed corporate actions, oldest first. ``p1``,
+    #: ``l1``, ``l2`` and ``stop`` are passed already in current units.
+    adjustments: tuple[ShareAdjustment, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.buys or self.buys[0].tranche != 1:
@@ -510,7 +614,29 @@ class Position:
 
     @property
     def shares_held(self) -> int:
-        return self.shares_bought - sum(sale.shares for sale in self.sales)
+        """In current units: a bonus's added shares included (v1.2j)."""
+        sold = sum(sale.shares for sale in self.sales)
+        return self.shares_bought - sold + sum(a.shares_delta for a in self.adjustments)
+
+    # ------------------------------------------------- corporate actions
+    def _factors(self, action: OrderAction) -> tuple[Decimal, Decimal]:
+        """(price factor, unit factor) turning one fill into current units."""
+        price, units = Decimal("1"), Decimal("1")
+        for adjustment in self.adjustments:
+            if action in adjustment.applies_to:
+                price *= adjustment.price_factor
+                units *= adjustment.unit_factor
+        return price, units
+
+    def current_price(self, fill: BuyFill | SaleFill) -> Decimal:
+        """A fill's price in current units — what a restated history shows
+        for its session (spec 4.14 detection)."""
+        action = fill.action if isinstance(fill, SaleFill) else OrderAction.buy(fill.tranche)
+        return fill.price * self._factors(action)[0]
+
+    @property
+    def adjustment_cash(self) -> Decimal:
+        return sum((a.cash for a in self.adjustments), Decimal("0"))
 
     @property
     def tranches_used(self) -> int:
@@ -557,8 +683,16 @@ class Position:
 
     @property
     def average_cost(self) -> Decimal:
-        """Average buy price, before fees."""
-        return self.buy_value / self.shares_bought
+        """Average buy price in current units, before fees. After a demerger
+        the cost is apportioned by its ratio (spec 4.14: fill prices x ratio)."""
+        if not self.adjustments:
+            return self.buy_value / self.shares_bought
+        cost, shares = Decimal("0"), Decimal("0")
+        for buy in self.buys:
+            price, units = self._factors(OrderAction.buy(buy.tranche))
+            cost += buy.value * price * units
+            shares += buy.shares * units
+        return cost / shares
 
     @property
     def cost_of_held(self) -> Decimal:
@@ -587,8 +721,13 @@ class Position:
 
     @property
     def net_pnl(self) -> Decimal:
-        """Realised P&L net of every modelled cost. Final once CLOSED."""
-        return self.sale_value - self.buy_value - self.fees
+        """Realised P&L net of every modelled cost. Final once CLOSED.
+
+        Economic P&L of the whole holding (4a-fix, operator-approved): the
+        cash a corporate action paid is included and the rupee cost is not
+        apportioned, so a demerger never shows a false loss or triggers a
+        false cooling-off."""
+        return self.sale_value + self.adjustment_cash - self.buy_value - self.fees
 
 
 @dataclass(frozen=True, slots=True)

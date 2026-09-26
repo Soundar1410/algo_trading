@@ -1,7 +1,7 @@
 # `positional_stocks` operator inputs
 
-Three CSVs that `wsr1_weekly_stochrsi` reads and never writes. Spec sections
-6.3–6.5 of `strategies/positional_stocks/wsr1_weekly_stochrsi/WSR1_WEEKLY_STOCH_RSI_SPEC.md`
+The CSVs that `wsr1_weekly_stochrsi` reads and never writes. Spec sections
+4.14 and 6.1–6.5 of `strategies/positional_stocks/wsr1_weekly_stochrsi/WSR1_WEEKLY_STOCH_RSI_SPEC.md`
 are the contract; `strategies/positional_stocks/wsr1_weekly_stochrsi/inputs.py`
 enforces it and **fails closed** on any deviation — a renamed column, a
 duplicated symbol or a non-ISO date stops the run rather than being guessed at.
@@ -96,3 +96,50 @@ acknowledge it here. A move of 15–30% is only reported.
   stays blocked (operator decision, 23 September 2026). The loader fails
   closed on a malformed row, an ambiguous date, or the same gap acknowledged
   twice.
+
+## `corporate_actions.csv` (spec 4.14)
+
+`symbol, ex_session, kind, ratio, confirmed_on, note`
+
+Dhan back-adjusts history for bonuses, splits and (sometimes) demergers. A
+held position, though, keeps its fill prices, P1, L1, L2, Stop and share count
+in the units of its fills. Every decision run compares each fill of each open
+position with the cached open of that session. When they differ by more than
+0.5%, the history was restated and the position is **frozen**:
+- no exit, add or partial decision is made for it;
+- it still counts toward every limit;
+- it is marked at close ÷ f in its own units, so equity and the brakes see no
+  false drop;
+- it is flagged in the report.
+
+After more than 2 weekly runs frozen it is escalated as an operator action.
+Confirm the action here, within 2 weekly runs of the flag:
+
+| `kind` | `ratio` | Examples |
+|---|---|---|
+| `BONUS_SPLIT` | new shares per old share (> 1) | 1:1 bonus → `2`; 1:2 bonus → `1.5`; 1:10 split → `10` |
+| `DEMERGER` | the price factor Dhan applied (between 0 and 1) | `0.90` |
+
+- **`DEMERGER` covers any price-only restatement**, for example a special
+  dividend Dhan adjusts for. The share count is unchanged and the value
+  removed is credited as cash.
+- `ex_session` is the first session in the new units. A row is applied only
+  if its factor matches the detected one within 0.5% (BONUS_SPLIT: 1 ÷ ratio;
+  DEMERGER: ratio). Every fill before `ex_session` must be restated and every
+  fill on or after it must not be. Otherwise the position stays frozen and the
+  mismatch is reported.
+- **What a rescale does:**
+  - BONUS_SPLIT: shares × ratio, floored, with the fraction paid as cash at the
+    adjusted pre-ex close. Prices and levels ÷ ratio; rupee cost unchanged.
+  - DEMERGER: prices and levels × ratio; shares unchanged. The credit is
+    shares × actual pre-ex close × (1 − ratio).
+  - Either way, a pending sell decided before the restatement is re-issued in
+    the new units for the next session.
+  - The rescale is stored as its own record and the original fills are never
+    edited. A trade's P&L includes the cash the action paid.
+- Shipped **header-only**. The loader fails closed on a missing file, a wrong
+  header, an unknown kind, a ratio out of range, a bad date, or the same
+  (symbol, ex_session) twice.
+- **Known limit:** two actions stacked on one open position (both unconfirmed
+  at once) cannot be resolved by one row. The position stays frozen and
+  escalates.

@@ -1,4 +1,4 @@
-"""Loaders for the operator-maintained CSVs (spec 6.1, 6.3, 6.4, 6.5).
+"""Loaders for the operator-maintained CSVs (spec 4.14, 6.1, 6.3, 6.4, 6.5).
 
 All three are **fail-closed**. These files are the only place a human decision
 enters an otherwise deterministic strategy, and every way they can be wrong —
@@ -33,6 +33,8 @@ from common.logging import get_logger
 
 from .gaps import RATIO_PLACES
 from .models import (
+    CorporateActionKind,
+    CorporateActionRow,
     GapAcknowledgement,
     OnExit,
     QualityRow,
@@ -56,6 +58,7 @@ UNIVERSE_COLUMNS = (
 QUALITY_COLUMNS = ("symbol", "status", "checked_on", "valid_until", "notes")
 RESULTS_COLUMNS = ("symbol", "results_date")
 GAP_ACK_COLUMNS = ("symbol", "gap_session", "ratio", "acknowledged_on", "note")
+CORPORATE_ACTION_COLUMNS = ("symbol", "ex_session", "kind", "ratio", "confirmed_on", "note")
 
 _TRUE = frozenset({"true", "yes", "y", "1"})
 _FALSE = frozenset({"false", "no", "n", "0", ""})
@@ -319,6 +322,59 @@ def load_gap_acknowledgements(path: Path | str) -> tuple[GapAcknowledgement, ...
                 note=(record.get("note") or "").strip(),
             )
         )
+    return tuple(rows)
+
+
+def load_corporate_actions(path: Path | str) -> tuple[CorporateActionRow, ...]:
+    """Parse ``corporate_actions.csv`` (spec 4.14 v1.2j). Header-only is valid.
+
+    Fail closed: a row here rescales a held position's shares, levels and
+    cash, so a missing file, a wrong header, an unknown kind, a ratio out of
+    its range, a bad date or the same (symbol, ex_session) twice stops the run
+    rather than rescaling on a guess.
+
+    Raises:
+        InputFileError: any of the above.
+    """
+    location = Path(path)
+    rows: list[CorporateActionRow] = []
+    seen: set[tuple[str, date]] = set()
+    for line, record in _records(location, CORPORATE_ACTION_COLUMNS, "corporate actions"):
+        symbol = _required(record, "symbol", location, line).upper()
+        ex_session = _required_date(record.get("ex_session"), "ex_session", location, line)
+        if (symbol, ex_session) in seen:
+            raise InputFileError(
+                f"{location} line {line}: {symbol} {ex_session} is confirmed twice."
+            )
+        seen.add((symbol, ex_session))
+        raw_kind = _required(record, "kind", location, line)
+        try:
+            kind = CorporateActionKind(raw_kind.upper())
+        except ValueError:
+            raise InputFileError(
+                f"{location} line {line}: kind is {raw_kind!r}; expected BONUS_SPLIT or DEMERGER."
+            ) from None
+        raw_ratio = _required(record, "ratio", location, line)
+        try:
+            ratio = Decimal(raw_ratio)
+        except InvalidOperation:
+            raise InputFileError(
+                f"{location} line {line}: ratio is {raw_ratio!r}; expected a number."
+            ) from None
+        try:
+            row = CorporateActionRow(
+                symbol=symbol,
+                ex_session=ex_session,
+                kind=kind,
+                ratio=ratio,
+                confirmed_on=_required_date(
+                    record.get("confirmed_on"), "confirmed_on", location, line
+                ),
+                note=(record.get("note") or "").strip(),
+            )
+        except ValueError as exc:
+            raise InputFileError(f"{location} line {line}: {exc}.") from None
+        rows.append(row)
     return tuple(rows)
 
 

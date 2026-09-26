@@ -36,6 +36,7 @@ STOCK_TABLES = {
     "stock_universe_seen",
     "stock_signals",
     "stock_position_reviews",
+    "stock_corporate_actions",
 }
 
 
