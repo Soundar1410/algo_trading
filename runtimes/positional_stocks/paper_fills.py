@@ -14,6 +14,9 @@ the next weekly run, which is the first moment the candle exists (spec 8).
 * **``at_week_open`` (spec 4.9 v1.2g)** is true only when the fill session is
   the calendar's first trading session of its ISO week — Monday, or Tuesday
   after a Monday holiday. A weekend special session is never the first.
+* **Late candle (v1.2j).** A fill whose session is in an earlier week than the
+  run's week — its candle was missing at the earlier run — is ``late_fill``;
+  the caller replays the add-touch memory from that week before deciding.
 * **Sells before buys** at the same open, in a deterministic order.
 
 Pure apart from reading its arguments: no I/O, no clock.
@@ -45,6 +48,8 @@ class FillPlan:
     at_week_open: bool
     #: Spec 8: the symbol did not trade on the execution session.
     not_traded_on_execution_session: bool
+    #: Spec 8 v1.2j: the session is in an earlier week than ``through``'s.
+    late_fill: bool = False
 
 
 def plan_fill(
@@ -65,6 +70,7 @@ def plan_fill(
         open_price=bar.open,
         at_week_open=bar.session == calendar.first_session(week_of(bar.session)),
         not_traded_on_execution_session=bar.session != order.execute_on_or_after,
+        late_fill=week_of(bar.session) < week_of(through),
     )
 
 

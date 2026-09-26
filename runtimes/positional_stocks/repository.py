@@ -24,11 +24,12 @@ import json
 import sqlite3
 from collections.abc import Iterable
 from datetime import UTC, date, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 from common.persistence import Database
 from strategies.positional_stocks.wsr1_weekly_stochrsi.iso_weeks import WeekKey
 from strategies.positional_stocks.wsr1_weekly_stochrsi.models import (
+    PAISA,
     Book,
     BrakeState,
     BuyFill,
@@ -66,6 +67,13 @@ def _opt_week(text: str | None) -> WeekKey | None:
 
 def _opt_date(text: str | None) -> date | None:
     return None if text is None else date.fromisoformat(text)
+
+
+def drawdown_pct(equity: Decimal, peak: Decimal) -> Decimal:
+    """Spec 9: (peak - equity) / peak x 100, to 0.01; 0 at or above the peak."""
+    if peak <= 0 or equity >= peak:
+        return Decimal("0.00")
+    return ((peak - equity) / peak * 100).quantize(PAISA, rounding=ROUND_HALF_UP)
 
 
 def order_id(strategy_id: str, order: PendingOrder) -> str:
@@ -116,6 +124,31 @@ class StockRepository:
             .fetchone()
         )
         return None if row is None else (date.fromisoformat(row["week_ending"]), row["status"])
+
+    def run_status_for_week(self, week: WeekKey) -> str | None:
+        """The status of the run for ISO week ``week`` — by week, not by date,
+        so a holiday Friday makes no difference."""
+        row = (
+            self._db.connect()
+            .execute(
+                "SELECT status FROM stock_weekly_runs WHERE strategy_id = ? AND iso_week = ?",
+                (self._strategy_id, week_text(week)),
+            )
+            .fetchone()
+        )
+        return None if row is None else str(row["status"])
+
+    def has_runs_other_than(self, week_ending: date) -> bool:
+        row = (
+            self._db.connect()
+            .execute(
+                "SELECT 1 FROM stock_weekly_runs WHERE strategy_id = ? AND week_ending != ? "
+                "LIMIT 1",
+                (self._strategy_id, week_ending.isoformat()),
+            )
+            .fetchone()
+        )
+        return row is not None
 
     def mark_started(self, week_ending: date, week: WeekKey, fingerprint: str) -> None:
         """Record STARTED in its own transaction, before the week's work."""
@@ -318,6 +351,7 @@ class StockRepository:
         *,
         cash_delta: Decimal,
         not_traded_on_execution_session: bool,
+        late_fill: bool = False,
         week: WeekKey,
     ) -> None:
         """The fill this order just made — the position's latest buy or sale."""
@@ -332,8 +366,8 @@ class StockRepository:
         conn.execute(
             "INSERT INTO stock_fills (strategy_id, order_id, position_id, symbol, action, "
             "session, price, shares, fees, at_week_open, cash_delta, "
-            "not_traded_on_execution_session, recorded_week) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "not_traded_on_execution_session, late_fill, recorded_week) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 self._strategy_id,
                 order_id(self._strategy_id, order),
@@ -347,6 +381,7 @@ class StockRepository:
                 at_open,
                 str(cash_delta),
                 int(not_traded_on_execution_session),
+                int(late_fill),
                 week_text(week),
             ),
         )
@@ -409,9 +444,9 @@ class StockRepository:
         assert brakes.peak is not None
         conn.execute(
             "INSERT INTO stock_equity (strategy_id, week_ending, iso_week, cash, "
-            "positions_value, equity, peak, regime, brake1_until, brake1_can_fire, "
-            "brake2_fired_on, entries_blocked, warnings) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "positions_value, equity, peak, drawdown_pct, regime, brake1_until, "
+            "brake1_can_fire, brake2_fired_on, entries_blocked, warnings) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 self._strategy_id,
                 week_ending.isoformat(),
@@ -420,6 +455,7 @@ class StockRepository:
                 str(decision.equity - cash),
                 str(decision.equity),
                 str(brakes.peak),
+                str(drawdown_pct(decision.equity, brakes.peak)),
                 decision.regime.value,
                 None if brakes.brake1_until is None else week_text(brakes.brake1_until),
                 int(brakes.brake1_can_fire),

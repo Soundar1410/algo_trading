@@ -61,6 +61,7 @@ from .models import (
     Sizing,
     UniverseRow,
     WeekDecision,
+    WeeklyBar,
     money,
 )
 
@@ -573,6 +574,48 @@ def review_position(
     return _review_add(position, inputs, i, ctx, params, cash_available, kd_flags)
 
 
+def _touch_step(
+    position: Position,
+    level: Decimal,
+    touch: WeekKey | None,
+    bar: WeeklyBar,
+    week: WeekKey,
+) -> WeekKey | None:
+    """Touch memory before one week's close check.
+
+    The first week, from the previous buy's fill week on, whose low reached
+    the level. If that buy filled after its week's first session, the window
+    starts the following week: the fill week's low may predate the fill
+    (v1.2g). The caller then clears it on a close >= P1 (4.9 item 4).
+    """
+    opens = 0 if position.buys[-1].at_week_open else 1
+    in_window = weeks_between(position.last_buy_week, week) >= opens
+    if touch is None and in_window and money(bar.low) <= level:
+        return week
+    return touch
+
+
+def replay_touch_memory(position: Position, series: IndicatorSeries, before: WeekKey) -> Position:
+    """Spec 8 v1.2j: after a late buy fill, rebuild the next level's touch
+    memory over the weeks from the fill week up to (not including)
+    ``before`` — the weeks whose decision runs did not yet know of the fill.
+    Week ``before`` itself is the normal decision's. The same step as
+    :func:`_review_add`, so the two cannot diverge.
+    """
+    level = position.next_level
+    if level is None:
+        return position
+    touch: WeekKey | None = None
+    for bar in series.bars:
+        week = bar.iso_key
+        if weeks_between(position.last_buy_week, week) < 0 or weeks_between(week, before) <= 0:
+            continue
+        touch = _touch_step(position, level, touch, bar, week)
+        if money(bar.close) >= position.p1:
+            touch = None
+    return replace(position, touch_week=touch)
+
+
 def _review_add(
     position: Position,
     inputs: SymbolWeek,
@@ -589,15 +632,7 @@ def _review_add(
     if level is None:
         return _review(position, "hold: no further add", flags=flags), position
 
-    # Touch memory: the first week, from the previous buy's fill week on,
-    # whose low reached the level. A close >= P1 clears it (4.9 item 4). If
-    # that buy filled after its week's first session, the window starts the
-    # following week: the fill week's low may predate the fill (v1.2g).
-    touch = position.touch_week
-    opens = 0 if position.buys[-1].at_week_open else 1
-    in_window = weeks_between(position.last_buy_week, ctx.week) >= opens
-    if touch is None and in_window and money(bar.low) <= level:
-        touch = ctx.week
+    touch = _touch_step(position, level, position.touch_week, bar, ctx.week)
     if close >= position.p1:
         cleared = touch is not None
         position = replace(position, touch_week=None)

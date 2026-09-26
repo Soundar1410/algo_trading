@@ -110,6 +110,9 @@ CREATE TABLE IF NOT EXISTS stock_fills (
     -- at a later session's open.
     not_traded_on_execution_session INTEGER NOT NULL DEFAULT 0
         CHECK (not_traded_on_execution_session IN (0, 1)),
+    -- Spec 8 v1.2j: the fill session is in an earlier week than the run that
+    -- recorded it (its candle was missing at the earlier run).
+    late_fill           INTEGER NOT NULL DEFAULT 0 CHECK (late_fill IN (0, 1)),
     recorded_week       TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_stock_fills_position
@@ -124,6 +127,8 @@ CREATE TABLE IF NOT EXISTS stock_equity (
     positions_value   TEXT NOT NULL,
     equity            TEXT NOT NULL,
     peak              TEXT NOT NULL,
+    -- Spec 9: (peak - equity) / peak x 100, to 0.01.
+    drawdown_pct      TEXT NOT NULL,
     regime            TEXT NOT NULL CHECK (regime IN ('normal', 'red', 'unknown')),
     brake1_until      TEXT,
     brake1_can_fire   INTEGER NOT NULL CHECK (brake1_can_fire IN (0, 1)),

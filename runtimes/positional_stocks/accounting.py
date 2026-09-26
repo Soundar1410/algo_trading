@@ -17,7 +17,13 @@ Order within the week, spec 4.13:
 
 **Idempotent per (strategy_id, week_ending).** A COMPLETED week returns
 without writing. An earlier week than the latest run is refused, and so is a
-new week while an earlier one is still STARTED.
+new week while an earlier one is still STARTED. **Strict week order (10.2
+v1.2j):** week W is decided only as the first run or when W - 1 is COMPLETED —
+a skipped week is a skipped stop check.
+
+**Late fills (spec 8 v1.2j).** A fill whose session falls in an earlier week
+than this run's is flagged ``late_fill``, and the add-touch memory of a
+position bought late is replayed from its fill week before deciding.
 
 **Crash-safe.** STARTED is committed on its own first; steps 1-5 and the flip to
 COMPLETED are **one** transaction. A crash anywhere inside rolls all of it back,
@@ -41,6 +47,7 @@ from strategies.positional_stocks.wsr1_weekly_stochrsi.iso_weeks import shift
 from strategies.positional_stocks.wsr1_weekly_stochrsi.models import (
     DailyBar,
     GapAcknowledgement,
+    PositionState,
     RulesParameters,
     UniverseRow,
     WeekDecision,
@@ -49,13 +56,14 @@ from strategies.positional_stocks.wsr1_weekly_stochrsi.rules import (
     SymbolWeek,
     WeekContext,
     decide_week,
+    replay_touch_memory,
     traded_value,
     trigger,
 )
 from strategies.positional_stocks.wsr1_weekly_stochrsi.trading_calendar import TradingCalendar
 
 from .paper_fills import OrderFill, fill_orders
-from .repository import StockRepository
+from .repository import StockRepository, week_text
 
 
 class RunOrderError(RuntimeError):
@@ -117,6 +125,15 @@ def run_decision_week(
             raise RunOrderError(
                 f"{latest_week} was started and not finished; run it again before {ctx.week_ending}"
             )
+    previous = shift(ctx.week, -1)
+    if (
+        repository.has_runs_other_than(ctx.week_ending)
+        and repository.run_status_for_week(previous) != "COMPLETED"
+    ):
+        raise RunOrderError(
+            f"cannot decide {ctx.week_ending}: week {week_text(previous)} is not COMPLETED "
+            "(spec 10.2: a skipped week is a skipped stop check)"
+        )
 
     repository.mark_started(ctx.week_ending, ctx.week, inputs.fingerprint)
     daily = {
@@ -135,6 +152,7 @@ def run_decision_week(
             calendar=calendar,
             params=params,
         )
+        late_buys: set[str] = set()
         for result in fills:
             outcome = result.outcome
             if outcome is None:
@@ -156,11 +174,25 @@ def run_decision_week(
                 position,
                 cash_delta=outcome.cash_delta,
                 not_traded_on_execution_session=result.plan.not_traded_on_execution_session,
+                late_fill=result.plan.late_fill,
                 week=ctx.week,
             )
+            if result.plan.late_fill and result.order.action.is_buy:
+                late_buys.add(position.position_id)
             if outcome.closed is not None and outcome.closed.is_loss:
                 until = shift(outcome.closed.exit_week, params.cooling_off_weeks)
                 repository.save_cooling_off(conn, outcome.closed, until)
+
+        # Spec 8 v1.2j: the weeks between a late buy and this one were decided
+        # without it; rebuild its touch memory over them.
+        for position_id in sorted(late_buys):
+            position = filled_positions[position_id]
+            week_inputs = inputs.symbols.get(position.symbol)
+            if week_inputs is None or position.state is not PositionState.OPEN:
+                continue
+            replayed = replay_touch_memory(position, week_inputs.series, before=ctx.week)
+            if replayed.touch_week != position.touch_week:
+                repository.save_position(conn, replayed, ctx.week)
 
         # Steps 2-4: decide on the book as it now stands.
         book = repository.book(conn)
