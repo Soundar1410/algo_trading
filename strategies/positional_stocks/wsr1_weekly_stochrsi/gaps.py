@@ -30,13 +30,21 @@ from itertools import pairwise
 from .iso_weeks import monday_of
 from .models import DailyBar, GapAcknowledgement, WeeklyBar
 
-#: Spec 6.1: flag (and block) at 30%, report at 15%.
-FLAG_MOVE = 0.30
-REPORT_MOVE = 0.15
+#: Spec 6.1: flag (and block) at 30%, report at 15%. Compared on the exact
+#: decimal close ratio (v1.2j): as a float, 130.26 / 100.20 - 1 is 0.2999...
+#: and a move of exactly 30% was missed.
+FLAG_MOVE = Decimal("0.30")
+REPORT_MOVE = Decimal("0.15")
 #: Spec 6.1 v1.2e: only gaps inside the most recent 520 weekly bars block.
 BLOCK_WINDOW_BARS = 520
 #: Acknowledgements match a gap on its ratio to this precision.
 RATIO_PLACES = Decimal("0.0001")
+
+
+def exact_move(previous_close: float, close: float) -> Decimal:
+    """close / previous close - 1, exactly: each float through its shortest
+    repr, so 130.26 / 100.20 is 1.3 and not 1.2999999999999998."""
+    return Decimal(str(close)) / Decimal(str(previous_close)) - 1
 
 
 def gap_ratio(previous_close: float, close: float) -> Decimal:
@@ -58,8 +66,9 @@ class Gap:
     ratio: Decimal
 
     @property
-    def move(self) -> float:
-        return self.close / self.previous_close - 1.0
+    def move(self) -> Decimal:
+        """The exact move (v1.2j), never the 4-decimal acknowledgement key."""
+        return exact_move(self.previous_close, self.close)
 
     @property
     def flagged(self) -> bool:
@@ -72,7 +81,7 @@ def scan(symbol: str, daily: Iterable[DailyBar]) -> list[Gap]:
     ordered = sorted(daily, key=lambda bar: bar.session)
     gaps: list[Gap] = []
     for before, after in pairwise(ordered):
-        if abs(after.close / before.close - 1.0) >= REPORT_MOVE:
+        if abs(exact_move(before.close, after.close)) >= REPORT_MOVE:
             gaps.append(
                 Gap(
                     symbol=symbol,
