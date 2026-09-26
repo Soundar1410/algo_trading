@@ -1,9 +1,11 @@
 """``positional_stocks`` runtime — the paper book of ``wsr1_weekly_stochrsi``.
 
-Phase 4a (persistence and paper accounting). The weekly run itself — the
-``fetch`` / ``decide`` CLI, the report and Telegram — is Phase 4b, and nothing
-here is scheduled or registered anywhere: there is no ``RUNTIMES`` entry and no
-``auto_start`` route (spec section 13).
+Phase 4a built persistence and paper accounting; Phase 4b-1 adds the offline
+weekly run: ``python -m runtimes.positional_stocks.weekly_run --mode decide``
+(:mod:`.weekly_run`), with its report, journal and Telegram summary. Fetch
+mode — the network — is Phase 4b-2. Nothing here is scheduled or registered
+anywhere: there is no ``RUNTIMES`` entry and no ``auto_start`` route (spec
+section 13); the two LaunchAgents come in Phase 5.
 
 **Own migration set (spec 9, v1.2i).** ``positional_stocks.db`` is migrated from
 ``runtimes/positional_stocks/migrations/`` by the shared ``MigrationRunner``,
