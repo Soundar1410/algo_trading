@@ -5,7 +5,7 @@
 **Engine kind:** `stock_portfolio_engine` (the existing, reserved `EngineKind.STOCK_PORTFOLIO_ENGINE`; no new enum value)
 **Execution shape:** a run-to-completion weekly job — no tick feed, no long-lived worker, no intraday decisions
 **Initial mode:** paper only
-**Status:** implementation specification v1.2i — own migration set for positional_stocks (live paper databases untouched)
+**Status:** implementation specification v1.2j — corporate actions on held positions; strict week order; late fills
 **Scheduling:** two of its own LaunchAgents (a fetch/preview job and an offline decision job). **Not** registered with `auto_start`, and no change to shared auto-start code
 **Rule source:** "Weekly Stoch RSI V1 Trading Plan" (operator's V1 rulebook, 20 Sep 2026), including its resolved ambiguities and the first-cross / K < 50 fix
 **Target branch:** new `strategy-wsr1-weekly-stochrsi`, cut from `feature-paper-auto-start` at `701e030`
@@ -113,6 +113,16 @@ Numbers in brackets are the Phase 0 question numbers.
 | 1 | **`positional_stocks.db` uses its own migration directory**; nothing is added to the shared `common/persistence/migrations/versions/` | 9 |
 | 2 | Reason: the paper runtimes run from this working tree and migrate at every start; `verify_checksums()` would refuse to start both of them if a shared stock migration were later edited or missing | 9 |
 | 3 | Phases 4a and 4b add new files only: no existing module that the two paper runtimes import is modified | 13 |
+
+### Changes in v1.2j (26 Sep 2026 — Phase 4a audit)
+
+| # | Decision | Section |
+|---|---|---|
+| 1 | **Corporate actions on held positions: detect, freeze, operator confirms in `corporate_actions.csv`, then rescale** (bonus/split and demerger) | 4.14 (new) |
+| 2 | A decision run for week W requires W − 1 COMPLETED (or no prior run) | 10.2 |
+| 3 | Late-arriving candles: `late_fill` flag and touch-memory replay from the fill week | 8 |
+| 4 | Gap thresholds compared on exact decimal ratios, not floats (a move of exactly 30% was missed) | 6.1 |
+| 5 | Section 9's `stock_fills` late/catch-up flag and `stock_equity` drawdown % columns are required | 9 |
 
 ---
 
@@ -326,6 +336,31 @@ Every exit fills at the next session's open. A position is **closed** when its s
 4. Evaluate new entries (4.5–4.8) with the slots, cash and limits left after step 3's decisions. (v1.2f) A decided SELL_ALL frees its slot, sector, group and committed amount for this week's entries; a decided SELL_HALF recomputes committed as the cost of the shares that will remain. **Sale proceeds are not counted as cash until filled**, and each planned buy reserves its amount plus buy costs.
 5. Persist decisions as pending orders for the next session; write the report.
 
+### 4.14 Corporate actions on held positions (v1.2j)
+
+Dhan back-adjusts history for bonuses, splits and (sometimes) demergers, but a held position's stored P1, levels, share count and fill prices are in the units at the time of the fill. Left alone, a 1:1 bonus halves the adjusted price while the stop stays at the old level: a false stop, a false loss, a false cooling-off and a false drawdown (reproduced in the Phase 4a audit: −₹19,685 on a flat stock). The gap scan cannot see it, because a correctly adjusted series has no gap.
+
+1. **Detect**, every run (both modes), for every fill of every open position: compare the stored fill price with the cached open of the fill session. A relative difference above 0.5% means the history was restated; the factor is `f = cached open ÷ stored fill price`.
+2. **Freeze** the position while unresolved:
+    - no exit, add or partial decision for it;
+    - it still counts toward every limit;
+    - it is marked to market at `stored shares × (close ÷ f)` — in its own units — so equity and the brakes see no false drop;
+    - it is flagged in the report and in the Telegram summary. New entries are unaffected.
+3. **Confirm**: the operator adds a row to `config/positional_stocks/corporate_actions.csv`, with columns `symbol, ex_session, kind, ratio, confirmed_on, note`:
+    - `kind = BONUS_SPLIT`: `ratio` is new shares per old share (1:1 bonus → 2; 1:2 bonus → 1.5; 1:10 split → 10);
+    - `kind = DEMERGER`: `ratio` is the price factor Dhan applied (for example 0.90). Shares are unchanged.
+4. **Rescale** at the next run, only if the confirmed row matches the detected factor within 0.5% (BONUS_SPLIT: 1 ÷ ratio ≈ f; DEMERGER: ratio ≈ f); otherwise stay frozen and flag the mismatch:
+    - **BONUS_SPLIT:** shares × ratio, floored; the fractional share is credited as cash at the adjusted close ("cash in lieu"). P1, L1, L2, Stop and every stored fill price ÷ ratio. Total cost in ₹ is unchanged.
+    - **DEMERGER:** P1, L1, L2, Stop and fill prices × ratio; shares unchanged. The value removed, `shares × pre-ex close × (1 − ratio)`, is credited as cash. This stands in for the demerged company's shares, which the paper book does not hold.
+    - The rescale is stored as its own record (position, ex session, kind, ratio) and applied whenever positions are rebuilt from fills. Original fill rows are never edited.
+5. A frozen position whose freeze lasts more than 2 weekly runs is escalated in the report as an operator action.
+6. **Pending orders at rescale.** A pending SELL decided before the
+restatement is **re-issued in the new units** for the next session — SELL_ALL
+for all rescaled shares, SELL_HALF for floor(rescaled shares ÷ 2) — not
+dropped: the exit was decided on valid data and must still happen. Pending
+buys are amount-based and proceed unchanged. The kind `DEMERGER` covers any
+price-only restatement (a special dividend Dhan adjusts for, for example).
+
 ---
 
 ## 5. Instruments and identity
@@ -351,7 +386,7 @@ Every exit fills at the next session's open. A position is **closed** when its s
 - **Corporate-action adjustment must be verified in Phase 1, not assumed.** Test known events, e.g. Reliance 1:1 bonus (Oct 2024) and HDFC Bank 1:1 bonus (Aug 2025).
     - If Dhan history is adjusted → record the evidence in the runbook.
     - If it is not → STOP and report. Do not build an adjustment engine without approval.
-- Any symbol whose adjusted series shows an unexplained overnight gap of 30% or more is flagged and skipped for new entries until the operator acknowledges it.
+- Any symbol whose adjusted series shows an unexplained overnight gap of 30% or more is flagged and skipped for new entries until the operator acknowledges it. Thresholds are compared on the exact decimal close ratio, never a float difference (v1.2j).
     - **An acknowledgement is keyed to (symbol, gap session, ratio), never to the symbol alone (v1.2b).** A new unexplained gap re-blocks an acknowledged symbol.
     - **Only gaps in the most recent 520 weekly bars (~10 years) block (v1.2e).** Older gaps are reported, never blocking. A price break of factor r that is N weeks old moves EMA200 by about |1 − r| × 0.99005^N: a 1:1 bonus (r = 0.5) left unadjusted 520 weeks ago moves it by ~0.3%, inside parity tolerance, and every other indicator here looks back far less. Applied to full history without a window, the rule would block 43 symbols — RELIANCE and HDFCBANK among them — over breaks 15–20 years old.
     - **Monthly full refetch (v1.2b):** the first fetch of each calendar month refetches every symbol's full history instead of the tail. The overlap check sees only the last 10 sessions, so it cannot detect Dhan restating older history — for example correcting, or newly breaking, a partial back-adjustment like MOTHERSON's.
@@ -413,6 +448,7 @@ Columns: `symbol, results_date`.
 | Fill price | The official open of the execution session, from that session's daily candle |
 | Fill time | Recorded at the next weekly run, which has the candle. A run never fills an order before its session exists in the data |
 | Symbol not traded that session | Fill at the next session's open; flag it |
+| Candle arrives late (v1.2j) | If an order fills at a session in an earlier week than the run's week (its data was missing at the earlier run), it is flagged `late_fill`, and the add-touch memory is replayed over the bars from that fill week (respecting `at_week_open`) before this week's decisions |
 | Costs | Configurable: `cost_bps_buy` (default 12), `cost_bps_sell` (default 11), `fixed_cost_per_sell_rs` (default 15). Defaults approximate STT + stamp duty + exchange charges + DP charge for equity delivery at a zero-brokerage broker. **Operator to verify against Dhan's current charges** |
 | Taxes | Not modelled |
 | Gaps through the stop | No special handling. The exit fills at the open, whatever the price, and the report shows the planned vs actual loss |
@@ -466,7 +502,7 @@ python -m runtimes.positional_stocks.weekly_run --mode decide [--as-of auto|YYYY
 ### 10.2 Algorithm
 
 1. Load config; confirm `mode: paper` (anything else is refused in this spec version).
-2. Determine the weeks to process: every completed week after the last completed run, in order, up to `--as-of`. If there is no prior run, process only the latest completed week (no backfill of trades).
+2. Determine the weeks to process: every completed week after the last completed run, in order, up to `--as-of`. If there is no prior run, process only the latest completed week (no backfill of trades). **A decision run for week W is refused unless W is the first run or W − 1 is COMPLETED (v1.2j)**: a skipped week is a skipped stop check.
 3. For each week: in `fetch` mode refresh the cache and verify staleness (6.1, 6.2), then compute and report without persisting; in `decide` mode read the cache only, apply section 4.13 steps 1–5 and record the run.
 4. Write the report and send the Telegram summary once, for the final week processed.
 
@@ -632,3 +668,4 @@ All thirteen Phase 0 questions are answered in the v1.2 changes table at the top
 | 3 | Supply TradingView K / D / EMA50 / ATR readings for ≥ 5 symbols at one weekly close | Operator | Phase 2 |
 | 4 | Maintain `universe.csv` (NIFTY 200) and `quality_gate.csv` | Operator | From Phase 1, then weekly |
 | 5 | Decide whether to fix `token_cache.py`'s timezone-less `expiry_time` and the stale `positional_options/__init__.py` docstring | Operator | Separate approval, outside this feature |
+| 6 | When a held position is flagged FROZEN (a bonus, split or demerger), confirm it in `config/positional_stocks/corporate_actions.csv` (section 4.14) | Operator | Within 2 weekly runs of the flag |
