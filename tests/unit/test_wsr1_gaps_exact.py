@@ -50,5 +50,6 @@ def test_just_under_a_threshold_stays_under() -> None:
 
 
 def test_thresholds_are_decimals() -> None:
-    assert FLAG_MOVE == Decimal("0.30") and REPORT_MOVE == Decimal("0.15")
+    assert isinstance(FLAG_MOVE, Decimal) and isinstance(REPORT_MOVE, Decimal)
+    assert (Decimal("0.30"), Decimal("0.15")) == (FLAG_MOVE, REPORT_MOVE)
     assert exact_move(100.20, 130.26) == Decimal("0.3")
