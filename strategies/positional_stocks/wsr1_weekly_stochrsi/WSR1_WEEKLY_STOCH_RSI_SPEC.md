@@ -5,7 +5,7 @@
 **Engine kind:** `stock_portfolio_engine` (the existing, reserved `EngineKind.STOCK_PORTFOLIO_ENGINE`; no new enum value)
 **Execution shape:** a run-to-completion weekly job — no tick feed, no long-lived worker, no intraday decisions
 **Initial mode:** paper only
-**Status:** implementation specification v1.2l — corporate-action checks after fills; unit factor per fill; stuck-freeze exit
+**Status:** implementation specification v1.2m — price corrections change no units; silent freeze lifts flagged; report contents for Phase 4b
 **Scheduling:** two of its own LaunchAgents (a fetch/preview job and an offline decision job). **Not** registered with `auto_start`, and no change to shared auto-start code
 **Rule source:** "Weekly Stoch RSI V1 Trading Plan" (operator's V1 rulebook, 20 Sep 2026), including its resolved ambiguities and the first-cross / K < 50 fix
 **Target branch:** new `strategy-wsr1-weekly-stochrsi`, cut from `feature-paper-auto-start` at `701e030`
@@ -143,6 +143,15 @@ Numbers in brackets are the Phase 0 question numbers.
 | 4 | A consolidation that floors a holding to 0 shares closes the position on cash in lieu (D101) | 4.14 item 4 |
 | 5 | **Stuck-freeze exit (D102, revised)**: the row must be eligible by its ex date; a factor that includes a gap matches within 10%; the exit fills at open ÷ the row's factor; it is skipped if an acknowledgement lifts the freeze first | 4.14 item 8 |
 | 6 | Operator rule: never acknowledge a gap you know is a bonus, split or consolidation | 4.14 item 7, 16 |
+
+### Changes in v1.2m (26 Sep 2026 — Phase 4a-fix3 audit)
+
+| # | Decision | Section |
+|---|---|---|
+| 1 | **A PRICE_CORRECTION changes no units**: once an eligible PRICE_CORRECTION row matches a freeze, its mark and its stuck-freeze exit use factor 1 (the audit's +₹3,546 false P&L) | 4.14 items 2, 8 |
+| 2 | **A freeze that lifts with neither an acknowledgement nor a rescale is flagged** in the report for the operator to check; a partial restatement whose boundary gap is below 15% can lift it silently (known limitation, low plausibility) | 4.14 item 7, 11 |
+| 3 | The report's corporate-actions section and the Telegram operator-action count are specified (the Phase 4a carry-overs) | 11 |
+| 4 | The journal export's columns are the V1 plan's trade-sheet columns, listed in full | 11 |
 
 ---
 
@@ -384,13 +393,14 @@ Dhan back-adjusts history for bonuses, splits and (sometimes) demergers, but a h
    **Unit factor (v1.2l).** Each buy fill has a unit factor: its item-1 factor f (1 if not restated) × the ratios of the unacknowledged gaps on sessions after its fill session. When the factors of all buy fills agree within 10%, they reflect one unit break — for example a gap where Dhan's back-adjustment stops, with the restated fills after it — and the position's freeze factor is the factor of its **latest restated fill** (exact, from item 1) or, when no fill is restated, of its first fill. The same break is never counted twice. Factors that disagree by more than 10% mean mixed units: the position is frozen at its first fill's factor and escalated, and item 8 does not apply.
    **Operator rule (v1.2l):** never acknowledge a gap you know is a bonus, split or consolidation. An acknowledgement means a real move and resumes decisions on mismatched units — the false stop again. Add a `corporate_actions.csv` row instead.
    **Trade-off, accepted:** a genuine crash of 15% or more on a held stock waits for the operator's acknowledgement before its stop or trail can fire. With the fetch/preview run before the decision run, the operator resolves it in between and there is no delay; otherwise the exit is one week late. A genuine rise of 15% or more likewise pauses that position's partial, add and trail decisions until acknowledged.
-   **Known limitation:** a bonus smaller than about 1:6 (price factor above 0.85) is below the threshold; it is caught only once Dhan restates the history (item 1).
+   **Known limitation:** a bonus smaller than about 1:6 (price factor above 0.85) is below the threshold; it is caught only once Dhan restates the history (item 1). The same holds when Dhan restates only part of the history and the boundary gap left behind is below 15%: a freeze can then lift with neither an acknowledgement nor a rescale, or never start. **Every freeze that lifts that way is flagged in the report (v1.2m)**, and the operator checks the position against the exchange's corporate-action record.
 8. **Stuck-freeze exit (v1.2l, D102).** Dhan's back-adjustment can be missing or partial (MOTHERSON, section 6.1); then no restatement ever resolves the freeze. A position frozen in **3 or more consecutive runs** (any run in which it is not frozen resets the count) is closed when an **eligible** `corporate_actions.csv` row **matches** its freeze factor but cannot be applied under item 4:
     - **eligible:** the row's ex session is after the position's first fill session and on or before the last session of the run's week. A row for a future ex date never matches and never produces the "waiting for Dhan restatement" note;
     - **matches:** the row's price factor (BONUS_SPLIT: 1 ÷ ratio; DEMERGER and PRICE_CORRECTION: ratio) is within 0.5% of the freeze factor when no unacknowledged gap is involved (item 1 only), and within **10%** otherwise, because a gap ratio carries that day's market move;
     - **exit:** a SELL_ALL of the stored shares is queued for the next execution session, reason "exit: corporate action not adjusted by Dhan". It fills at that session's open ÷ **the row's price factor** (the position's own units), with normal sell costs and no separate DEMERGER cash credit. The position's other pending sells are superseded and its pending buys skipped. P&L, cooling-off and re-entry apply as for any exit;
     - if an acknowledgement lifts the freeze before the fill (the operator says it was a real move), the queued exit is skipped ("freeze lifted") and decisions resume in that run. If Dhan restates first and the position is rescaled, item 6 re-issues the exit in the new units, with no price factor;
     - no eligible matching row: the position stays frozen and escalated.
+    - **PRICE_CORRECTION changes no units (v1.2m):** once an eligible PRICE_CORRECTION row matches the freeze, the position is marked at the close and its exit fills at the open (factor 1). The correction applies only to the stored prices and levels (item 4).
    **Known limitation:** two unconfirmed actions stacked on one position multiply their factors, so no single row matches; the position stays frozen and escalated.
 
 ---
@@ -575,9 +585,14 @@ Between the two, the operator reads the preview report and fills `quality_gate.c
     - closed trades this week;
     - the trigger funnel (triggered → filters → ranked → taken, with reasons);
     - a watchlist (armed, K ≤ D, K < 50, filters pass), ranked by RS;
+    - **corporate actions (section 4.14, v1.2m):** every frozen position with its detail, freeze factor and run count (escalations highlighted); for each unadjusted-gap freeze, both the exact `gap_acknowledgements.csv` line (symbol, session, ratio to 4 dp — for a real move only) and a `corporate_actions.csv` row template (for a corporate action); rescales; re-issued sells; consolidation closes (D101); stuck-freeze exits queued, filled or skipped ("freeze lifted"); "waiting for Dhan restatement" notes; and every freeze that lifted with neither an acknowledgement nor a rescale;
+    - `late_fill` and not-traded fills, the "partial sold 0" flag, and blocking or reported gaps;
     - data and input warnings.
-- **Telegram:** a short summary through the existing notifier (regime, orders for next session, exits, equity). No secrets, no full tables.
-- **Journal export:** one CSV row per closed trade, with the V1 journal columns.
+- **Telegram:** a short summary through the existing notifier (regime, orders for next session, exits, equity, and **the number of operator actions**: frozen or escalated positions, freezes lifted without an acknowledgement or rescale, candidates waiting for a quality row — v1.2m). No secrets, no full tables.
+- **Journal export:** one CSV row per closed trade, with the V1 plan's trade-sheet columns in this order (v1.2m), so the paper journal compares line by line with a manual one. `sector` is the universe `industry`; `rule_breaks` and `screenshot` stay blank; `notes` carries corporate-action events (rescale, D101 close, stuck-freeze exit) and flags (`late_fill`, not traded):
+  ```
+  trade_id,symbol,sector,promoter_group,event_risk,regime,arm_week,trigger_week,K_trigger,D_trigger,close_trigger,ema50_1w,perf6m_stock,perf6m_nifty,high_52w,atr_1w,atr_pct,s,A,T1_date,T1_price,T1_shares,L1,L2,stop,T2_date,T2_price,T2_shares,T3_date,T3_price,T3_shares,avg_cost,partial_date,partial_price,partial_shares,exit_date,exit_price,exit_shares,exit_type,pnl_rs,pnl_pct_of_A,weeks_held,rule_breaks,notes,screenshot
+  ```
 
 ---
 
