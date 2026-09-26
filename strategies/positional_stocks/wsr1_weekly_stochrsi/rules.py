@@ -627,7 +627,15 @@ def _frozen_review(position: Position, freeze: Freeze) -> PositionReview:
         f"frozen: {freeze.detail}; no exit, add or partial until confirmed in corporate_actions.csv"
     )
     flags: tuple[str, ...] = (FROZEN_FLAG,)
-    if freeze.escalated:
+    if freeze.mixed_units:
+        # v1.2l item 7: the buy fills are in different units; no row can
+        # resolve it and item 8 does not apply.
+        flags = (
+            *flags,
+            "operator action: mixed units — the buy fills' unit factors disagree by more "
+            "than 10%; resolve by hand",
+        )
+    elif freeze.escalated:
         flags = (
             *flags,
             f"operator action: frozen {freeze.runs} weekly runs — confirm the corporate "

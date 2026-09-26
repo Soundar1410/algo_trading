@@ -296,14 +296,82 @@ def gap_detail(gaps: Iterable[Gap]) -> str:
     return "; ".join(f"unadjusted gap {gap.session} ratio {gap.ratio}" for gap in gaps)
 
 
+#: Spec 4.14 v1.2l: unit factors of one break agree within 10%, and item 8
+#: matches a factor that includes a gap within 10% — a gap ratio carries
+#: that day's market move.
+GAP_TOLERANCE = Decimal("0.10")
+
+
+@dataclass(frozen=True, slots=True)
+class UnitFactor:
+    """A position's freeze factor under item 7's unit-factor rule (v1.2l)."""
+
+    factor: Decimal
+    #: The buy fills' unit factors disagree by more than 10%: mixed units.
+    mixed: bool
+    #: Each buy fill's unit factor, oldest first — for the report.
+    per_fill: tuple[Decimal, ...]
+
+
+def freeze_factor(
+    position: Position, fill_checks: Iterable[FillCheck], gaps: Iterable[Gap]
+) -> UnitFactor:
+    """Spec 4.14 item 7, "Unit factor" (v1.2l).
+
+    Each buy fill's unit factor is its item-1 f (1 if not restated) times the
+    ratios of the unacknowledged gaps on sessions after its fill session. If
+    they all agree within 10% they reflect one unit break — e.g. a gap where
+    Dhan's back-adjustment stops, with the restated fills after it — and the
+    factor is the latest restated fill's (exact, from item 1), or the first
+    fill's when none is restated: the same break is never counted twice.
+    Otherwise the units are mixed: the first fill's factor, flagged.
+    """
+    restated = {c.action: c for c in fill_checks if c.restated}
+    gap_list = tuple(gaps)
+    factors: list[Decimal] = []
+    latest_restated: Decimal | None = None
+    for buy in position.buys:
+        check = restated.get(OrderAction.buy(buy.tranche))
+        f = check.factor if check is not None else Decimal("1")
+        assert f is not None
+        u = f * gap_factor(g for g in gap_list if g.session > buy.session)
+        factors.append(u)
+        if check is not None:
+            latest_restated = u
+    agree = max(factors) / min(factors) - 1 <= GAP_TOLERANCE
+    if not agree:
+        return UnitFactor(factors[0], True, tuple(factors))
+    chosen = latest_restated if latest_restated is not None else factors[0]
+    return UnitFactor(chosen, False, tuple(factors))
+
+
+def eligible_rows(
+    position: Position, rows: Iterable[CorporateActionRow], through: date
+) -> list[CorporateActionRow]:
+    """Spec 4.14 item 8 (v1.2l): rows whose ex session is after the position's
+    first fill session and on or before ``through`` — the last session of the
+    run's week — and later than any action already applied. A row for a
+    future ex date never matches a stuck freeze and never produces the
+    "waiting for Dhan restatement" note."""
+    return [row for row in unapplied_rows(position, rows) if row.ex_session <= through]
+
+
 def stuck_exit_row(
-    position: Position, rows: Iterable[CorporateActionRow], factor: Decimal
+    position: Position,
+    rows: Iterable[CorporateActionRow],
+    factor: Decimal,
+    *,
+    through: date,
+    gap_based: bool,
 ) -> CorporateActionRow | None:
-    """D102: a confirmed row explaining the freeze ``factor`` within 0.5%
-    (BONUS_SPLIT: 1 / ratio; DEMERGER and PRICE_CORRECTION: ratio) that the
-    caller could not apply — the history was never, or only partly, restated."""
-    for row in unapplied_rows(position, rows):
-        if _close_to(factor, row.price_factor):
+    """Spec 4.14 item 8 (v1.2l, D103): an eligible row whose price factor
+    (BONUS_SPLIT: 1 / ratio; DEMERGER and PRICE_CORRECTION: ratio) matches the
+    freeze ``factor`` — within 0.5% for item 1 alone, within 10% when an
+    unacknowledged gap is part of the factor — but that could not be applied:
+    the history was never, or only partly, restated."""
+    tolerance = GAP_TOLERANCE if gap_based else TOLERANCE
+    for row in eligible_rows(position, rows, through):
+        if abs(factor / row.price_factor - 1) <= tolerance:
             return row
     return None
 

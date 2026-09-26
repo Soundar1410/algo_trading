@@ -554,19 +554,30 @@ class ShareAdjustment:
 
 @dataclass(frozen=True, slots=True)
 class Freeze:
-    """A held position whose history was restated and is not yet confirmed
-    (spec 4.14 v1.2j). ``factor`` is cached open / stored fill price; ``runs``
-    counts this run and the consecutive frozen runs before it."""
+    """A held position frozen by spec 4.14: its history was restated and not
+    yet confirmed (item 1), or it has an unacknowledged raw gap (item 7).
+
+    ``factor`` turns a current close into the position's own units (it is
+    marked at close / factor): f for item 1 alone, the unit factor of item 7
+    (v1.2l) when a gap is involved. ``runs`` counts this run and the
+    consecutive frozen runs before it. ``gap_based`` records that an
+    unacknowledged gap is part of the factor (item 8 then matches within
+    10%); ``mixed_units`` that the buy fills' unit factors disagree by more
+    than 10% — escalated at once, and item 8 never applies.
+    """
 
     position_id: str
     factor: Decimal
     detail: str
     runs: int = 1
+    gap_based: bool = False
+    mixed_units: bool = False
 
     @property
     def escalated(self) -> bool:
-        """Spec 4.14 item 5: frozen for more than 2 weekly runs."""
-        return self.runs > 2
+        """Spec 4.14 item 5: frozen for more than 2 weekly runs — or, v1.2l
+        item 7, holding mixed units."""
+        return self.runs > 2 or self.mixed_units
 
 
 @dataclass(frozen=True, slots=True)

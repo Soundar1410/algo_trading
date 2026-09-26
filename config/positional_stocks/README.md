@@ -166,17 +166,34 @@ Confirm the action here, within 2 weekly runs of the flag:
     session's restated open, flagged `late_fill` (v1.2k).
   - The rescale is stored as its own record and the original fills are never
     edited. A trade's P&L includes the cash the action paid.
-- **Stuck freeze (D102).** Dhan's back-adjustment can be missing, or partial:
-  MOTHERSON's 1:2 bonus was adjusted back only to 30 Apr 2024. Then a row can
-  never apply, and the position would stay frozen forever, holding a slot
-  with no stop able to fire. So after 3 or more consecutive frozen runs, if a
-  row here matches the freeze factor within 0.5% but cannot be applied, the
-  position is exited:
-  - a SELL_ALL of its stored shares at the next session's open ÷ the factor
-    (its own units), with normal sell costs;
-  - reason "exit: corporate action not adjusted by Dhan".
+- **Stuck freeze (spec 4.14 item 8, D102 revised by D103).** Dhan's
+  back-adjustment can be missing, or partial: MOTHERSON's 1:2 bonus was
+  adjusted back only to 30 Apr 2024. Then a row can never apply, and the
+  position would stay frozen forever, holding a slot with no stop able to
+  fire. So after **3 or more consecutive frozen runs** the position is exited,
+  if a row here is **eligible** and **matches** but cannot be applied:
+  - **eligible:** its `ex_session` is after the position's first fill and on
+    or before the last session of the run's week. A row for a future ex date
+    neither exits nor shows the "waiting for Dhan restatement" note until
+    that date has passed;
+  - **matches:** its price factor (BONUS_SPLIT 1 ÷ ratio; the others: ratio)
+    is within **0.5%** of the freeze factor when only a restatement is
+    involved, and within **10%** when a raw gap is part of it, since a gap
+    ratio carries that day's market move;
+  - **exit:** a SELL_ALL of its stored shares at the next session's open ÷
+    **the row's** price factor (its own units), with normal sell costs and
+    reason "exit: corporate action not adjusted by Dhan";
+  - if you acknowledge the gap before that fill, the exit is skipped ("freeze
+    lifted") and decisions resume that run. If Dhan restates first, the exit
+    is re-issued in the new units.
 
-  With no matching row, it stays frozen and escalated.
+  With no eligible matching row, or with **mixed units** (the buy fills' unit
+  factors disagree by more than 10%, which is escalated at once), it stays
+  frozen and escalated.
+- **Unit factor (v1.2l).** Each buy fill's factor is its restatement factor
+  (1 if not restated) × the raw gaps after it. When Dhan's back-adjustment
+  stops at a boundary, the gap there and the restated fills after it are one
+  break, counted once.
 - **Never acknowledge a gap you know is a bonus, split or consolidation.** An
   entry in `gap_acknowledgements.csv` means "this was a real price move". It
   lifts the freeze and resumes decisions on mismatched units, which gives a
@@ -185,6 +202,5 @@ Confirm the action here, within 2 weekly runs of the flag:
   header, an unknown kind, a ratio out of range, a bad date, or the same
   (symbol, ex_session) twice.
 - **Known limit:** two actions stacked on one open position (both unconfirmed
-  at once) cannot be resolved by one row. The position stays frozen and
-  escalates, and then exits under D102 only if a row explains the combined
-  factor.
+  at once) multiply their factors, so no single row matches. The position
+  stays frozen and escalated.

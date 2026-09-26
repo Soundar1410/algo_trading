@@ -28,6 +28,8 @@ from _wsr1_rules_fixtures import (
 from strategies.positional_stocks.wsr1_weekly_stochrsi.corporate_actions import (
     Rescale,
     detect,
+    eligible_rows,
+    freeze_factor,
     gap_detail,
     gap_factor,
     rescale_levels,
@@ -434,12 +436,109 @@ def test_t2_on_the_gap_session_then_restated_rescales_t1_only() -> None:
 
 # ============================================ D102: the stuck-exit row
 def test_the_stuck_exit_row_must_explain_the_freeze_factor() -> None:
+    # v1.2l item 8: the signature now carries the run's last session (for
+    # eligibility) and whether a gap is part of the factor (for the tolerance).
     position = open_position("A", atr_pct=0.06, p1=1000.0, fill_week=200)
+    through = friday(205)
     bonus = _row("2", monday_after(202))
-    assert stuck_exit_row(position, [bonus], D("0.5")) == bonus
-    assert stuck_exit_row(position, [bonus], D("0.6")) is None
+    for gap_based in (False, True):
+        assert (
+            stuck_exit_row(position, [bonus], D("0.5"), through=through, gap_based=gap_based)
+            == bonus
+        )
+        assert (
+            stuck_exit_row(position, [bonus], D("0.6"), through=through, gap_based=gap_based)
+            is None
+        )
+    demerger = _row("0.9", monday_after(202), DEMERGER)
     assert (
-        stuck_exit_row(position, [_row("0.9", monday_after(202), DEMERGER)], D("0.9")) is not None
+        stuck_exit_row(position, [demerger], D("0.9"), through=through, gap_based=False) is not None
     )
     # A row for the T1 fill's own session or earlier cannot be the cause.
-    assert stuck_exit_row(position, [_row("2", position.buys[0].session)], D("0.5")) is None
+    early = _row("2", position.buys[0].session)
+    assert stuck_exit_row(position, [early], D("0.5"), through=through, gap_based=True) is None
+
+
+def test_item_8_tolerance_is_half_a_percent_without_a_gap_and_10_percent_with_one() -> None:
+    position = open_position("A", atr_pct=0.06, p1=1000.0, fill_week=200)
+    bonus = _row("2", monday_after(202))
+    through = friday(205)
+    # An ex-day ratio of 0.51 (2% off 0.5) and 0.46 (8%) match only with a gap.
+    for factor in ("0.51", "0.46"):
+        assert (
+            stuck_exit_row(position, [bonus], D(factor), through=through, gap_based=False) is None
+        )
+        assert (
+            stuck_exit_row(position, [bonus], D(factor), through=through, gap_based=True) == bonus
+        )
+    # 0.44 is 12% off: no match either way.
+    assert stuck_exit_row(position, [bonus], D("0.44"), through=through, gap_based=True) is None
+    # 0.502 is within 0.5%: matches without a gap too.
+    assert stuck_exit_row(position, [bonus], D("0.502"), through=through, gap_based=False) == bonus
+
+
+def test_a_row_for_a_future_ex_date_is_not_eligible_until_it_passes() -> None:
+    position = open_position("A", atr_pct=0.06, p1=1000.0, fill_week=200)
+    future = _row("2", monday_after(210))
+    assert eligible_rows(position, [future], friday(205)) == []
+    assert stuck_exit_row(position, [future], D("0.5"), through=friday(205), gap_based=True) is None
+    assert eligible_rows(position, [future], friday(211)) == [future]
+    # Its ex session is itself the last one allowed (on or before).
+    assert eligible_rows(position, [future], monday_after(210)) == [future]
+
+
+# ================================================ v1.2l: unit factor per fill
+def _two_fills(t2_price: float = 450.0) -> Position:
+    position = open_position("A", atr_pct=0.06, p1=1000.0, fill_week=200)
+    return fill(position, OrderAction.BUY_T2, price=t2_price, week_index=203)
+
+
+def test_one_break_counted_once_the_restated_fill_wins() -> None:
+    """The partial-restatement case. A 1:1 bonus; Dhan restates only back to a
+    boundary B. T1 (1,000) is before B and stays unrestated, with B's gap of
+    0.5398 after it; T2 (bought at a raw 1,079.60 after B) is restated by 0.5
+    to 539.80, with no gap after it. One break, counted once: 0.5 — not
+    0.5398 x 0.5 = 0.27."""
+    position = _two_fills(t2_price=1079.6)
+    boundary = monday_after(201)
+    assert position.buys[0].session < boundary < position.buys[1].session
+    daily = _gap_bars(position, {boundary: 539.8}, friday(205))
+    gaps = unadjusted_gaps(position, daily, ())
+    found = detect(position, daily)
+    assert found is not None and len(gaps) == 1
+    unit = freeze_factor(position, found.checks, gaps)
+    assert unit.per_fill == (D("0.5398"), D("0.5"))
+    assert (unit.factor, unit.mixed) == (D("0.5"), False)
+
+
+def test_item_1_and_a_later_gap_after_every_fill_multiply() -> None:
+    """The audit's 0.40 case: every fill restated by 0.5, then a raw 0.8 gap
+    after all of them — two breaks, so the product."""
+    position = open_position("A", atr_pct=0.06, p1=1000.0, fill_week=200)
+    later = monday_after(203)
+    bars = []
+    for b in _bars({}, friday(205)):
+        price = 500.0 if b.session < later else 400.0
+        bars.append(DailyBar(b.session, price, price + 1, price - 1, price, 1e6))
+    gaps = unadjusted_gaps(position, bars, ())
+    found = detect(position, bars)
+    assert found is not None and len(gaps) == 1
+    unit = freeze_factor(position, found.checks, gaps)
+    assert (unit.factor, unit.mixed) == (D("0.4"), False)
+
+
+def test_unit_factors_more_than_10_percent_apart_are_mixed_units() -> None:
+    """T1 restated by 0.5; T2 bought later in new units with no gap after it
+    (u = 1): the fills are in different units. Frozen at T1's factor,
+    escalated at once, and item 8 never applies."""
+    position = _two_fills()
+    t1 = position.buys[0].session
+    daily = _bars({t1: 500.0}, friday(205), default=450.0)
+    found = detect(position, daily)
+    assert found is not None
+    unit = freeze_factor(position, found.checks, ())
+    assert (unit.factor, unit.mixed) == (D("0.5"), True)
+    freeze = Freeze(
+        position.position_id, unit.factor, "x", runs=1, gap_based=True, mixed_units=True
+    )
+    assert freeze.escalated
