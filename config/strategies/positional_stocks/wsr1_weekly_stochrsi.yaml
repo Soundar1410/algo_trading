@@ -1,0 +1,43 @@
+# wsr1_weekly_stochrsi — weekly Stoch RSI swing entries on NIFTY 200 cash
+# equities, with a three-tranche averaging plan (spec v1.3, section 12).
+#
+# PAPER ONLY. `enabled: false` here AND in config/runtimes/positional_stocks.yaml:
+# both gate the job (D115). The operator's go-live commit sets both to true in
+# one commit; installing the two LaunchAgents is the second, separate switch.
+#
+# Every value below is bound strictly by runtimes/positional_stocks/run_config.py:
+# an unknown key, or a key whose value the code does not implement (the stoch
+# lengths, rs_weeks, the regime index, the input paths...), refuses the run.
+
+strategy_id: wsr1_weekly_stochrsi
+runtime_id: positional_stocks
+enabled: false
+mode: paper
+live_approved: false
+engine: stock_portfolio_engine
+
+parameters:
+  # IST. The LaunchAgent plists are generated from these values
+  # (orchestration/launchd/generate_plists.py). Spec 10.3 v1.3.
+  schedule:
+    fetch_attempts: ["SATURDAY 08:00", "SATURDAY 14:00", "SUNDAY 10:00"]
+    decide: "MONDAY 08:30"
+  deadlines: {fetch_minutes: 20, decide_minutes: 5, fetch_requests_per_second: 3}
+  paths: {reports: data/reports/positional_stocks}
+  capital: 1000000
+  base_allocation: 100000
+  max_positions: 10
+  committed_cap_pct: 100
+  buffer_pct: 0
+  max_per_sector: 2
+  max_per_group: 1
+  stoch: {rsi_length: 14, stoch_length: 14, k: 3, d: 3, arm_level: 20, arm_window_weeks: 8, max_k_at_cross: 50, overbought: 90}
+  filters: {ema_trend: 50, rs_weeks: 26, min_pct_of_52w_high: 60, max_atr_pct: 12, min_history_weeks: 200, min_traded_value_cr: 20, repeat_lookback_weeks: 26}
+  sizing: {spacing_floor_pct: 10, spacing_atr_mult: 1.5, tranches_pct: [40, 30, 30], stop_spacing_mult: 3, event_risk_alloc_mult: 0.5}
+  adds: {require_close_above_prior_high: true, require_close_above_ema: 200}
+  exits: {trail_ema: 10, time_exit_weeks: 52, trail_time_weeks: 52}
+  reentry: {cooling_off_weeks: 26}
+  regime: {index: NIFTY 50, ema: 40, slope_lookback_weeks: 4, red_max_entries: 1, normal_max_entries: 2}
+  brakes: {dd1_pct: 10, dd1_pause_weeks: 4, dd2_pct: 20, brake_2_cleared_on: null}
+  costs: {cost_bps_buy: 12, cost_bps_sell: 11, fixed_cost_per_sell_rs: 15}
+  inputs: {universe: config/positional_stocks/universe.csv, quality_gate: config/positional_stocks/quality_gate.csv, results_calendar: config/positional_stocks/results_calendar.csv, require_results_calendar: false}

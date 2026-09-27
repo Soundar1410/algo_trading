@@ -91,7 +91,6 @@ from strategies.positional_stocks.wsr1_weekly_stochrsi.inputs import InputFileEr
 from strategies.positional_stocks.wsr1_weekly_stochrsi.iso_weeks import WeekKey, week_of
 from strategies.positional_stocks.wsr1_weekly_stochrsi.models import DailyBar
 from strategies.positional_stocks.wsr1_weekly_stochrsi.pacing import (
-    DEFAULT_FETCH_DEADLINE_MINUTES,
     DEFAULT_REQUESTS_PER_SECOND,
     RequestThrottle,
     RunDeadline,
@@ -355,7 +354,7 @@ def run_fetch(options: Options, env: RunEnvironment) -> int:
     """Fetch mode, under the weekly run's lock (see the module docstring)."""
     config = env.config
     paths = env.paths
-    deadline = RunDeadline.of_minutes(DEFAULT_FETCH_DEADLINE_MINUTES, monotonic=env.monotonic)
+    deadline = RunDeadline.of_minutes(config.fetch_deadline_minutes, monotonic=env.monotonic)
     calendar = TradingCalendar.from_config(paths.config_root)
     try:
         operator = load_operator_inputs(paths.config_root / "positional_stocks")
@@ -415,7 +414,7 @@ def run_fetch(options: Options, env: RunEnvironment) -> int:
         f"Refreshed {len(run.tally.refreshed)}: {run.tally.counts()}",
         *lines,
         f"Fetch took {env.monotonic() - started:.1f} s of the "
-        f"{DEFAULT_FETCH_DEADLINE_MINUTES}-minute budget",
+        f"{config.fetch_deadline_minutes:.0f}-minute budget",
     ]
     if run.tally.restated:
         lines.append(f"Restated and refetched in full: {', '.join(run.tally.restated)}")

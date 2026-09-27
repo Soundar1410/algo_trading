@@ -1,0 +1,27 @@
+# Positional stocks strategy group — wsr1_weekly_stochrsi's weekly batch job.
+#
+# Spec: strategies/positional_stocks/wsr1_weekly_stochrsi/
+# WSR1_WEEKLY_STOCH_RSI_SPEC.md (v1.3), sections 10, 12 and 13.
+#
+# NOT a supervisor/worker runtime. It has no scripts/_runtimes.py RUNTIMES
+# entry and orchestration.auto_start never starts it: it is two
+# run-to-completion jobs (`python -m runtimes.positional_stocks.weekly_run
+# --mode fetch|decide`), scheduled only by their own two LaunchAgents, which
+# ship generated but NOT installed.
+#
+# `enabled: false` here AND in the strategy file: BOTH gate the job (D115).
+# While either is false, fetch and every writing decide run refuse (exit 1,
+# alerted); --dry-run and the replay harness still run. Go-live is one
+# operator commit setting both to true — after the spec 16 go-live checklist
+# (runbook "Operator guide"). PAPER ONLY: live_execution_allowed stays false.
+#
+# This file and config/strategies/positional_stocks/wsr1_weekly_stochrsi.yaml
+# must always land in the same commit: common/config/loader.py scans every
+# strategy file and raises for one whose runtime file is missing, which would
+# stop intraday_options and positional_options from starting.
+
+runtime_id: positional_stocks
+enabled: false
+live_execution_allowed: false
+shared_market_feed: false
+database: data/operational/positional_stocks.db

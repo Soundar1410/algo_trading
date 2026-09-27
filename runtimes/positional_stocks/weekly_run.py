@@ -136,6 +136,9 @@ class RunEnvironment:
     monotonic: Callable[[], float] = _time.monotonic
     out: Callable[[str], None] = print
     config: RunConfig = field(default_factory=RunConfig)
+    #: Phase 5: why the committed configuration could not be bound, if it
+    #: could not; the run then refuses with it.
+    config_error: str | None = None
     #: Fetch mode's network services (Phase 4b-2); ``None`` builds the real
     #: ones from settings. Tests inject fakes — no test touches the network.
     fetch_services: FetchServices | None = None
@@ -167,11 +170,21 @@ def default_environment() -> RunEnvironment:
 
     settings = load_settings()
     paths = load_paths(settings=settings)
+    # Phase 5: the committed YAML pair, bound strictly. A config that cannot
+    # be bound leaves the fail-closed defaults (both flags off) and a reason
+    # the run refuses with — reported and alerted, never a traceback.
+    config, config_error = RunConfig(), None
+    try:
+        config = RunConfig.from_config(paths.config_root)
+    except RunRefused as exc:
+        config_error = str(exc)
     return RunEnvironment(
         project_root=paths.project_root,
         now=now_ist,
         notifier=SafeNotifier(build_notifier(settings)),
-        preflight=lambda: default_preflight(paths.config_root, RunConfig().runtime_id),
+        preflight=lambda: default_preflight(paths.config_root, config.runtime_id),
+        config=config,
+        config_error=config_error,
     )
 
 
@@ -437,6 +450,8 @@ def refuse(env: RunEnvironment, options: Options, reason: str) -> int:
 def run(options: Options, env: RunEnvironment) -> int:
     say = env.out
     config = env.config
+    if env.config_error is not None:
+        return refuse(env, options, env.config_error)
     try:
         config.check_paper()
     except RunRefused as exc:
