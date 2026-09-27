@@ -5,7 +5,7 @@
 **Engine kind:** `stock_portfolio_engine` (the existing, reserved `EngineKind.STOCK_PORTFOLIO_ENGINE`; no new enum value)
 **Execution shape:** a run-to-completion weekly job — no tick feed, no long-lived worker, no intraday decisions
 **Initial mode:** paper only
-**Status:** implementation specification v1.2m — price corrections change no units; silent freeze lifts flagged; report contents for Phase 4b
+**Status:** implementation specification v1.3 — operations: fetch mode, preview, backup, schedule; D104–D114 folded in; Phase 5 scope
 **Scheduling:** two of its own LaunchAgents (a fetch/preview job and an offline decision job). **Not** registered with `auto_start`, and no change to shared auto-start code
 **Rule source:** "Weekly Stoch RSI V1 Trading Plan" (operator's V1 rulebook, 20 Sep 2026), including its resolved ambiguities and the first-cross / K < 50 fix
 **Target branch:** new `strategy-wsr1-weekly-stochrsi`, cut from `feature-paper-auto-start` at `701e030`
@@ -153,6 +153,27 @@ Numbers in brackets are the Phase 0 question numbers.
 | 3 | The report's corporate-actions section and the Telegram operator-action count are specified (the Phase 4a carry-overs) | 11 |
 | 4 | The journal export's columns are the V1 plan's trade-sheet columns, listed in full | 11 |
 
+### Changes in v1.3 (27 Sep 2026 — Phase 4b review; folds in D104–D114)
+
+| # | Decision | Section |
+|---|---|---|
+| 1 | **Backup:** a verified snapshot of the book before every decide run that writes, 12 kept; any snapshot failure refuses the run cleanly (D104, D112) | 9 |
+| 2 | **First-run guard:** a new book starts at the latest completed week; a STARTED first week can always be redone (D105; audit R6-5) | 10.2 |
+| 3 | **Fetch failures:** 10 or fewer symbols failed → preview, exit 6; more, or NIFTY, → no preview, exit 5. A held or pending symbol the scrip master cannot resolve counts as **failed**, never quietly skipped (D106; audit R6-2) | 6.1 |
+| 4 | **Every fetch request ends at the target week's last session**, and a fetch never shortens a cache that already reaches further (D107; audit R6-3) | 6.1 |
+| 5 | **Monthly full refetch per symbol** (a `full_history_at` marker); a restated symbol's file is replaced only after its full refetch has arrived (D108; audit R6-1) | 6.1 |
+| 6 | A silent freeze lift is explained only by acknowledging a gap of the previous run's freeze, or by a rescale (D109) | 4.14 item 7 |
+| 7 | A stale held or pending symbol is marked at its last daily close (D110) | 6.2 |
+| 8 | The journal writes each value in the units of its event (D111) | 11 |
+| 9 | A catch-up stopped part-way still reports every committed week (D113) | 10.2 |
+| 10 | The replay is a committed harness that runs on a temporary project only (D114) | 14 |
+| 11 | Exit codes for both modes | 10.1 |
+| 12 | **The watchlist ignores the quality gate and shows each symbol's quality status**, so it tells the operator what to check before a trigger | 11 |
+| 13 | **Sizing (operator decision A): a tranche worth less than one share still skips the order** — high-priced stocks are not traded | 4.8 |
+| 14 | **Schedule:** fetch Saturday 08:00, retried Saturday 14:00 and Sunday 10:00 (Friday 18:00 dropped); decide Monday 08:30. "Not yet published" alerts only on the final attempt; a fetch never mints a token during a session window or while a paper runtime runs; every refusal alerts (audit R6-4) | 3, 10.3, 12 |
+| 15 | Eight verified real moves acknowledged in `gap_acknowledgements.csv`; four symbols stay blocked | 6.1, 16 |
+| 16 | **`enabled: false` gates the job**; go-live is an operator commit (`enabled: true`) plus installing the agents; the branch checked out on the Mac must contain this feature | 12, 16 |
+
 ---
 
 ## 1. Purpose and authority
@@ -197,7 +218,7 @@ Buy quality NIFTY 200 stocks when weekly momentum turns up from oversold, inside
 | Timezone | All dates and times in `Asia/Kolkata` via `common.utils.timeutils`. Never the host clock's local date (see D88+) |
 | Weekly bar | One bar per ISO week from that week's trading sessions: open = first session open, high/low = extremes, close = last session close. The bar's date = its last trading session |
 | Completed week | A week is usable only after its last session has closed (after 15:30 IST on its last trading day). A run must never use an incomplete current week |
-| Fetch and preview | Friday 18:00 IST, retried Saturday and Sunday 10:00 IST; idempotent (section 10.3) |
+| Fetch and preview | Saturday 08:00 IST, retried Saturday 14:00 and Sunday 10:00 IST; idempotent (section 10.3, v1.3) |
 | Decision time | Monday 08:30 IST — the decision run, offline from the cache the fetch job wrote (section 10.3) |
 | Execution time | Every order decided for a week fills at the **open of the first trading session that starts after the decision run** — normally Monday. A decision run that happens after a session has opened (late start, retry) fills at the next session's open, never at an open that has already passed. Catch-up of fully missed weeks (section 10.2) fills each week's orders at the first session after that week, and the report flags those fills as catch-up fills |
 | Holidays | Trading sessions come from the data. A Monday holiday moves execution to the next session |
@@ -296,7 +317,7 @@ L2   = P1 × (1 − 2s)
 Stop = P1 × (1 − 3s)
 ```
 
-Levels are fixed at the T1 fill and never recalculated. If `floor(...)` gives 0 shares, the order is skipped and reported.
+Levels are fixed at the T1 fill and never recalculated. If `floor(...)` gives 0 shares, the order is skipped and reported. **Kept by operator decision (v1.3, option A):** a stock whose single share costs more than its tranche (MRF, PAGEIND, POWERINDIA and similar) is never entered, because the averaging plan needs three buyable tranches. The report states "one share costs more than the tranche".
 
 ### 4.9 Averaging (adds)
 
@@ -393,7 +414,7 @@ Dhan back-adjusts history for bonuses, splits and (sometimes) demergers, but a h
    **Unit factor (v1.2l).** Each buy fill has a unit factor: its item-1 factor f (1 if not restated) × the ratios of the unacknowledged gaps on sessions after its fill session. When the factors of all buy fills agree within 10%, they reflect one unit break — for example a gap where Dhan's back-adjustment stops, with the restated fills after it — and the position's freeze factor is the factor of its **latest restated fill** (exact, from item 1) or, when no fill is restated, of its first fill. The same break is never counted twice. Factors that disagree by more than 10% mean mixed units: the position is frozen at its first fill's factor and escalated, and item 8 does not apply.
    **Operator rule (v1.2l):** never acknowledge a gap you know is a bonus, split or consolidation. An acknowledgement means a real move and resumes decisions on mismatched units — the false stop again. Add a `corporate_actions.csv` row instead.
    **Trade-off, accepted:** a genuine crash of 15% or more on a held stock waits for the operator's acknowledgement before its stop or trail can fire. With the fetch/preview run before the decision run, the operator resolves it in between and there is no delay; otherwise the exit is one week late. A genuine rise of 15% or more likewise pauses that position's partial, add and trail decisions until acknowledged.
-   **Known limitation:** a bonus smaller than about 1:6 (price factor above 0.85) is below the threshold; it is caught only once Dhan restates the history (item 1). The same holds when Dhan restates only part of the history and the boundary gap left behind is below 15%: a freeze can then lift with neither an acknowledgement nor a rescale, or never start. **Every freeze that lifts that way is flagged in the report (v1.2m)**, and the operator checks the position against the exchange's corporate-action record.
+   **Known limitation:** a bonus smaller than about 1:6 (price factor above 0.85) is below the threshold; it is caught only once Dhan restates the history (item 1). The same holds when Dhan restates only part of the history and the boundary gap left behind is below 15%: a freeze can then lift with neither an acknowledgement nor a rescale, or never start. **Every freeze that lifts that way is flagged in the report (v1.2m)**, and the operator checks the position against the exchange's corporate-action record. A lift counts as explained only by acknowledging one of the gaps stored with the previous run's freeze, or by a rescale in this run (v1.3, D109).
 8. **Stuck-freeze exit (v1.2l, D102).** Dhan's back-adjustment can be missing or partial (MOTHERSON, section 6.1); then no restatement ever resolves the freeze. A position frozen in **3 or more consecutive runs** (any run in which it is not frozen resets the count) is closed when an **eligible** `corporate_actions.csv` row **matches** its freeze factor but cannot be applied under item 4:
     - **eligible:** the row's ex session is after the position's first fill session and on or before the last session of the run's week. A row for a future ex date never matches and never produces the "waiting for Dhan restatement" note;
     - **matches:** the row's price factor (BONUS_SPLIT: 1 ÷ ratio; DEMERGER and PRICE_CORRECTION: ratio) is within 0.5% of the freeze factor when no unacknowledged gap is involved (item 1 only), and within **10%** otherwise, because a gap ratio carries that day's market move;
@@ -432,10 +453,20 @@ Dhan back-adjusts history for bonuses, splits and (sometimes) demergers, but a h
     - **An acknowledgement is keyed to (symbol, gap session, ratio), never to the symbol alone (v1.2b).** A new unexplained gap re-blocks an acknowledged symbol.
     - **Only gaps in the most recent 520 weekly bars (~10 years) block (v1.2e).** Older gaps are reported, never blocking. A price break of factor r that is N weeks old moves EMA200 by about |1 − r| × 0.99005^N: a 1:1 bonus (r = 0.5) left unadjusted 520 weeks ago moves it by ~0.3%, inside parity tolerance, and every other indicator here looks back far less. Applied to full history without a window, the rule would block 43 symbols — RELIANCE and HDFCBANK among them — over breaks 15–20 years old.
     - **Monthly full refetch (v1.2b):** the first fetch of each calendar month refetches every symbol's full history instead of the tail. The overlap check sees only the last 10 sessions, so it cannot detect Dhan restating older history — for example correcting, or newly breaking, a partial back-adjustment like MOTHERSON's.
+    - **Fetch mechanics (v1.3):**
+        - **End date (D107):** every request, full or tail, ends at the target week's expected last session, never at the as-of date, so an unfinished trading-day candle never enters the cache. **A fetch whose target ends before a symbol's cached last session never replaces or shortens that file**: it leaves the symbol as it is (audit R6-3).
+        - **Monthly refetch per symbol (D108):** each cache file records `full_history_at`; a full fetch sets it, a tail merge keeps it. A marker from an earlier IST month, or none, means a full refetch. `--force-refetch` refetches every symbol now and retries unresolved ones (limitation 40).
+        - **Restatement (audit R6-1):** a tail whose overlap shows a restatement is refetched in full, and the cached file is replaced only after that full history has arrived (atomically). If the full refetch fails, the old file stays and the symbol counts as failed.
+        - **Failures (D106):** after the client's retries and a second pass at the end of the run —
+            - **systemic** (the deadline; NIFTY 50 failing; more than **10** universe symbols failed): no preview, a `<week_ending>-preview-failed.md` listing what was refreshed, failed and unresolved, an alert, and the next scheduled attempt retries;
+            - **small** (10 or fewer, NIFTY refreshed): the preview is written; each failed symbol is stale to it exactly as to Monday's decide run (6.2); held or pending ones are at the top of the report ("its stop cannot be checked this week"); each is an operator action; exit 6.
+        - **Unresolved symbols (audit R6-2):** a symbol the scrip master cannot resolve (a rename, a delisting) is skipped and reported (section 5) only when it is neither held nor pending. **A held or pending unresolved symbol counts as failed** — highlighted, an operator action, exit 6 — and is never exempt from the idempotency check.
+        - **Idempotency:** a later attempt exits 0 with no network call only when NIFTY and every universe, held and pending symbol (except non-held unresolved ones) cover the week's last session and the preview exists. Otherwise it fetches only the symbols not yet covering it, and rewrites the preview.
+    - **Gap acknowledgements (v1.3):** eight gaps verified against independent NSE data as real moves are acknowledged — the 25 Oct 2017 PSU-bank recapitalisation rally (BANKBARODA, BANKINDIA, CANBK, PNB, UNIONBANK), INDUSINDBK 26 Mar 2020, TATACOMM 17 Sep 2019 and POLICYBZR 24 Sep 2026. MOTHERSON (partial Dhan adjustment), PATANJALI (insolvency relisting), IDEA and YESBANK (rights issues, reconstruction) stay blocked until their gaps leave the 520-week window.
 
 ### 6.2 Staleness
 
-A run for week W requires every used series to contain W's last session. Series that don't are skipped and reported. If NIFTY 50 is stale, the whole run stops (regime unknown). **Fail closed.**
+A run for week W requires every used series to contain W's last session. Series that don't are skipped and reported. If NIFTY 50 is stale, the whole run stops (regime unknown). **Fail closed.** A held or pending stale symbol is kept, never decided on the truncated week, and **marked at its last daily close** — the session its corporate-action checks also scan up to (v1.3, D110). From its second consecutive stale week it is an operator action.
 
 **W's last session comes from the calendar, never from the data (v1.2b).** It is the last weekday (Monday–Friday) of the ISO week that is not in the verified NSE holiday list in `config/global.yaml` (`holidays`), read through the existing session/calendar code rather than a second copy.
 
@@ -519,6 +550,7 @@ Columns: `symbol, results_date`.
 - Repository access lives in a new module for these tables, not in new overloads on `ExecutionRepository`.
 - **Idempotency:** a run is keyed by `(strategy_id, week_ending)`. Re-running a completed week changes nothing. A pending order is filled exactly once, by state transition inside one transaction.
 - **Crash safety:** a run interrupted mid-way is resumable. Each week's writes commit in one transaction, or in clearly ordered transactions with a run status that the next run checks.
+- **Backup (v1.3, D104 / D112):** before a decide run writes its first week, `positional_stocks.db` is copied with SQLite's online backup API to `data/backups/positional_stocks_<UTC timestamp>.db`, verified (it opens and restores clean), and the newest 12 are kept. No snapshot on a dry run, a preview, a cold cache, a deadline or an up-to-date run. Any snapshot failure deletes the partial file, refuses the run (exit 1), writes a report and alerts. The helper is local to the runtime: `common.retention` is not imported, because it loads `common.market_data`, which the offline decide run must never load.
 
 ---
 
@@ -527,8 +559,9 @@ Columns: `symbol, results_date`.
 ### 10.1 Command
 
 ```
-python -m runtimes.positional_stocks.weekly_run --mode fetch  [--as-of auto|YYYY-MM-DD] [--dry-run]
+python -m runtimes.positional_stocks.weekly_run --mode fetch  [--as-of auto|YYYY-MM-DD] [--force-refetch]
 python -m runtimes.positional_stocks.weekly_run --mode decide [--as-of auto|YYYY-MM-DD] [--dry-run]
+python -m runtimes.positional_stocks.replay --workdir DIR [--weeks 12] [--through YYYY-MM-DD]
 ```
 
 | Mode | Network | What it does | Deadline |
@@ -536,8 +569,20 @@ python -m runtimes.positional_stocks.weekly_run --mode decide [--as-of auto|YYYY
 | `fetch` | Dhan Data API + scrip master | Refreshes the on-disk cache for every universe symbol and NIFTY 50, verifies staleness and adjustment, then writes a **preview** report (same content as the decision report, marked PREVIEW). Persists no decisions, changes no position | 20 minutes; on expiry it fails closed and reports |
 | `decide` | **No Dhan call of any kind** | Reads only the local cache, applies section 4.13, persists the week, writes the report | 5 minutes |
 
-- `--dry-run` computes and writes the report but persists nothing. `fetch` always behaves this way.
+- `--dry-run` computes and writes the report (`<week_ending>-dry-run.md`) but persists nothing, takes no snapshot and sends no Telegram. `fetch` always behaves this way for the book, and takes no `--dry-run`.
 - `auto` = the most recent completed week.
+- **Exit codes (v1.3):**
+
+| Code | `decide` | `fetch` |
+|---|---|---|
+| 0 | Done, or up to date | Preview written, or up to date (no network call) |
+| 1 | Refused: not paper, preflight, an input file, the backup, the first-run guard | Refused: the same, plus authentication, token life, scrip master, a deferred login (10.3) |
+| 2 | Cold cache: NIFTY 50 lacks the week's last session | NIFTY 50 not yet published |
+| 3 | Another weekly run holds the lock | Same |
+| 4 | Deadline | Deadline |
+| 5 | — | Systemic fetch failure (6.1) |
+| 6 | — | Preview written; 10 or fewer symbols failed |
+
 - Both modes take a process lock so two runs can never overlap; neither starts a supervisor, a worker or a market feed.
 - Both modes run `scripts.validate_environment` and the paper-safety check first, both of which are offline-safe.
 
@@ -545,8 +590,9 @@ python -m runtimes.positional_stocks.weekly_run --mode decide [--as-of auto|YYYY
 
 1. Load config; confirm `mode: paper` (anything else is refused in this spec version).
 2. Determine the weeks to process: every completed week after the last completed run, in order, up to `--as-of`. If there is no prior run, process only the latest completed week (no backfill of trades). **A decision run for week W is refused unless W is the first run or W − 1 is COMPLETED (v1.2j)**: a skipped week is a skipped stop check.
+    - **First-run guard (v1.3, D105):** with no COMPLETED run in the real book, a writing decide run must target the latest completed week; an earlier `--as-of` is refused (exit 1), or the next `auto` run would backfill trades from it. A STARTED first week can always be redone, and the refusal message gives one consistent instruction (audit R6-5). Dry runs, the preview and the replay harness (on a temporary project) are exempt.
 3. For each week: in `fetch` mode refresh the cache and verify staleness (6.1, 6.2), then compute and report without persisting; in `decide` mode read the cache only, apply section 4.13 steps 1–5 and record the run.
-4. Write the report and send the Telegram summary once, for the final week processed.
+4. Write the report and send the Telegram summary once, for the final week processed. **The report covers every week processed in that invocation (v1.3):** fills, closed trades, corporate-action events and warnings per week; positions, orders, equity and the watchlist as of the final week. If a later week stops the run (cold cache or deadline), the weeks already committed are still reported, journalled and summarised, with the stop appended, and the run exits with the stop's code (D113).
 
 ### 10.3 Schedule
 
@@ -554,8 +600,14 @@ python -m runtimes.positional_stocks.weekly_run --mode decide [--as-of auto|YYYY
 
 | Job | Times (IST) | Mode | Notes |
 |---|---|---|---|
-| Fetch + preview | **Friday 18:00**, retried **Saturday 10:00** and **Sunday 10:00** — **provisional (v1.2b):** Dhan had not published Monday 21 Sep 2026's daily candle by 22:20 IST that day, so Friday 18:00 may find Friday missing. The times are fixed in Phase 5 from the publication-lag probe; until then the calendar rule in 6.2 makes an early fetch fail closed, never silently wrong | `--mode fetch` | Idempotent: if the cache already covers the completed week and its preview report exists, it exits immediately. Market closed and the intraday runtimes stopped, so nothing else is drawing on Dhan's 5 req/s Data-API budget |
+| Fetch + preview | **Saturday 08:00**, retried **Saturday 14:00** and **Sunday 10:00** — **decided (v1.3).** Evidence: Dhan publishes a session's daily candle overnight (Monday 21 Sep: absent at 22:20, present by 08:36 next day; Friday 25 Sep: present by Sunday 11:53), so a Friday 18:00 attempt would only fail. *Assumption:* Friday's candle is published by Saturday 08:00, as on weekdays; the 14:00 and Sunday attempts cover it if not | `--mode fetch` | Idempotent (6.1). A Saturday 08:00 run normally reuses Friday's 09:00 token (about an hour of life left, above the 25-minute margin); the later attempts may log in |
 | Decision | **Monday 08:30** | `--mode decide` | Offline. If the cache does not cover the completed week, it makes **no trades**, reports the reason and alerts. The operator may re-run either mode by hand |
+
+**Operational rules (v1.3):**
+
+- **Alerts:** "not yet published" (exit 2) alerts only on the **final attempt** — a run after which `parameters.schedule` holds no later fetch attempt before the decide time (the Sunday 10:00 run, or any run after it); earlier attempts only log it. No command-line flag: the job works this out from the schedule and the clock. Every refusal (exit 1), systemic failure (exit 5), deadline (exit 4) and exit 6 alerts and writes a `-preview-failed.md` or report — never a silent console line (audit R6-4). A decide run's cold cache always alerts.
+- **Token safety:** fetch mode shares `data/cache/token_cache.json` with the paper runtimes. **It never mints a new token during a session window of any calendar session day (including special weekend sessions, from the existing session code), or while a paper runtime's supervisor is running** (read-only check). In that case it uses a cached token with enough life, or refuses with "login deferred" (exit 1). *Unverified:* whether a new Dhan login cancels older tokens; this rule is safe either way.
+- **LaunchAgents:** calendar intervals only, no `KeepAlive` or relaunch on exit, so no exit code (6 included) makes launchd retry; the next scheduled attempt is the retry.
 
 Between the two, the operator reads the preview report and fills `quality_gate.csv` for the candidates it lists. That weekend window is the point of splitting the job in two: a candidate with no valid quality row is refused (section 4.2), and the preview is what makes it reachable in time.
 
@@ -566,13 +618,13 @@ Between the two, the operator reads the preview report and fills `quality_gate.c
 3. It must not construct a market-feed adapter or the historical client. It is a batch job, not a worker; it does not follow the `__main__.py` pattern of the existing runtimes.
 4. Telegram is the one outbound call it may make. "No Dhan call" is not "no network"; a missing or failing notifier is non-fatal.
 
-**Fetch job authentication.** It reuses the token cache. A Friday 18:00 run finds the day's 09:00 token with roughly 15 hours of life left and performs no login. A Saturday or Sunday fallback run will log in, which is permitted. Phase 1 asserts the remaining life explicitly rather than assuming Dhan keeps issuing 24-hour tokens.
+**Fetch job authentication.** It reuses the token cache. A Saturday 08:00 run normally finds Friday's 09:00 token with about an hour of life left (above the 25-minute margin) and performs no login; the Saturday 14:00 and Sunday attempts log in, which is permitted because no session is open (v1.3; the token-safety rule above still applies). Phase 1 asserts the remaining life explicitly rather than assuming Dhan keeps issuing 24-hour tokens.
 
 **LaunchAgent constraints to handle in Phase 5** (all verified):
 
 - `tests/unit/test_launchd_plists.py` asserts the exact set `{autostart, dashboard}` and that every spec has its `.plist` committed. Both new specs and both generated plists land in the same change as the test update.
 - `scripts/install_launch_agents.py` installs and enables **every** spec unconditionally. Either `PlistSpec` gains a flag the installer honours, or the plists are generated and deliberately not installed. **Nothing is scheduled until the operator says so.**
-- Both jobs use `wait_policy="elapsed"` (the dashboard's policy), not `"session_deadline"`: an 18:00 job whose volume is not yet mounted would otherwise give up on its first pass with a misleading 15:15-deadline message.
+- Both jobs use `wait_policy="elapsed"` (the dashboard's policy), not `"session_deadline"`: a weekend job whose volume is not yet mounted would otherwise give up on its first pass with a misleading 15:15-deadline message.
 - Label namespace: `LABEL_PREFIX` plus a new `short_name` is automatically unique.
 
 ## 11. Outputs
@@ -584,12 +636,12 @@ Between the two, the operator reads the preview report and fills `quality_gate.c
     - open positions (P1, s, L1, L2, Stop / trail, unrealised P&L, weeks held);
     - closed trades this week;
     - the trigger funnel (triggered → filters → ranked → taken, with reasons);
-    - a watchlist (armed, K ≤ D, K < 50, filters pass), ranked by RS;
+    - a watchlist (armed, K ≤ D, K < 50, every filter passing **except the quality gate**), ranked by RS, **with each symbol's quality status** (PASS / EVENT_RISK / FAIL / missing, and the `valid_until` date) — so the operator can check a stock before it triggers (v1.3);
     - **corporate actions (section 4.14, v1.2m):** every frozen position with its detail, freeze factor and run count (escalations highlighted); for each unadjusted-gap freeze, both the exact `gap_acknowledgements.csv` line (symbol, session, ratio to 4 dp — for a real move only) and a `corporate_actions.csv` row template (for a corporate action); rescales; re-issued sells; consolidation closes (D101); stuck-freeze exits queued, filled or skipped ("freeze lifted"); "waiting for Dhan restatement" notes; and every freeze that lifted with neither an acknowledgement nor a rescale;
     - `late_fill` and not-traded fills, the "partial sold 0" flag, and blocking or reported gaps;
     - data and input warnings.
 - **Telegram:** a short summary through the existing notifier (regime, orders for next session, exits, equity, and **the number of operator actions**: frozen or escalated positions, freezes lifted without an acknowledgement or rescale, candidates waiting for a quality row — v1.2m). No secrets, no full tables.
-- **Journal export:** one CSV row per closed trade, with the V1 plan's trade-sheet columns in this order (v1.2m), so the paper journal compares line by line with a manual one. `sector` is the universe `industry`; `rule_breaks` and `screenshot` stay blank; `notes` carries corporate-action events (rescale, D101 close, stuck-freeze exit) and flags (`late_fill`, not traded):
+- **Journal export:** `data/reports/positional_stocks/journal.csv`, regenerated from the book on every writing run. **Each value is in the units of its event (v1.3, D111):** fills as filled; L1, L2 and stop as set at the T1 fill; a consolidation-to-zero close as the old-unit holding at cash in lieu ÷ old shares; each rescale in `notes`. One CSV row per closed trade, with the V1 plan's trade-sheet columns in this order (v1.2m), so the paper journal compares line by line with a manual one. `sector` is the universe `industry`; `rule_breaks` and `screenshot` stay blank; `notes` carries corporate-action events (rescale, D101 close, stuck-freeze exit) and flags (`late_fill`, not traded):
   ```
   trade_id,symbol,sector,promoter_group,event_risk,regime,arm_week,trigger_week,K_trigger,D_trigger,close_trigger,ema50_1w,perf6m_stock,perf6m_nifty,high_52w,atr_1w,atr_pct,s,A,T1_date,T1_price,T1_shares,L1,L2,stop,T2_date,T2_price,T2_shares,T3_date,T3_price,T3_shares,avg_cost,partial_date,partial_price,partial_shares,exit_date,exit_price,exit_shares,exit_type,pnl_rs,pnl_pct_of_A,weeks_held,rule_breaks,notes,screenshot
   ```
@@ -607,7 +659,7 @@ live_approved: false
 engine: stock_portfolio_engine   # reserved EngineKind; verified accepted by StrategyConfig
 parameters:
   # schedule stays INSIDE parameters — a top-level key is rejected by the strict model
-  schedule: {fetch_days: [FRIDAY, SATURDAY, SUNDAY], fetch_time: "18:00", fallback_fetch_time: "10:00", decide_day: MONDAY, decide_time: "08:30"}
+  schedule: {fetch_attempts: ["SATURDAY 08:00", "SATURDAY 14:00", "SUNDAY 10:00"], decide: "MONDAY 08:30"}   # v1.3; the plists are generated from these values
   deadlines: {fetch_minutes: 20, decide_minutes: 5, fetch_requests_per_second: 3}
   paths: {reports: data/reports/positional_stocks}
   capital: 1000000
@@ -630,6 +682,8 @@ parameters:
 ```
 
 Committed configuration must keep every live gate disabled (the existing `assert_no_live_config_committed.py` must cover this file).
+
+**`enabled` (v1.3):** committed as `false`. While it is `false`, `weekly_run` refuses `fetch` and any writing `decide` (exit 1, "strategy disabled in config"); `--dry-run` and the replay harness still run. The operator's go-live commit sets it to `true`; installing the LaunchAgents is the second, separate switch. Adding these two YAML files must change nothing for the existing runtimes: `resolve_runtime_strategies` for `intraday_options` and `positional_options` returns exactly what it returned before, and `auto_start` / `RUNTIMES` never see `positional_stocks`.
 
 ---
 
@@ -686,7 +740,7 @@ Also:
 - **Cold cache:** `--mode decide` with the completed week missing from the cache makes no trades, reports the reason and exits non-zero.
 - Idempotency: running the same week twice changes nothing.
 - A catch-up over 3 missed weeks equals 3 sequential runs.
-- Replay: the last 12 completed weeks, on real data from an empty book, run end to end without error. This is a smoke test, not a performance study.
+- Replay: the last 12 completed weeks, on real data from an empty book, run end to end without error. This is a smoke test, not a performance study. **v1.3 (D114):** `runtimes.positional_stocks.replay` copies the configuration, operator CSVs and daily cache into a temporary directory (it refuses the project root, anything inside it and any non-empty directory) and runs decide once per week; it never touches the real book, reports or Telegram.
 - Timezone: the full suite passes under `TZ=UTC` and `TZ=America/New_York`.
 - The live-config guard covers the new config.
 
@@ -702,7 +756,7 @@ Also:
 | 3 | `rules.py` + golden tests | Every section 14 golden case and every YES/NO row passes; a guard test proves `rules.py` imports no engine, runtime, broker, database or clock | I/O of any kind |
 | 4a | **Persistence and paper accounting:** the runtime's own migration set in `runtimes/positional_stocks/migrations/` (all `stock_`-prefixed; nothing added to the shared directory, v1.2i), repository module, paper fill model (section 8: official open, costs, not-traded → next session + flag, `at_week_open` from the calendar for every buy), applying fills through the rules' fill function, clearing filled orders before deciding (v1.2h), carrying unfilled orders' sizing/sector/group across runs, persisting `half_sold_week` and each symbol's last-seen universe row, equity/peak/brake persistence, gap acknowledgements keyed per (symbol, session, ratio) with the 520-bar block window, idempotency per (strategy_id, week_ending), crash-safe transactions | Idempotency (same week twice = no change), crash-mid-run resume, fill-model and cost tests, a multi-week book simulated end to end through persistence, under `TZ=UTC` and `TZ=America/New_York` | CLI, fetching, report, Telegram, scheduling |
 | 4b | **The weekly run:** `weekly_run.py` with `--mode fetch` and `--mode decide`, `--dry-run`, `--force-refetch` (limitation 40), catch-up, the offline-decide rules of 10.3, deadlines and throttle, the monthly full refetch, report writer (section 11, including the "partial sold 0" flag, held symbols with no bar this week, truncated-week warnings only for calendar-covered weeks), Telegram summary, journal CSV, `validate_environment` and paper-safety at start, a process lock | Offline-decide (Dhan client, scrip master and `AuthBootstrap` monkeypatched to raise), cold-cache, catch-up (3 missed weeks = 3 runs), a 12-week replay smoke on the real local cache, **first real preview report reviewed by the operator** | Scheduling, plists, dashboard |
-| 5 | `config/runtimes/positional_stocks.yaml` **and** the strategy YAML in one commit; two `PlistSpec`s with `wait_policy="elapsed"` and their generated plists; installer handling so nothing is enabled silently; runbook; sweep of the stale "placeholder" lines in the architecture doc | Operator installs and enables the two agents | Dashboard page (needs its own approval); any `auto_start` / `RUNTIMES` change |
+| 5 | `config/runtimes/positional_stocks.yaml` **and** the strategy YAML in one commit; two `PlistSpec`s with `wait_policy="elapsed"` and their generated plists; installer handling so nothing is enabled silently; runbook; sweep of the stale "placeholder" lines in the architecture doc. **v1.3:** first, the Phase 4b-2 audit fixes (R6-1 to R6-5), the watchlist change, the schedule and token rules of 10.3, and the gap acknowledgements | The existing plists byte-identical; `auto_start` and `RUNTIMES` unchanged; operator installs and enables the two agents | Dashboard page (needs its own approval); any `auto_start` / `RUNTIMES` change |
 
 ## 16. Decisions and remaining operator actions
 
@@ -711,8 +765,16 @@ All thirteen Phase 0 questions are answered in the v1.2 changes table at the top
 | # | Item | Owner | When |
 |---|---|---|---|
 | 1 | Confirm the Dhan Data API subscription is active for `/v2/charts/historical` on this account | Operator | **Blocks Phase 1** |
-| 2 | Verify the paper cost defaults (12 bps buy, 11 bps sell, ₹15 per sell) against Dhan's current equity delivery charges | Operator | Before Phase 4 |
+| 2 | Verify the paper cost defaults (12 bps buy, 11 bps sell, ₹15 per sell) against Dhan's current equity delivery charges | Operator | **Before the first real decision run** (overdue) |
 | 3 | Supply TradingView K / D / EMA50 / ATR readings for ≥ 5 symbols at one weekly close | Operator | Phase 2 |
 | 4 | Maintain `universe.csv` (NIFTY 200) and `quality_gate.csv` | Operator | From Phase 1, then weekly |
 | 5 | Decide whether to fix `token_cache.py`'s timezone-less `expiry_time` and the stale `positional_options/__init__.py` docstring | Operator | Separate approval, outside this feature |
 | 6 | When a held position is flagged FROZEN, resolve it (section 4.14): a corporate action → a row in `config/positional_stocks/corporate_actions.csv`; a real move of 15% or more → a line in `gap_acknowledgements.csv`. **Never acknowledge a gap you know is a corporate action** | Operator | Before the next decision run (the preview prints both lines); escalated after 2 weekly runs, exited under item 8 after 3 |
+| 7 | **Weekly quality-gate routine (v1.3):** for every "needs quality check" candidate in the preview, every watchlist symbol likely to trigger, and every held symbol whose row is about to expire, add or renew a `quality_gate.csv` row using the section 4.2 criteria; `valid_until` = the company's next results date, or quarter-end + 45 days when unknown | Operator | Each weekend, between the preview and Monday 08:30 |
+| 8 | Record known results dates in `results_calendar.csv` (an entry is skipped when results fall in its execution week) | Operator | With each quality check |
+| 9 | Rebuild `universe.csv` after each NIFTY 200 reconstitution, **including `nifty100` and `group`** (next: effective 30 Sep 2026). Blank `nifty100` means nothing can enter in a Red regime; blank `group` means the promoter-group limit never binds | Operator (Claude drafts it from NSE's constituent files) | Before the first real decision run |
+| 10 | Review each new blocking gap in the preview: acknowledge a verified real move, keep blocked otherwise | Operator | As they appear |
+| 11 | Install and enable the two LaunchAgents | Operator | After the Phase 5 review |
+| 12 | Add the 2027 NSE holiday list to `config/global.yaml` | Operator | Before 1 Jan 2027 |
+| 13 | **Branch on the Mac:** the LaunchAgents run whatever is checked out in `/Volumes/Trading/algo_trading`. Merge this branch into the branch the paper runtimes run from (separate approval), and keep that branch checked out | Operator | Before go-live |
+| 14 | **Go-live commit:** `enabled: true` in the strategy YAML, then install and enable the two agents (item 11). The first decide run starts the book at the latest completed week (10.2) | Operator | After items 2, 7, 9 and 13 |
