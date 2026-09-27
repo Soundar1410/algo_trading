@@ -182,21 +182,55 @@ def _launchd_slot(text: str) -> tuple[int, int, int]:
     return (_LAUNCHD_WEEKDAY[day.upper()], hhmm.hour, hhmm.minute)
 
 
+class OperatorSpecsUnavailable(RuntimeError):
+    """The positional_stocks agents cannot be built: their strategy file is
+    missing, is not YAML, or has no usable ``parameters.schedule``. The message
+    is one line naming the file and the problem (D125)."""
+
+
+#: The operator-installed agents' short names, known without reading the
+#: strategy file — so ``uninstall``/``status``/``logs`` of them never depend on
+#: it (D125). The specs themselves, which need the schedule, are built lazily.
+OPERATOR_AGENT_NAMES: tuple[str, ...] = ("positional_stocks_fetch", "positional_stocks_decide")
+
+
 def positional_stocks_schedule(
     config_root: Path | None = None,
 ) -> tuple[list[tuple[int, int, int]], list[tuple[int, int, int]]]:
-    """``(fetch slots, decide slots)`` from the committed strategy file."""
+    """``(fetch slots, decide slots)`` from the committed strategy file.
+
+    Raises:
+        OperatorSpecsUnavailable: the file is missing or unusable.
+    """
     import yaml
 
     if config_root is None:
         config_root = Path(__file__).resolve().parents[2] / "config"
     path = config_root.parent / POSITIONAL_STOCKS_STRATEGY_FILE
-    schedule = yaml.safe_load(path.read_text(encoding="utf-8"))["parameters"]["schedule"]
-    fetch = [_launchd_slot(slot) for slot in schedule["fetch_attempts"]]
-    return fetch, [_launchd_slot(schedule["decide"])]
+    name = POSITIONAL_STOCKS_STRATEGY_FILE.as_posix()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise OperatorSpecsUnavailable(f"{name}: {exc.strerror or exc}") from exc
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        first = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+        raise OperatorSpecsUnavailable(f"{name}: not valid YAML ({first})") from exc
+    try:
+        schedule = data["parameters"]["schedule"]
+        fetch = [_launchd_slot(slot) for slot in schedule["fetch_attempts"]]
+        decide = [_launchd_slot(schedule["decide"])]
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise OperatorSpecsUnavailable(
+            f"{name}: no usable parameters.schedule ({type(exc).__name__}: {exc})"
+        ) from exc
+    if not fetch:
+        raise OperatorSpecsUnavailable(f"{name}: parameters.schedule.fetch_attempts is empty")
+    return fetch, decide
 
 
-def _operator_installed_specs() -> tuple[PlistSpec, ...]:
+def operator_installed_specs(config_root: Path | None = None) -> tuple[PlistSpec, ...]:
     """The two ``positional_stocks`` jobs (spec 10.3). Calendar intervals
     only: no ``RunAtLoad`` (a login must not run a weekly job) and no
     ``KeepAlive`` (no exit code makes launchd retry; the next scheduled
@@ -204,7 +238,7 @@ def _operator_installed_specs() -> tuple[PlistSpec, ...]:
     the volume still unmounted must wait for it, not give up at a 15:15
     trading boundary. Generated and committed, **never installed by
     default**."""
-    fetch, decide = positional_stocks_schedule()
+    fetch, decide = positional_stocks_schedule(config_root)
     module = "runtimes.positional_stocks.weekly_run"
     return (
         PlistSpec(
@@ -228,13 +262,14 @@ def _operator_installed_specs() -> tuple[PlistSpec, ...]:
     )
 
 
-#: Installed only when named: ``install --agent positional_stocks_fetch
-#: --agent positional_stocks_decide``. ``PLIST_SPECS`` stays exactly the two
-#: agents the default install has always installed.
-OPERATOR_INSTALLED_SPECS: tuple[PlistSpec, ...] = _operator_installed_specs()
-
-#: Every committed plist.
-ALL_PLIST_SPECS: tuple[PlistSpec, ...] = PLIST_SPECS + OPERATOR_INSTALLED_SPECS
+def all_plist_specs(config_root: Path | None = None) -> tuple[PlistSpec, ...]:
+    """Every committed plist's spec. Installed only when named: ``install
+    --agent positional_stocks_fetch --agent positional_stocks_decide``
+    (either flag order works). ``PLIST_SPECS`` stays exactly the two agents
+    the default install has always installed, and never reads the strategy
+    file. Raises :class:`OperatorSpecsUnavailable` like
+    :func:`operator_installed_specs`."""
+    return PLIST_SPECS + operator_installed_specs(config_root)
 
 
 #: Absolute, on the boot volume, present before any external volume mounts.
@@ -459,8 +494,11 @@ def generate_all(
     launchd_log_root: Path | None = None,
     working_directory: Path | None = None,
     deadline_hhmm: str | None = None,
+    specs: tuple[PlistSpec, ...] | None = None,
 ) -> dict[str, bytes]:
-    """Every plist's filename mapped to its serialised XML content."""
+    """Every plist's filename mapped to its serialised XML content — for
+    ``specs``, or every committed plist (which raises
+    :class:`OperatorSpecsUnavailable` when the strategy file is unusable)."""
     project_root = root if root is not None else resolve_project_root()
     paths = ProjectPaths(project_root=project_root)
     return {
@@ -474,7 +512,7 @@ def generate_all(
             ),
             fmt=plistlib.FMT_XML,
         )
-        for spec in ALL_PLIST_SPECS
+        for spec in (specs if specs is not None else all_plist_specs())
     }
 
 
@@ -488,7 +526,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     output_dir = Path(__file__).resolve().parent
-    generated = generate_all()
+    # D125: autostart and dashboard never depend on the positional_stocks
+    # strategy file; an unusable one refuses only its own two plists.
+    generated = generate_all(specs=PLIST_SPECS)
+    unavailable: str | None = None
+    try:
+        generated.update(generate_all(specs=operator_installed_specs()))
+    except OperatorSpecsUnavailable as exc:
+        unavailable = str(exc)
 
     if args.check:
         drifted = [
@@ -501,12 +546,18 @@ def main(argv: list[str] | None = None) -> int:
             for name in drifted:
                 print(f"  {name}")
             return 1
+        if unavailable is not None:
+            print(f"REFUSED: positional_stocks plists not checked: {unavailable}")
+            return 1
         print(f"{len(generated)} plist(s) match the generator.")
         return 0
 
     for name, content in generated.items():
         (output_dir / name).write_bytes(content)
         print(f"wrote {output_dir / name}")
+    if unavailable is not None:
+        print(f"REFUSED: positional_stocks plists not generated: {unavailable}")
+        return 1
     return 0
 
 

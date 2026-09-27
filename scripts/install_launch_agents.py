@@ -16,6 +16,11 @@ which the operator installs explicitly:
     .venv/bin/python -m scripts.install_launch_agents install \
         --agent positional_stocks_fetch --agent positional_stocks_decide --execute
 
+``--agent``, ``--execute`` and ``--config-root`` work before or after the
+subcommand (D124). Removing or inspecting a named positional_stocks agent needs
+only its label, so ``uninstall``/``status``/``logs`` work even when its strategy
+file is broken; ``install`` and ``validate`` then refuse with one line (D125).
+
 **Dry-run by default.** Without ``--execute`` this prints the exact commands
 and changes nothing. That default is the point: loading a LaunchAgent is the
 step that turns committed files into a Mac that trades by itself at 09:00, and
@@ -58,10 +63,12 @@ from common.config.paths import resolve_project_root
 from common.process import legacy_system_status
 from orchestration.auto_start.gate import system_timezone_matches, system_timezone_name
 from orchestration.launchd.generate_plists import (
-    ALL_PLIST_SPECS,
+    OPERATOR_AGENT_NAMES,
     PLIST_SPECS,
+    OperatorSpecsUnavailable,
     PlistSpec,
     boot_log_root,
+    operator_installed_specs,
 )
 
 EXIT_OK = 0
@@ -80,17 +87,45 @@ def _domain() -> str:
     return f"gui/{os.getuid()}"
 
 
-def _selected(args: argparse.Namespace) -> list[PlistSpec]:
+def _selected(args: argparse.Namespace, *, need_schedule: bool = False) -> list[PlistSpec]:
     """The agents a command acts on: those named with ``--agent``, or else
-    every agent installed by default. An unknown name is refused."""
+    every agent installed by default. An unknown name is refused.
+
+    A named positional_stocks agent is built from its strategy file only when
+    ``need_schedule`` (install); otherwise only its label is needed, so
+    removing or inspecting it never depends on that file (D125).
+
+    Raises:
+        OperatorSpecsUnavailable: ``need_schedule`` and the file is unusable.
+    """
     names = getattr(args, "agent", None) or []
     if not names:
-        return [spec for spec in ALL_PLIST_SPECS if spec.installed_by_default]
-    by_name = {spec.short_name: spec for spec in ALL_PLIST_SPECS}
-    unknown = sorted(set(names) - set(by_name))
+        return [spec for spec in PLIST_SPECS if spec.installed_by_default]
+    defaults = {spec.short_name: spec for spec in PLIST_SPECS}
+    known = [*defaults, *OPERATOR_AGENT_NAMES]
+    unknown = sorted(set(names) - set(known))
     if unknown:
-        raise SystemExit(f"unknown --agent {', '.join(unknown)}; known: {', '.join(by_name)}")
-    return [by_name[name] for name in dict.fromkeys(names)]
+        raise SystemExit(f"unknown --agent {', '.join(unknown)}; known: {', '.join(known)}")
+    chosen: list[PlistSpec] = []
+    operator: dict[str, PlistSpec] | None = None
+    for name in dict.fromkeys(names):
+        if name in defaults:
+            chosen.append(defaults[name])
+        elif need_schedule:
+            if operator is None:
+                operator = {spec.short_name: spec for spec in operator_installed_specs()}
+            chosen.append(operator[name])
+        else:
+            chosen.append(
+                PlistSpec(
+                    short_name=name,
+                    module_args=[],
+                    run_at_load=False,
+                    keep_alive=False,
+                    installed_by_default=False,
+                )
+            )
+    return chosen
 
 
 def _preconditions(config_root: Path) -> list[str]:
@@ -215,9 +250,24 @@ def _print_plan(header: str, steps: list[Step], *, execute: bool) -> int:
 
 def cmd_validate(args: argparse.Namespace) -> int:
     """Structural check of the generated plists. Read-only, always safe."""
+    specs = list(PLIST_SPECS)
+    unavailable: str | None = None
+    try:
+        specs += list(operator_installed_specs())
+    except OperatorSpecsUnavailable as exc:
+        unavailable = str(exc)
+    failures = _validate(specs)
+    if unavailable is not None:
+        print(f"REFUSED: positional_stocks plists not validated: {unavailable}")
+        return EXIT_FAILED
+    return EXIT_OK if failures == 0 else EXIT_FAILED
+
+
+def _validate(specs: list[PlistSpec]) -> int:
+    """Check each spec's committed plist; returns the number of failures."""
     source = _source_dir()
     failures = 0
-    for spec in ALL_PLIST_SPECS:
+    for spec in specs:
         path = source / spec.filename
         if not path.is_file():
             print(f"MISSING  {path}")
@@ -239,8 +289,8 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 failures += 1
                 continue
         print(f"OK       {path.name}  ({document['Label']})")
-    print(f"\n{len(ALL_PLIST_SPECS) - failures}/{len(ALL_PLIST_SPECS)} plist(s) valid.")
-    return EXIT_OK if failures == 0 else EXIT_FAILED
+    print(f"\n{len(specs) - failures}/{len(specs)} plist(s) valid.")
+    return failures
 
 
 def install_steps(
@@ -306,13 +356,19 @@ def cmd_install(args: argparse.Namespace) -> int:
             print(f"  - {problem}")
         return EXIT_REFUSED
 
-    if cmd_validate(args) != EXIT_OK:
+    try:
+        specs = _selected(args, need_schedule=True)
+    except OperatorSpecsUnavailable as exc:
+        print(f"REFUSED: {exc}")
+        return EXIT_REFUSED
+    # D125: only the agents being installed are validated, so an unusable
+    # positional_stocks file never blocks installing autostart or dashboard.
+    if _validate(specs) != 0:
         print("Refusing to install: the generated plists did not validate.")
         return EXIT_REFUSED
 
     # Probe only when actually executing: a dry run must not run launchctl at
     # all, so it prints the full plan with the bootout marked conditional.
-    specs = _selected(args)
     loaded: dict[str, bool | None] = {}
     if args.execute:
         for spec in specs:
@@ -350,16 +406,30 @@ def cmd_logs(args: argparse.Namespace) -> int:
         print(f"    {boot_log_root() / f'{spec.short_name}.out.log'}")
         print(f"    {boot_log_root() / f'{spec.short_name}.err.log'}")
 
-    print("\nApplication log (written by the controller, after the volume is up):")
+    selected = _selected(args)
+    names = {spec.short_name for spec in selected}
     try:
-        project_log = resolve_project_root() / "logs" / "auto_start.log"
+        project_root: Path | None = resolve_project_root()
     except Exception as exc:  # an unmounted volume must not crash a read-only command
-        print(f"    (project root unavailable: {exc})")
-    else:
-        print(f"    {project_log}")
+        project_root = None
+        root_problem = str(exc)
+    if "autostart" in names:
+        print("\nApplication log (written by the controller, after the volume is up):")
+        if project_root is None:
+            print(f"    (project root unavailable: {root_problem})")
+        else:
+            print(f"    {project_root / 'logs' / 'auto_start.log'}")
+    if names & set(OPERATOR_AGENT_NAMES):
+        # D127: the weekly job's reports, journal and failure reports.
+        print("\nReports (weekly run, preview, refusals, journal):")
+        if project_root is None:
+            print(f"    (project root unavailable: {root_problem})")
+        else:
+            print(f"    {project_root / 'data' / 'reports' / 'positional_stocks'}")
 
     print("\nTail them with:")
-    print(f"    tail -f {boot_log_root() / 'autostart.err.log'}")
+    first = "autostart" if "autostart" in names else selected[0].short_name
+    print(f"    tail -f {boot_log_root() / f'{first}.err.log'}")
     return EXIT_OK
 
 
@@ -408,22 +478,9 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    parser.add_argument("--config-root", type=Path, default=Path("config"))
-    parser.add_argument(
-        "--execute",
-        action="store_true",
-        help="Actually run the commands. Without this, they are only printed.",
-    )
-    parser.add_argument(
-        "--agent",
-        action="append",
-        metavar="SHORT_NAME",
-        help=(
-            "Act on this agent only (repeatable). Without it: the agents installed by "
-            "default. The positional_stocks jobs are installed only when named."
-        ),
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        parents=[_common_flags(suffix="")],
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     for name, handler in (
@@ -433,12 +490,54 @@ def main(argv: list[str] | None = None) -> int:
         ("logs", cmd_logs),
         ("uninstall", cmd_uninstall),
     ):
-        sub = subparsers.add_parser(name, help=handler.__doc__ or name)
+        # D124: the same flags after the subcommand, too.
+        sub = subparsers.add_parser(
+            name, help=handler.__doc__ or name, parents=[_common_flags(suffix="_after")]
+        )
         sub.set_defaults(handler=handler)
 
     args = parser.parse_args(argv)
+    # Merge the two placements: a flag before the subcommand is never
+    # overwritten by the subparser (its copies default to SUPPRESS).
+    args.execute = args.execute or getattr(args, "execute_after", False)
+    args.agent = (args.agent or []) + (getattr(args, "agent_after", None) or [])
+    if hasattr(args, "config_root_after"):
+        args.config_root = args.config_root_after
     handler = args.handler
     return int(handler(args))
+
+
+def _common_flags(*, suffix: str) -> argparse.ArgumentParser:
+    """``--config-root``, ``--execute`` and ``--agent``, as a parent parser:
+    with ``suffix=""`` for the top level (real defaults), and ``"_after"`` for
+    each subcommand (``SUPPRESS``, merged in :func:`main`)."""
+    suppress = suffix != ""
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--config-root",
+        type=Path,
+        dest=f"config_root{suffix}",
+        default=argparse.SUPPRESS if suppress else Path("config"),
+    )
+    common.add_argument(
+        "--execute",
+        action="store_true",
+        dest=f"execute{suffix}",
+        default=argparse.SUPPRESS if suppress else False,
+        help="Actually run the commands. Without this, they are only printed.",
+    )
+    common.add_argument(
+        "--agent",
+        action="append",
+        metavar="SHORT_NAME",
+        dest=f"agent{suffix}",
+        default=argparse.SUPPRESS if suppress else None,
+        help=(
+            "Act on this agent only (repeatable). Without it: the agents installed by "
+            "default. The positional_stocks jobs are installed only when named."
+        ),
+    )
+    return common
 
 
 if __name__ == "__main__":

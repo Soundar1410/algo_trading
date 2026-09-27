@@ -16,11 +16,13 @@ from pathlib import Path
 import pytest
 
 from orchestration.launchd.generate_plists import (
-    ALL_PLIST_SPECS,
     LABEL_PREFIX,
-    OPERATOR_INSTALLED_SPECS,
+    OPERATOR_AGENT_NAMES,
     PLIST_SPECS,
+    OperatorSpecsUnavailable,
+    all_plist_specs,
     generate_all,
+    operator_installed_specs,
 )
 
 LAUNCHD_DIR = Path(__file__).resolve().parents[2] / "orchestration" / "launchd"
@@ -31,7 +33,7 @@ def _committed_plists() -> dict[str, dict[str, object]]:
     # Phase 5: every committed plist, the two positional_stocks jobs included,
     # so each structural rule below also covers them.
     documents = {}
-    for spec in ALL_PLIST_SPECS:
+    for spec in all_plist_specs():
         path = LAUNCHD_DIR / spec.filename
         with path.open("rb") as handle:
             documents[spec.filename] = plistlib.load(handle)
@@ -68,11 +70,11 @@ def test_exactly_two_agents_are_committed():
     on_disk = {path.name for path in LAUNCHD_DIR.glob("*.plist")}
     # Phase 5: the two positional_stocks jobs are committed too, but are not in
     # PLIST_SPECS — the set the default install installs is still exactly two.
-    assert {spec.short_name for spec in OPERATOR_INSTALLED_SPECS} == {
+    assert {spec.short_name for spec in operator_installed_specs()} == {
         "positional_stocks_fetch",
         "positional_stocks_decide",
     }
-    assert on_disk == {spec.filename for spec in ALL_PLIST_SPECS}
+    assert on_disk == {spec.filename for spec in all_plist_specs()}
     assert "com.soundarraj.algotrading.auth.plist" not in on_disk
     assert "com.soundarraj.algotrading.intraday_options.plist" not in on_disk
 
@@ -422,7 +424,7 @@ def test_the_positional_stocks_agents_are_never_installed_by_default():
     from scripts import install_launch_agents as ila
 
     assert all(spec.installed_by_default for spec in PLIST_SPECS)
-    assert not any(spec.installed_by_default for spec in OPERATOR_INSTALLED_SPECS)
+    assert not any(spec.installed_by_default for spec in operator_installed_specs())
     default_plan = " ".join(
         " ".join(step.command) for step in ila.install_steps(source=LAUNCHD_DIR)
     )
@@ -453,3 +455,103 @@ def test_naming_the_agents_selects_only_them(capsys):
     assert "autostart" not in plan and "dashboard" not in plan
     with pytest.raises(SystemExit, match="unknown --agent"):
         ila._selected(argparse.Namespace(agent=["nope"]))
+
+
+# ============================== Phase 5-fix: the installer's flags and file
+def _plan(capsys, argv):
+    from scripts import install_launch_agents as ila
+
+    code = ila.main(argv)
+    return code, capsys.readouterr().out
+
+
+@pytest.fixture
+def _no_preconditions(monkeypatch):
+    from scripts import install_launch_agents as ila
+
+    monkeypatch.setattr(ila, "_preconditions", lambda config_root: [])
+    monkeypatch.setattr(ila, "_run", lambda command: pytest.fail(f"ran {command}"))
+
+
+AGENTS = ["--agent", "positional_stocks_fetch", "--agent", "positional_stocks_decide"]
+
+
+@pytest.mark.parametrize("command", ["install", "uninstall", "status", "logs"])
+@pytest.mark.parametrize("placement", ["before", "after"])
+def test_the_flags_work_before_or_after_the_subcommand(
+    capsys, _no_preconditions, command, placement
+):
+    """D124: the documented `install --agent ... --execute` used to exit 2."""
+    argv = [*AGENTS, command] if placement == "before" else [command, *AGENTS]
+    code, out = _plan(capsys, argv)
+    assert code == 0
+    assert "positional_stocks_fetch" in out and "positional_stocks_decide" in out
+    if command in ("install", "uninstall", "status"):
+        assert "dry run" in out  # nothing executed
+    if command != "logs":
+        assert "algotrading.autostart" not in out and "algotrading.dashboard" not in out
+
+
+def test_execute_before_the_subcommand_survives_the_subparser(monkeypatch, capsys):
+    from scripts import install_launch_agents as ila
+
+    seen = []
+    monkeypatch.setattr(ila, "cmd_status", lambda args: seen.append(args.execute) or 0)
+    assert ila.main(["--execute", "status"]) == 0 and seen == [True]
+
+
+def _broken(tmp_path, kind):
+    path = tmp_path / "wsr1_weekly_stochrsi.yaml"
+    if kind == "syntax":
+        path.write_text("parameters: [unclosed\n")
+    elif kind == "no_schedule":
+        path.write_text("parameters:\n  capital: 1000000\n")
+    return path  # "missing": never written
+
+
+@pytest.mark.parametrize("kind", ["missing", "syntax", "no_schedule"])
+def test_an_unusable_strategy_file_leaves_the_default_agents_untouched(
+    monkeypatch, capsys, tmp_path, _no_preconditions, kind
+):
+    """D125: autostart and dashboard never read it; only the positional_stocks
+    plists refuse, each with one line naming the file and the problem."""
+    import orchestration.launchd.generate_plists as gp
+
+    before = {p.name: p.read_bytes() for p in LAUNCHD_DIR.glob("*.plist")}
+    monkeypatch.setattr(gp, "POSITIONAL_STOCKS_STRATEGY_FILE", _broken(tmp_path, kind))
+    with pytest.raises(OperatorSpecsUnavailable, match=r"wsr1_weekly_stochrsi\.yaml: "):
+        operator_installed_specs()
+
+    for command in ("install", "uninstall", "status", "logs"):
+        code, out = _plan(capsys, [command])
+        assert code == 0, command
+        assert "algotrading.autostart" in out or command == "logs"
+
+    code, out = _plan(capsys, ["validate"])
+    refused = [line for line in out.splitlines() if line.startswith("REFUSED")]
+    assert code == 1 and len(refused) == 1 and "wsr1_weekly_stochrsi.yaml" in refused[0]
+    assert "OK       com.soundarraj.algotrading.autostart.plist" in out
+
+    assert gp.main(["--check"]) == 1
+    refused = [line for line in capsys.readouterr().out.splitlines() if "REFUSED" in line]
+    assert len(refused) == 1 and "wsr1_weekly_stochrsi.yaml" in refused[0]
+
+    code, out = _plan(capsys, ["install", *AGENTS])
+    assert code == 2 and out.startswith("REFUSED: ") and "wsr1_weekly_stochrsi.yaml" in out
+    # Removing or inspecting them needs only the label.
+    for command in ("uninstall", "status"):
+        code, out = _plan(capsys, [command, *AGENTS])
+        assert code == 0 and "algotrading.positional_stocks_fetch" in out
+    assert {p.name: p.read_bytes() for p in LAUNCHD_DIR.glob("*.plist")} == before
+
+
+def test_logs_for_a_positional_stocks_agent_names_its_own_files(capsys):
+    from orchestration.launchd.generate_plists import boot_log_root
+
+    code, out = _plan(capsys, ["logs", "--agent", "positional_stocks_fetch"])
+    assert code == 0
+    assert str(boot_log_root() / "positional_stocks_fetch.err.log") in out
+    assert "autostart" not in out and "auto_start.log" not in out
+    assert "data/reports/positional_stocks" in out
+    assert f"tail -f {boot_log_root() / 'positional_stocks_fetch.err.log'}" in out
+    assert set(OPERATOR_AGENT_NAMES) == {"positional_stocks_fetch", "positional_stocks_decide"}
