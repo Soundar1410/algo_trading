@@ -5,7 +5,7 @@
 **Engine kind:** `stock_portfolio_engine` (the existing, reserved `EngineKind.STOCK_PORTFOLIO_ENGINE`; no new enum value)
 **Execution shape:** a run-to-completion weekly job — no tick feed, no long-lived worker, no intraday decisions
 **Initial mode:** paper only
-**Status:** implementation specification v1.3 — operations: fetch mode, preview, backup, schedule; D104–D114 folded in; Phase 5 scope
+**Status:** implementation specification v1.3.1 — D115–D129 folded in; catch-up weeks defined by the run's clock; go-live ready once Phase 5-fix2 passes
 **Scheduling:** two of its own LaunchAgents (a fetch/preview job and an offline decision job). **Not** registered with `auto_start`, and no change to shared auto-start code
 **Rule source:** "Weekly Stoch RSI V1 Trading Plan" (operator's V1 rulebook, 20 Sep 2026), including its resolved ambiguities and the first-cross / K < 50 fix
 **Target branch:** new `strategy-wsr1-weekly-stochrsi`, cut from `feature-paper-auto-start` at `701e030`
@@ -174,6 +174,22 @@ Numbers in brackets are the Phase 0 question numbers.
 | 15 | Eight verified real moves acknowledged in `gap_acknowledgements.csv`; four symbols stay blocked | 6.1, 16 |
 | 16 | **`enabled: false` gates the job**; go-live is an operator commit (`enabled: true`) plus installing the agents; the branch checked out on the Mac must contain this feature | 12, 16 |
 
+### Changes in v1.3.1 (27 Sep 2026 — Phase 5 and 5-fix reviews; folds in D115–D129)
+
+| # | Decision | Section |
+|---|---|---|
+| 1 | **Both `enabled` flags gate the job** (runtime and strategy YAML, as CLAUDE.md and the repository convention say); go-live flips both in one commit (D115; supersedes v1.3's "only the strategy flag") | 12, 16 |
+| 2 | **Token safety made concrete:** no new login from 08:30 to 16:00 IST on a calendar trading day, nor while another runtime's supervisor verifiably runs (a stale or recycled pid never blocks). The session code has no special-session list; special weekend sessions are covered by the supervisor check (D116) | 10.3 |
+| 3 | Every refusal writes a report (`-refused.md`, `-preview-failed.md`, or `refused-<date>.md`) and alerts; dry runs only print (D117) | 10.1, 10.3 |
+| 4 | "Not yet published" is final when no scheduled fetch lies between now and the week's decide slot (D118) | 10.3 |
+| 5 | The strategy YAML is bound strictly: unknown, missing, mistyped or duplicate keys, non-positive deadlines, and **any YAML load error (an invalid date included)** refuse cleanly with a report and alert, never a traceback (D119, D126; audit R8-1) | 12 |
+| 6 | The two LaunchAgents are committed but installed only when named with `--agent`; a broken strategy YAML never affects `autostart` / `dashboard`, and removing a positional_stocks agent always works (D120, D124, D125, D127) | 10.3, 15 |
+| 7 | The watchlist skips only the quality gate (D121) | 11 |
+| 8 | **Execution time implemented and catch-up weeks defined by the run's clock:** the latest completed week (as of the run's start) executes at the later of its next session and the first 09:15 open strictly after the run started; **every older week is a catch-up week, however the invocations are split** — its orders fill at the first session after that week and are flagged `catch_up` (D122, D123; audit R8-2) | 3, 10.2 |
+| 9 | A STARTED first week is redone only while it is the latest completed week; otherwise the run refuses with the exact `mv …abandoned-<timestamp>` command (D128) | 10.2 |
+| 10 | `python -m runtimes.positional_stocks.check_config` is run after any config edit; it warns about the paper runtimes only when their own strategy loads fail (D129; audit R8-3) | 10.1, 16 |
+| 11 | **`0001` is frozen from go-live:** it was edited in place for the last time in Phase 5-fix; every later schema change is a new migration | 9 |
+
 ---
 
 ## 1. Purpose and authority
@@ -220,7 +236,7 @@ Buy quality NIFTY 200 stocks when weekly momentum turns up from oversold, inside
 | Completed week | A week is usable only after its last session has closed (after 15:30 IST on its last trading day). A run must never use an incomplete current week |
 | Fetch and preview | Saturday 08:00 IST, retried Saturday 14:00 and Sunday 10:00 IST; idempotent (section 10.3, v1.3) |
 | Decision time | Monday 08:30 IST — the decision run, offline from the cache the fetch job wrote (section 10.3) |
-| Execution time | Every order decided for a week fills at the **open of the first trading session that starts after the decision run** — normally Monday. A decision run that happens after a session has opened (late start, retry) fills at the next session's open, never at an open that has already passed. Catch-up of fully missed weeks (section 10.2) fills each week's orders at the first session after that week, and the report flags those fills as catch-up fills |
+| Execution time | Every order decided for a week fills at the **open of the first trading session that starts after the decision run** — normally Monday. A decision run that happens after a session has opened (late start, retry) fills at the next session's open, never at an open that has already passed: the latest completed week (as of the run's start) executes at the later of its next session and the first 09:15 IST open strictly after the run started (v1.3.1, D122). **Every older week is a catch-up week, however the operator splits the runs** (plain `auto`, or one `--as-of` at a time): its orders fill at the first session after that week and are flagged `catch_up` (v1.3.1, D123; audit R8-2) |
 | Holidays | Trading sessions come from the data. A Monday holiday moves execution to the next session |
 | Missed runs | The run catches up week by week, in order, from the last completed run (section 10.2) |
 
@@ -537,7 +553,7 @@ Columns: `symbol, results_date`.
     - The two paper runtimes run from the same working tree and call `run_pending()` at every start, so a shared migration reaches their live databases the next morning.
     - `verify_checksums()` then refuses to start a runtime if an applied migration file is later **edited** (likely while this feature is still under review) or **missing** (after switching the tree back to a branch without it). Either would stop both paper runtimes.
     - A separate set keeps the live databases byte-identical and makes every stock migration disposable until Phase 5.
-- **`positional_stocks.db` is disposable until Phase 5** (paper, no real history yet): if a stock migration is edited during development, delete that database rather than work around the checksum check.
+- **`positional_stocks.db` is disposable until Phase 5** (paper, no real history yet): if a stock migration is edited during development, delete that database rather than work around the checksum check. **From go-live, `0001` is frozen (v1.3.1):** every later schema change is a new migration in the stock set.
 - **Naming rule: every new table is still prefixed `stock_`** — no longer needed to avoid a collision, but it keeps the schema unambiguous in queries and backups.
 - Minimum entities:
     - **stock_weekly_runs:** strategy_id, week_ending, status, input fingerprints (universe, quality, calendar, config), started/finished.
@@ -562,6 +578,7 @@ Columns: `symbol, results_date`.
 python -m runtimes.positional_stocks.weekly_run --mode fetch  [--as-of auto|YYYY-MM-DD] [--force-refetch]
 python -m runtimes.positional_stocks.weekly_run --mode decide [--as-of auto|YYYY-MM-DD] [--dry-run]
 python -m runtimes.positional_stocks.replay --workdir DIR [--weeks 12] [--through YYYY-MM-DD]
+python -m runtimes.positional_stocks.check_config      # read-only; run after any config edit (D129)
 ```
 
 | Mode | Network | What it does | Deadline |
@@ -590,7 +607,7 @@ python -m runtimes.positional_stocks.replay --workdir DIR [--weeks 12] [--throug
 
 1. Load config; confirm `mode: paper` (anything else is refused in this spec version).
 2. Determine the weeks to process: every completed week after the last completed run, in order, up to `--as-of`. If there is no prior run, process only the latest completed week (no backfill of trades). **A decision run for week W is refused unless W is the first run or W − 1 is COMPLETED (v1.2j)**: a skipped week is a skipped stop check.
-    - **First-run guard (v1.3, D105):** with no COMPLETED run in the real book, a writing decide run must target the latest completed week; an earlier `--as-of` is refused (exit 1), or the next `auto` run would backfill trades from it. A STARTED first week can always be redone, and the refusal message gives one consistent instruction (audit R6-5). Dry runs, the preview and the replay harness (on a temporary project) are exempt.
+    - **First-run guard (v1.3, D105):** with no COMPLETED run in the real book, a writing decide run must target the latest completed week; an earlier `--as-of` is refused (exit 1), or the next `auto` run would backfill trades from it. A STARTED first week is redone only while it is the latest completed week; an older one is refused with one instruction and the exact command to move the book aside (`mv …positional_stocks.db …abandoned-<UTC timestamp>`, plus `-wal`/`-shm`), since nothing was ever completed (v1.3.1, D128; supersedes R6-5's "always"). Dry runs, the preview and the replay harness (on a temporary project) are exempt.
 3. For each week: in `fetch` mode refresh the cache and verify staleness (6.1, 6.2), then compute and report without persisting; in `decide` mode read the cache only, apply section 4.13 steps 1–5 and record the run.
 4. Write the report and send the Telegram summary once, for the final week processed. **The report covers every week processed in that invocation (v1.3):** fills, closed trades, corporate-action events and warnings per week; positions, orders, equity and the watchlist as of the final week. If a later week stops the run (cold cache or deadline), the weeks already committed are still reported, journalled and summarised, with the stop appended, and the run exits with the stop's code (D113).
 
@@ -606,7 +623,7 @@ python -m runtimes.positional_stocks.replay --workdir DIR [--weeks 12] [--throug
 **Operational rules (v1.3):**
 
 - **Alerts:** "not yet published" (exit 2) alerts only on the **final attempt** — a run after which `parameters.schedule` holds no later fetch attempt before the decide time (the Sunday 10:00 run, or any run after it); earlier attempts only log it. No command-line flag: the job works this out from the schedule and the clock. Every refusal (exit 1), systemic failure (exit 5), deadline (exit 4) and exit 6 alerts and writes a `-preview-failed.md` or report — never a silent console line (audit R6-4). A decide run's cold cache always alerts.
-- **Token safety:** fetch mode shares `data/cache/token_cache.json` with the paper runtimes. **It never mints a new token during a session window of any calendar session day (including special weekend sessions, from the existing session code), or while a paper runtime's supervisor is running** (read-only check). In that case it uses a cached token with enough life, or refuses with "login deferred" (exit 1). *Unverified:* whether a new Dhan login cancels older tokens; this rule is safe either way.
+- **Token safety:** fetch mode shares `data/cache/token_cache.json` with the paper runtimes. **It never mints a new token from 08:30 to 16:00 IST on a calendar trading day (30 minutes around `auto_start.startup_time` and the 15:30 close), or while another runtime's supervisor verifiably runs** (read-only pid check; a stale or recycled pid never blocks) (v1.3.1, D116). The session code has no list of special weekend sessions; those are covered by the supervisor check, since the paper runtimes are what a login could disturb. In that case it uses a cached token with enough life, or refuses with "login deferred" (exit 1). *Unverified:* whether a new Dhan login cancels older tokens; this rule is safe either way.
 - **LaunchAgents:** calendar intervals only, no `KeepAlive` or relaunch on exit, so no exit code (6 included) makes launchd retry; the next scheduled attempt is the retry.
 
 Between the two, the operator reads the preview report and fills `quality_gate.csv` for the candidates it lists. That weekend window is the point of splitting the job in two: a candidate with no valid quality row is refused (section 4.2), and the preview is what makes it reachable in time.
@@ -683,7 +700,7 @@ parameters:
 
 Committed configuration must keep every live gate disabled (the existing `assert_no_live_config_committed.py` must cover this file).
 
-**`enabled` (v1.3):** committed as `false`. While it is `false`, `weekly_run` refuses `fetch` and any writing `decide` (exit 1, "strategy disabled in config"); `--dry-run` and the replay harness still run. The operator's go-live commit sets it to `true`; installing the LaunchAgents is the second, separate switch. Adding these two YAML files must change nothing for the existing runtimes: `resolve_runtime_strategies` for `intraday_options` and `positional_options` returns exactly what it returned before, and `auto_start` / `RUNTIMES` never see `positional_stocks`.
+**`enabled` (v1.3.1, D115):** committed as `false` in **both** `config/runtimes/positional_stocks.yaml` and the strategy YAML, and **both gate the job**, as CLAUDE.md and the repository convention say. While either is `false`, `weekly_run` refuses `fetch` and any writing `decide` (exit 1, a report and an alert naming the flag); `--dry-run` and the replay harness still run. The operator's go-live commit sets both to `true` in one commit, after `check_config` reports OK; installing the LaunchAgents is the second, separate switch. The binding is strict (D119, D126): an unknown, missing, mistyped or duplicate key, a non-positive deadline, or any YAML load error refuses cleanly with a report and alert. Adding these two YAML files must change nothing for the existing runtimes: `resolve_runtime_strategies` for `intraday_options` and `positional_options` returns exactly what it returned before, and `auto_start` / `RUNTIMES` never see `positional_stocks`.
 
 ---
 
@@ -777,4 +794,4 @@ All thirteen Phase 0 questions are answered in the v1.2 changes table at the top
 | 11 | Install and enable the two LaunchAgents | Operator | After the Phase 5 review |
 | 12 | Add the 2027 NSE holiday list to `config/global.yaml` | Operator | Before 1 Jan 2027 |
 | 13 | **Branch on the Mac:** the LaunchAgents run whatever is checked out in `/Volumes/Trading/algo_trading`. Merge this branch into the branch the paper runtimes run from (separate approval), and keep that branch checked out | Operator | Before go-live |
-| 14 | **Go-live commit:** `enabled: true` in the strategy YAML, then install and enable the two agents (item 11). The first decide run starts the book at the latest completed week (10.2) | Operator | After items 2, 7, 9 and 13 |
+| 14 | **Go-live commit:** `enabled: true` in **both** the runtime and the strategy YAML, in one commit, after `check_config` reports OK; then install and enable the two agents (item 11). The first decide run starts the book at the latest completed week (10.2) | Operator | After items 2, 7, 9 and 13 |
