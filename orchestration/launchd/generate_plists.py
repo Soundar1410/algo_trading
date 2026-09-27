@@ -90,6 +90,10 @@ class PlistSpec:
     #: :func:`_wait_for_project_command` for why the trading controller cannot
     #: use an elapsed budget.
     wait_policy: str = "session_deadline"
+    #: Whether ``scripts/install_launch_agents.py install`` installs this agent
+    #: with no ``--agent`` argument. ``False`` means generated and committed,
+    #: but installed only when the operator names it explicitly.
+    installed_by_default: bool = True
 
     @property
     def label(self) -> str:
@@ -149,6 +153,88 @@ PLIST_SPECS: tuple[PlistSpec, ...] = (
         wait_policy="elapsed",
     ),
 )
+
+
+#: The strategy file whose ``parameters.schedule`` the two positional_stocks
+#: agents are generated from (spec 10.3 v1.3, section 12). Read with plain
+#: ``yaml`` — nothing under ``orchestration`` may import ``positional_stocks``
+#: (``tests/unit/test_stock_isolation.py``).
+POSITIONAL_STOCKS_STRATEGY_FILE = (
+    Path("config") / "strategies" / "positional_stocks" / "wsr1_weekly_stochrsi.yaml"
+)
+
+#: launchd's ``StartCalendarInterval`` weekday numbers (Sunday is 0).
+_LAUNCHD_WEEKDAY = {
+    "SUNDAY": 0,
+    "MONDAY": 1,
+    "TUESDAY": 2,
+    "WEDNESDAY": 3,
+    "THURSDAY": 4,
+    "FRIDAY": 5,
+    "SATURDAY": 6,
+}
+
+
+def _launchd_slot(text: str) -> tuple[int, int, int]:
+    """``"SATURDAY 08:00"`` -> ``(6, 8, 0)``."""
+    day, clock = str(text).split()
+    hhmm = parse_hhmm(clock)
+    return (_LAUNCHD_WEEKDAY[day.upper()], hhmm.hour, hhmm.minute)
+
+
+def positional_stocks_schedule(
+    config_root: Path | None = None,
+) -> tuple[list[tuple[int, int, int]], list[tuple[int, int, int]]]:
+    """``(fetch slots, decide slots)`` from the committed strategy file."""
+    import yaml
+
+    if config_root is None:
+        config_root = Path(__file__).resolve().parents[2] / "config"
+    path = config_root.parent / POSITIONAL_STOCKS_STRATEGY_FILE
+    schedule = yaml.safe_load(path.read_text(encoding="utf-8"))["parameters"]["schedule"]
+    fetch = [_launchd_slot(slot) for slot in schedule["fetch_attempts"]]
+    return fetch, [_launchd_slot(schedule["decide"])]
+
+
+def _operator_installed_specs() -> tuple[PlistSpec, ...]:
+    """The two ``positional_stocks`` jobs (spec 10.3). Calendar intervals
+    only: no ``RunAtLoad`` (a login must not run a weekly job) and no
+    ``KeepAlive`` (no exit code makes launchd retry; the next scheduled
+    attempt is the retry). ``elapsed``, like the dashboard: a weekend job with
+    the volume still unmounted must wait for it, not give up at a 15:15
+    trading boundary. Generated and committed, **never installed by
+    default**."""
+    fetch, decide = positional_stocks_schedule()
+    module = "runtimes.positional_stocks.weekly_run"
+    return (
+        PlistSpec(
+            short_name="positional_stocks_fetch",
+            module_args=["-m", module, "--mode", "fetch"],
+            run_at_load=False,
+            keep_alive=False,
+            weekday_hour_minute=fetch,
+            wait_policy="elapsed",
+            installed_by_default=False,
+        ),
+        PlistSpec(
+            short_name="positional_stocks_decide",
+            module_args=["-m", module, "--mode", "decide"],
+            run_at_load=False,
+            keep_alive=False,
+            weekday_hour_minute=decide,
+            wait_policy="elapsed",
+            installed_by_default=False,
+        ),
+    )
+
+
+#: Installed only when named: ``install --agent positional_stocks_fetch
+#: --agent positional_stocks_decide``. ``PLIST_SPECS`` stays exactly the two
+#: agents the default install has always installed.
+OPERATOR_INSTALLED_SPECS: tuple[PlistSpec, ...] = _operator_installed_specs()
+
+#: Every committed plist.
+ALL_PLIST_SPECS: tuple[PlistSpec, ...] = PLIST_SPECS + OPERATOR_INSTALLED_SPECS
 
 
 #: Absolute, on the boot volume, present before any external volume mounts.
@@ -388,7 +474,7 @@ def generate_all(
             ),
             fmt=plistlib.FMT_XML,
         )
-        for spec in PLIST_SPECS
+        for spec in ALL_PLIST_SPECS
     }
 
 

@@ -7,6 +7,15 @@
     .venv/bin/python -m scripts.install_launch_agents logs
     .venv/bin/python -m scripts.install_launch_agents uninstall [--execute]
 
+``--agent SHORT_NAME`` (repeatable) acts on exactly the named agents. Without
+it, ``install``/``uninstall``/``status``/``logs`` act on the agents installed by
+default — ``autostart`` and ``dashboard`` — and never on an agent generated with
+``installed_by_default=False``, such as the two ``positional_stocks`` jobs,
+which the operator installs explicitly:
+
+    .venv/bin/python -m scripts.install_launch_agents install \
+        --agent positional_stocks_fetch --agent positional_stocks_decide --execute
+
 **Dry-run by default.** Without ``--execute`` this prints the exact commands
 and changes nothing. That default is the point: loading a LaunchAgent is the
 step that turns committed files into a Mac that trades by itself at 09:00, and
@@ -48,7 +57,12 @@ from common.config import load_auto_start_config
 from common.config.paths import resolve_project_root
 from common.process import legacy_system_status
 from orchestration.auto_start.gate import system_timezone_matches, system_timezone_name
-from orchestration.launchd.generate_plists import PLIST_SPECS, boot_log_root
+from orchestration.launchd.generate_plists import (
+    ALL_PLIST_SPECS,
+    PLIST_SPECS,
+    PlistSpec,
+    boot_log_root,
+)
 
 EXIT_OK = 0
 EXIT_REFUSED = 2
@@ -64,6 +78,19 @@ def _source_dir() -> Path:
 
 def _domain() -> str:
     return f"gui/{os.getuid()}"
+
+
+def _selected(args: argparse.Namespace) -> list[PlistSpec]:
+    """The agents a command acts on: those named with ``--agent``, or else
+    every agent installed by default. An unknown name is refused."""
+    names = getattr(args, "agent", None) or []
+    if not names:
+        return [spec for spec in ALL_PLIST_SPECS if spec.installed_by_default]
+    by_name = {spec.short_name: spec for spec in ALL_PLIST_SPECS}
+    unknown = sorted(set(names) - set(by_name))
+    if unknown:
+        raise SystemExit(f"unknown --agent {', '.join(unknown)}; known: {', '.join(by_name)}")
+    return [by_name[name] for name in dict.fromkeys(names)]
 
 
 def _preconditions(config_root: Path) -> list[str]:
@@ -190,7 +217,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
     """Structural check of the generated plists. Read-only, always safe."""
     source = _source_dir()
     failures = 0
-    for spec in PLIST_SPECS:
+    for spec in ALL_PLIST_SPECS:
         path = source / spec.filename
         if not path.is_file():
             print(f"MISSING  {path}")
@@ -212,11 +239,16 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 failures += 1
                 continue
         print(f"OK       {path.name}  ({document['Label']})")
-    print(f"\n{len(PLIST_SPECS) - failures}/{len(PLIST_SPECS)} plist(s) valid.")
+    print(f"\n{len(ALL_PLIST_SPECS) - failures}/{len(ALL_PLIST_SPECS)} plist(s) valid.")
     return EXIT_OK if failures == 0 else EXIT_FAILED
 
 
-def install_steps(*, source: Path, loaded: dict[str, bool | None] | None = None) -> list[Step]:
+def install_steps(
+    *,
+    source: Path,
+    loaded: dict[str, bool | None] | None = None,
+    specs: list[PlistSpec] | None = None,
+) -> list[Step]:
     """The deterministic install lifecycle, in order.
 
     Per label, after the directories exist and the plist is copied:
@@ -244,7 +276,7 @@ def install_steps(*, source: Path, loaded: dict[str, bool | None] | None = None)
         # remove, so the directory must exist before any bootstrap.
         Step(["/bin/mkdir", "-p", str(boot_log_root())]),
     ]
-    for spec in PLIST_SPECS:
+    for spec in specs if specs is not None else list(PLIST_SPECS):
         target = LAUNCH_AGENTS_DIR / spec.filename
         service = f"{_domain()}/{spec.label}"
         steps.append(Step(["/bin/cp", str(source / spec.filename), str(target)]))
@@ -280,9 +312,10 @@ def cmd_install(args: argparse.Namespace) -> int:
 
     # Probe only when actually executing: a dry run must not run launchctl at
     # all, so it prints the full plan with the bootout marked conditional.
+    specs = _selected(args)
     loaded: dict[str, bool | None] = {}
     if args.execute:
-        for spec in PLIST_SPECS:
+        for spec in specs:
             loaded[spec.label] = label_is_loaded(spec.label)
 
     print(
@@ -292,7 +325,7 @@ def cmd_install(args: argparse.Namespace) -> int:
     )
     return _print_plan(
         "Install commands:",
-        install_steps(source=_source_dir(), loaded=loaded),
+        install_steps(source=_source_dir(), loaded=loaded, specs=specs),
         execute=args.execute,
     )
 
@@ -304,7 +337,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             tolerate_not_loaded=True,
             note="'not found' simply means this agent is not installed",
         )
-        for spec in PLIST_SPECS
+        for spec in _selected(args)
     ]
     steps.append(Step(["/bin/launchctl", "list"]))
     return _print_plan("Status commands:", steps, execute=args.execute)
@@ -313,7 +346,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 def cmd_logs(args: argparse.Namespace) -> int:
     """Where to look. Read-only, and it runs nothing."""
     print("launchd streams (boot volume — readable even when the mount is what failed):")
-    for spec in PLIST_SPECS:
+    for spec in _selected(args):
         print(f"    {boot_log_root() / f'{spec.short_name}.out.log'}")
         print(f"    {boot_log_root() / f'{spec.short_name}.err.log'}")
 
@@ -330,7 +363,9 @@ def cmd_logs(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def uninstall_steps(*, loaded: dict[str, bool | None] | None = None) -> list[Step]:
+def uninstall_steps(
+    *, loaded: dict[str, bool | None] | None = None, specs: list[PlistSpec] | None = None
+) -> list[Step]:
     """Rollback, ordered so a partially-installed agent still comes out.
 
     Every launchctl step tolerates the authoritative not-loaded result, and
@@ -340,7 +375,7 @@ def uninstall_steps(*, loaded: dict[str, bool | None] | None = None) -> list[Ste
     """
     loaded = loaded or {}
     steps: list[Step] = []
-    for spec in PLIST_SPECS:
+    for spec in specs if specs is not None else list(PLIST_SPECS):
         service = f"{_domain()}/{spec.label}"
         steps.append(
             Step(
@@ -366,7 +401,9 @@ def uninstall_steps(*, loaded: dict[str, bool | None] | None = None) -> list[Ste
 
 
 def cmd_uninstall(args: argparse.Namespace) -> int:
-    return _print_plan("Rollback commands:", uninstall_steps(), execute=args.execute)
+    return _print_plan(
+        "Rollback commands:", uninstall_steps(specs=_selected(args)), execute=args.execute
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -378,6 +415,15 @@ def main(argv: list[str] | None = None) -> int:
         "--execute",
         action="store_true",
         help="Actually run the commands. Without this, they are only printed.",
+    )
+    parser.add_argument(
+        "--agent",
+        action="append",
+        metavar="SHORT_NAME",
+        help=(
+            "Act on this agent only (repeatable). Without it: the agents installed by "
+            "default. The positional_stocks jobs are installed only when named."
+        ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     for name, handler in (

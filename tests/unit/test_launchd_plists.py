@@ -15,15 +15,23 @@ from pathlib import Path
 
 import pytest
 
-from orchestration.launchd.generate_plists import LABEL_PREFIX, PLIST_SPECS, generate_all
+from orchestration.launchd.generate_plists import (
+    ALL_PLIST_SPECS,
+    LABEL_PREFIX,
+    OPERATOR_INSTALLED_SPECS,
+    PLIST_SPECS,
+    generate_all,
+)
 
 LAUNCHD_DIR = Path(__file__).resolve().parents[2] / "orchestration" / "launchd"
 COMMITTED_PROJECT_ROOT = Path("/Volumes/Trading/algo_trading")
 
 
 def _committed_plists() -> dict[str, dict[str, object]]:
+    # Phase 5: every committed plist, the two positional_stocks jobs included,
+    # so each structural rule below also covers them.
     documents = {}
-    for spec in PLIST_SPECS:
+    for spec in ALL_PLIST_SPECS:
         path = LAUNCHD_DIR / spec.filename
         with path.open("rb") as handle:
             documents[spec.filename] = plistlib.load(handle)
@@ -58,7 +66,13 @@ def test_exactly_two_agents_are_committed():
     assert names == {"autostart", "dashboard"}
 
     on_disk = {path.name for path in LAUNCHD_DIR.glob("*.plist")}
-    assert on_disk == {spec.filename for spec in PLIST_SPECS}
+    # Phase 5: the two positional_stocks jobs are committed too, but are not in
+    # PLIST_SPECS — the set the default install installs is still exactly two.
+    assert {spec.short_name for spec in OPERATOR_INSTALLED_SPECS} == {
+        "positional_stocks_fetch",
+        "positional_stocks_decide",
+    }
+    assert on_disk == {spec.filename for spec in ALL_PLIST_SPECS}
     assert "com.soundarraj.algotrading.auth.plist" not in on_disk
     assert "com.soundarraj.algotrading.intraday_options.plist" not in on_disk
 
@@ -362,3 +376,80 @@ def test_the_only_environment_variable_is_the_project_root():
     never through the plist, which is world-readable in ~/Library."""
     for document in _committed_plists().values():
         assert set(document["EnvironmentVariables"]) == {"PROJECT_ROOT"}
+
+
+# ================================== Phase 5: the two positional_stocks agents
+def _stock(short_name: str) -> dict[str, object]:
+    return _committed_plists()[f"{LABEL_PREFIX}.{short_name}.plist"]
+
+
+def test_the_positional_stocks_agents_follow_the_committed_schedule():
+    """Spec 10.3 v1.3: fetch Saturday 08:00, Saturday 14:00, Sunday 10:00;
+    decide Monday 08:30 — generated from the strategy YAML, and equal to what
+    the weekly run itself parses from it (launchd numbers Sunday 0)."""
+    from runtimes.positional_stocks.run_config import RunConfig
+
+    fetch = _stock("positional_stocks_fetch")["StartCalendarInterval"]
+    decide = _stock("positional_stocks_decide")["StartCalendarInterval"]
+    assert fetch == [
+        {"Weekday": 6, "Hour": 8, "Minute": 0},
+        {"Weekday": 6, "Hour": 14, "Minute": 0},
+        {"Weekday": 0, "Hour": 10, "Minute": 0},
+    ]
+    assert decide == [{"Weekday": 1, "Hour": 8, "Minute": 30}]
+    schedule = RunConfig.from_config(LAUNCHD_DIR.parents[1] / "config").schedule
+    as_launchd = [
+        {"Weekday": (slot.weekday + 1) % 7, "Hour": slot.at.hour, "Minute": slot.at.minute}
+        for slot in schedule.fetch_attempts
+    ]
+    assert as_launchd == fetch
+
+
+def test_the_positional_stocks_agents_never_run_at_load_or_relaunch():
+    for name, mode in (
+        ("positional_stocks_fetch", "fetch"),
+        ("positional_stocks_decide", "decide"),
+    ):
+        document = _stock(name)
+        assert document["RunAtLoad"] is False and document["KeepAlive"] is False
+        command = " ".join(document["ProgramArguments"])
+        assert f"-m' 'runtimes.positional_stocks.weekly_run' '--mode' '{mode}'" in command
+        assert "/usr/bin/caffeinate" not in command
+        assert "did not appear within" in command  # the elapsed wait, not 15:15
+
+
+def test_the_positional_stocks_agents_are_never_installed_by_default():
+    from scripts import install_launch_agents as ila
+
+    assert all(spec.installed_by_default for spec in PLIST_SPECS)
+    assert not any(spec.installed_by_default for spec in OPERATOR_INSTALLED_SPECS)
+    default_plan = " ".join(
+        " ".join(step.command) for step in ila.install_steps(source=LAUNCHD_DIR)
+    )
+    assert "positional_stocks" not in default_plan
+    uninstall_plan = " ".join(" ".join(step.command) for step in ila.uninstall_steps())
+    assert "positional_stocks" not in uninstall_plan
+
+
+def test_naming_the_agents_selects_only_them(capsys):
+    import argparse
+
+    from scripts import install_launch_agents as ila
+
+    args = argparse.Namespace(
+        config_root=LAUNCHD_DIR.parents[1] / "config",
+        execute=False,
+        agent=["positional_stocks_fetch", "positional_stocks_decide"],
+    )
+    selected = ila._selected(args)
+    assert [spec.short_name for spec in selected] == [
+        "positional_stocks_fetch",
+        "positional_stocks_decide",
+    ]
+    plan = " ".join(
+        " ".join(step.command) for step in ila.install_steps(source=LAUNCHD_DIR, specs=selected)
+    )
+    assert "positional_stocks_fetch" in plan and "positional_stocks_decide" in plan
+    assert "autostart" not in plan and "dashboard" not in plan
+    with pytest.raises(SystemExit, match="unknown --agent"):
+        ila._selected(argparse.Namespace(agent=["nope"]))

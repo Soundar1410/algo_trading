@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PROJECT_ROOT</key>
+		<string>/Volumes/Trading/algo_trading</string>
+	</dict>
+	<key>KeepAlive</key>
+	<false/>
+	<key>Label</key>
+	<string>com.soundarraj.algotrading.positional_stocks_decide</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/sh</string>
+		<string>-c</string>
+		<string>n=0; while [ ! -x '/Volumes/Trading/algo_trading/.venv/bin/python' ]; do n=$((n+1)); if [ "$n" -gt 2880 ]; then echo "positional_stocks_decide: /Volumes/Trading/algo_trading/.venv/bin/python did not appear within 43200s; is /Volumes/Trading mounted? Log in again to retry." &gt;&amp;2; exit 75; fi; /bin/sleep 15; done; cd '/Volumes/Trading/algo_trading' || { echo "positional_stocks_decide: cannot enter /Volumes/Trading/algo_trading" &gt;&amp;2; exit 75; }; exec '/Volumes/Trading/algo_trading/.venv/bin/python' '-m' 'runtimes.positional_stocks.weekly_run' '--mode' 'decide'</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>/Users/Soundarraj/Library/Logs/algo_trading/launchd/positional_stocks_decide.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/Soundarraj/Library/Logs/algo_trading/launchd/positional_stocks_decide.out.log</string>
+	<key>StartCalendarInterval</key>
+	<array>
+		<dict>
+			<key>Hour</key>
+			<integer>8</integer>
+			<key>Minute</key>
+			<integer>30</integer>
+			<key>Weekday</key>
+			<integer>1</integer>
+		</dict>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/Users/Soundarraj</string>
+</dict>
+</plist>
