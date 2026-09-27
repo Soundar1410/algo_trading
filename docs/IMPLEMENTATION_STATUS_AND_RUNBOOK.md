@@ -14866,7 +14866,7 @@ Phase 4 is accepted. Audit round 6 found every round-5 fix working, 0 socket eve
 | 2 | `2133ebf` | Part A: R6-1 … R6-5, the watchlist, the sizing reason, final-attempt alerts, token safety, the `enabled` gate |
 | 3 | `6c95ca6` | The config pair and the strict `RunConfig` binding |
 | 4 | `aa8d59e` | **Shared, approved:** `orchestration/launchd/generate_plists.py`, `scripts/install_launch_agents.py`, `tests/unit/test_launchd_plists.py`, and the two new plists |
-| 5 | `6821809` | Operator rows: eight gap acknowledgements |
+| 5 | `e978f5e` | Operator rows: eight gap acknowledgements |
 | 6 | this one | Architecture-doc sweep, this runbook |
 
 ### Part A — audit round 6 and the v1.3 rules
