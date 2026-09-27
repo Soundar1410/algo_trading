@@ -96,11 +96,12 @@ Build now:
 2. positional_options runtime foundation
 3. intraday_stocks runtime foundation
 
-Placeholder only:
+Scoped, paper only (a weekly batch job, not a supervisor/worker runtime):
 4. positional_stocks
 ```
 
-The placeholder preserves the repository structure without forcing unused implementation.
+`positional_stocks` is no longer a placeholder: it runs one approved strategy as a
+run-to-completion weekly job — see "Positional stocks — scoped, paper only" below.
 
 ---
 
@@ -572,7 +573,7 @@ Use one SQLite database per runtime group:
 data/operational/intraday_options.db
 data/operational/positional_options.db
 data/operational/intraday_stocks.db
-data/operational/positional_stocks.db   # create later
+data/operational/positional_stocks.db   # created by the first writing decide run (paper)
 ```
 
 Use SQLite WAL mode and foreign keys. Keep dashboards read-only.
@@ -1468,7 +1469,7 @@ Initial process allocation:
 intraday_options_runtime   → one feed connection
 positional_options_runtime → one feed connection when implemented
 intraday_stocks_runtime    → one feed connection when implemented
-positional_stocks_runtime  → future placeholder
+positional_stocks          → no feed connection (weekly batch job; decide is offline)
 streamlit_dashboard        → no feed connection
 ```
 
@@ -2051,7 +2052,7 @@ data/operational/
 ├── intraday_options.db
 ├── positional_options.db
 ├── intraday_stocks.db
-└── positional_stocks.db  # later
+└── positional_stocks.db  # created by the first writing decide run (paper)
 ```
 
 Enable:
@@ -2933,6 +2934,15 @@ has one approved consumer.
   one open cycle per strategy and key identity on an option expiry.
 - One approved strategy: `wsr1_weekly_stochrsi`. Authoritative specification:
   `strategies/positional_stocks/wsr1_weekly_stochrsi/WSR1_WEEKLY_STOCH_RSI_SPEC.md`.
+- **Configuration and schedule (Phase 5, spec v1.3).** `config/runtimes/positional_stocks.yaml`
+  and `config/strategies/positional_stocks/wsr1_weekly_stochrsi.yaml` ship together,
+  both `enabled: false`; **both flags gate the job** (fetch and every writing decide run
+  refuse while either is false). The two LaunchAgents — fetch Saturday 08:00, retried
+  Saturday 14:00 and Sunday 10:00; decide Monday 08:30 — are generated from the strategy
+  file and committed, but `scripts/install_launch_agents.py` installs them only when the
+  operator names them (`--agent`). Go-live is one operator commit setting both flags to
+  `true`, then installing the two agents; the runbook's "Operator guide" has the
+  checklist.
 
 #### Phase 6 — Paper recovery and expiry handling
 
