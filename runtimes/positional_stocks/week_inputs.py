@@ -18,8 +18,9 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from strategies.positional_stocks.wsr1_weekly_stochrsi.daily_cache import (
     DailyBarCache,
@@ -67,6 +68,39 @@ OPERATOR_FILES = (
     "gap_acknowledgements.csv",
     "corporate_actions.csv",
 )
+
+
+#: NSE's cash-market open (IST). An order can execute only at an open that
+#: has not happened yet when its decision run started (spec 3, D122).
+MARKET_OPEN = time(9, 15)
+
+
+def execution_session(
+    week_ending: date, calendar: TradingCalendar, run_started: datetime | None
+) -> tuple[date, str | None]:
+    """Where a week's orders execute (spec 3 "Execution time", D122), and a
+    note when the run's clock moved it.
+
+    Always at least the first session after the week. For the final week of a
+    run (``run_started`` given) also no earlier than the first calendar
+    session whose 09:15 IST open is strictly after the run started — a
+    decision made at Monday 11:00 fills at Tuesday's open, never at an open
+    that had already passed. Catch-up weeks pass ``None``: their orders fill at
+    their own historical sessions (and are flagged catch-up, D123).
+    """
+    base = calendar.next_session_after(week_ending)
+    if run_started is None:
+        return base, None
+    tz = ZoneInfo(calendar.timezone)
+    started = run_started.astimezone(tz)
+    day = started.date()
+    for _ in range(60):
+        if calendar.is_trading_day(day) and datetime.combine(day, MARKET_OPEN, tz) > started:
+            break
+        day += timedelta(days=1)
+    if day <= base:
+        return base, None
+    return day, (f"orders execute at {day:%a %d %b} open: this run started after {base:%A}'s open")
 
 
 class ColdCache(RuntimeError):
@@ -123,6 +157,8 @@ class PreparedWeek:
     warnings: tuple[str, ...] = ()
     #: Every symbol's series, for the report (watchlist, marks).
     series: Mapping[str, IndicatorSeries] = field(default_factory=dict)
+    #: D122: set when the run's clock moved the execution session later.
+    execution_note: str | None = None
 
 
 def _sunday(week: WeekKey) -> date:
@@ -154,8 +190,13 @@ def prepare_week(
     pending: Iterable[str],
     index_symbol: str,
     params: RulesParameters,
+    run_started: datetime | None = None,
 ) -> PreparedWeek:
     """Everything :func:`~.accounting.run_decision_week` needs for ``week``.
+
+    ``run_started`` is the run's clock, given for its **final** week only:
+    the execution session is then never an open that has already passed
+    (:func:`execution_session`, D122).
 
     Raises:
         ColdCache: the index has not published the week's last session.
@@ -235,11 +276,8 @@ def prepare_week(
     if results.absent or not len(results):
         warnings.append("results_calendar.csv has no rows: every symbol is 'results date unknown'")
 
-    ctx = WeekContext(
-        week=week,
-        week_ending=week_ending,
-        execution_date=calendar.next_session_after(week_ending),
-    )
+    execution_date, execution_note = execution_session(week_ending, calendar, run_started)
+    ctx = WeekContext(week=week, week_ending=week_ending, execution_date=execution_date)
     inputs = WeekInputs(
         ctx=ctx,
         symbols=symbols,
@@ -257,4 +295,5 @@ def prepare_week(
         unlisted_sessions=verdict.unlisted_sessions,
         warnings=tuple(warnings),
         series=all_series,
+        execution_note=execution_note,
     )

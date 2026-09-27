@@ -31,6 +31,8 @@ from strategies.positional_stocks.wsr1_weekly_stochrsi.models import (
 
 from .accounting import STUCK_EXIT, CorporateActionEvent, WeekOutcome
 from .paper_fills import OrderFill
+from .repository import order_id
+from .run_config import STRATEGY_ID
 from .week_inputs import StaleSymbol
 
 #: Spec 4.14 item 5 / decision 5: highlighted for the operator.
@@ -96,6 +98,8 @@ class ReportData:
     preview: PreviewInfo | None = None
     #: R5-2: a later week stopped this invocation; the weeks here committed.
     stopped: str | None = None
+    #: D122: the run's clock moved the final week's execution session later.
+    execution_note: str | None = None
 
 
 def _rs(value: float | None) -> str:
@@ -204,9 +208,11 @@ def _state(data: ReportData) -> list[str]:
 
 
 # ------------------------------------------------------------ 2. fills
-def _fill_flags(result: OrderFill) -> str:
+def _fill_flags(result: OrderFill, catch_up: frozenset[str] = frozenset()) -> str:
     assert result.plan is not None
     flags = []
+    if order_id(STRATEGY_ID, result.order) in catch_up:
+        flags.append("catch_up")
     if result.plan.late_fill:
         flags.append("late_fill")
     if result.plan.not_traded_on_execution_session:
@@ -216,7 +222,7 @@ def _fill_flags(result: OrderFill) -> str:
     return ", ".join(flags)
 
 
-def _fill_line(result: OrderFill) -> str | None:
+def _fill_line(result: OrderFill, catch_up: frozenset[str] = frozenset()) -> str | None:
     outcome = result.outcome
     if outcome is None or outcome.skipped is not None or outcome.position is None:
         return None
@@ -231,14 +237,15 @@ def _fill_line(result: OrderFill) -> str | None:
         shares, price, fees = sale.shares, sale.price, sale.fees
     return (
         f"| {result.plan.session} | {order.symbol} | {order.action.value} | {shares} | "
-        f"{_money(price)} | {_money(fees)} | {_fill_flags(result)} |"
+        f"{_money(price)} | {_money(fees)} | {_fill_flags(result, catch_up)} |"
     )
 
 
 def _fills(data: ReportData) -> list[str]:
     lines = ["## 2. Fills since the last run", ""]
     for record in data.weeks:
-        rows = [line for r in record.outcome.fills if (line := _fill_line(r)) is not None]
+        catch_up = frozenset(record.outcome.catch_up_fills)
+        rows = [line for r in record.outcome.fills if (line := _fill_line(r, catch_up)) is not None]
         skipped = [r for r in record.outcome.fills if r.skipped]
         lines.append(f"### {week_label(record.week)}")
         lines.append("")
@@ -273,6 +280,8 @@ def _levels(order: PendingOrder, held: dict[str, Position]) -> str:
 
 def _pending(data: ReportData) -> list[str]:
     lines = ["## 3. Pending orders for the next session", ""]
+    if data.execution_note:
+        lines += [f"**{FLAG} {data.execution_note}.**", ""]
     if not data.pending:
         return [*lines, "None.", ""]
     lines += [
@@ -540,6 +549,19 @@ def _flags(data: ReportData) -> list[str]:
     ]
     lines.append("**late_fill and not-traded fills:** " + ("" if flagged else "none."))
     lines += flagged
+    catch_up = [
+        f"- {week_label(r.week)}: {f.order.symbol} {f.order.action.value} on {f.plan.session} "
+        f"(decided {week_label(f.order.decided_week)})"
+        for r in data.weeks
+        for f in r.outcome.fills
+        if f.plan is not None and order_id(STRATEGY_ID, f.order) in r.outcome.catch_up_fills
+    ]
+    lines.append("")
+    lines.append(
+        "**catch_up fills** (decided in a catch-up week, filled at that week's own "
+        "session, spec 3): " + ("" if catch_up else "none.")
+    )
+    lines += catch_up
     partial = [
         f"- {r.symbol} ({r.position_id}): {r.reason}"
         for r in data.decision.reviews

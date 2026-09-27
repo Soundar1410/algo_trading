@@ -104,6 +104,9 @@ class StockRepository:
         self._db = database
         self._strategy_id = strategy_id
         self._capital = capital
+        #: D123: set by ``run_decision_week`` while it decides a catch-up week;
+        #: every order saved meanwhile is stored with ``catch_up = 1``.
+        self.catch_up = False
 
     @property
     def database(self) -> Database:
@@ -386,8 +389,8 @@ class StockRepository:
         conn.execute(
             "INSERT INTO stock_pending_orders (order_id, strategy_id, symbol, action, "
             "decided_week, execute_on_or_after, reason, position_id, amount, quantity, spacing, "
-            "allocation, t1_amount, t2_amount, t3_amount, event_risk, sector, grp, price_factor) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "allocation, t1_amount, t2_amount, t3_amount, event_risk, sector, grp, price_factor, "
+            "catch_up) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 identifier,
                 self._strategy_id,
@@ -410,6 +413,7 @@ class StockRepository:
                 order.sector,
                 order.group,
                 None if order.price_factor is None else str(order.price_factor),
+                int(self.catch_up),
             ),
         )
         return identifier
@@ -442,8 +446,10 @@ class StockRepository:
         not_traded_on_execution_session: bool,
         late_fill: bool = False,
         week: WeekKey,
-    ) -> None:
-        """The fill this order just made — the position's latest buy or sale."""
+    ) -> bool:
+        """The fill this order just made — the position's latest buy or sale.
+        Returns whether it is a catch-up fill (D123): its order was decided in a
+        catch-up week; the flag is copied from the order's row."""
         if order.action.is_buy:
             buy = position.buys[order.action.tranche - 1]
             session, price, shares, fees = buy.session, buy.price, buy.shares, buy.fees
@@ -452,14 +458,19 @@ class StockRepository:
             sale = position.sales[-1]
             session, price, shares, fees = sale.session, sale.price, sale.shares, sale.fees
             at_open = None
+        identifier = order_id(self._strategy_id, order)
+        row = conn.execute(
+            "SELECT catch_up FROM stock_pending_orders WHERE order_id = ?", (identifier,)
+        ).fetchone()
+        catch_up = bool(row is not None and row["catch_up"])
         conn.execute(
             "INSERT INTO stock_fills (strategy_id, order_id, position_id, symbol, action, "
             "session, price, shares, fees, at_week_open, cash_delta, "
-            "not_traded_on_execution_session, late_fill, recorded_week) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "not_traded_on_execution_session, late_fill, catch_up, recorded_week) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 self._strategy_id,
-                order_id(self._strategy_id, order),
+                identifier,
                 position.position_id,
                 order.symbol,
                 order.action.value,
@@ -471,9 +482,11 @@ class StockRepository:
                 str(cash_delta),
                 int(not_traded_on_execution_session),
                 int(late_fill),
+                int(catch_up),
                 week_text(week),
             ),
         )
+        return catch_up
 
     def save_corporate_action(
         self, conn: sqlite3.Connection, position: Position, rescale: Rescale, week: WeekKey

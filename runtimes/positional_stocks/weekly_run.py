@@ -45,7 +45,7 @@ import tempfile
 import time as _time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import date, datetime, time
+from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -326,14 +326,29 @@ def _first_run_refusal(
     of now: an earlier ``--as-of`` would start the book in the past, and the
     next ``auto`` run would then catch up — backfilling trades.
 
-    Audit R6-5: a STARTED first week can always be redone — it was the latest
-    completed week when it started, and the run resumes from it — and the one
-    refusal left gives one instruction that works."""
+    D128 (supersedes the R6-5 wording "can always be redone"): a STARTED
+    first week is redone only while it is still the latest completed week.
+    An older one would backfill trades from a book that never completed a
+    week, so the run refuses with one instruction: move the book aside."""
     if _has_completed_run(db_path, strategy_id):
         return None
-    if latest is not None and latest[1] == "STARTED":
-        return None
     now_target = target_week(env.now(), calendar)
+    if latest is not None and latest[1] == "STARTED":
+        started = week_of(latest[0])
+        if started == now_target:
+            return None
+        stamp = env.now().astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+        moves = [f"mv {db_path} {db_path}.abandoned-{stamp}"]
+        for suffix in ("-wal", "-shm"):
+            sidecar = db_path.with_name(db_path.name + suffix)
+            if sidecar.exists():
+                moves.append(f"mv {sidecar} {db_path}.abandoned-{stamp}{suffix}")
+        return (
+            f"no week has been COMPLETED yet, and the STARTED first week {week_label(started)} "
+            f"is older than the latest completed week, {week_label(now_target)}: redoing it "
+            "would backfill trades. Nothing was ever completed, so move the book aside and "
+            f"start fresh: {' && '.join(moves)}"
+        )
     if target != now_target:
         return (
             f"no week has been COMPLETED yet, so the first run must decide the latest "
@@ -529,6 +544,7 @@ def _run_locked(
         return EXIT_OK
 
     run = _Run(options, env, operator, calendar, reports, suffix, deadline, preview)
+    run.run_started = env.now()
     with tempfile.TemporaryDirectory(prefix="positional_stocks_dry_run_") as scratch:
         if on_copy:
             working = Path(scratch) / "positional_stocks.db"
@@ -557,6 +573,8 @@ class _Run:
     preview: PreviewInfo | None
     database: Database | None = None
     records: list[tuple[PreparedWeek, WeekOutcome]] = field(default_factory=list)
+    #: D122: the run's clock, taken once at the start of the locked run.
+    run_started: datetime | None = None
 
     @property
     def sends(self) -> bool:
@@ -585,6 +603,8 @@ def _process(
     run.reports.mkdir(parents=True, exist_ok=True)
     repository: StockRepository | None = None
 
+    final_week = weeks[-1]
+
     def prepare(week: WeekKey, held: list[str], pending: list[str]) -> PreparedWeek:
         return prepare_week(
             week,
@@ -595,6 +615,9 @@ def _process(
             pending=pending,
             index_symbol=config.index_symbol,
             params=config.params,
+            # D122: only the final week executes after the run; a catch-up
+            # week's orders fill at that week's own next session (D123).
+            run_started=run.run_started if week == final_week else None,
         )
 
     for week in weeks:
@@ -640,7 +663,11 @@ def _process(
                 # never decide on a week prepared for another book.
                 prepared = prepare(week, *opened)
         outcome = run_decision_week(
-            repository, prepared.inputs, calendar=run.calendar, params=config.params
+            repository,
+            prepared.inputs,
+            calendar=run.calendar,
+            params=config.params,
+            catch_up=week != final_week,
         )
         env.out(f"{week_label(week)}: {outcome.status}")
         run.records.append((prepared, outcome))
@@ -693,6 +720,7 @@ def _finish(run: _Run, repository: StockRepository, *, stopped: str | None = Non
         _report_data(env, run.options, repository, run.records, run.calendar),
         preview=run.preview,
         stopped=stopped,
+        execution_note=run.records[-1][0].execution_note,
     )
     status = "not sent (dry run)"
     if run.sends:

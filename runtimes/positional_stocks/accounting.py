@@ -97,7 +97,7 @@ from strategies.positional_stocks.wsr1_weekly_stochrsi.rules import (
 from strategies.positional_stocks.wsr1_weekly_stochrsi.trading_calendar import TradingCalendar
 
 from .paper_fills import OrderFill, fill_orders
-from .repository import StockRepository, week_text
+from .repository import StockRepository, order_id, week_text
 
 
 class RunOrderError(RuntimeError):
@@ -144,6 +144,9 @@ class WeekOutcome:
     #: Spec 4.14 item 7 v1.2m: freezes that lifted with neither an
     #: acknowledgement nor a rescale — for the operator to check.
     silent_lifts: tuple[CorporateActionEvent, ...] = ()
+    #: D123: order ids of this week's fills whose order was decided in a
+    #: catch-up week (spec 3: "the report flags those fills as catch-up").
+    catch_up_fills: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,8 +167,26 @@ def run_decision_week(
     *,
     calendar: TradingCalendar,
     params: RulesParameters,
+    catch_up: bool = False,
 ) -> WeekOutcome:
-    """Fill, decide and persist one week — or nothing, if it is already done."""
+    """Fill, decide and persist one week — or nothing, if it is already done.
+
+    ``catch_up`` (D123): this week is not the final week of its invocation, so
+    its orders fill at their historical sessions and are flagged catch-up."""
+    repository.catch_up = catch_up
+    try:
+        return _run_decision_week(repository, inputs, calendar=calendar, params=params)
+    finally:
+        repository.catch_up = False
+
+
+def _run_decision_week(
+    repository: StockRepository,
+    inputs: WeekInputs,
+    *,
+    calendar: TradingCalendar,
+    params: RulesParameters,
+) -> WeekOutcome:
     ctx = inputs.ctx
     status = repository.run_status(ctx.week_ending)
     if status == "COMPLETED":
@@ -224,6 +245,7 @@ def run_decision_week(
             params=params,
         )
         late_buys: set[str] = set()
+        catch_up_fills: list[str] = []
         for result in fills:
             outcome = result.outcome
             if outcome is None:
@@ -239,7 +261,7 @@ def run_decision_week(
             repository.resolve_order(
                 conn, result.order, state="FILLED", week=ctx.week, resolution="filled"
             )
-            repository.save_fill(
+            if repository.save_fill(
                 conn,
                 result.order,
                 position,
@@ -247,7 +269,8 @@ def run_decision_week(
                 not_traded_on_execution_session=result.plan.not_traded_on_execution_session,
                 late_fill=result.plan.late_fill,
                 week=ctx.week,
-            )
+            ):
+                catch_up_fills.append(order_id(repository.strategy_id, result.order))
             if result.plan.late_fill and result.order.action.is_buy:
                 late_buys.add(position.position_id)
             if outcome.closed is not None and outcome.closed.is_loss:
@@ -339,6 +362,7 @@ def run_decision_week(
         rescaled=tuple(found.rescaled),
         events=tuple(found.events),
         silent_lifts=tuple(silent),
+        catch_up_fills=tuple(catch_up_fills),
     )
 
 

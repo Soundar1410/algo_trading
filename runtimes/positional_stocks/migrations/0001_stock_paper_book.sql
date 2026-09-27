@@ -89,7 +89,10 @@ CREATE TABLE IF NOT EXISTS stock_pending_orders (
     resolution           TEXT,
     -- D102: a stuck-freeze exit fills at open / price_factor, in the
     -- position's own units. NULL for every other order.
-    price_factor         TEXT
+    price_factor         TEXT,
+    -- Phase 5-fix (D123): decided in a catch-up week — a week of a multi-week
+    -- invocation other than its final one (spec 3, 9 "catch-up flag").
+    catch_up             INTEGER NOT NULL DEFAULT 0 CHECK (catch_up IN (0, 1))
 );
 CREATE INDEX IF NOT EXISTS idx_stock_pending_orders_state
     ON stock_pending_orders (strategy_id, state);
@@ -118,6 +121,9 @@ CREATE TABLE IF NOT EXISTS stock_fills (
     -- Spec 8 v1.2j: the fill session is in an earlier week than the run that
     -- recorded it (its candle was missing at the earlier run).
     late_fill           INTEGER NOT NULL DEFAULT 0 CHECK (late_fill IN (0, 1)),
+    -- Phase 5-fix (D123): the order was decided in a catch-up week, so it
+    -- filled at its week's historical session (spec 3). Not late_fill.
+    catch_up            INTEGER NOT NULL DEFAULT 0 CHECK (catch_up IN (0, 1)),
     recorded_week       TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_stock_fills_position

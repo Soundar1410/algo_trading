@@ -13,7 +13,7 @@ from datetime import date
 from pathlib import Path
 
 import pytest
-from _stock_run_fixtures import Root, falling, wobble
+from _stock_run_fixtures import IST, Root, falling, wobble
 from _wsr1_rules_fixtures import (
     PARAMS0,
     book,
@@ -156,14 +156,17 @@ def test_8_a_frozen_position_prints_both_resolution_lines(tmp_path: Path) -> Non
         assert root.run("--as-of", root.as_of(n)) == 0
     section = _section(root.report(4), 8)
     ex = root.first_session(2)
+    # Phase 5-fix (D122): the fixture decides each week at its Monday 08:30
+    # slot, so the paste-ready lines carry that run's date, not 25 Sep.
+    today = root.config.schedule.decide_after(root.last_session(4), IST).date()
     assert (
         "**⚠ ESCALATED — operator action.** A (A-2026W23): factor 0.5000, frozen 3 run(s)"
         in section
     )
-    assert f"    A,{ex},0.5000,2026-09-25,real move: <why>" in section
+    assert f"    A,{ex},0.5000,{today},real move: <why>" in section
     assert (
         f"    A,{ex},BONUS_SPLIT,<new shares per old share, ~2.00; check the exchange "
-        "record>,2026-09-25,<note>"
+        f"record>,{today},<note>"
     ) in section
     assert "**Real move only**" in section and "**Corporate action**" in section
     assert isinstance(root.notifier.events[-1].message, str)

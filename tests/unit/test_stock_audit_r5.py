@@ -17,13 +17,13 @@ import hashlib
 import re
 import shutil
 import sqlite3
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from _stock_run_fixtures import Root, falling, week, wobble
+from _stock_run_fixtures import IST, Root, falling, week, wobble
 from _wsr1_rules_fixtures import friday
 from test_stock_accounting import _repo
 from test_stock_unadjusted_gaps import _ack, _run, _through, _world, monday
@@ -279,14 +279,17 @@ def test_the_first_writing_run_must_decide_the_latest_completed_week(tmp_path: P
     root = Root.create(tmp_path)
     root.standard_cache()
     # now = 25 Sep 2026 20:00 IST: the latest completed week is 2026-W39.
-    assert root.run("--as-of", root.as_of(1)) == EXIT_REFUSED
+    # Phase 5-fix: passed explicitly, since the fixture otherwise decides a
+    # week at its own Monday 08:30 slot (D122).
+    friday = datetime.combine(date(2026, 9, 25), time(20, 0), IST)
+    assert root.run("--as-of", root.as_of(1), now=lambda: friday) == EXIT_REFUSED
     # Phase 5 (R6-4): a refusal also writes a report and alerts, so the
     # REFUSED line is no longer the last one printed; R6-5: one instruction.
     (refused,) = [line for line in root.output if line.startswith("REFUSED")]
     assert "the first run must decide the latest completed week, 2026-W39" in refused
     assert "Run with --as-of auto (or omit --as-of), or add --dry-run" in refused
     assert not root.db.exists()
-    assert root.run("--as-of", root.as_of(1), "--dry-run") == EXIT_OK  # still allowed
+    assert root.run("--as-of", root.as_of(1), "--dry-run", now=lambda: friday) == EXIT_OK
     assert root.run("--as-of", "auto") == EXIT_OK
     assert root.repo().latest_run() == (date(2026, 9, 25), "COMPLETED")
 
@@ -298,10 +301,13 @@ def test_a_book_with_a_completed_week_is_not_guarded(tmp_path: Path) -> None:
     assert root.run("--as-of", root.as_of(1)) == EXIT_OK
 
 
-def test_a_started_first_week_can_always_be_redone(tmp_path: Path) -> None:
-    """Phase 5 (audit R6-5, spec 10.2 v1.3): replaces 4b-2's "a first run left
-    STARTED for another week is refused". A STARTED first week was the latest
-    completed week when it started; it is redone, and the run catches up."""
+def test_a_started_first_week_is_redone_while_it_is_the_latest_completed_week(
+    tmp_path: Path,
+) -> None:
+    """Phase 5 (audit R6-5) as narrowed by Phase 5-fix (D128): the STARTED
+    first week is redone because it is still the latest completed week at the
+    run's clock (the fixture decides week 1 at its Monday 08:30 slot). An older
+    one is refused: test_stock_phase5_fix.py."""
     root = Root.create(tmp_path)
     root.standard_cache()
     root.seed_entry(mark_week=False)

@@ -229,6 +229,8 @@ def _row(
         flags = []
         if fill["late_fill"]:
             flags.append("late_fill")
+        if fill["catch_up"]:
+            flags.append("catch_up")
         if fill["not_traded_on_execution_session"]:
             flags.append("not traded on the execution session")
         if fill["reason"] == STUCK_EXIT:

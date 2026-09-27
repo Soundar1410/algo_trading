@@ -35,6 +35,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from common.notifications.base import RecordingNotifier
 from common.utils.timeutils import now_ist
@@ -108,7 +109,8 @@ def replay(
     config: RunConfig | None = None,
 ) -> list[WeekSummary]:
     """Decide ``weeks`` weeks ending at ``through`` (default: the latest
-    complete as of ``now``) on the book in ``workdir``, one run per week."""
+    complete as of ``now``) on the book in ``workdir``, one run per week, each
+    at its own scheduled decide slot (D122)."""
     calendar = TradingCalendar.from_config(workdir / "config")
     last = through if through is not None else target_week(now(), calendar)
     order = [shift(last, -n) for n in range(weeks - 1, -1, -1)]
@@ -129,6 +131,11 @@ def replay(
     for week in order:
         lines.clear()
         ending = calendar.expected_last_session(week)
+        # D122: each week is decided at its own scheduled slot (the Monday
+        # 08:30 after it), so its orders execute at that Monday's open — as
+        # the scheduled job would have — never at the wall clock's next open.
+        slot = env.config.schedule.decide_after(ending, ZoneInfo(calendar.timezone))
+        env.now = lambda slot=slot: slot  # type: ignore[misc]
         code = run(Options(mode="decide", as_of=ending.isoformat()), env)
         summary = _summarise(env, week, ending.isoformat(), code, lines)
         out(summary.line())

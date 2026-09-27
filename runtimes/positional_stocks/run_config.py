@@ -155,6 +155,10 @@ class RunConfig:
         """
         from common.config import load_runtime_config, load_strategy_config
 
+        # D126: the shared loader keeps the last of two duplicate keys without
+        # a word; this runtime refuses them before the shared loader runs.
+        for relative in (RUNTIME_FILE, STRATEGY_FILE):
+            reject_duplicate_keys(config_root / relative)
         try:
             runtime = load_runtime_config(config_root, RUNTIME_ID)
             strategy = load_strategy_config(config_root, STRATEGY_ID, runtime_id=RUNTIME_ID)
@@ -166,6 +170,12 @@ class RunConfig:
         deadlines = binder.section("deadlines")
         decide_minutes = binder.number(deadlines, "decide_minutes", "deadlines")
         fetch_minutes = binder.number(deadlines, "fetch_minutes", "deadlines")
+        rate = deadlines.get("fetch_requests_per_second")
+        if isinstance(rate, int | float) and not isinstance(rate, bool) and not rate > 0:
+            raise RunRefused(
+                f"configuration: parameters.deadlines.fetch_requests_per_second must be > 0, "
+                f"got {rate}"
+            )
         binder.fixed(
             deadlines, "fetch_requests_per_second", DEFAULT_REQUESTS_PER_SECOND, "deadlines"
         )
@@ -182,6 +192,46 @@ class RunConfig:
             runtime_enabled=runtime.enabled,
             strategy_enabled=strategy.enabled,
         )
+
+
+#: The two committed files, relative to ``config/``.
+RUNTIME_FILE = Path("runtimes") / f"{RUNTIME_ID}.yaml"
+STRATEGY_FILE = Path("strategies") / "positional_stocks" / f"{STRATEGY_ID}.yaml"
+
+
+def reject_duplicate_keys(path: Path) -> None:
+    """Parse ``path`` with a YAML loader that refuses a duplicate mapping key
+    (D126). The shared loader is not changed; this runs before it.
+
+    Raises:
+        RunRefused: the file is missing, is not YAML, or repeats a key.
+    """
+    import yaml
+
+    class _Strict(yaml.SafeLoader):
+        pass
+
+    def construct_mapping(loader: _Strict, node: yaml.MappingNode, deep: bool = False) -> Any:
+        seen: set[object] = set()
+        for key_node, _ in node.value:
+            key = loader.construct_object(key_node, deep=deep)
+            if key in seen:
+                raise RunRefused(
+                    f"configuration: {path}: duplicate key {key!r} on line "
+                    f"{key_node.start_mark.line + 1}"
+                )
+            seen.add(key)
+        return yaml.SafeLoader.construct_mapping(loader, node, deep=deep)
+
+    _Strict.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, construct_mapping)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RunRefused(f"configuration: {path}: {exc}") from exc
+    try:
+        yaml.load(text, Loader=_Strict)  # a SafeLoader subclass: safe
+    except yaml.YAMLError as exc:
+        raise RunRefused(f"configuration: {path}: not valid YAML: {exc}") from exc
 
 
 #: Keys whose values the code fixes (spec 4.4, 4.3, 6.1, 11); the YAML must
@@ -259,9 +309,12 @@ class _Binder:
         return self._sections[name]
 
     def number(self, where: dict[str, Any], key: str, label: str) -> float:
+        """A positive number (D126: a zero or negative deadline is refused)."""
         value = where.pop(key, None)
         if isinstance(value, bool) or not isinstance(value, int | float):
             raise RunRefused(f"configuration: parameters.{label}.{key} must be a number")
+        if not value > 0:
+            raise RunRefused(f"configuration: parameters.{label}.{key} must be > 0, got {value}")
         return float(value)
 
     def fixed(self, where: dict[str, Any], key: str, expected: object, label: str) -> None:

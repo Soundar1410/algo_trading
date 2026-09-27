@@ -105,6 +105,8 @@ def summary_text(data: ReportData) -> str:
         for symbol, held in failed_kept(data, data.preview):
             what = "held: its stop cannot be checked" if held else "pending order"
             lines.insert(1, f"⚠ FETCH FAILED {symbol} ({what})")
+    if data.execution_note:
+        lines.insert(2, data.execution_note[0].upper() + data.execution_note[1:])
     if decision.entries_blocked:
         lines.append(f"Entries blocked: {decision.entries_blocked}")
     if data.stopped:

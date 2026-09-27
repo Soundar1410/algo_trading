@@ -215,6 +215,16 @@ class Root:
         return env
 
     def run(self, *argv: str, **overrides: object) -> int:
+        """The decide CLI. Phase 5-fix (D122): an order executes no earlier
+        than the first open after the run's clock, so a week given with
+        ``--as-of`` is decided at its scheduled slot — the Monday 08:30 after
+        it — unless the test passes its own ``now``."""
+        if "now" not in overrides and "--as-of" in argv:
+            as_of = argv[argv.index("--as-of") + 1]
+            if as_of != "auto":
+                ending = date.fromisoformat(as_of)
+                slot = self.config.schedule.decide_after(ending, IST)
+                overrides["now"] = lambda: slot
         return main(["--mode", "decide", *argv], self.env(**overrides))
 
     def report(self, n: int, *, dry_run: bool = False) -> str:
