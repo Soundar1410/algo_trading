@@ -123,10 +123,13 @@ def _write(tmp_path: Path, body: str) -> Path:
     return path
 
 
-def test_the_committed_file_is_header_only() -> None:
-    assert (
-        load_gap_acknowledgements(CONFIG / "positional_stocks" / "gap_acknowledgements.csv") == ()
-    )
+def test_the_committed_file_holds_only_the_operators_verified_rows() -> None:
+    """Phase 5 (spec 16 v1.3): the file shipped header-only until the operator
+    acknowledged eight verified real moves; exactly those, every one a real
+    move (test_stock_gap_acknowledgements.py checks each key)."""
+    rows = load_gap_acknowledgements(CONFIG / "positional_stocks" / "gap_acknowledgements.csv")
+    assert len(rows) == 8
+    assert all(row.note.startswith("real ") for row in rows)
 
 
 def test_the_loader_reads_and_rounds_a_row(tmp_path: Path) -> None:
