@@ -12,12 +12,12 @@ import sqlite3
 import subprocess
 import sys
 import textwrap
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from _stock_run_fixtures import REPO, Root, falling, week, wobble
+from _stock_run_fixtures import IST, REPO, Root, falling, week, wobble
 from filelock import FileLock
 
 from common.notifications.base import NotificationEvent, RecordingNotifier
@@ -326,7 +326,10 @@ def test_no_snapshot_on_a_first_run_or_a_dry_run(tmp_path: Path) -> None:
     root = Root.create(tmp_path)
     root.standard_cache()
     assert root.run("--as-of", root.as_of(1), "--dry-run") == EXIT_OK
-    assert root.run("--as-of", root.as_of(1)) == EXIT_OK  # the DB did not exist yet
+    # Phase 4b-2's first-run guard: a fresh book starts at the latest completed
+    # week as of now, so the clock is set to week 1's evening.
+    evening = datetime.combine(root.last_session(1), time(20, 0), IST)
+    assert root.run("--as-of", root.as_of(1), now=lambda: evening) == EXIT_OK  # no DB yet
     assert not root.backups.exists()
 
 

@@ -110,6 +110,8 @@ class StaleSymbol:
     kept: bool
     #: Consecutive weeks, ending with this one, without the expected session.
     weeks: int
+    #: Held (a position), not only a pending order: its stop cannot be checked.
+    held: bool = False
 
 
 @dataclass(frozen=True)
@@ -172,7 +174,8 @@ def prepare_week(
         build_weekly_bars(index_daily, as_of=release, calendar=calendar, warn_uncovered=False)
     )
 
-    kept = set(held) | set(pending)
+    held_symbols = set(held)
+    kept = held_symbols | set(pending)
     universe = operator.universe.by_symbol
     quality = operator.quality.by_symbol
     results = operator.results
@@ -194,7 +197,9 @@ def prepare_week(
                 else f"{symbol}: last cached session {last} is before the week's last "
                 f"session {week_ending}"
             )
-            stale.append(StaleSymbol(symbol, reason, symbol in kept, missing))
+            stale.append(
+                StaleSymbol(symbol, reason, symbol in kept, missing, symbol in held_symbols)
+            )
             if symbol not in kept:
                 continue
             # Kept, but never decided on a truncated week (6.2).
@@ -205,6 +210,10 @@ def prepare_week(
                     f"{symbol} is held or has a pending order but the cache has no "
                     "completed week for it at all; the book cannot be marked"
                 )
+        # R5-1: a kept stale symbol is marked at its last daily close, the
+        # session the corporate-action checks also scan up to — an in-week
+        # gap's freeze factor then divides a close from the same side of it.
+        mark_close = bars[-1].close if missing and bars else None
         series = compute(weekly)
         all_series[symbol] = series
         daily[symbol] = [bar for bar in bars if bar.session >= keep_from]
@@ -214,6 +223,7 @@ def prepare_week(
             universe_row=universe.get(symbol),
             quality=quality.get(symbol),
             results_dates=results.dates_for(symbol) if results.knows(symbol) else None,
+            mark_close=mark_close,
         )
 
     warnings: list[str] = []

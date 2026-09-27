@@ -1,7 +1,8 @@
 """The weekly report (spec 11 v1.2m) — pure: data in, markdown out.
 
 Written to ``data/reports/positional_stocks/<week_ending>.md`` (a dry run to
-``<week_ending>-dry-run.md``, marked DRY RUN, so a real report is never
+``<week_ending>-dry-run.md``, marked DRY RUN, and fetch mode's preview to
+``<week_ending>-preview.md``, marked PREVIEW, so a real report is never
 overwritten). When one invocation catches up several weeks, fills, closed
 trades, corporate-action events and warnings are listed **per week**;
 positions, pending orders, equity, brakes, the funnel and the watchlist show
@@ -65,6 +66,15 @@ class WeekRecord:
 
 
 @dataclass(frozen=True)
+class PreviewInfo:
+    """Fetch mode's part of a PREVIEW report (Phase 4b-2): the fetch
+    section's lines, and the symbols whose refresh failed."""
+
+    lines: tuple[str, ...] = ()
+    failed: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class ReportData:
     strategy_id: str
     generated_at: datetime
@@ -82,6 +92,10 @@ class ReportData:
     blocking_gaps: tuple[Gap, ...] = ()
     notifier_status: str | None = None
     today: date | None = None
+    #: Set on fetch mode's preview.
+    preview: PreviewInfo | None = None
+    #: R5-2: a later week stopped this invocation; the weeks here committed.
+    stopped: str | None = None
 
 
 def _rs(value: float | None) -> str:
@@ -99,11 +113,22 @@ def _pct(value: float | Decimal | None) -> str:
 def render(data: ReportData) -> str:
     final = data.weeks[-1]
     title = f"# {data.strategy_id} — week {week_label(final.week)} (ending {final.week_ending})"
-    lines = [title + (" — DRY RUN" if data.dry_run else ""), ""]
-    if data.dry_run:
+    if data.preview is not None:
+        lines = [title + " — PREVIEW", ""]
+        lines += [
+            "**PREVIEW** — fetch mode's look at the decision, computed on a copy of the book; "
+            "nothing was persisted. The offline decide run makes the real decisions, from "
+            "the same cache and whatever the operator adds before then.",
+            "",
+        ]
+    else:
+        lines = [title + (" — DRY RUN" if data.dry_run else ""), ""]
+    if data.dry_run and data.preview is None:
         lines += ["**DRY RUN** — computed on a copy of the book; nothing was persisted.", ""]
     processed = ", ".join(week_label(w.week) for w in data.weeks)
     lines += [f"Generated {data.generated_at.isoformat()} · weeks processed: {processed}", ""]
+    if data.preview is not None:
+        lines += _fetch(data, data.preview)
     lines += _state(data)
     lines += _fills(data)
     lines += _pending(data)
@@ -114,7 +139,49 @@ def render(data: ReportData) -> str:
     lines += _corporate_actions(data)
     lines += _flags(data)
     lines += _warnings(data)
+    if data.stopped:
+        lines += [
+            "## Run stopped",
+            "",
+            f"**{FLAG} {data.stopped}**",
+            "",
+            "The weeks above were committed. The stopped week was not decided; the next "
+            "scheduled attempt retries it, or re-run by hand once the cause is fixed.",
+            "",
+        ]
     return "\n".join(lines).rstrip() + "\n"
+
+
+# ------------------------------------------------------ 0. fetch (preview)
+def failed_kept(data: ReportData, preview: PreviewInfo) -> list[tuple[str, bool]]:
+    """Failed symbols that are held (True) or only have a pending order (False)."""
+    held = {row.position.symbol for row in data.positions}
+    pending = {order.symbol for order in data.pending}
+    return [(s, s in held) for s in preview.failed if s in held or s in pending]
+
+
+def _fetch(data: ReportData, preview: PreviewInfo) -> list[str]:
+    lines: list[str] = []
+    for symbol, is_held in failed_kept(data, preview):
+        consequence = (
+            "held — its stop cannot be checked this week"
+            if is_held
+            else "pending order — it has no bar this week"
+        )
+        lines.append(
+            f"**{FLAG} FETCH FAILED: {symbol} — {consequence}.** Kept, marked at its last "
+            "close, no decision; fix the fetch before the decide run."
+        )
+    if lines:
+        lines.append("")
+    lines += ["## 0. Fetch", ""]
+    lines += [f"- {line}" for line in preview.lines]
+    if preview.failed:
+        lines.append(
+            f"- **Fetch failed ({len(preview.failed)}), treated as stale (spec 6.2):** "
+            + ", ".join(preview.failed)
+        )
+    return [*lines, ""]
 
 
 # ------------------------------------------------------------ 1. state
@@ -503,9 +570,14 @@ def _warnings(data: ReportData) -> list[str]:
                 "kept: marked at its last close, no decision" if stale.kept else "skipped this week"
             )
             flag = f"{FLAG} " if stale.kept and stale.weeks >= 2 else ""
+            consequence = (
+                " — a suspended stock cannot hit its stop"
+                if stale.held
+                else " — its pending buy cannot fill while it has no bar"
+            )
             items.append(
                 f"{flag}stale ({stale.weeks} week(s)) — {stale.reason}; {action}"
-                + (" — a suspended stock cannot hit its stop" if flag else "")
+                + (consequence if flag else "")
             )
         items += [f"unlisted session present: {day}" for day in record.unlisted_sessions]
         items += list(record.warnings)
@@ -551,6 +623,7 @@ def render_failure(
 __all__ = [
     "STUCK_EXIT",
     "OpenPosition",
+    "PreviewInfo",
     "ReportData",
     "WeekRecord",
     "render",

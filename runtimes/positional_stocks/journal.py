@@ -10,8 +10,11 @@ Conventions (the spec fixes the columns, not their formats):
 * dates ISO ``YYYY-MM-DD``; weeks ``YYYY-Www``; flags ``yes`` / ``no``;
 * ``s``, ``atr_pct``, ``perf6m_stock``, ``perf6m_nifty`` and ``pnl_pct_of_A``
   are **percent**, to 2 dp; money to the paisa;
-* prices, shares and levels are the stored ones, in the units of their fills
-  (a later rescale is listed in ``notes``);
+* every value is in the units at the time of its event (R5-7): fills as
+  filled; P1-derived levels (L1, L2, stop) as set at the T1 fill; a D101
+  close as the old-unit holding at cash in lieu / old shares. Each rescale is
+  in ``notes`` ("1:1 bonus ex 2026-07-06: 40 -> 80 shares"), and ``avg_cost``
+  is in the units after the last one;
 * the trigger-week columns come from ``stock_entry_signals``, written at the
   decision so a later restatement cannot change them.
 """
@@ -22,6 +25,7 @@ import csv
 import io
 import json
 import sqlite3
+from decimal import Decimal
 from pathlib import Path
 
 from strategies.positional_stocks.wsr1_weekly_stochrsi.iso_weeks import week_of, weeks_between
@@ -70,6 +74,20 @@ def exit_type(reason: str) -> str:
     return "other"
 
 
+def rescale_label(kind: str, ratio: Decimal) -> str:
+    """A corporate action as an operator writes it: a BONUS_SPLIT of ratio
+    2 is a "1:1 bonus", 1.2 a "1:5 bonus"; 0.1 a "10:1 consolidation"."""
+    if kind == "BONUS_SPLIT" and ratio > 1:
+        per = 1 / (ratio - 1)
+        if per == per.to_integral_value():
+            return f"1:{per:.0f} bonus"
+    if kind == "BONUS_SPLIT" and ratio < 1:
+        old = 1 / ratio
+        if old == old.to_integral_value():
+            return f"{old:.0f}:1 consolidation"
+    return f"{kind} {ratio}"
+
+
 def build_rows(repository: StockRepository) -> list[dict[str, str]]:
     """One row per CLOSED position, oldest exit first."""
     conn = repository.database.connect()
@@ -88,6 +106,12 @@ def build_rows(repository: StockRepository) -> list[dict[str, str]]:
     ):
         actions.setdefault(row["position_id"], []).append(row)
     signals = repository.entry_signals()
+    levels = {
+        row["position_id"]: row
+        for row in conn.execute(
+            "SELECT position_id, l1, l2, stop FROM stock_positions WHERE strategy_id = ?", (sid,)
+        )
+    }
 
     rows: list[dict[str, str]] = []
     closed = [p for p in repository.positions().values() if p.state is PositionState.CLOSED]
@@ -98,6 +122,7 @@ def build_rows(repository: StockRepository) -> list[dict[str, str]]:
                 by_position.get(position.position_id, []),
                 actions.get(position.position_id, []),
                 signals,
+                levels[position.position_id],
             )
         )
     return rows
@@ -108,6 +133,7 @@ def _row(
     fills: list[sqlite3.Row],
     actions: list[sqlite3.Row],
     signals: dict[str, sqlite3.Row],
+    levels: sqlite3.Row,
 ) -> dict[str, str]:
     t1_order = next((f["order_id"] for f in fills if f["action"] == "BUY_T1"), None)
     signal = signals.get(t1_order) if t1_order else None
@@ -121,9 +147,11 @@ def _row(
         event_risk="yes" if sizing.event_risk else "no",
         s=_pct(float(sizing.spacing)),
         A=str(sizing.allocation),
-        L1=str(position.l1),
-        L2=str(position.l2),
-        stop=str(position.stop),
+        # As set at the T1 fill, like T1's own price (R5-7): the stored row,
+        # never the rescaled levels a rebuilt position carries.
+        L1=str(levels["l1"]),
+        L2=str(levels["l2"]),
+        stop=str(levels["stop"]),
         avg_cost=str(money(position.average_cost)),
         pnl_rs=str(position.net_pnl),
         pnl_pct_of_A=_pct(float(position.net_pnl / sizing.allocation)),
@@ -165,10 +193,12 @@ def _row(
     if zeroed is not None and (
         closing is None or zeroed["ex_session"] > closing.session.isoformat()
     ):
+        # R5-7: the old-unit holding, at the cash in lieu per old share.
+        old_shares = int(zeroed["shares_before"])
         row.update(
             exit_date=zeroed["ex_session"],
-            exit_price=zeroed["reference_close"],
-            exit_shares=str(zeroed["shares_before"]),
+            exit_price=str(money(Decimal(zeroed["cash"]) / old_shares)),
+            exit_shares=str(old_shares),
             exit_type="consolidation_cash_in_lieu",
         )
         notes.append(f"D101: {CLOSED_IN_LIEU} {zeroed['cash']}")
@@ -187,11 +217,14 @@ def _row(
 
     for action in actions:
         applies = ", ".join(json.loads(action["applies_to"]))
+        cash = Decimal(action["cash"])
         notes.append(
-            f"{action['kind']} {action['ratio']} ex {action['ex_session']}: "
-            f"{action['shares_before']} -> {action['shares_after']} shares ({applies}), "
-            f"cash {action['cash']}"
+            f"{rescale_label(action['kind'], Decimal(action['ratio']))} ex "
+            f"{action['ex_session']}: {action['shares_before']} -> {action['shares_after']} "
+            f"shares ({applies})" + (f", cash {cash}" if cash else "")
         )
+    if actions:
+        notes.append("avg_cost in the units after the last rescale")
     for fill in fills:
         flags = []
         if fill["late_fill"]:

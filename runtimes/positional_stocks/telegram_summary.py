@@ -20,7 +20,8 @@ from decimal import Decimal
 from common.config.models import ExecutionMode
 from common.notifications.base import NotificationEvent, Notifier
 
-from .report import ReportData, week_label
+from .journal import exit_type
+from .report import ReportData, failed_kept, week_label
 
 #: The one refusal that means "fill in quality_gate.csv" (spec 4.2).
 NEEDS_QUALITY = "needs quality check"
@@ -33,10 +34,12 @@ class OperatorActions:
     silent_lifts: int
     needs_quality: int
     stale: int
+    #: Fetch mode's preview: symbols whose refresh failed (Phase 4b-2).
+    fetch_failed: int = 0
 
     @property
     def total(self) -> int:
-        return self.frozen + self.silent_lifts + self.needs_quality + self.stale
+        return self.frozen + self.silent_lifts + self.needs_quality + self.stale + self.fetch_failed
 
 
 def operator_actions(data: ReportData) -> OperatorActions:
@@ -50,6 +53,7 @@ def operator_actions(data: ReportData) -> OperatorActions:
         silent_lifts=sum(len(r.outcome.silent_lifts) for r in data.weeks),
         needs_quality=sum(1 for e in data.decision.funnel if e.reason == NEEDS_QUALITY),
         stale=len(stale),
+        fetch_failed=len(data.preview.failed) if data.preview is not None else 0,
     )
 
 
@@ -61,8 +65,8 @@ def exits(data: ReportData) -> list[str]:
             outcome = result.outcome
             if outcome is None or outcome.closed is None:
                 continue
-            reason = result.order.reason.split(":")[0]
-            out.append(f"{outcome.closed.symbol} {reason} {_signed(outcome.closed.net_pnl)}")
+            label = exit_type(result.order.reason).replace("_", " ")
+            out.append(f"{outcome.closed.symbol} {label} {_signed(outcome.closed.net_pnl)}")
         out += [
             f"{e.symbol} consolidation close"
             for e in record.outcome.events
@@ -86,32 +90,43 @@ def summary_text(data: ReportData) -> str:
     order_text = "; ".join(order_parts) or "none"
     actions = operator_actions(data)
     lines = [
-        f"Weekly run — {weeks}",
+        ("PREVIEW — " if data.preview is not None else "") + f"Weekly run — {weeks}",
         f"Regime: {decision.regime.value} | Equity Rs {decision.equity:,.2f} "
         f"(drawdown {data.drawdown_pct}%)",
         f"Next session: {order_text}",
         f"Exits: {', '.join(exits(data)) or 'none'}",
         f"Operator actions: {actions.total} (frozen {actions.frozen}, escalated "
         f"{actions.escalated}, silent freeze lifts {actions.silent_lifts}, waiting for a "
-        f"quality row {actions.needs_quality}, stale 2+ weeks {actions.stale})",
+        f"quality row {actions.needs_quality}, stale 2+ weeks {actions.stale}"
+        + (f", fetch failed {actions.fetch_failed}" if data.preview is not None else "")
+        + ")",
     ]
+    if data.preview is not None:
+        for symbol, held in failed_kept(data, data.preview):
+            what = "held: its stop cannot be checked" if held else "pending order"
+            lines.insert(1, f"⚠ FETCH FAILED {symbol} ({what})")
     if decision.entries_blocked:
         lines.append(f"Entries blocked: {decision.entries_blocked}")
+    if data.stopped:
+        lines.append(f"STOPPED: {data.stopped}")
     return "\n".join(lines)
 
 
 def send_summary(notifier: Notifier, data: ReportData, *, runtime_id: str, strategy_id: str) -> str:
     """Send once; return a status line for the report. Never raises."""
     actions = operator_actions(data)
+    required = (
+        f"{actions.total} operator action(s): see the weekly report" if actions.total else None
+    )
+    if data.stopped:
+        required = "the run stopped part-way: see the weekly report, then re-run"
     event = NotificationEvent(
-        event_type="weekly_summary",
+        event_type="weekly_preview" if data.preview is not None else "weekly_summary",
         message=summary_text(data),
         runtime_id=runtime_id,
         strategy_id=strategy_id,
         execution_mode=ExecutionMode.PAPER,
-        required_action=(
-            f"{actions.total} operator action(s): see the weekly report" if actions.total else None
-        ),
+        required_action=required,
     )
     return _deliver(notifier, event)
 

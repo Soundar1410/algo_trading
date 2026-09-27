@@ -66,7 +66,6 @@ from strategies.positional_stocks.wsr1_weekly_stochrsi.corporate_actions import 
 from strategies.positional_stocks.wsr1_weekly_stochrsi.gaps import (
     block_window_start,
     blocking_gaps,
-    is_acknowledged,
     scan,
 )
 from strategies.positional_stocks.wsr1_weekly_stochrsi.indicators import IndicatorSeries
@@ -320,7 +319,12 @@ def run_decision_week(
             for symbol, week_inputs in symbols.items()
         }
         repository.save_decision(
-            conn, decision, ctx.week_ending, cash=book.cash, triggered=triggered
+            conn,
+            decision,
+            ctx.week_ending,
+            cash=book.cash,
+            triggered=triggered,
+            frozen_gaps={pid: freeze.gaps for pid, freeze in frozen.items()},
         )
         repository.save_universe_seen(conn, inputs.universe_rows, ctx.week)
         repository.mark_completed(conn, ctx.week_ending)
@@ -691,10 +695,11 @@ def _silent_lifts(
 ) -> list[CorporateActionEvent]:
     """Spec 4.14 item 7 (v1.2m): a freeze that lifted with neither an
     acknowledgement nor a rescale — frozen last run, not frozen now, no
-    rescale this run, and no acknowledgement covering any gap of 15% or more
-    after the first fill. A partial restatement whose boundary gap is below
-    15% can do that; the operator checks the position against the exchange's
-    record. Reported only: the lift logic is unchanged."""
+    rescale this run, and no acknowledgement of a gap **that was part of last
+    run's freeze** (R5-3: an older, unrelated acknowledged gap explains
+    nothing). A partial restatement whose boundary gap is below 15% can do
+    that; the operator checks the position against the exchange's record.
+    Reported only: the lift logic is unchanged."""
     ctx = inputs.ctx
     lifts: list[CorporateActionEvent] = []
     for position in sorted(positions.values(), key=lambda p: p.symbol):
@@ -706,10 +711,11 @@ def _silent_lifts(
             or repository.frozen_streak(pid, ctx.week) == 0
         ):
             continue
-        first = position.buys[0].session
+        frozen_on = repository.previous_frozen_gaps(pid, ctx.week)
         acknowledged = any(
-            gap.session > first and is_acknowledged(gap, inputs.acknowledgements)
-            for gap in scan(position.symbol, daily.get(position.symbol, ()))
+            (ack.gap_session, ack.ratio) in frozen_on
+            for ack in inputs.acknowledgements
+            if ack.symbol == position.symbol
         )
         if acknowledged:
             continue

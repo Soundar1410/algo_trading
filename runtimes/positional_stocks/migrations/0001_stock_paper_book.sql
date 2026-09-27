@@ -196,6 +196,10 @@ CREATE TABLE IF NOT EXISTS stock_position_reviews (
     reason       TEXT NOT NULL,
     order_id     TEXT,
     flags        TEXT NOT NULL DEFAULT '[]',
+    -- Phase 4b-2 (R5-3): a frozen position's unacknowledged gaps as JSON
+    -- [session, ratio] pairs. Next run, only an acknowledgement of one of
+    -- these explains a lifted freeze (spec 4.14 item 7).
+    frozen_gaps  TEXT NOT NULL DEFAULT '[]',
     PRIMARY KEY (strategy_id, week_ending, position_id)
 );
 

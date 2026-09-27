@@ -111,7 +111,10 @@ class SymbolWeek:
     left the file (spec 6.3 v1.2f). ``results_dates`` is ``None`` when the
     results calendar has no row for the symbol ("results date unknown").
     ``gap_blocked`` is spec 6.1's unacknowledged-gap flag, computed by the
-    runtime (Phase 4).
+    runtime (Phase 4). ``mark_close`` overrides the week's close as a held
+    position's mark: set for a held symbol with no bar this week, to its last
+    daily close — the session the corporate-action checks also stop at, so the
+    mark and a freeze factor never come from two different days (R5-1).
     """
 
     symbol: str
@@ -122,6 +125,7 @@ class SymbolWeek:
     traded_value_30d: float | None = None
     gap_blocked: bool = False
     last_seen_row: UniverseRow | None = None
+    mark_close: float | None = None
 
 
 # ---------------------------------------------------- None-safe comparisons
@@ -947,8 +951,9 @@ def _repeat_refusal(series: IndicatorSeries, i: int, params: RulesParameters) ->
             continue
         lower = series.bars[j].close > series.bars[i].close
         if lower and not series.bars[i].close > series.bars[i - 1].high:
+            year, week = series.bars[j].iso_key
             return (
-                f"repeat signal below the previous trigger's close ({series.bars[j].iso_key}) "
+                f"repeat signal below the previous trigger's close ({year}-W{week:02d}) "
                 "without a close above the prior week's high"
             )
         return None
@@ -993,7 +998,9 @@ def decide_week(
     for position in book.positions:
         inputs = symbols.get(position.symbol)
         if inputs is not None and inputs.series.bars:
-            close = inputs.series.bars[-1].close
+            close = (
+                inputs.mark_close if inputs.mark_close is not None else inputs.series.bars[-1].close
+            )
             freeze = frozen.get(position.position_id)
             # v1.2j: a frozen position is marked in its own units, so equity
             # and the brakes see no false drop.

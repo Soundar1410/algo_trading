@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, date, datetime
 from decimal import ROUND_HALF_UP, Decimal
 
@@ -237,6 +237,29 @@ class StockRepository:
             streak += 1
             expected = shift(expected, -1)
         return streak
+
+    def previous_frozen_gaps(self, position_id: str, week: WeekKey) -> set[tuple[date, Decimal]]:
+        """The gaps the position's freeze was made of in week W-1's COMPLETED
+        run (R5-3). Empty when it was not frozen then, or frozen on a
+        restatement alone."""
+        row = (
+            self._db.connect()
+            .execute(
+                "SELECT r.frozen_gaps FROM stock_position_reviews r "
+                "JOIN stock_weekly_runs w ON w.strategy_id = r.strategy_id "
+                "AND w.week_ending = r.week_ending "
+                "WHERE r.strategy_id = ? AND r.position_id = ? AND w.status = 'COMPLETED' "
+                "AND w.iso_week = ?",
+                (self._strategy_id, position_id, week_text(shift(week, -1))),
+            )
+            .fetchone()
+        )
+        if row is None:
+            return set()
+        return {
+            (date.fromisoformat(session), Decimal(ratio))
+            for session, ratio in json.loads(row["frozen_gaps"])
+        }
 
     def positions(self, conn: sqlite3.Connection | None = None) -> dict[str, Position]:
         """Every position ever opened, by id (CLOSED ones included)."""
@@ -566,9 +589,11 @@ class StockRepository:
         *,
         cash: Decimal,
         triggered: dict[str, bool],
+        frozen_gaps: Mapping[str, Sequence[tuple[date, Decimal]]] | None = None,
     ) -> None:
         """The week's equity/brake row, its funnel with trigger history, and
-        each held position's review."""
+        each held position's review — with, for a frozen one, the gaps its
+        freeze is made of (R5-3)."""
         brakes = decision.brakes
         assert brakes.peak is not None
         conn.execute(
@@ -610,15 +635,20 @@ class StockRepository:
                     int(triggered.get(symbol, False)),
                 ),
             )
+        gaps = frozen_gaps or {}
         for review in decision.reviews:
-            self._save_review(conn, review, week_ending)
+            self._save_review(conn, review, week_ending, gaps.get(review.position_id, ()))
 
     def _save_review(
-        self, conn: sqlite3.Connection, review: PositionReview, week_ending: date
+        self,
+        conn: sqlite3.Connection,
+        review: PositionReview,
+        week_ending: date,
+        frozen_gaps: Sequence[tuple[date, Decimal]] = (),
     ) -> None:
         conn.execute(
             "INSERT INTO stock_position_reviews (strategy_id, week_ending, position_id, symbol, "
-            "reason, order_id, flags) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "reason, order_id, flags, frozen_gaps) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 self._strategy_id,
                 week_ending.isoformat(),
@@ -627,6 +657,7 @@ class StockRepository:
                 review.reason,
                 None if review.order is None else order_id(self._strategy_id, review.order),
                 json.dumps(list(review.flags)),
+                json.dumps([[session.isoformat(), str(ratio)] for session, ratio in frozen_gaps]),
             ),
         )
 
