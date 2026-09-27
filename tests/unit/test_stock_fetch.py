@@ -76,9 +76,12 @@ class FakeDhan:
         return {s: str(100 + i) for i, s in enumerate(sorted(self.prices)) if s != "NIFTY"}
 
     # ------------------------------------------------------------- services
-    def services(self, *, auth: Callable[[float], Credentials] | None = None) -> FetchServices:
+    def services(
+        self, *, auth: Callable[[float, bool], Credentials] | None = None
+    ) -> FetchServices:
         return FetchServices(
-            authenticate=auth or (lambda minimum: Credentials("CID", "TOKEN", "cache", 50_000.0)),
+            authenticate=auth
+            or (lambda minimum, allow: Credentials("CID", "TOKEN", "cache", 50_000.0)),
             scrip_master_text=self.master,
             http_post=self.post,
             sleep=self.sleep,
@@ -302,7 +305,10 @@ def test_nifty_not_yet_published_writes_no_preview_and_stops_at_once(tmp_path: P
     assert not _preview(root).exists()
     failed = (root.reports / f"{FRIDAY}-preview-failed.md").read_text()
     assert "not yet published" in failed and "NIFTY 50 has no session on 2026-09-25" in failed
-    assert root.notifier.events[-1].event_type == "weekly_run_no_trades"  # type: ignore[attr-defined]
+    # Phase 5 (spec 10.3 v1.3): Friday 20:00 is not the final attempt — the
+    # Saturday and Sunday ones follow — so it is reported but not alerted.
+    assert root.notifier.events == []  # type: ignore[attr-defined]
+    assert "a later fetch attempt is scheduled" in failed
     dhan.missing.clear()  # the next scheduled attempt: published now
     assert _fetch(root, dhan) == EXIT_OK
     assert _preview(root).is_file()
@@ -346,7 +352,9 @@ def test_a_second_run_with_everything_current_exits_at_once(tmp_path: Path) -> N
     preview = _sha(_preview(root))
     dhan.requests.clear()
     calls: list[float] = []
-    services = dhan.services(auth=lambda m: calls.append(m) or Credentials("C", "T", "cache", 1))
+    services = dhan.services(
+        auth=lambda m, allow: calls.append(m) or Credentials("C", "T", "cache", 1)
+    )
     assert _fetch(root, dhan, fetch_services=services) == EXIT_OK
     assert dhan.requests == [] and calls == []  # no login, no request
     assert root.output[-1].startswith("up to date")
@@ -477,7 +485,7 @@ def test_a_token_without_enough_life_is_refused_before_any_request(tmp_path: Pat
     root, dhan = _setup(tmp_path)
     asked: list[float] = []
 
-    def short(minimum: float) -> Credentials:
+    def short(minimum: float, allow: bool) -> Credentials:
         asked.append(minimum)
         raise FetchRefused("Cached token has 0.10 h of life left")
 

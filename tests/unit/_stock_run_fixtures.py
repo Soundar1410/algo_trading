@@ -84,7 +84,11 @@ class Root:
     calendar: TradingCalendar
     notifier: Notifier = field(default_factory=RecordingNotifier)
     output: list[str] = field(default_factory=list)
-    config: RunConfig = field(default_factory=RunConfig)
+    #: Phase 5 (D115): both enabled flags default to False (fail closed); the
+    #: synthetic project enables both, as the go-live commit would.
+    config: RunConfig = field(
+        default_factory=lambda: RunConfig(runtime_enabled=True, strategy_enabled=True)
+    )
 
     @classmethod
     def create(cls, tmp: Path) -> Root:

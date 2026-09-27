@@ -16,8 +16,9 @@ anywhere inside it, so the real ``data/operational/positional_stocks.db``,
 network call (decide mode is offline), and its notifier only records: no
 Telegram is sent.
 
-Two deliberate differences from a scheduled run, each because the replay is
-not one: the preflight (``scripts.validate_environment`` and the paper-safety
+Three deliberate differences from a scheduled run, each because the replay is
+not one: both ``enabled`` flags are treated as true (D115: they gate the real
+book, and this is a copy); the preflight (``scripts.validate_environment`` and the paper-safety
 check, which inspect the real project and its LaunchAgents) is not run, and
 the first-run guard is off — starting a book in the past is the whole point
 of a replay, and the guard exists to stop exactly that on the real one.
@@ -31,7 +32,7 @@ import shutil
 import sqlite3
 import sys
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -119,7 +120,9 @@ def replay(
         notifier=notifier,
         preflight=lambda: [],
         out=lines.append,
-        config=config or RunConfig(),
+        # D115: both enabled flags gate a writing run on the real project; the
+        # replay's book is a temporary copy, so it runs whatever they say.
+        config=replace(config or RunConfig(), runtime_enabled=True, strategy_enabled=True),
         first_run_guard=False,
     )
     summaries = []

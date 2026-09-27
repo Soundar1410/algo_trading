@@ -405,12 +405,29 @@ def _funnel(data: ReportData) -> list[str]:
 
 # --------------------------------------------------------- 7. watchlist
 def _watchlist(data: ReportData) -> list[str]:
-    lines = ["## 7. Watchlist (armed, K ≤ D, K < 50, filters pass — by RS)", ""]
+    lines = [
+        "## 7. Watchlist (armed, K ≤ D, K < 50, every filter except the quality gate — by RS)",
+        "",
+    ]
     if not data.watchlist:
         return [*lines, "None.", ""]
-    lines += ["| # | Symbol | RS | K | D |", "|---|---|---|---|---|"]
+    lines += [
+        "Spec 11 v1.3: the quality gate is ignored here, so a stock can be checked before "
+        "it triggers. A symbol without a valid PASS or EVENT_RISK row is still refused "
+        "if it triggers.",
+        "",
+        "| # | Symbol | RS | K | D | Quality | Valid until |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    today = data.today or data.generated_at.date()
     for n, entry in enumerate(data.watchlist, 1):
-        lines.append(f"| {n} | {entry.symbol} | {_rs(entry.rs)} | {entry.k:.2f} | {entry.d:.2f} |")
+        until = "—"
+        if entry.valid_until is not None:
+            until = str(entry.valid_until) + (" (expired)" if entry.valid_until < today else "")
+        lines.append(
+            f"| {n} | {entry.symbol} | {_rs(entry.rs)} | {entry.k:.2f} | {entry.d:.2f} | "
+            f"{entry.quality} | {until} |"
+        )
     return [*lines, ""]
 
 

@@ -20,18 +20,26 @@ with ``decide`` in :func:`~.weekly_run.run`):
    plus NIFTY 50, whose cache does not cover the end date, or whose last full
    fetch was in an earlier calendar month (spec 6.1: the first fetch of each
    month refetches everything; a file with no marker is refetched in full), or
-   every symbol with ``--force-refetch`` (limitation 40). A symbol the scrip
-   master could not resolve last time is skipped (spec 5).
+   every symbol with ``--force-refetch`` (limitation 40). A symbol whose cache
+   already reaches **past** the end date is never fetched or written (audit
+   R6-3). A symbol the scrip master could not resolve last time is skipped
+   (spec 5) — unless it is held or pending (audit R6-2).
 3. **Idempotent:** nothing to refresh and the preview exists -> exit 0 at
    once, with no network call.
-4. Authentication (spec 10.3: a weekend run may log in) and the token's
-   remaining life, asserted against the whole fetch budget; the scrip master.
+4. Authentication and the token's remaining life, asserted against the whole
+   fetch budget. **Token safety (spec 10.3 v1.3, D116):** no new login during
+   a trading day's session window or while another runtime's supervisor is
+   running — a cached token with enough life, or "login deferred" (exit 1).
+   Then the scrip master; a held or pending symbol it cannot resolve counts
+   as failed (audit R6-2).
 5. NIFTY 50 first. It failing is systemic (exit 5); it lacking the end date
-   is "not yet published" (exit 2) — no preview, the next attempt retries.
+   is "not yet published" (exit 2) — no preview, the next attempt retries,
+   and only the schedule's final attempt alerts (spec 10.3 v1.3).
 6. Every other symbol, throttled to 3 requests/second (retries included),
    the deadline checked before each: a tail refetch that overlaps 10 cached
    sessions (``merge_tail``; a restated series is refetched in full), or full
-   history from 2000-01-01. Failures get a second pass at the end.
+   history from 2000-01-01; a restated file is replaced only once its full
+   history has arrived (audit R6-1). Failures get a second pass at the end.
 7. **Systemic** — the deadline (exit 4), or more than
    :data:`MAX_FAILED_SYMBOLS` failed (exit 5): no preview, a report listing
    what was refreshed, a Telegram alert. **Small** — 10 or fewer failed: the
@@ -48,10 +56,15 @@ import json
 import time as _time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
+from common.authentication import AuthBootstrap, AuthCredentials, AuthError
+from common.authentication.exceptions import MissingCredentialsError
+from common.authentication.token_cache import StoredToken
+from common.config import load_auto_start_config
 from common.logging import get_logger
 from common.market_data.dhan_historical import (
     DhanHistoricalDataClient,
@@ -83,6 +96,8 @@ from strategies.positional_stocks.wsr1_weekly_stochrsi.pacing import (
     RequestThrottle,
     RunDeadline,
     RunDeadlineExceeded,
+    TokenLifeError,
+    require_remaining_life,
 )
 from strategies.positional_stocks.wsr1_weekly_stochrsi.trading_calendar import TradingCalendar
 
@@ -95,12 +110,12 @@ from .weekly_run import (
     EXIT_NO_TRADES,
     EXIT_OK,
     EXIT_PREVIEW_PARTIAL,
-    EXIT_REFUSED,
     Options,
     RunEnvironment,
     _held_and_pending,
     _run_locked,
     as_of_moment,
+    refuse,
     target_week,
 )
 
@@ -120,6 +135,14 @@ STATE_FILE = "fetch_state.json"
 
 #: The minimum token life asked for: the whole fetch budget plus 5 minutes.
 TOKEN_MARGIN_SECONDS = 300.0
+
+#: Spec 10.3 v1.3 token safety (D116): on a calendar trading day, no new
+#: login from this long before ``auto_start.startup_time`` (when the paper
+#: runtimes authenticate) to this long after the market close.
+LOGIN_BLACKOUT_MARGIN = timedelta(minutes=30)
+#: NSE's cash-market close. Not in ``config/global.yaml``, whose session
+#: times are the options runtimes' entry cut-off and square-off.
+MARKET_CLOSE = time(15, 30)
 
 
 class FetchRefused(RuntimeError):
@@ -143,9 +166,11 @@ class FetchServices:
     """Fetch mode's network seams. The real ones come from settings; every
     test injects fakes, so no test reaches the network."""
 
-    #: Returns credentials good for at least the given number of seconds;
-    #: raises :class:`FetchRefused`.
-    authenticate: Callable[[float], Credentials]
+    #: ``(minimum_seconds, allow_login)``: credentials good for at least that
+    #: long. With ``allow_login`` false it may only reuse an environment or
+    #: cached token, never mint one (spec 10.3 token safety). Raises
+    #: :class:`FetchRefused`.
+    authenticate: Callable[[float, bool], Credentials]
     #: Today's instrument master CSV text (through ``ScripMasterCache``).
     scrip_master_text: Callable[[], str]
     #: ``None`` is ``httpx.post``.
@@ -159,16 +184,10 @@ def default_services(env: RunEnvironment) -> FetchServices:
     """The real services: ``.env`` credentials through ``AuthBootstrap`` (the
     token cache first), a log redactor that learns every minted token, and
     the day-stamped scrip-master cache."""
-    from common.authentication import AuthBootstrap, AuthCredentials, AuthError
-    from common.authentication.token_cache import StoredToken
     from common.config import load_settings
     from common.config.secrets import read_secret
     from common.logging import setup_logging
     from common.market_data.scrip_master import ScripMasterCache
-    from strategies.positional_stocks.wsr1_weekly_stochrsi.pacing import (
-        TokenLifeError,
-        require_remaining_life,
-    )
 
     settings = load_settings()
     paths = env.paths
@@ -176,40 +195,119 @@ def default_services(env: RunEnvironment) -> FetchServices:
         level=settings.algo_log_level, log_dir=paths.log_root, settings=settings
     )
 
-    def authenticate(minimum_seconds: float) -> Credentials:
-        client_id = read_secret(settings.dhan_client_id)
-        if not client_id:
-            raise FetchRefused("DHAN_CLIENT_ID is not set in .env")
-        bootstrap = AuthBootstrap(
-            AuthCredentials(
-                client_id=client_id,
-                pin=read_secret(settings.dhan_pin),
-                totp_secret=read_secret(settings.dhan_totp_secret),
-                access_token=read_secret(settings.dhan_access_token),
-            ),
-            cache_dir=paths.cache_root,
-            # A cached token with less life than the run needs is passed
-            # over for a fresh login rather than dying mid-fetch.
-            expiry_margin_seconds=int(minimum_seconds),
-            on_token_minted=lambda token: redactor.add_secrets([token]),
+    def authenticate(minimum_seconds: float, allow_login: bool) -> Credentials:
+        credentials = AuthCredentials(
+            client_id=read_secret(settings.dhan_client_id) or "",
+            pin=read_secret(settings.dhan_pin),
+            totp_secret=read_secret(settings.dhan_totp_secret),
+            access_token=read_secret(settings.dhan_access_token),
         )
-        try:
-            token, outcome = bootstrap.get_token()
-        except AuthError as exc:
-            raise FetchRefused(f"cannot authenticate ({type(exc).__name__}): {exc}") from exc
-        redactor.add_secrets([token])
-        try:
-            remaining = require_remaining_life(
-                StoredToken(token, client_id, "", None), minimum_seconds
-            )
-        except TokenLifeError as exc:
-            raise FetchRefused(str(exc)) from exc
-        return Credentials(client_id, token, outcome.source, remaining)
+        result = authenticate_with(
+            credentials,
+            cache_dir=paths.cache_root,
+            minimum_seconds=minimum_seconds,
+            allow_login=allow_login,
+            on_minted=lambda token: redactor.add_secrets([token]),
+        )
+        redactor.add_secrets([result.access_token])
+        return result
 
     return FetchServices(
         authenticate=authenticate,
         scrip_master_text=lambda: ScripMasterCache(paths.cache_root).text(),
     )
+
+
+def authenticate_with(
+    credentials: AuthCredentials,
+    *,
+    cache_dir: Path,
+    minimum_seconds: float,
+    allow_login: bool,
+    on_minted: Callable[[str], None] | None = None,
+) -> Credentials:
+    """A token for the fetch, through the existing ``AuthBootstrap``.
+
+    With ``allow_login`` false (spec 10.3 token safety) the bootstrap is
+    handed no PIN and no TOTP secret, so it *cannot* mint a token: it has no
+    login object at all, and a missing or short-lived cached token raises
+    before any request to the auth endpoint. The fetch then refuses with
+    "login deferred".
+    """
+    if not credentials.client_id:
+        raise FetchRefused("DHAN_CLIENT_ID is not set in .env")
+    usable = (
+        credentials
+        if allow_login
+        else AuthCredentials(client_id=credentials.client_id, access_token=credentials.access_token)
+    )
+    bootstrap = AuthBootstrap(
+        usable,
+        cache_dir=cache_dir,
+        # A cached token with less life than the run needs is passed over:
+        # for a fresh login when one is allowed, for a refusal otherwise.
+        expiry_margin_seconds=int(minimum_seconds),
+        on_token_minted=on_minted,
+    )
+    try:
+        token, outcome = bootstrap.get_token()
+    except MissingCredentialsError as exc:
+        if not allow_login:
+            raise FetchRefused(
+                "login deferred: no environment or cached token with "
+                f"{minimum_seconds / 60:.0f} minutes of life, and a new login is not allowed now"
+            ) from exc
+        raise FetchRefused(f"cannot authenticate ({type(exc).__name__}): {exc}") from exc
+    except AuthError as exc:
+        raise FetchRefused(f"cannot authenticate ({type(exc).__name__}): {exc}") from exc
+    try:
+        remaining = require_remaining_life(
+            StoredToken(token, credentials.client_id, "", None), minimum_seconds
+        )
+    except TokenLifeError as exc:
+        raise FetchRefused(str(exc)) from exc
+    return Credentials(credentials.client_id, token, outcome.source, remaining)
+
+
+def login_block(env: RunEnvironment, calendar: TradingCalendar, now: datetime) -> str | None:
+    """Why a new Dhan login is not allowed now (spec 10.3 v1.3, D116), or
+    ``None``. Fetch shares ``data/cache/token_cache.json`` with the paper
+    runtimes, and whether a new login cancels older tokens is unverified, so:
+
+    * on a calendar trading day, never from 30 minutes before
+      ``auto_start.startup_time`` to 30 minutes after the 15:30 close;
+    * never while another runtime's supervisor is verifiably running. This
+      is read-only: :meth:`~common.process.locks.ProcessLock.current_owner`
+      reads the pid file and asks the OS; it creates, locks and changes
+      nothing. It also covers a special weekend session, which the existing
+      session code does not model (D116): the paper runtimes never start on
+      a weekend, and a manual one would be caught here.
+    """
+    from common.process.locks import supervisor_lock
+    from common.utils.timeutils import parse_hhmm
+
+    paths = env.paths
+    local = now.astimezone(ZoneInfo(calendar.timezone))
+    if calendar.is_trading_day(local.date()):
+        startup = parse_hhmm(load_auto_start_config(paths.config_root).startup_time)
+        tz = local.tzinfo
+        opens = datetime.combine(local.date(), startup, tz) - LOGIN_BLACKOUT_MARGIN
+        closes = datetime.combine(local.date(), MARKET_CLOSE, tz) + LOGIN_BLACKOUT_MARGIN
+        if opens <= local <= closes:
+            return (
+                f"{local:%A %d %b %H:%M} IST is a trading day's session window "
+                f"({opens:%H:%M}-{closes:%H:%M})"
+            )
+    runtimes_dir = paths.config_root / "runtimes"
+    own = env.config.runtime_id
+    for runtime_id in sorted(p.stem for p in runtimes_dir.glob("*.yaml") if p.stem != own):
+        lock = supervisor_lock(
+            runtime_id=runtime_id, lock_dir=paths.lock_root, pid_dir=paths.pid_root
+        )
+        owner = lock.current_owner()
+        if owner is not None:
+            return f"the {runtime_id} supervisor is running (pid {owner.pid})"
+    return None
 
 
 # ---------------------------------------------------------------- the run
@@ -262,8 +360,7 @@ def run_fetch(options: Options, env: RunEnvironment) -> int:
     try:
         operator = load_operator_inputs(paths.config_root / "positional_stocks")
     except InputFileError as exc:
-        env.out(f"REFUSED: {exc}")
-        return EXIT_REFUSED
+        return refuse(env, options, str(exc))
     now = env.now()
     target = target_week(as_of_moment(options.as_of, now, calendar.timezone), calendar)
     end = calendar.expected_last_session(target)
@@ -274,11 +371,13 @@ def run_fetch(options: Options, env: RunEnvironment) -> int:
     started = env.monotonic()
 
     held, pending = _held_and_pending(paths.database_path(config.runtime_id), config.strategy_id)
-    symbols = sorted(set(operator.universe.by_symbol) | set(held) | set(pending))
+    kept = set(held) | set(pending)
+    symbols = sorted(set(operator.universe.by_symbol) | kept)
     # --force-refetch tries every symbol again, the unresolved ones included.
+    # A held or pending symbol is never exempt (spec 6.1 v1.3, audit R6-2).
     known_unresolved = (
         set() if options.force_refetch else set(_load_state(cache).get("unresolved", []))
-    )
+    ) - kept
     needed = [s for s in (config.index_symbol, *symbols) if _needs_refresh(run, s)]
     needed = [s for s in needed if s not in known_unresolved]
     preview_path = reports / f"{end}-preview.md"
@@ -292,7 +391,7 @@ def run_fetch(options: Options, env: RunEnvironment) -> int:
 
     lines: list[str] = []
     if needed:
-        code = _refresh(run, needed, config.index_symbol, known_unresolved, lines)
+        code = _refresh(run, needed, config.index_symbol, known_unresolved, kept, lines)
         if code is not None:
             return code
 
@@ -343,9 +442,13 @@ def _services(env: RunEnvironment) -> FetchServices:
 
 
 def _needs_refresh(run: _Fetch, symbol: str) -> bool:
+    cached = run.cache.read(symbol)
+    if cached and cached[-1].session > run.end:
+        # Spec 6.1 v1.3 (audit R6-3): a fetch for an earlier week never
+        # replaces or shortens a cache that already reaches further.
+        return False
     if run.options.force_refetch:
         return True
-    cached = run.cache.read(symbol)
     if not cached or cached[-1].session < run.end:
         return True
     return _full_is_due(run, run.cache.metadata(symbol))
@@ -366,20 +469,25 @@ def _refresh(
     needed: list[str],
     index_symbol: str,
     known_unresolved: set[str],
+    kept: set[str],
     lines: list[str],
 ) -> int | None:
     """Authenticate, resolve and refresh ``needed``. Returns an exit code to
     stop with, or ``None`` to go on to the preview."""
     services = run.services
     minimum = run.deadline.total_seconds + TOKEN_MARGIN_SECONDS
+    block = login_block(run.env, run.calendar, run.now)
     try:
-        credentials = services.authenticate(minimum)
+        credentials = services.authenticate(minimum, block is None)
+    except FetchRefused as exc:
+        reason = str(exc) if block is None else f"{exc} ({block})"
+        return refuse(run.env, run.options, reason)
+    try:
         text = services.scrip_master_text()
         equities = EquityScripMaster().load_from_text(text)
         index_row = resolve_index(text, index_symbol)
-    except (FetchRefused, ScripMasterError) as exc:
-        run.say(f"REFUSED: {exc}")
-        return EXIT_REFUSED
+    except (ScripMasterError, OSError, ValueError) as exc:
+        return refuse(run.env, run.options, f"scrip master: {exc}")
     life = (
         "undeterminable"
         if credentials.remaining_seconds < 0
@@ -389,9 +497,15 @@ def _refresh(
 
     stocks = [s for s in needed if s != index_symbol]
     resolved, unresolved = equities.resolve_all(stocks)
-    run.tally.unresolved = sorted(unresolved)
+    # Spec 6.1 v1.3 (audit R6-2): only a symbol neither held nor pending is
+    # skipped quietly. A held or pending one counts as failed: highlighted,
+    # an operator action, exit 6, and never exempt from idempotency.
+    for symbol in sorted(s for s in unresolved if s in kept):
+        run.tally.failed[symbol] = "not in the scrip master (held or pending: counts as failed)"
+    run.tally.unresolved = sorted(s for s in unresolved if s not in kept)
     _save_state(
-        run.cache, {"unresolved": sorted(set(unresolved) | (known_unresolved - set(stocks)))}
+        run.cache,
+        {"unresolved": sorted(set(run.tally.unresolved) | (known_unresolved - set(stocks)))},
     )
     ids: dict[str, tuple[str, str, str]] = {
         s: (row.security_id, *EQUITY) for s, row in resolved.items()
@@ -427,7 +541,7 @@ def _refresh(
             unpublished = _unpublished(run, index_symbol)
             if unpublished is not None:
                 return unpublished
-        second = list(run.tally.failed)
+        second = [s for s in run.tally.failed if s in ids]
         if second:
             run.say(f"second pass: {len(second)} symbol(s)")
         for symbol in second:
@@ -454,7 +568,9 @@ def _unpublished(run: _Fetch, index_symbol: str) -> int | None:
     )
     if verdict.is_published:
         return None
-    return _systemic(run, "not yet published", verdict.reason, EXIT_NO_TRADES)
+    # Spec 10.3 v1.3: alert only on the final attempt before the decide run.
+    final = run.env.config.schedule.is_final_fetch_attempt(run.now, run.end)
+    return _systemic(run, "not yet published", verdict.reason, EXIT_NO_TRADES, alert=final)
 
 
 def _one(
@@ -489,6 +605,8 @@ def _one(
         cached = cache.read(symbol)
         meta = cache.metadata(symbol)
         start = refetch_from(cached)
+        if cached and cached[-1].session > end:
+            return  # audit R6-3: never shorten a cache that reaches further
         if run.options.force_refetch or start is None or _full_is_due(run, meta):
             write(fetch(FULL_HISTORY_FROM), run.now.isoformat())
             run.tally.full.append(symbol)
@@ -498,8 +616,11 @@ def _one(
         outcome = merge_tail(cached, fetch(start))
         if outcome.needs_full_refetch:
             run.say(outcome.describe(symbol))
-            cache.discard(symbol)
-            write(fetch(FULL_HISTORY_FROM), run.now.isoformat())
+            # Audit R6-1: the old file stays until the full history has
+            # arrived; the write then replaces it atomically. A failed full
+            # refetch leaves it untouched and the symbol failed.
+            full = fetch(FULL_HISTORY_FROM)
+            write(full, run.now.isoformat())
             run.tally.full.append(symbol)
             run.tally.restated.append(symbol)
             return
@@ -511,9 +632,11 @@ def _one(
         run.say(f"{symbol}: FAILED — {type(exc).__name__}")
 
 
-def _systemic(run: _Fetch, kind: str, reason: str, code: int) -> int:
+def _systemic(run: _Fetch, kind: str, reason: str, code: int, *, alert: bool = True) -> int:
     """No preview: report what was refreshed and what failed, alert, and let
-    the next scheduled attempt retry."""
+    the next scheduled attempt retry. ``alert`` is false only for "not yet
+    published" before the final attempt (spec 10.3 v1.3): logged, reported,
+    not sent."""
     env = run.env
     config = env.config
     tally = run.tally
@@ -525,12 +648,14 @@ def _systemic(run: _Fetch, kind: str, reason: str, code: int) -> int:
         detail += " Failed: " + "; ".join(f"{s} ({r})" for s, r in tally.failed.items()) + "."
     if tally.unresolved:
         detail += " Not in the scrip master: " + ", ".join(tally.unresolved) + "."
-    status = send_alert(
-        env.notifier,
-        f"PREVIEW {week_label(run.target)}: {kind} — {reason}",
-        runtime_id=config.runtime_id,
-        strategy_id=config.strategy_id,
-    )
+    status = "not sent: a later fetch attempt is scheduled before the decide run"
+    if alert:
+        status = send_alert(
+            env.notifier,
+            f"PREVIEW {week_label(run.target)}: {kind} — {reason}",
+            runtime_id=config.runtime_id,
+            strategy_id=config.strategy_id,
+        )
     text = render_failure(
         strategy_id=config.strategy_id,
         generated_at=env.now(),

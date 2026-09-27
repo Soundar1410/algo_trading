@@ -894,12 +894,17 @@ class FunnelEntry:
 
 @dataclass(frozen=True, slots=True)
 class WatchEntry:
-    """One watchlist line (spec 11): armed, K <= D, K < 50, filters pass."""
+    """One watchlist line (spec 11 v1.3): armed, K <= D, K < 50, every filter
+    passing **except the quality gate**, with the symbol's quality status —
+    so the operator can check a stock before it triggers."""
 
     symbol: str
     rs: float | None
     k: float
     d: float
+    #: ``PASS``, ``EVENT_RISK``, ``FAIL`` or ``missing`` (no quality row).
+    quality: str = "missing"
+    valid_until: date | None = None
 
 
 @dataclass(frozen=True, slots=True)

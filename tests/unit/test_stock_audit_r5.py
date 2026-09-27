@@ -280,7 +280,11 @@ def test_the_first_writing_run_must_decide_the_latest_completed_week(tmp_path: P
     root.standard_cache()
     # now = 25 Sep 2026 20:00 IST: the latest completed week is 2026-W39.
     assert root.run("--as-of", root.as_of(1)) == EXIT_REFUSED
-    assert "the first run must decide the latest completed week, 2026-W39" in root.output[-1]
+    # Phase 5 (R6-4): a refusal also writes a report and alerts, so the
+    # REFUSED line is no longer the last one printed; R6-5: one instruction.
+    (refused,) = [line for line in root.output if line.startswith("REFUSED")]
+    assert "the first run must decide the latest completed week, 2026-W39" in refused
+    assert "Run with --as-of auto (or omit --as-of), or add --dry-run" in refused
     assert not root.db.exists()
     assert root.run("--as-of", root.as_of(1), "--dry-run") == EXIT_OK  # still allowed
     assert root.run("--as-of", "auto") == EXIT_OK
@@ -294,15 +298,18 @@ def test_a_book_with_a_completed_week_is_not_guarded(tmp_path: Path) -> None:
     assert root.run("--as-of", root.as_of(1)) == EXIT_OK
 
 
-def test_a_first_run_left_started_for_another_week_is_refused(tmp_path: Path) -> None:
+def test_a_started_first_week_can_always_be_redone(tmp_path: Path) -> None:
+    """Phase 5 (audit R6-5, spec 10.2 v1.3): replaces 4b-2's "a first run left
+    STARTED for another week is refused". A STARTED first week was the latest
+    completed week when it started; it is redone, and the run catches up."""
     root = Root.create(tmp_path)
     root.standard_cache()
     root.seed_entry(mark_week=False)
     repo = root.repo()
     repo.mark_started(root.last_session(1), week(1), "crashed")
     repo.database.close()
-    assert root.run("--as-of", "auto") == EXIT_REFUSED
-    assert "was STARTED and never finished" in root.output[-1]
+    assert root.run("--as-of", root.as_of(1)) == EXIT_OK  # the redo itself
+    assert root.repo().run_status(root.last_session(1)) == "COMPLETED"
 
 
 def _sha(path: Path) -> str:

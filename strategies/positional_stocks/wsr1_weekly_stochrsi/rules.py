@@ -350,7 +350,10 @@ def apply_fill(
         shares = int(order.amount / price)
         if shares == 0:
             return FillOutcome(
-                order, position, Decimal("0"), skipped="0 shares at this price; skipped"
+                order,
+                position,
+                Decimal("0"),
+                skipped="one share costs more than the tranche; skipped",
             )
         fill = BuyFill(
             action.tranche, session, price, shares, at_week_open, _buy_fees(price * shares, params)
@@ -803,11 +806,14 @@ def _entry_refusals(
     book: Book,
     ctx: WeekContext,
     params: RulesParameters,
+    *,
+    check_quality: bool = True,
 ) -> tuple[list[str], list[str]]:
     """Spec 4.6 and 4.11 for an armed symbol at bar ``i``: every refusal, and
     the report flags. Shared by :func:`screen` (a triggered symbol) and
     :func:`watchlist` (an armed one), so the two can never disagree about
-    what "filters pass" means."""
+    what "filters pass" means — except that the watchlist skips the quality
+    gate (``check_quality=False``, spec 11 v1.3)."""
     symbol = inputs.symbol
     series = inputs.series
     bar = series.bars[i]
@@ -834,7 +840,7 @@ def _entry_refusals(
         refusals.append(f"history {i + 1} < {params.min_history_weeks} weekly bars")
     if not _ge(inputs.traded_value_30d, params.min_traded_value_cr * _CRORE):
         refusals.append("liquidity below 20 cr (or unknown)")
-    if not _quality_allows(inputs.quality, ctx.execution_date):
+    if check_quality and not _quality_allows(inputs.quality, ctx.execution_date):
         refusals.append("needs quality check")
     if inputs.gap_blocked:
         refusals.append("unacknowledged price gap")
@@ -872,10 +878,12 @@ def watchlist(
     ctx: WeekContext,
     params: RulesParameters,
 ) -> list[WatchEntry]:
-    """Spec 11's watchlist: symbols not held and with no pending order that
-    are armed but not triggered, with K <= D and K < 50 at this week's close,
-    and that would pass every entry filter — ranked by RS, highest first.
-    Pure; it decides nothing."""
+    """Spec 11's watchlist (v1.3): symbols not held and with no pending order
+    that are armed but not triggered, with K <= D and K < 50 at this week's
+    close, and that would pass every entry filter **except the quality gate**
+    — ranked by RS, highest first, each with its quality status, so the
+    operator can check a stock before it triggers. Pure; it decides nothing.
+    :func:`screen` still applies the quality gate."""
     held = {p.symbol for p in book.positions} | {o.symbol for o in book.pending}
     out: list[WatchEntry] = []
     for symbol in sorted(symbols):
@@ -893,9 +901,15 @@ def watchlist(
         if k is None or d is None or not (k <= d and k < params.max_k_at_cross):
             continue
         rs = relative_strength(series.bars, index.bars)[i]
-        refusals, _ = _entry_refusals(inputs, i, verdict, rs, book, ctx, params)
+        refusals, _ = _entry_refusals(
+            inputs, i, verdict, rs, book, ctx, params, check_quality=False
+        )
         if not refusals:
-            out.append(WatchEntry(symbol, rs, k, d))
+            row = inputs.quality
+            quality = "missing" if row is None else row.status.value
+            out.append(
+                WatchEntry(symbol, rs, k, d, quality, None if row is None else row.valid_until)
+            )
     out.sort(key=lambda e: (e.rs is None, -(e.rs or 0.0), e.symbol))
     return out
 

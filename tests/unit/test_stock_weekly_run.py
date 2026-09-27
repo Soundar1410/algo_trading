@@ -154,7 +154,10 @@ def test_a_failed_environment_check_refuses_before_anything(tmp_path: Path) -> N
     root.standard_cache()
     code = root.run("--as-of", root.as_of(1), preflight=lambda: ["validate_environment: x"])
     assert code == EXIT_REFUSED
-    assert not root.db.exists() and not root.reports.exists()
+    # Phase 5 (spec 10.3 v1.3, audit R6-4): a refusal writes only its own
+    # -refused.md report and alerts; nothing else is created.
+    assert not root.db.exists() and not root.backups.exists()
+    assert sorted(p.name for p in root.reports.iterdir()) == [f"{root.last_session(1)}-refused.md"]
 
 
 def test_the_default_preflight_calls_both_checks(monkeypatch: pytest.MonkeyPatch) -> None:

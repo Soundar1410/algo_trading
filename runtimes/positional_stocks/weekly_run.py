@@ -308,25 +308,25 @@ def _first_run_refusal(
     env: RunEnvironment,
     calendar: TradingCalendar,
 ) -> str | None:
-    """The first-run guard (Phase 4b-2). With no COMPLETED run in the real
-    database, a writing run decides only the latest week complete as of now:
-    an earlier ``--as-of`` would start the book in the past, and the next
-    ``auto`` run would then catch up — backfilling trades (spec 10.2)."""
+    """The first-run guard (spec 10.2 v1.3, D105). With no COMPLETED run in
+    the real database, a writing run decides only the latest week complete as
+    of now: an earlier ``--as-of`` would start the book in the past, and the
+    next ``auto`` run would then catch up — backfilling trades.
+
+    Audit R6-5: a STARTED first week can always be redone — it was the latest
+    completed week when it started, and the run resumes from it — and the one
+    refusal left gives one instruction that works."""
     if _has_completed_run(db_path, strategy_id):
+        return None
+    if latest is not None and latest[1] == "STARTED":
         return None
     now_target = target_week(env.now(), calendar)
     if target != now_target:
         return (
             f"no week has been COMPLETED yet, so the first run must decide the latest "
-            f"completed week, {week_label(now_target)} — not {week_label(target)} "
-            "(spec 10.2: no backfill of trades). Use --as-of auto, or --dry-run to look "
-            "at an earlier week."
-        )
-    if latest is not None and week_of(latest[0]) != target:
-        return (
-            f"no week has been COMPLETED yet, but {latest[0]} was STARTED and never finished; "
-            f"the first run must decide {week_label(target)}. Nothing was ever completed, "
-            f"so move {db_path} aside and run again."
+            f"completed week, {week_label(now_target)}, not {week_label(target)} "
+            "(spec 10.2: no backfill of trades). Run with --as-of auto (or omit --as-of), "
+            "or add --dry-run to look at an earlier week."
         )
     return None
 
@@ -384,19 +384,71 @@ def main(argv: Sequence[str] | None = None, env: RunEnvironment | None = None) -
     return run(options, env if env is not None else default_environment())
 
 
+def refuse(env: RunEnvironment, options: Options, reason: str) -> int:
+    """Spec 10.3 v1.3 (audit R6-4, D117): a refusal is never a silent console
+    line. It prints ``REFUSED``, and — except on a dry run — writes a report
+    and alerts: ``<week_ending>-preview-failed.md`` for fetch,
+    ``<week_ending>-refused.md`` for a writing decide run (a name that never
+    overwrites a real report), or ``refused-<today>.md`` when not even the
+    target week can be worked out. Returns exit 1."""
+    env.out(f"REFUSED: {reason}")
+    if options.mode == "decide" and options.dry_run:
+        return EXIT_REFUSED
+    config = env.config
+    paths = env.paths
+    week: WeekKey | None = None
+    suffix = "-preview-failed" if options.mode == "fetch" else "-refused"
+    try:
+        calendar = TradingCalendar.from_config(paths.config_root)
+        week = target_week(as_of_moment(options.as_of, env.now(), calendar.timezone), calendar)
+        name = f"{calendar.expected_last_session(week)}{suffix}.md"
+    except Exception:  # the report must not depend on what may have failed
+        name = f"refused-{env.now().date()}.md"
+    label = week_label(week) if week is not None else "—"
+    status = send_alert(
+        env.notifier,
+        f"{options.mode} {label}: REFUSED — {reason}",
+        runtime_id=config.runtime_id,
+        strategy_id=config.strategy_id,
+    )
+    reports = paths.data_root / "reports" / "positional_stocks"
+    try:
+        reports.mkdir(parents=True, exist_ok=True)
+        path = reports / name
+        path.write_text(
+            render_failure(
+                strategy_id=config.strategy_id,
+                generated_at=env.now(),
+                week=week,
+                kind=f"REFUSED ({options.mode})",
+                reason=f"{reason}. Nothing was fetched, decided or written.",
+                dry_run=False,
+                notifier_status=status,
+            ),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        env.out(f"(the refusal report could not be written: {exc})")
+    else:
+        env.out(f"report: {path}")
+    return EXIT_REFUSED
+
+
 def run(options: Options, env: RunEnvironment) -> int:
     say = env.out
     config = env.config
     try:
         config.check_paper()
     except RunRefused as exc:
-        say(f"REFUSED: {exc}")
-        return EXIT_REFUSED
+        return refuse(env, options, str(exc))
+    if options.mode == "fetch" or not options.dry_run:
+        # D115: both enabled flags gate fetch and every writing decide run.
+        disabled = config.disabled_reason()
+        if disabled is not None:
+            return refuse(env, options, disabled)
     problems = env.preflight()
     if problems:
-        for problem in problems:
-            say(f"REFUSED: {problem}")
-        return EXIT_REFUSED
+        return refuse(env, options, "; ".join(problems))
 
     paths = env.paths
     paths.lock_root.mkdir(parents=True, exist_ok=True)
@@ -448,16 +500,14 @@ def _run_locked(
     try:
         operator = load_operator_inputs(paths.config_root / "positional_stocks")
     except InputFileError as exc:
-        say(f"REFUSED: {exc}")
-        return EXIT_REFUSED
+        return refuse(env, options, str(exc))
     moment = as_of_moment(options.as_of, env.now(), calendar.timezone)
     target = target_week(moment, calendar)
     latest = _latest_run(db_path, config.strategy_id)
     if not on_copy and env.first_run_guard:
         refusal = _first_run_refusal(db_path, config.strategy_id, latest, target, env, calendar)
         if refusal is not None:
-            say(f"REFUSED: {refusal}")
-            return EXIT_REFUSED
+            return refuse(env, options, refusal)
     weeks = weeks_to_process(latest, target)
     if not weeks:
         say(f"up to date: {week_label(target)} is already decided; nothing to do")
