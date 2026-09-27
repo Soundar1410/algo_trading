@@ -239,14 +239,19 @@ def test_the_same_week_twice_through_the_cli_changes_nothing(root: Root) -> None
 
 
 def test_a_catch_up_over_3_weeks_equals_3_sequential_runs(tmp_path: Path) -> None:
+    """Spec 14. Phase 5-fix2 (D130): every run at the SAME real clock — the
+    Monday 08:30 after week 3 — rather than each sequential run at its own
+    week's decide slot. Catch-up weeks are defined by the run's clock, so
+    three runs made at that moment must equal one catch-up made then."""
     sequential = Root.create(tmp_path / "sequential")
     catch_up = Root.create(tmp_path / "catch_up")
     for r in (sequential, catch_up):
         r.standard_cache(a=falling(r.first_session(2)))
         r.seed_entry()
+    clock = datetime.combine(sequential.first_session(4), time(8, 30), IST)
     for n in (1, 2, 3):
-        assert sequential.run("--as-of", sequential.as_of(n)) == EXIT_OK
-    assert catch_up.run("--as-of", catch_up.as_of(3)) == EXIT_OK
+        assert sequential.run("--as-of", sequential.as_of(n), now=lambda: clock) == EXIT_OK
+    assert catch_up.run("--as-of", catch_up.as_of(3), now=lambda: clock) == EXIT_OK
     assert [line.split(":")[0] for line in catch_up.output if ": COMPLETED" in line] == [
         f"{week(n)[0]}-W{week(n)[1]:02d}" for n in (1, 2, 3)
     ]

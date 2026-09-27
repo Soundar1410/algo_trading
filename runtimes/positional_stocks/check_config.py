@@ -17,7 +17,9 @@ It checks, and changes nothing:
    ``RunConfig`` binding (D119);
 3. ``scripts.assert_no_live_config_committed``.
 
-Prints ``OK`` or each problem on its own line. Exit 0 or 1.
+Prints ``OK`` or each problem on its own line; a paper runtime whose own
+strategy load fails is named as one that would refuse to start (D132). Exit 0
+or 1.
 """
 
 from __future__ import annotations
@@ -49,9 +51,16 @@ def check(config_root: Path) -> list[str]:
             discover_strategies(config_root, runtime_id, settings=Settings())
         except Exception as exc:  # anything the shared loader would refuse on
             detail = " ".join(str(exc).split())
+            # D132 (audit R8-3): the paper runtimes are warned about only when
+            # their own strategy load fails, not for a problem confined to
+            # positional_stocks (e.g. a mismatched strategy_id).
+            warning = (
+                f" — {' and '.join(PAPER_RUNTIMES)} would refuse to start"
+                if runtime_id in PAPER_RUNTIMES
+                else ""
+            )
             problems.append(
-                f"runtime {runtime_id}: the shared config loader refuses: {detail} — "
-                f"{' and '.join(PAPER_RUNTIMES)} would refuse to start"
+                f"runtime {runtime_id}: the shared config loader refuses: {detail}{warning}"
             )
     try:
         RunConfig.from_config(config_root)

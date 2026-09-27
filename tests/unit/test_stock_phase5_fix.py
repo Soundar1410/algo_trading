@@ -82,7 +82,11 @@ def test_f1_the_report_and_telegram_say_when_the_clock_moved_it(tmp_path: Path) 
         assert root.run("--as-of", root.as_of(n)) == EXIT_OK
     late = datetime.combine(root.first_session(4), time(11), IST)
     assert root.run("--as-of", root.as_of(3), now=lambda: late) == EXIT_OK
-    note = "orders execute at Tue 23 Jun open: this run started after Monday's open"
+    # Phase 5-fix2 (D133): the note states the run's own start.
+    note = (
+        "orders execute at Tue 23 Jun open: this run started Mon 22 Jun 11:00, "
+        "after that session's open"
+    )
     assert note in root.report(3).split("## 3.")[1].split("## 4.")[0]
     assert "Orders execute at Tue 23 Jun open" in root.notifier.events[-1].message  # type: ignore[attr-defined]
 
@@ -163,7 +167,10 @@ def test_f1_the_preview_uses_the_same_rule_with_its_own_clock(tmp_path: Path) ->
     monday_noon = datetime(2026, 9, 28, 12, 0, tzinfo=IST)
     assert _fetch(root, dhan, now=lambda: monday_noon) == EXIT_OK
     text = _preview(root).read_text()
-    assert "orders execute at Tue 29 Sep open: this run started after Monday's open" in text
+    assert (
+        "orders execute at Tue 29 Sep open: this run started Mon 28 Sep 12:00, "
+        "after that session's open"
+    ) in text  # Phase 5-fix2 (D133) wording
 
 
 # ======================================================================= F4

@@ -95,7 +95,7 @@ from .report import (
     week_label,
 )
 from .repository import StockRepository, drawdown_pct
-from .run_config import RunConfig, RunRefused
+from .run_config import RunConfig, RunRefused, load_run_config
 from .telegram_summary import send_alert, send_summary
 from .week_inputs import (
     ColdCache,
@@ -173,11 +173,7 @@ def default_environment() -> RunEnvironment:
     # Phase 5: the committed YAML pair, bound strictly. A config that cannot
     # be bound leaves the fail-closed defaults (both flags off) and a reason
     # the run refuses with — reported and alerted, never a traceback.
-    config, config_error = RunConfig(), None
-    try:
-        config = RunConfig.from_config(paths.config_root)
-    except RunRefused as exc:
-        config_error = str(exc)
+    config, config_error = load_run_config(paths.config_root)
     return RunEnvironment(
         project_root=paths.project_root,
         now=now_ist,
@@ -603,7 +599,12 @@ def _process(
     run.reports.mkdir(parents=True, exist_ok=True)
     repository: StockRepository | None = None
 
-    final_week = weeks[-1]
+    # D130 (spec 3 v1.3.1, audit R8-2): catch-up weeks are defined by the
+    # run's clock, not by how the operator splits the invocations. Only the
+    # latest completed week at the run's start executes after the run; every
+    # older week is a catch-up week, even when it is this invocation's last.
+    assert run.run_started is not None
+    latest = target_week(run.run_started, run.calendar)
 
     def prepare(week: WeekKey, held: list[str], pending: list[str]) -> PreparedWeek:
         return prepare_week(
@@ -615,9 +616,9 @@ def _process(
             pending=pending,
             index_symbol=config.index_symbol,
             params=config.params,
-            # D122: only the final week executes after the run; a catch-up
-            # week's orders fill at that week's own next session (D123).
-            run_started=run.run_started if week == final_week else None,
+            # D122: only the latest completed week executes after the run; a
+            # catch-up week's orders fill at that week's own next session.
+            run_started=run.run_started if week == latest else None,
         )
 
     for week in weeks:
@@ -667,7 +668,7 @@ def _process(
             prepared.inputs,
             calendar=run.calendar,
             params=config.params,
-            catch_up=week != final_week,
+            catch_up=week != latest,
         )
         env.out(f"{week_label(week)}: {outcome.status}")
         run.records.append((prepared, outcome))

@@ -100,7 +100,16 @@ def execution_session(
         day += timedelta(days=1)
     if day <= base:
         return base, None
-    return day, (f"orders execute at {day:%a %d %b} open: this run started after {base:%A}'s open")
+    # D133 (audit R8-4): state the run's own start. "that session" when it
+    # started after its own day's open; otherwise name the open it missed.
+    own_open = datetime.combine(started.date(), MARKET_OPEN, tz)
+    if calendar.is_trading_day(started.date()) and started >= own_open:
+        after = "after that session's open"
+    else:
+        after = f"after {base:%a %d %b}'s open"
+    return day, (
+        f"orders execute at {day:%a %d %b} open: this run started {started:%a %d %b %H:%M}, {after}"
+    )
 
 
 class ColdCache(RuntimeError):

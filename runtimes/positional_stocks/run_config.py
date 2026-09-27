@@ -139,6 +139,27 @@ class RunConfig:
 
     @classmethod
     def from_config(cls, config_root: Path) -> RunConfig:
+        """The committed configuration, bound strictly (see :meth:`_bind`).
+
+        D131 (audit R8-1): whatever goes wrong while loading or binding is a
+        :class:`RunRefused` naming the file and the problem — the run then
+        refuses with a report and an alert, never a traceback.
+
+        Raises:
+            RunRefused: the configuration cannot be loaded or bound.
+        """
+        try:
+            return cls._bind(config_root)
+        except RunRefused:
+            raise
+        except Exception as exc:
+            raise RunRefused(
+                f"configuration: {config_root / STRATEGY_FILE}: cannot be bound "
+                f"({type(exc).__name__}: {exc})"
+            ) from exc
+
+    @classmethod
+    def _bind(cls, config_root: Path) -> RunConfig:
         """The committed configuration (spec 12), bound strictly.
 
         ``config/runtimes/positional_stocks.yaml`` and the strategy file are
@@ -230,8 +251,17 @@ def reject_duplicate_keys(path: Path) -> None:
         raise RunRefused(f"configuration: {path}: {exc}") from exc
     try:
         yaml.load(text, Loader=_Strict)  # a SafeLoader subclass: safe
+    except RunRefused:
+        raise
     except yaml.YAMLError as exc:
         raise RunRefused(f"configuration: {path}: not valid YAML: {exc}") from exc
+    except Exception as exc:
+        # D131 (audit R8-1): PyYAML raises ValueError for an invalid date
+        # (2026-02-30) and TypeError for an unhashable (list) key; anything
+        # the parse raises is a refusal naming the file, never a traceback.
+        raise RunRefused(
+            f"configuration: {path}: cannot be loaded ({type(exc).__name__}: {exc})"
+        ) from exc
 
 
 #: Keys whose values the code fixes (spec 4.4, 4.3, 6.1, 11); the YAML must
@@ -403,3 +433,13 @@ def _coerce(value: object, default: object, annotation: object, dotted: str) -> 
     except (TypeError, ValueError, InvalidOperation) as exc:
         raise RunRefused(f"configuration: parameters.{dotted} must be {exc}") from exc
     raise RunRefused(f"configuration: parameters.{dotted} has an unsupported type")
+
+
+def load_run_config(config_root: Path) -> tuple[RunConfig, str | None]:
+    """The committed configuration, or the fail-closed defaults (both
+    ``enabled`` flags off) and why it could not be loaded (D131). Used by the
+    real environment; the run then refuses with that reason."""
+    try:
+        return RunConfig.from_config(config_root), None
+    except RunRefused as exc:
+        return RunConfig(), str(exc)
