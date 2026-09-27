@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 from _stock_run_fixtures import IST, REPO, Root, falling, week, wobble
-from filelock import FileLock
+from filelock import FileLock, Timeout
 
 from common.notifications.base import NotificationEvent, RecordingNotifier
 from runtimes.positional_stocks import backup, weekly_run
@@ -121,9 +121,26 @@ def test_decide_never_loads_a_network_or_supervisor_module(tmp_path: Path) -> No
 
 
 # ============================================================ refusals
-def test_fetch_mode_is_not_built_yet(root: Root, capsys: pytest.CaptureFixture[str]) -> None:
-    assert weekly_run.main(["--mode", "fetch"], root.env()) == EXIT_NO_TRADES
-    assert "not built yet (Phase 4b-2)" in capsys.readouterr().out
+def test_fetch_mode_runs_through_the_fetch_module_under_the_lock(
+    root: Root, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Phase 4b-2 replaces 4b-1's "not built yet": fetch mode is dispatched,
+    under the shared lock, to runtimes.positional_stocks.fetch (tested in
+    test_stock_fetch.py)."""
+    from runtimes.positional_stocks import fetch
+
+    seen: list[bool] = []
+
+    def fake(options: weekly_run.Options, env: weekly_run.RunEnvironment) -> int:
+        lock = FileLock(str(env.paths.lock_root / weekly_run.LOCK_NAME), timeout=0)
+        with pytest.raises(Timeout):
+            lock.acquire()
+        seen.append(options.mode == "fetch")
+        return EXIT_OK
+
+    monkeypatch.setattr(fetch, "run_fetch", fake)
+    assert weekly_run.main(["--mode", "fetch"], root.env()) == EXIT_OK
+    assert seen == [True]
 
 
 def test_anything_but_paper_is_refused(root: Root) -> None:

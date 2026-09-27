@@ -313,12 +313,18 @@ class DailyBarCache:
         security_id: str = "",
         exchange_segment: str = "",
         instrument: str = "",
+        full_history_at: str | None = None,
     ) -> Path:
         """Replace ``symbol``'s cached series, atomically.
 
         ``security_id`` and friends are **provenance**, recorded so a stale or
         mis-resolved file can be recognised later. They are never part of the
         key, because the decision run resolves no instrument ids at all.
+
+        ``full_history_at`` (Phase 4b-2) is when the series was last fetched
+        in full, as an ISO timestamp: fetch mode refetches everything on its
+        first run of each calendar month (spec 6.1), and a file without it
+        is refetched in full.
         """
         name = check_symbol(symbol)
         ordered = sorted(bars, key=lambda bar: bar.session)
@@ -329,6 +335,7 @@ class DailyBarCache:
             "exchange_segment": exchange_segment,
             "instrument": instrument,
             "fetched_at": fetched_at.isoformat(),
+            "full_history_at": full_history_at,
             "first_session": ordered[0].session.isoformat() if ordered else None,
             "last_session": ordered[-1].session.isoformat() if ordered else None,
             "bars": [

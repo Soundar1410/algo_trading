@@ -1,9 +1,12 @@
-"""The weekly run of ``wsr1_weekly_stochrsi`` (spec 10) — ``decide`` mode.
+"""The weekly run of ``wsr1_weekly_stochrsi`` (spec 10) — both modes.
 
     python -m runtimes.positional_stocks.weekly_run --mode decide \
         [--as-of auto|YYYY-MM-DD] [--dry-run]
+    python -m runtimes.positional_stocks.weekly_run --mode fetch \
+        [--as-of auto|YYYY-MM-DD] [--force-refetch]
 
-``--mode fetch`` is Phase 4b-2 and refuses for now.
+``fetch`` (Phase 4b-2) refreshes the daily cache over the network and writes
+a PREVIEW; it lives in :mod:`.fetch`, imported only in that mode.
 
 **Offline (spec 10.3).** ``decide`` reads only the local, symbol-keyed daily
 cache and the operator CSVs. It constructs no scrip master, no
@@ -13,15 +16,20 @@ failing notifier is non-fatal.
 
 **Order of a run.** Paper mode; ``scripts.validate_environment`` and the
 paper-safety check; the process lock (shared by both modes); the 5-minute
-deadline; the weeks to process (10.2); a verified snapshot of the database
-before its first write (D104); each week through
+deadline; the weeks to process (10.2), behind the first-run guard; the
+first week prepared, then a verified snapshot of the database before its
+first write (D104, R5-4); each week through
 :func:`~.accounting.run_decision_week`; the report, journal and Telegram
-summary, once, for everything processed.
+summary, once, for everything processed — also when a later week stops the
+run (R5-2).
 
 **Exit codes:** 0 done or already up to date; 1 refused (not paper, an
-environment or paper-safety check, an input file, a backup); 2 no trades
-(cold cache) or fetch mode not built; 3 another run holds the lock (nothing
-touched); 4 deadline exceeded (fail closed).
+environment or paper-safety check, an input file, a backup, the first-run
+guard; in fetch mode also authentication, the token's life, the scrip
+master); 2 no trades (cold cache; in fetch mode, NIFTY 50 not yet
+published); 3 another run holds the lock (nothing touched); 4 deadline
+exceeded (fail closed); 5 fetch mode, a systemic fetch failure (no preview);
+6 fetch mode, the preview was written but some symbols failed.
 
 ``--dry-run`` computes and writes ``<week_ending>-dry-run.md`` on a temporary
 copy of the book: ``positional_stocks.db`` is never created or changed, no
@@ -40,6 +48,7 @@ from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time
 from decimal import Decimal
 from pathlib import Path
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from filelock import FileLock, Timeout
@@ -96,6 +105,9 @@ from .week_inputs import (
     prepare_week,
 )
 
+if TYPE_CHECKING:  # pragma: no cover - fetch is loaded only in fetch mode
+    from .fetch import FetchServices
+
 _log = get_logger(__name__)
 
 EXIT_OK = 0
@@ -124,6 +136,9 @@ class RunEnvironment:
     monotonic: Callable[[], float] = _time.monotonic
     out: Callable[[str], None] = print
     config: RunConfig = field(default_factory=RunConfig)
+    #: Fetch mode's network services (Phase 4b-2); ``None`` builds the real
+    #: ones from settings. Tests inject fakes — no test touches the network.
+    fetch_services: FetchServices | None = None
     #: Phase 4b-2: with no COMPLETED run yet, a writing decide run must target
     #: the latest completed week as of now (spec 10.2: no backfill of trades).
     #: Only the replay harness, on a temporary project, turns this off.
@@ -366,9 +381,6 @@ def parse(argv: Sequence[str] | None) -> Options:
 
 def main(argv: Sequence[str] | None = None, env: RunEnvironment | None = None) -> int:
     options = parse(argv)
-    if options.mode == "fetch":
-        print("--mode fetch: not built yet (Phase 4b-2)")
-        return EXIT_NO_TRADES
     return run(options, env if env is not None else default_environment())
 
 
@@ -398,6 +410,13 @@ def run(options: Options, env: RunEnvironment) -> int:
         )
         return EXIT_LOCKED
     try:
+        if options.mode == "fetch":
+            # Imported here, never at module level: decide mode must not load
+            # the Dhan client, the scrip master or the authentication stack
+            # (spec 10.3; the subprocess import check enforces it).
+            from . import fetch
+
+            return fetch.run_fetch(options, env)
         return _run_locked(options, env)
     finally:
         lock.release()
