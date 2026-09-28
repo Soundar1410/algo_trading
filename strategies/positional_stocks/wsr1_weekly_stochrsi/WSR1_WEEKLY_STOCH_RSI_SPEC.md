@@ -5,7 +5,7 @@
 **Engine kind:** `stock_portfolio_engine` (the existing, reserved `EngineKind.STOCK_PORTFOLIO_ENGINE`; no new enum value)
 **Execution shape:** a run-to-completion weekly job — no tick feed, no long-lived worker, no intraday decisions
 **Initial mode:** paper only
-**Status:** implementation specification v1.3.1 — D115–D129 folded in; catch-up weeks defined by the run's clock; go-live ready once Phase 5-fix2 passes
+**Status:** implementation specification v1.3.2 — build complete (D130–D133 folded in); Phase 6 dashboard page approved
 **Scheduling:** two of its own LaunchAgents (a fetch/preview job and an offline decision job). **Not** registered with `auto_start`, and no change to shared auto-start code
 **Rule source:** "Weekly Stoch RSI V1 Trading Plan" (operator's V1 rulebook, 20 Sep 2026), including its resolved ambiguities and the first-cross / K < 50 fix
 **Target branch:** new `strategy-wsr1-weekly-stochrsi`, cut from `feature-paper-auto-start` at `701e030`
@@ -190,6 +190,13 @@ Numbers in brackets are the Phase 0 question numbers.
 | 10 | `python -m runtimes.positional_stocks.check_config` is run after any config edit; it warns about the paper runtimes only when their own strategy loads fail (D129; audit R8-3) | 10.1, 16 |
 | 11 | **`0001` is frozen from go-live:** it was edited in place for the last time in Phase 5-fix; every later schema change is a new migration | 9 |
 
+### Changes in v1.3.2 (28 Sep 2026 — Phase 5-fix2 review; Phase 6 approved)
+
+| # | Decision | Section |
+|---|---|---|
+| 1 | Catch-up weeks by the run's clock, however the runs are split (D130, revises D123); every YAML load or binding error is a clean refusal (D131); `check_config` warns about the paper runtimes only when their own loads fail (D132); the execution note states the run's own start (D133) | 3, 10, 12 |
+| 2 | **Phase 6 approved by the operator: a read-only Streamlit dashboard page** for the stock book (section 11.1), built in a separate git worktree so the running dashboard never sees work in progress | 1.1, 11.1, 15 |
+
 ---
 
 ## 1. Purpose and authority
@@ -217,7 +224,7 @@ Out of scope (each needs separate approval and a spec revision):
 - intraday execution, live quotes or the shared tick feed;
 - automatic fundamentals or news checks (the quality gate stays an operator input);
 - a backtesting framework (a replay of recent weeks for testing is allowed, section 14);
-- a dashboard page (deferred by decision 7; needs its own approval).
+- ~~a dashboard page (deferred by decision 7; needs its own approval)~~ — **approved as Phase 6 (v1.3.2), read-only, section 11.1**.
 
 ---
 
@@ -663,6 +670,29 @@ Between the two, the operator reads the preview report and fills `quality_gate.c
   trade_id,symbol,sector,promoter_group,event_risk,regime,arm_week,trigger_week,K_trigger,D_trigger,close_trigger,ema50_1w,perf6m_stock,perf6m_nifty,high_52w,atr_1w,atr_pct,s,A,T1_date,T1_price,T1_shares,L1,L2,stop,T2_date,T2_price,T2_shares,T3_date,T3_price,T3_shares,avg_cost,partial_date,partial_price,partial_shares,exit_date,exit_price,exit_shares,exit_type,pnl_rs,pnl_pct_of_A,weeks_held,rule_breaks,notes,screenshot
   ```
 
+### 11.1 Dashboard page (Phase 6, v1.3.2)
+
+A **read-only** page in the existing Streamlit dashboard (`dashboards/`), following its pattern: a `dashboards/pages/<n>_Positional_Stocks.py` shim, the page logic in `dashboards/positional_stocks.py`, and a read model in `dashboards/data/positional_stocks.py`.
+
+**Hard rules**
+
+- **Read-only, always:** no write to any database or file, no network call, no subprocess, no `launchctl`. The book is opened only through the dashboard's existing bounded read-only helper (`dashboards/_shared.py`, `connect_readonly`).
+- **No trading logic is re-derived.** Positions, marks, P&L and flags come from what the weekly run persisted (the `stock_` tables, `journal.csv`, the report files) or from the runtime's own read functions on a read-only connection — never from a second implementation of the rules or the rescale arithmetic.
+- **Never disturbs a run:** a dashboard read open while a decide run writes must not block, fail or change that run; a locked or missing book shows a clear state, never a traceback.
+- **Never loads network code:** the page must not import `fetch.py`, the Dhan client, the scrip master, `AuthBootstrap` or `dhanhq`.
+- **Before go-live** (no `positional_stocks.db`), every tab says plainly "not started yet" and points to the go-live checklist — never an empty table that reads as "no trades".
+
+**Tabs**
+
+| Tab | Content |
+|---|---|
+| Overview | Regime; equity, cash, peak, drawdown %; brake 1 / brake 2 state; open positions vs 10 slots; committed %; last decide run (week, status, time) and last preview; **operator actions** (frozen / escalated positions, silent lifts, stale held symbols, needs-quality candidates, failed fetch symbols) with what to do; both `enabled` flags; whether each agent's plist exists in `~/Library/LaunchAgents` (a file check only) |
+| Positions & orders | Open positions: symbol, state, P1, s, L1, L2, Stop or "trail (10W EMA)", shares, average cost, mark, unrealised ₹ and %, weeks held, frozen flag and reason. Pending orders for the next session with levels and the `catch_up` flag |
+| Trades & performance | Closed trades from `journal.csv` (net P&L, exit type, weeks held, notes); totals: trades, win rate, average win / loss, net P&L, best / worst; recent fills with `late_fill` / not-traded / `catch_up` flags |
+| Equity | Weekly equity curve and drawdown % from `stock_equity`, with brake-level lines (10% / 20%) |
+| Latest report | The newest decision report, and the newest preview when it is newer, rendered as markdown (this carries the funnel, watchlist and corporate-action lines) |
+| Health | The weekly runs (week, status, started, finished); recent refusals (`-refused.md`, `-preview-failed.md`); backups (count, newest); cache freshness (NIFTY's last session vs the calendar's expected session) |
+
 ---
 
 ## 12. Configuration contract (example)
@@ -774,6 +804,7 @@ Also:
 | 4a | **Persistence and paper accounting:** the runtime's own migration set in `runtimes/positional_stocks/migrations/` (all `stock_`-prefixed; nothing added to the shared directory, v1.2i), repository module, paper fill model (section 8: official open, costs, not-traded → next session + flag, `at_week_open` from the calendar for every buy), applying fills through the rules' fill function, clearing filled orders before deciding (v1.2h), carrying unfilled orders' sizing/sector/group across runs, persisting `half_sold_week` and each symbol's last-seen universe row, equity/peak/brake persistence, gap acknowledgements keyed per (symbol, session, ratio) with the 520-bar block window, idempotency per (strategy_id, week_ending), crash-safe transactions | Idempotency (same week twice = no change), crash-mid-run resume, fill-model and cost tests, a multi-week book simulated end to end through persistence, under `TZ=UTC` and `TZ=America/New_York` | CLI, fetching, report, Telegram, scheduling |
 | 4b | **The weekly run:** `weekly_run.py` with `--mode fetch` and `--mode decide`, `--dry-run`, `--force-refetch` (limitation 40), catch-up, the offline-decide rules of 10.3, deadlines and throttle, the monthly full refetch, report writer (section 11, including the "partial sold 0" flag, held symbols with no bar this week, truncated-week warnings only for calendar-covered weeks), Telegram summary, journal CSV, `validate_environment` and paper-safety at start, a process lock | Offline-decide (Dhan client, scrip master and `AuthBootstrap` monkeypatched to raise), cold-cache, catch-up (3 missed weeks = 3 runs), a 12-week replay smoke on the real local cache, **first real preview report reviewed by the operator** | Scheduling, plists, dashboard |
 | 5 | `config/runtimes/positional_stocks.yaml` **and** the strategy YAML in one commit; two `PlistSpec`s with `wait_policy="elapsed"` and their generated plists; installer handling so nothing is enabled silently; runbook; sweep of the stale "placeholder" lines in the architecture doc. **v1.3:** first, the Phase 4b-2 audit fixes (R6-1 to R6-5), the watchlist change, the schedule and token rules of 10.3, and the gap acknowledgements | The existing plists byte-identical; `auto_start` and `RUNTIMES` unchanged; operator installs and enables the two agents | Dashboard page (needs its own approval); any `auto_start` / `RUNTIMES` change |
+| 6 | **Dashboard page (v1.3.2, section 11.1)**, built in a separate git worktree on its own branch; new files under `dashboards/` plus, at most, a minimal additive `Home.py` card | The page renders from a replayed book and from "not started yet"; read-only proven; the operator reviews it running from the worktree on a spare port | Any write, any network code, any change to the other pages' behaviour |
 
 ## 16. Decisions and remaining operator actions
 
