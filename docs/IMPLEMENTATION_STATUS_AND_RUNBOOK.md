@@ -15005,6 +15005,8 @@ The R6-3 guard exists twice, in the refresh decision and in the write, so removi
 
 ## `positional_stocks` — Operator guide
 
+Never switch the branch of /Volumes/Trading/algo_trading: the paper runtimes, the dashboard and the weekly positional_stocks jobs all run from it. Do other branch work in a separate worktree: git -C /Volumes/Trading/algo_trading worktree add ../algo_trading-<branch> <branch>, and remove it afterwards.
+
 ### The weekly routine
 
 1. **Saturday 08:00 (retried 14:00, Sunday 10:00): fetch and preview.**
