@@ -2670,9 +2670,15 @@ Everything else in D102 stands: 3 or more consecutive frozen runs, SELL_ALL of t
 | **D136** | **Marks come from the report, and only for the latest COMPLETED week** | Phase 6 (operator-approved). The mark is the week's close over the freeze factor, or the R5-1 mark close. Rule-side values are not persisted anywhere else, so the mark, unrealised ₹ and weeks held are read from the newest decision report's section 4. They are used only when that report's title week equals the latest COMPLETED run's `iso_week`; otherwise the page shows "—" and "no report for week W (the newest decision report, X, is for Y)". Unrealised % is that ₹ ÷ (`average_cost` × `shares_held`), a display ratio only. |
 | **D137** | **"Committed" on the page is held positions only** | Phase 6 (operator-approved). Σ `Position.committed` of held positions ÷ `committed_cap`, labelled "held positions". Pending BUY_T1 entries are shown as a count (they hold a slot and a commitment until they fill) and are **not** added in. The rules' full figure is computed inside `decide_week` and not persisted, so adding it here would be a second implementation. |
 | **D138** | **Every state is said plainly, and nothing unreadable is shown as zero** | Phase 6 (operator addition). **No `positional_stocks.db`:** every tab says "Not started yet" and points to the go-live checklist, with no table except Overview's LaunchAgent table. **Locked past the read's busy timeout:** "Book busy — refresh". In WAL mode a writer never blocks this reader, so busy is rare; a rollback-journal `EXCLUSIVE` lock produces it in the tests. **Corrupt DB:** the reason is shown. **Corrupt `journal.csv`** (wrong header, wrong field count, not UTF-8): a message in that section only. **Every value parsed from report text has a contract test** that renders a real report through `runtimes.positional_stocks.report` with the item present: section 4 mark, unrealised and "no bar N week(s)"; section 8 "freeze lifted with neither an acknowledgement nor a rescale"; the preview's "Fetch failed (N), treated as stale". A section, table header or line the parser cannot read is shown as "could not read <item> from <file>", and the operator-action total then reads "could not be counted", never 0. |
-| **D139** | **Home.py is not changed** | Phase 6 (operator decision in plan mode). The page is `dashboards/pages/5_Positional_Stocks.py`, reached from Streamlit's sidebar. Adding a Home card would have changed three existing tests (two pin three category links; `test_stock_config.py` pins positional_stocks out of `_CATEGORIES`). The only existing test changed is `test_dashboard.py`'s directory guard, which gains the three new files. |
+| **D139** | **Home.py is not changed** | Phase 6 (operator decision in plan mode). The page is `dashboards/pages/4_Positional_Stocks.py` (it was `5_Positional_Stocks.py` until Phase 6-fix, D147), reached from Streamlit's sidebar. Adding a Home card would have changed three existing tests (two pin three category links; `test_stock_config.py` pins positional_stocks out of `_CATEGORIES`). The only existing test changed is `test_dashboard.py`'s directory guard, which gains the three new files. |
 | **D140** | **What a read leaves on disk: SQLite's own empty sidecars** | Phase 6, measured. A `mode=ro` connection to a WAL database whose `-wal`/`-shm` were removed at the writer's clean close re-creates them: a **0-byte `-wal`** and the `-shm` index. The database file itself is byte- and mtime-identical, and nothing else changes. Every existing page's `connect_readonly` does the same (this is backlog item R6-6's behaviour, in a shared file). `test_the_page_writes_nothing` allows exactly this and nothing more: it also turns every write-mode `open`, `socket.connect`, `subprocess.Popen` and `os.system` into an error while the page renders. An empty `-wal` is harmless to the next decide run, and the backup's `read_only_uri` treats it as empty. |
 | **D141** | **The demo book has no closed trade: the real data holds none through W39** | Phase 6 acceptance. The 12-week replay through 2026-W39, with an all-PASS `quality_gate.csv` on a scratch copy, gives 9 open positions and 9 fills, but no exit. The regime is Red through W30, so the first entries are W31/W32, and none has reached a stop, a partial or a time exit by W39. A 26-week replay gives the same book: every week before W31 is Red with 0 taken. Nothing was fabricated. The closed-trade path (journal table, totals) is exercised on the fixture book in `test_dashboard_positional_stocks_*.py`, where A stops out. |
+| **D142** | **A failed weekend fetch is never "Operator actions: 0" in green** | Phase 6-fix (audit R10-1, HIGH). Before: `load_view` only looked at `-preview.md`, and with no preview newer than the last decision it set "Failed fetch symbols = 0". Audit `p4k_fetchfail_page.py` showed "Last preview: none yet" and 0 in green after an exit 5, an exit 1 (auth) and an exit 2 at the final attempt. **Now:** the newest `-preview-failed.md` that is newer (by `(day, mtime)`) than both the newest `-preview.md` and the newest decision report is the **fetch failure**:<br>• Overview opens with a red "Weekend fetch failed: <kind — reason> — see Health" banner, before the first book too;<br>• "Last preview" reads "FAILED — <file>";<br>• **Failed fetch symbols** is the list `fetch._systemic` wrote after "Failed:" (the count is its length), or `None` with "unknown: <file> does not list the symbols (<kind>)" when the file has none (a refusal, or not yet published);<br>• the operator-action total is then ≥ 1 in red, or "could not be counted", never 0.<br>A later successful preview clears it. `parse_failure` reads `render_failure`'s title and `**kind:** reason` line (the two kinds must agree). `parse_failed_fetch_symbols` reads the "Failed:" segment up to "Not in the scrip master:", and a segment it cannot read is an error. Both are contract-tested on the real exit-5 file (11 symbols, kind `PREVIEW NOT WRITTEN — fetch failed`), and wording mutations of either marker fail. |
+| **D143** | **Refusals and NO TRADES reports show on Overview** | Phase 6-fix (audit R10-2, MEDIUM). Every `refused` (`<date>-refused.md` or `refused-<date>.md`), `preview-failed` or `no-trades` report newer than the last COMPLETED run shows on Overview as a warning "<file>: <kind — reason>". Newer means a later day than its `week_ending`, or the same day with an mtime after its `finished_at`; with no COMPLETED run, every one counts. The D142 banner's file is not repeated. **Found while planning:** a decide cold cache or deadline (`weekly_run.py` suffix `""`) and a failed backup write their NO TRADES report under the plain `<week_ending>.md` name. The page used to take such a file for the decision report ("could not read open positions"). A `<date>.md` whose first line is a `render_failure` title is now kind `no-trades`: a failure, never the source of marks. |
+| **D144** | **"Book is behind" only after the week's decide slot + 60 minutes** | Phase 6-fix (operator's rule). A week counts as expected-decided only once `decide_after(its last session) + 60 min` has **passed** (strictly). The slot is `parameters.schedule.decide`, read from the strategy YAML through the shared `load_strategy_config` and parsed like `run_config.Slot.parse`, never hardcoded; `ConfigView.decide_after` is `Schedule.decide_after`'s calendar-day arithmetic. A pin test holds it equal to `RunConfig.schedule.decide_after` for a Monday-holiday week (W04), Friday-holiday weeks (W14, W26, W40) and changed slots. `latest_expected_decided_week` walks back from `latest_complete_week`. If the last COMPLETED week is older: "Book is behind: last decided W38, expected W39 — the Monday decide run did not complete; see Health." Friday 15:30 to Monday 09:30 shows nothing, and 09:31 warns. An unreadable slot says "Cannot check whether the book is behind: …". |
+| **D145** | **Before the first book, previews and refusals are still listed** | Phase 6-fix (audit R10-2). With no `positional_stocks.db`:<br>• Overview: "Not started yet", then the D142 banner, then every preview and failure report newest first (`file — kind`), then the flags and agents;<br>• Latest report: the newest preview rendered, then the list;<br>• Health: the failure reports as expanders.<br>Positions, Trades and Equity show only "Not started yet"; there is no zero and no book table anywhere. |
+| **D146** | **One `NEEDS_QUALITY` constant, exported by the rules** | Phase 6-fix (audit R10-3, LOW). `rules.NEEDS_QUALITY = "needs quality check"` (byte-identical text) is used by `_entry_refusals`, `telegram_summary` (re-exported as `telegram_summary.NEEDS_QUALITY`) and the dashboard, and the copies are gone. **Differential:** `screen()` of this `rules.py` against `7b3b3ce`'s, loaded as a sibling module, on 20,000 random inputs (seed 20260928: random K/D tails, EMA50, ATR%, 52-week high, history length, quality missing, PASS, FAIL, EVENT_RISK or expired, liquidity, gap block, cooling-off trades). **0 differences**; 1,942 reached the filters and 209 became candidates; the quality refusal appeared 667 times, 112 as the only refusal. The golden rules tests pass (214). **End to end:** a real decide run over a seeded noisy uptrend with a 3-week 12% pullback (found by search: smooth paths make the Stoch RSI range flat, "undefined"). At W39 the real Stoch RSI crosses up from oversold with K < 50. With no quality row, the funnel records exactly `NEEDS_QUALITY`, and the dashboard and `operator_actions` both count 1. With a PASS row, the same symbol is taken. |
+| **D147** | **Sidebar order: Positional Stocks directly under Intraday Stocks** | Phase 6-fix (operator request). `git mv` `pages/5_Positional_Stocks.py` → `4_Positional_Stocks.py` and `pages/4_System_Health.py` → `5_System_Health.py`; both are 100% renames, and the System Health shim is byte-identical. A test captures what Streamlit's own `script_runner._mpa_v1` hands to `_navigation` during a real AppTest run of Home.py: Home, Intraday Options, Positional Options, Intraday Stocks, Positional Stocks, System Health, with URL paths `/Intraday_Options`, `/Positional_Options`, `/Intraday_Stocks`, `/Positional_Stocks`, `/System_Health`. **Every hit of the old names:** the directory list in `test_dashboard.py`, runbook D139, the Operator guide, Phase 6 "What was added", and the Phase 7 note (runbook 12916, annotated) were all updated. **Not changed:** `docs/ALGO_TRADING_FORWARD_TESTING_ARCHITECTURE_FINAL.md:689` (`05_system_health.py` in the architecture's planned layout, outside this phase's files) and `dashboards/Home.py:4`'s docstring "the other four pages" (Home must stay untouched). |
 
 #### D22 in detail: the rebuilt premium-candle mapping
 
@@ -12913,7 +12919,7 @@ the code alone:
 
 **Only Health was removed**, and only because it genuinely duplicated: it
 called the same `load_system_health` and `render` as
-`dashboards/pages/4_System_Health.py`, merely filtered through
+`dashboards/pages/4_System_Health.py` (renamed `5_System_Health.py` in Phase 6-fix, D147), merely filtered through
 `_scope_health_view` to the selected strategies. Per-strategy scoping of the
 health view is the only capability lost. `_scope_health_view` and the
 `system_health` import went with it.
@@ -15067,7 +15073,7 @@ A snapshot is taken before every writing decide run: `data/backups/positional_st
 
 ### Dashboard (Phase 6, read-only)
 
-**Where it is:** the **Positional Stocks** page in the existing dashboard's sidebar (`dashboards/pages/5_Positional_Stocks.py`). Home is unchanged (D139). The page only reads: the book through the dashboard's read-only helper, and `journal.csv`, the reports, `data/backups/` and the daily cache as files. It never writes or shells out, and never calls Dhan, `launchctl` or the network. It reads fresh on every reload.
+**Where it is:** the **Positional Stocks** page in the existing dashboard's sidebar, directly under Intraday Stocks (`dashboards/pages/4_Positional_Stocks.py`; System Health is now `5_System_Health.py`, D147). Home is unchanged (D139). The page only reads: the book through the dashboard's read-only helper, and `journal.csv`, the reports, `data/backups/` and the daily cache as files. It never writes or shells out, and never calls Dhan, `launchctl` or the network. It reads fresh on every reload.
 
 | Tab | Shows | Source |
 |---|---|---|
@@ -15079,7 +15085,10 @@ A snapshot is taken before every writing decide run: `data/backups/positional_st
 | Health | Weekly runs; recent `-refused.md` / `-preview-failed.md`; backups; NIFTY's last cached session against the calendar's expected session | Runs table, report files, `data/backups/`, the cache |
 
 What the messages mean:
-- **"Not started yet"** in every tab: there is no `positional_stocks.db`. Nothing has gone wrong; see the go-live checklist above.
+- **"Not started yet"** in every tab: there is no `positional_stocks.db`. Nothing has gone wrong; see the go-live checklist above. Overview, Latest report and Health still list any previews and refusals (D145).
+- **Red "Weekend fetch failed: … — see Health"**: the newest fetch attempt failed and nothing newer succeeded. The failed symbols are counted if the file lists them, otherwise "unknown", so the action total is never 0 (D142). Fix the cause and re-run `--mode fetch`.
+- **A warning "<file>: <reason>"**: a refusal or NO TRADES report newer than the last COMPLETED run (D143). Read it on Health.
+- **"Book is behind: last decided W38, expected W39"**: the week's decide slot passed more than 60 minutes ago and the week is not COMPLETED (D144). Check Health and the Monday agent's log; re-run decide by hand.
 - **"Book busy — refresh"**: a weekly run held the database past the read's 5-second timeout. Reload in a moment. The run is never affected (D138).
 - **"could not read <item> from <file>"**: a report section the page could not parse. The operator-action total then says "could not be counted"; read the report itself (Latest report tab).
 - **Marks "—"** with "no report for week W": the newest decision report is not for the latest completed week. The book's own values are still shown.
@@ -15275,7 +15284,7 @@ Spec **v1.3.2** section 11.1, operator-approved. Built in the worktree `/Volumes
 
 ### What was added
 
-- `dashboards/pages/5_Positional_Stocks.py`: the shim, the same pattern as the others.
+- `dashboards/pages/5_Positional_Stocks.py` (now `4_Positional_Stocks.py`, D147): the shim, the same pattern as the others.
 - `dashboards/positional_stocks.py`: the page. Six tabs: Overview, Positions & orders, Trades & performance, Equity, Latest report, Health.
 - `dashboards/data/positional_stocks.py`: the read model (D135–D138, D140).
 - `tests/unit/test_dashboard_positional_stocks_data.py` (42 tests) and `tests/unit/test_dashboard_positional_stocks_page.py` (9 tests).
@@ -15313,6 +15322,57 @@ No shared or runtime file changed. `Home.py` is unchanged (D139), and so is ever
 - The 51 new tests pass under `TZ=UTC` and `TZ=America/New_York`.
 - `ruff check .` is clean, and the five new or changed files are `ruff format`-clean (the repo-wide count of unformatted files is 168 before and after). `mypy` (strict) is clean across 279 source files, and the two new test modules also type-check.
 - `scripts/assert_no_live_config_committed.py`: OK. `test_stock_isolation.py`: passes. `python -m runtimes.positional_stocks.check_config`: OK.
+- Nothing under `data/` was staged; nothing was installed.
+
+Every live gate is untouched, no `mode: live` reached any committed YAML, no
+`EgressIpProvider` was added or chosen, nothing was installed or scheduled, and
+`OPERATIONAL LIVE ACTIVATION ELIGIBLE` remains **NO — BLOCKED**.
+
+---
+
+## `wsr1_weekly_stochrsi` Phase 6-fix — dashboard audit round 10 and sidebar order (28 September 2026)
+
+Audit round 10 passed:
+- read-only: 5 cases under write, subprocess and socket guards;
+- never-disturbs-a-run: decide, a 3-week catch-up and a preview, with the page polling;
+- field correctness;
+- the report-parsing contracts: 7 of 7 wording mutations caught;
+- imports, and the other pages unchanged.
+
+It found R10-1 (HIGH), R10-2 (MEDIUM) and R10-3 (LOW), all fixed here; the operator also asked for the sidebar order. The work was done in the worktree only.
+
+| Item | Fix | D-entry |
+|---|---|---|
+| R10-1 | A failed weekend fetch: red banner, "Last preview: FAILED — …", failed symbols from the file or unknown, never 0 in green | D142 |
+| R10-2 | Overview warnings for newer refusals and NO TRADES reports; a `<date>.md` NO TRADES report is a failure, not a decision; "book is behind" after the decide slot + 60 min; previews and refusals listed before the first book | D143, D144, D145 |
+| R10-3 | One `rules.NEEDS_QUALITY`, used by the rules, `telegram_summary` and the dashboard; differential 0 / 20,000; a real candidate end to end | D146 |
+| Sidebar | `4_Positional_Stocks.py`, `5_System_Health.py` (renames only) | D147 |
+
+### Files
+
+- `dashboards/data/positional_stocks.py` and `dashboards/positional_stocks.py`.
+- Renames: `dashboards/pages/4_Positional_Stocks.py` and `dashboards/pages/5_System_Health.py` (the System Health shim is byte-identical).
+- `strategies/positional_stocks/wsr1_weekly_stochrsi/rules.py` and `runtimes/positional_stocks/telegram_summary.py`: the constant only.
+- Tests:
+  - new: `tests/unit/test_dashboard_positional_stocks_r10.py` (25 tests);
+  - updated: `test_dashboard_positional_stocks_data.py` (the pin test is now an identity check across the three modules) and `test_dashboard_positional_stocks_page.py` (the old shim-path test moved into the discovery test);
+  - `tests/unit/test_dashboard.py`: the directory list's two page names.
+- This runbook.
+
+**Mutation checks** (each reverted, each caught): R10-1 turned off (5 tests fail), no 60-minute grace (3), the NO TRADES classification off (1), refusal warnings off (2), "unknown" reported as 0 (3).
+
+### Existing tests changed, and why
+
+- `tests/unit/test_dashboard.py::test_the_dashboards_directory_is_what_we_think_it_is`: the two renamed page files (D147). The System Health tests pass unchanged.
+
+### Verification (28 September 2026)
+
+- Full suite from the worktree: **4,636 passed, 19 skipped, 4 failed**, and pytest's exit code is 1. The only failures are the 4 path-bound launchd tests of D134:
+  - `test_launchd_plists.py::test_naming_the_agents_selects_only_them`
+  - `test_launchd_plists.py::test_an_unusable_strategy_file_leaves_the_default_agents_untouched[missing]`, `[syntax]` and `[no_schedule]`
+- The 75 tests of the three Phase 6 test modules pass under `TZ=UTC` and `TZ=America/New_York`. The golden rules tests pass (214).
+- `ruff check .` is clean, and the changed files are `ruff format`-clean. `mypy` (strict) is clean across 279 source files, plus the three Phase 6 test modules.
+- `scripts/assert_no_live_config_committed.py`: OK. `test_stock_isolation.py`: 3 passed. `check_config`: OK.
 - Nothing under `data/` was staged; nothing was installed.
 
 Every live gate is untouched, no `mode: live` reached any committed YAML, no
