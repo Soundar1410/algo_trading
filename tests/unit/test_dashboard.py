@@ -205,8 +205,8 @@ def test_the_dashboards_directory_is_what_we_think_it_is():
         "pages/1_Intraday_Options.py",
         "pages/2_Positional_Options.py",
         "pages/3_Intraday_Stocks.py",
-        "pages/4_System_Health.py",
-        "pages/5_Positional_Stocks.py",
+        "pages/4_Positional_Stocks.py",
+        "pages/5_System_Health.py",
     }
 
 

@@ -629,6 +629,10 @@ def replay_touch_memory(position: Position, series: IndicatorSeries, before: Wee
 #: The review flag of a frozen position; the runtime counts consecutive runs by it.
 FROZEN_FLAG = "frozen"
 
+#: The one entry refusal that means "fill in quality_gate.csv" (spec 4.2). The
+#: Telegram summary and the dashboard count the funnel by this exact text.
+NEEDS_QUALITY = "needs quality check"
+
 
 def _frozen_review(position: Position, freeze: Freeze) -> PositionReview:
     """Spec 4.14 item 2: no exit, add or partial decision while frozen."""
@@ -841,7 +845,7 @@ def _entry_refusals(
     if not _ge(inputs.traded_value_30d, params.min_traded_value_cr * _CRORE):
         refusals.append("liquidity below 20 cr (or unknown)")
     if check_quality and not _quality_allows(inputs.quality, ctx.execution_date):
-        refusals.append("needs quality check")
+        refusals.append(NEEDS_QUALITY)
     if inputs.gap_blocked:
         refusals.append("unacknowledged price gap")
 

@@ -462,14 +462,17 @@ def test_the_config_keys_are_the_runs_own() -> None:
 
 def test_constants_are_the_runtimes_own() -> None:
     from orchestration.launchd.generate_plists import LABEL_PREFIX, operator_installed_specs
+    from runtimes.positional_stocks import telegram_summary
     from runtimes.positional_stocks.run_config import INDEX_SYMBOL, STRATEGY_ID
-    from runtimes.positional_stocks.telegram_summary import NEEDS_QUALITY
+    from strategies.positional_stocks.wsr1_weekly_stochrsi import rules
 
     assert ps.LABEL_PREFIX == LABEL_PREFIX
     assert tuple(s.short_name for s in operator_installed_specs()) == ps.AGENT_NAMES
     assert ps.INDEX_SYMBOL == INDEX_SYMBOL
     assert ps.STRATEGY_ID == STRATEGY_ID
-    assert ps.NEEDS_QUALITY == NEEDS_QUALITY
+    # R10-3: one constant, exported by the rules, used by all three.
+    assert ps.NEEDS_QUALITY is rules.NEEDS_QUALITY is telegram_summary.NEEDS_QUALITY
+    assert rules.NEEDS_QUALITY == "needs quality check"
 
 
 @pytest.mark.parametrize(

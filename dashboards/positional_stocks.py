@@ -33,6 +33,7 @@ for _parent in Path(__file__).resolve().parents:
 from dashboards.data.positional_stocks import (  # noqa: E402
     NOT_STARTED_STATE,
     OK,
+    RECENT_REFUSALS,
     ActionItem,
     StocksPaths,
     StocksView,
@@ -94,11 +95,51 @@ def render(streamlit: Any, view: StocksView) -> None:
     for tab, fn in zip(tabs, renderers, strict=True):
         with tab:
             if not view.started:
+                # R10-2: before the first book, the tabs that can say something
+                # without one still list the previews and refusals — below the
+                # "not started yet" line, never as book tables or zeros.
                 streamlit.info(view.state_detail)
                 if fn is _overview:
+                    _fetch_failure_banner(streamlit, view)
+                    _report_list(streamlit, view)
                     _flags_and_agents(streamlit, view)
+                elif fn is _latest_report:
+                    _latest_report(streamlit, view)
+                    _report_list(streamlit, view)
+                elif fn is _health:
+                    _refusal_reports(streamlit, view)
                 continue
             fn(streamlit, view)
+
+
+def _fetch_failure_banner(streamlit: Any, view: StocksView) -> None:
+    """R10-1: a failed weekend fetch newer than any preview or decision."""
+    if view.fetch_failure is not None:
+        streamlit.error(f"Weekend fetch failed: {view.fetch_failure_reason} — see Health")
+
+
+def _report_list(streamlit: Any, view: StocksView) -> None:
+    """Previews and failure reports, newest first (shown before the first book)."""
+    reports = sorted((*view.previews, *view.refusals), key=lambda r: r.order_key, reverse=True)
+    streamlit.markdown("#### Previews and refusals so far")
+    if not reports:
+        streamlit.markdown("None yet.")
+    for report in reports:
+        what = "preview" if report.kind == "preview" else report.kind
+        streamlit.markdown(f"- `{report.path.name}` — {what}")
+
+
+def _refusal_reports(streamlit: Any, view: StocksView) -> None:
+    streamlit.markdown("#### Recent refusals and failed previews")
+    recent = view.refusals[-RECENT_REFUSALS:]
+    if not recent:
+        streamlit.markdown("None.")
+    for report in reversed(recent):
+        with streamlit.expander(report.path.name):
+            try:
+                streamlit.markdown(report.path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError) as exc:
+                streamlit.error(f"could not read {report.path.name}: {exc}")
 
 
 def _book_state(streamlit: Any, view: StocksView) -> bool:
@@ -132,6 +173,9 @@ def _flags_and_agents(streamlit: Any, view: StocksView) -> None:
 
 
 def _overview(streamlit: Any, view: StocksView) -> None:
+    _fetch_failure_banner(streamlit, view)
+    for warning in view.warnings:
+        streamlit.warning(warning)
     if _book_state(streamlit, view):
         assert view.book is not None
         book = view.book
@@ -187,10 +231,7 @@ def _overview(streamlit: Any, view: StocksView) -> None:
                 else MISSING
             )
         )
-    preview = view.latest_preview
-    streamlit.markdown(
-        "**Last preview:** " + (preview.path.name if preview is not None else "none yet")
-    )
+    streamlit.markdown("**Last preview:** " + view.last_preview_label)
     if view.state == OK:
         _operator_actions(streamlit, view.actions)
     _flags_and_agents(streamlit, view)
@@ -403,8 +444,9 @@ def _equity(streamlit: Any, view: StocksView) -> None:
 # ------------------------------------------------------ Latest report
 def _latest_report(streamlit: Any, view: StocksView) -> None:
     shown = False
+    newest_preview = view.newer_preview if view.started else view.latest_preview
     for label, report in (
-        ("Newest preview (newer than the last decision)", view.newer_preview),
+        ("Newest preview (newer than the last decision)", newest_preview),
         ("Newest decision report", view.latest_decision),
     ):
         if report is None:
@@ -444,15 +486,7 @@ def _health(streamlit: Any, view: StocksView) -> None:
                 hide_index=True,
                 width="stretch",
             )
-    streamlit.markdown("#### Recent refusals and failed previews")
-    if not view.refusals:
-        streamlit.markdown("None.")
-    for report in reversed(view.refusals):
-        with streamlit.expander(report.path.name):
-            try:
-                streamlit.markdown(report.path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeDecodeError) as exc:
-                streamlit.error(f"could not read {report.path.name}: {exc}")
+    _refusal_reports(streamlit, view)
     streamlit.markdown("#### Backups")
     streamlit.markdown(
         f"{view.backups.count} snapshot(s); newest: {view.backups.newest or MISSING}"

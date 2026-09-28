@@ -49,7 +49,7 @@ import re
 import sqlite3
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -58,7 +58,12 @@ from common.config import load_runtime_config, load_strategy_config
 from common.utils import timeutils
 from dashboards._shared import SnapshotUnavailable, run_bounded
 from runtimes.positional_stocks.journal import COLUMNS as JOURNAL_COLUMNS
-from runtimes.positional_stocks.repository import StockRepository, order_id, week_text
+from runtimes.positional_stocks.repository import (
+    StockRepository,
+    order_id,
+    week_key,
+    week_text,
+)
 from strategies.positional_stocks.wsr1_weekly_stochrsi.daily_cache import DailyBarCache
 from strategies.positional_stocks.wsr1_weekly_stochrsi.iso_weeks import WeekKey, shift, week_of
 from strategies.positional_stocks.wsr1_weekly_stochrsi.models import (
@@ -68,6 +73,7 @@ from strategies.positional_stocks.wsr1_weekly_stochrsi.models import (
     RulesParameters,
 )
 from strategies.positional_stocks.wsr1_weekly_stochrsi.rules import FROZEN_FLAG
+from strategies.positional_stocks.wsr1_weekly_stochrsi.rules import NEEDS_QUALITY as NEEDS_QUALITY
 from strategies.positional_stocks.wsr1_weekly_stochrsi.trading_calendar import TradingCalendar
 from strategies.positional_stocks.wsr1_weekly_stochrsi.weekly_bars import is_week_complete
 
@@ -79,9 +85,6 @@ INDEX_SYMBOL = "NIFTY"
 #: operator-installed agents' short names (a test holds them equal).
 LABEL_PREFIX = "com.soundarraj.algotrading"
 AGENT_NAMES = ("positional_stocks_fetch", "positional_stocks_decide")
-#: The one refusal that means "fill in quality_gate.csv" (spec 4.2) —
-#: ``telegram_summary.NEEDS_QUALITY`` (a test holds them equal).
-NEEDS_QUALITY = "needs quality check"
 #: A review flag of an escalated or mixed-units freeze (``rules._frozen_review``).
 OPERATOR_ACTION_PREFIX = "operator action:"
 #: Recent fills shown on the Trades tab.
@@ -98,6 +101,10 @@ NOT_STARTED = (
     "(data/operational/positional_stocks.db does not exist). " + GO_LIVE_POINTER
 )
 BUSY = "Book busy — a weekly run is writing to it right now. Refresh in a moment."
+#: A week counts as expected-decided once its decide slot plus this grace has passed.
+DECIDE_GRACE = timedelta(minutes=60)
+#: ``run_config._WEEKDAYS``: the day names ``parameters.schedule`` uses.
+WEEKDAYS = ("MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY")
 
 #: Book states.
 OK = "ok"
@@ -123,6 +130,31 @@ class ConfigView:
     dd1_pct: Decimal | None = None
     dd2_pct: Decimal | None = None
     error: str | None = None
+    #: ``parameters.schedule.decide`` (Python weekday, IST time), or why not.
+    decide_slot: tuple[int, time] | None = None
+    schedule_error: str | None = None
+
+    def decide_after(self, week_ending: date, tz_name: str = timeutils.DEFAULT_TZ) -> datetime:
+        """``run_config.Schedule.decide_after``: the first decide slot after
+        ``week_ending`` (the week's last session), in calendar days — so a
+        Monday-holiday week still decides at the Monday slot. A test holds the
+        two equal."""
+        if self.decide_slot is None:
+            raise ValueError(self.schedule_error or "no decide slot")
+        weekday, at = self.decide_slot
+        start = week_ending + timedelta(days=1)
+        day = start + timedelta(days=(weekday - start.weekday()) % 7)
+        return datetime.combine(day, at, timeutils.get_tz(tz_name))
+
+
+def parse_slot(text: str) -> tuple[int, time]:
+    """``run_config.Slot.parse``: ``"MONDAY 08:30"`` -> ``(0, 08:30)``."""
+    try:
+        day, clock = text.split()
+        hour, minute = clock.split(":")
+        return WEEKDAYS.index(day.upper()), time(int(hour), int(minute))
+    except (ValueError, IndexError) as exc:
+        raise ValueError(f"schedule slot must be like 'MONDAY 08:30', got {text!r}") from exc
 
 
 #: ``parameters`` key -> RulesParameters field, for the values shown here only.
@@ -155,8 +187,21 @@ def load_config_view(config_root: Path) -> ConfigView:
                 overrides[attr] = int(value) if isinstance(default, int) else Decimal(str(value))
         params = RulesParameters(**overrides)
     except Exception as exc:  # any load or validation problem is shown, never raised
-        return ConfigView(error=f"could not read the configuration: {type(exc).__name__}: {exc}")
+        error = f"could not read the configuration: {type(exc).__name__}: {exc}"
+        return ConfigView(error=error, schedule_error=error)
+    decide_slot: tuple[int, time] | None = None
+    schedule_error: str | None = None
+    try:
+        schedule = raw.get("schedule")
+        decide = schedule.get("decide") if isinstance(schedule, Mapping) else None
+        if not isinstance(decide, str):
+            raise ValueError("parameters.schedule.decide is missing")
+        decide_slot = parse_slot(decide)
+    except ValueError as exc:
+        schedule_error = f"could not read the decide slot: {exc}"
     return ConfigView(
+        decide_slot=decide_slot,
+        schedule_error=schedule_error,
         runtime_enabled=runtime.enabled,
         strategy_enabled=strategy.enabled,
         capital=params.capital,
@@ -394,6 +439,17 @@ def _read_book(conn: sqlite3.Connection, capital: Decimal) -> BookData:
 _DECISION_NAME = re.compile(r"^(\d{4}-\d{2}-\d{2})\.md$")
 _PREVIEW_NAME = re.compile(r"^(\d{4}-\d{2}-\d{2})-preview\.md$")
 _REFUSAL_NAME = re.compile(r"^(\d{4}-\d{2}-\d{2})-(refused|preview-failed)\.md$")
+#: ``weekly_run.refuse`` when not even the target week could be worked out.
+_UNDATED_REFUSAL_NAME = re.compile(r"^refused-(\d{4}-\d{2}-\d{2})\.md$")
+#: ``report.render_failure``'s title and its one ``**kind:** reason`` line.
+_FAILURE_TITLE = re.compile(r"^# \S+ — week \S+ — NO TRADES \((?P<kind>.*)\)$")
+_FAILURE_LINE = re.compile(r"^\*\*(?P<kind>.+?):\*\* (?P<reason>.*)$")
+#: ``fetch._systemic``'s list of failed symbols inside the reason.
+FETCH_FAILED_MARKER = " Failed: "
+_NOT_IN_SCRIP_MASTER = " Not in the scrip master: "
+_FAILED_SYMBOL = re.compile(r"(?:^|; )([A-Z0-9&.\-]+) \(")
+#: Report kinds that record a run which decided or previewed nothing.
+FAILURE_KINDS = frozenset({"refused", "preview-failed", "no-trades"})
 _TITLE = re.compile(r"^# \S+ — week (\d{4}-W\d{2}) \(ending (\d{4}-\d{2}-\d{2})\)")
 
 #: Report section headings the parsers rely on (``runtimes.positional_stocks.report``).
@@ -539,20 +595,79 @@ def parse_fetch_failed(text: str) -> tuple[str, ...]:
     return ()
 
 
+def _is_failure_report(path: Path) -> bool:
+    """A ``<week_ending>.md`` written by ``render_failure`` (a decide cold cache,
+    deadline or failed backup) is a failure report, not a decision."""
+    try:
+        with path.open(encoding="utf-8") as fh:
+            first = fh.readline().rstrip("\n")
+    except (OSError, UnicodeDecodeError):
+        return False
+    return _FAILURE_TITLE.match(first) is not None
+
+
 def list_reports(reports_dir: Path) -> list[ReportFile]:
-    """Every decision, preview and refusal report, oldest first. Dry runs are ignored."""
+    """Every decision, preview and failure report, oldest first. Dry runs are ignored.
+
+    Kinds: ``decision``, ``preview``, ``refused`` (``<date>-refused.md`` or
+    ``refused-<date>.md``), ``preview-failed``, and ``no-trades`` (a
+    ``<date>.md`` whose title is a NO TRADES failure).
+    """
     if not reports_dir.is_dir():
         return []
     out: list[ReportFile] = []
     for path in reports_dir.iterdir():
-        for pattern, kind in ((_DECISION_NAME, "decision"), (_PREVIEW_NAME, "preview")):
-            match = pattern.match(path.name)
-            if match:
-                out.append(ReportFile(path, date.fromisoformat(match.group(1)), kind))
-        refusal = _REFUSAL_NAME.match(path.name)
-        if refusal:
-            out.append(ReportFile(path, date.fromisoformat(refusal.group(1)), refusal.group(2)))
+        day = path.name[:10] if not path.name.startswith("refused-") else path.name[8:18]
+        if match := _DECISION_NAME.match(path.name):
+            kind = "no-trades" if _is_failure_report(path) else "decision"
+        elif match := _PREVIEW_NAME.match(path.name):
+            kind = "preview"
+        elif match := _REFUSAL_NAME.match(path.name):
+            kind = match.group(2)
+        elif match := _UNDATED_REFUSAL_NAME.match(path.name):
+            kind = "refused"
+        else:
+            continue
+        out.append(ReportFile(path, date.fromisoformat(day), kind))
     return sorted(out, key=lambda r: r.order_key)
+
+
+@dataclass(frozen=True)
+class FailureInfo:
+    kind: str
+    reason: str
+
+
+def parse_failure(text: str) -> FailureInfo:
+    """``report.render_failure``: the kind in the title and the reason line."""
+    lines = text.splitlines()
+    title = _FAILURE_TITLE.match(lines[0]) if lines else None
+    if title is None:
+        raise ReportParseError("failure-report title not recognised")
+    for line in lines[1:]:
+        match = _FAILURE_LINE.match(line)
+        if match is not None:
+            if match["kind"] != title["kind"]:
+                raise ReportParseError(
+                    f"reason line kind {match['kind']!r} differs from the title's {title['kind']!r}"
+                )
+            return FailureInfo(match["kind"], match["reason"])
+    raise ReportParseError("failure-report reason line not found")
+
+
+def parse_failed_fetch_symbols(reason: str) -> tuple[str, ...] | None:
+    """The symbols ``fetch._systemic`` lists after "Failed:"; None when it lists none."""
+    start = reason.find(FETCH_FAILED_MARKER)
+    if start < 0:
+        return None
+    segment = reason[start + len(FETCH_FAILED_MARKER) :]
+    end = segment.find(_NOT_IN_SCRIP_MASTER)
+    if end >= 0:
+        segment = segment[:end]
+    symbols = tuple(_FAILED_SYMBOL.findall(segment))
+    if not symbols:
+        raise ReportParseError(f"failed-symbol list not recognised: {segment[:120]!r}")
+    return symbols
 
 
 def _read_text(path: Path) -> str:
@@ -665,6 +780,42 @@ def latest_complete_week(moment: datetime, calendar: TradingCalendar) -> WeekKey
     raise ValueError(f"no complete week found before {moment.isoformat()}")
 
 
+def latest_expected_decided_week(
+    moment: datetime, calendar: TradingCalendar, config: ConfigView
+) -> WeekKey:
+    """The newest complete week whose decide slot plus :data:`DECIDE_GRACE`
+    has passed at ``moment`` — the week the book should have decided by now.
+    From a week's close until its slot + grace, the week before is expected."""
+    week = latest_complete_week(moment, calendar)
+    for _ in range(8):
+        if moment > config.decide_after(calendar.expected_last_session(week)) + DECIDE_GRACE:
+            return week
+        week = shift(week, -1)
+    raise ValueError(f"no decided week expected before {moment.isoformat()}")
+
+
+def behind_warning(
+    book: BookData, config: ConfigView, config_root: Path, now: datetime
+) -> str | None:
+    """ "Book is behind: …" when the last COMPLETED week is older than the week
+    whose decide slot (+ grace) has passed; a message when it cannot be checked."""
+    try:
+        calendar = TradingCalendar.from_config(config_root)
+        expected = latest_expected_decided_week(now, calendar, config)
+    except Exception as exc:
+        return f"Cannot check whether the book is behind: {exc}"
+    completed = book.latest_completed
+    last = week_key(completed.iso_week) if completed is not None else None
+    if last is not None and last >= expected:
+        return None
+    assert config.decide_slot is not None
+    day = WEEKDAYS[config.decide_slot[0]].capitalize()
+    return (
+        f"Book is behind: last decided {completed.iso_week if completed else 'no week yet'}, "
+        f"expected {week_text(expected)} — the {day} decide run did not complete; see Health."
+    )
+
+
 def cache_freshness(cache_root: Path, config_root: Path, now: datetime) -> CacheFreshness:
     try:
         bars = DailyBarCache.under(cache_root).read(INDEX_SYMBOL)
@@ -723,7 +874,16 @@ class StocksView:
     latest_preview: ReportFile | None = None
     #: The preview shown under "Latest report": only when newer than the decision.
     newer_preview: ReportFile | None = None
+    #: Every failure report (refused, preview-failed, no-trades), oldest first.
     refusals: tuple[ReportFile, ...] = ()
+    #: Every preview, oldest first (listed before the first book).
+    previews: tuple[ReportFile, ...] = ()
+    #: R10-1: a failed fetch newer than the newest preview and decision.
+    fetch_failure: ReportFile | None = None
+    fetch_failure_reason: str | None = None
+    #: R10-2: "<file>: <reason>" for failures newer than the last COMPLETED
+    #: run, and the "book is behind" line.
+    warnings: tuple[str, ...] = ()
     journal: JournalView = field(default_factory=JournalView)
     backups: BackupInfo = field(default_factory=lambda: BackupInfo(0, None))
     cache: CacheFreshness = field(default_factory=CacheFreshness)
@@ -731,6 +891,12 @@ class StocksView:
     @property
     def started(self) -> bool:
         return self.state != NOT_STARTED_STATE
+
+    @property
+    def last_preview_label(self) -> str:
+        if self.fetch_failure is not None:
+            return f"FAILED — {self.fetch_failure.path.name}"
+        return self.latest_preview.path.name if self.latest_preview is not None else "none yet"
 
 
 @dataclass(frozen=True)
@@ -778,8 +944,26 @@ def load_view(
     """Everything the page shows. Never raises for a missing, locked or corrupt input."""
     config = load_config_view(paths.config_root)
     agents = agents_installed(paths.launch_agents_dir)
+    reports = list_reports(paths.reports)
+    decisions = [r for r in reports if r.kind == "decision"]
+    previews = [r for r in reports if r.kind == "preview"]
+    failures = tuple(r for r in reports if r.kind in FAILURE_KINDS)
+    latest_decision = decisions[-1] if decisions else None
+    latest_preview = previews[-1] if previews else None
+    fetch_failure = _fetch_failure(reports, latest_preview, latest_decision)
+    fetch_failure_reason = _failure_reason(fetch_failure) if fetch_failure is not None else None
     if not paths.database.is_file():
-        return StocksView(NOT_STARTED_STATE, NOT_STARTED, config, agents)
+        return StocksView(
+            NOT_STARTED_STATE,
+            NOT_STARTED,
+            config,
+            agents,
+            latest_preview=latest_preview,
+            refusals=failures,
+            previews=tuple(previews),
+            fetch_failure=fetch_failure,
+            fetch_failure_reason=fetch_failure_reason,
+        )
 
     capital = config.capital if config.capital is not None else RulesParameters().capital
     result = run_bounded(paths.database, lambda conn: _read_book(conn, capital))
@@ -789,22 +973,26 @@ def load_view(
     else:
         state, detail, book = OK, "", result
 
-    reports = list_reports(paths.reports)
-    decisions = [r for r in reports if r.kind == "decision"]
-    previews = [r for r in reports if r.kind == "preview"]
-    latest_decision = decisions[-1] if decisions else None
-    latest_preview = previews[-1] if previews else None
     newer_preview = (
         latest_preview
         if latest_preview is not None
         and (latest_decision is None or latest_preview.order_key > latest_decision.order_key)
         else None
     )
-    refusals = tuple(r for r in reports if r.kind in {"refused", "preview-failed"})[
-        -RECENT_REFUSALS:
-    ]
-
-    positions, marks_note, actions = _positions_and_actions(book, latest_decision, newer_preview)
+    moment = now()
+    positions, marks_note, actions = _positions_and_actions(
+        book, latest_decision, newer_preview, fetch_failure
+    )
+    warnings: list[str] = []
+    if book is not None:
+        warnings += [
+            f"{r.path.name}: {_failure_reason(r)}"
+            for r in reversed(failures)
+            if r != fetch_failure and _newer_than_completed(r, book.latest_completed)
+        ]
+        behind = behind_warning(book, config, paths.config_root, moment)
+        if behind is not None:
+            warnings.append(behind)
     committed_held = (
         sum((p.committed for p in book.held), Decimal("0")) if book is not None else None
     )
@@ -825,17 +1013,56 @@ def load_view(
         latest_decision=latest_decision,
         latest_preview=latest_preview,
         newer_preview=newer_preview,
-        refusals=refusals,
+        refusals=failures,
+        previews=tuple(previews),
+        fetch_failure=fetch_failure,
+        fetch_failure_reason=fetch_failure_reason,
+        warnings=tuple(warnings),
         journal=read_journal(paths.reports / "journal.csv"),
         backups=backups(paths.backups),
-        cache=cache_freshness(paths.cache_root, paths.config_root, now()),
+        cache=cache_freshness(paths.cache_root, paths.config_root, moment),
     )
+
+
+def _fetch_failure(
+    reports: list[ReportFile], preview: ReportFile | None, decision: ReportFile | None
+) -> ReportFile | None:
+    """R10-1: the newest failed fetch, when newer than both the newest preview
+    and the newest decision report (a later success clears it)."""
+    failed = [r for r in reports if r.kind == "preview-failed"]
+    if not failed:
+        return None
+    newest = failed[-1]
+    for other in (preview, decision):
+        if other is not None and other.order_key >= newest.order_key:
+            return None
+    return newest
+
+
+def _failure_reason(report: ReportFile) -> str:
+    try:
+        info = parse_failure(_read_text(report.path))
+    except (OSError, UnicodeDecodeError, ReportParseError) as exc:
+        return f"could not read the reason from {report.path.name}: {exc}"
+    return f"{info.kind} — {info.reason}"
+
+
+def _newer_than_completed(report: ReportFile, completed: RunRow | None) -> bool:
+    """After the last COMPLETED run: a later day, or the same day written after it finished."""
+    if completed is None:
+        return True
+    ending = date.fromisoformat(completed.week_ending)
+    if report.day != ending:
+        return report.day > ending
+    finished = datetime.fromisoformat(completed.finished_at) if completed.finished_at else None
+    return finished is None or report.path.stat().st_mtime > finished.timestamp()
 
 
 def _positions_and_actions(
     book: BookData | None,
     decision: ReportFile | None,
     preview: ReportFile | None,
+    fetch_failure: ReportFile | None = None,
 ) -> tuple[tuple[PositionView, ...], str | None, tuple[ActionItem, ...]]:
     if book is None:
         return (), None, ()
@@ -945,7 +1172,9 @@ def _positions_and_actions(
             "decide run.",
         ),
     ]
-    if preview is None:
+    if fetch_failure is not None:
+        actions.append(_failed_fetch_action(fetch_failure))
+    elif preview is None:
         actions.append(
             ActionItem(
                 "Failed fetch symbols",
@@ -971,6 +1200,28 @@ def _positions_and_actions(
             )
         )
     return tuple(views), marks_note, tuple(actions)
+
+
+def _failed_fetch_action(report: ReportFile) -> ActionItem:
+    """R10-1: the symbols a failed fetch lists, or unknown — never 0."""
+    what = "Fix the cause (see Health) and re-run the fetch before the decide run."
+    label = "Failed fetch symbols"
+    try:
+        info = parse_failure(_read_text(report.path))
+        symbols = parse_failed_fetch_symbols(info.reason)
+    except (OSError, UnicodeDecodeError, ReportParseError) as exc:
+        return ActionItem(
+            label, None, (), what, error=_could_not("failed fetch symbols", report, exc)
+        )
+    if symbols is None:
+        return ActionItem(
+            label,
+            None,
+            (),
+            what,
+            error=f"unknown: {report.path.name} does not list the symbols ({info.kind})",
+        )
+    return ActionItem(label, len(symbols), symbols, what)
 
 
 def total_actions(actions: tuple[ActionItem, ...]) -> int | None:

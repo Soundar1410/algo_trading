@@ -19,12 +19,10 @@ from decimal import Decimal
 
 from common.config.models import ExecutionMode
 from common.notifications.base import NotificationEvent, Notifier
+from strategies.positional_stocks.wsr1_weekly_stochrsi.rules import NEEDS_QUALITY as NEEDS_QUALITY
 
 from .journal import exit_type
 from .report import ReportData, failed_kept, week_label
-
-#: The one refusal that means "fill in quality_gate.csv" (spec 4.2).
-NEEDS_QUALITY = "needs quality check"
 
 
 @dataclass(frozen=True)

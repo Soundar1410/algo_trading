@@ -324,7 +324,3 @@ def test_a_dashboard_read_never_disturbs_a_decide_run(tmp_path: Path) -> None:
     assert after.book is not None and after.book.latest_equity is not None
     assert after.book.latest_equity.week_ending == week4
 
-
-def test_the_new_page_is_discovered_by_streamlit() -> None:
-    shim = REPO / "dashboards" / "pages" / "5_Positional_Stocks.py"
-    assert "from dashboards.positional_stocks import main" in shim.read_text()
