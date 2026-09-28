@@ -191,6 +191,7 @@ def test_the_dashboards_directory_is_what_we_think_it_is():
         "intraday_options.py",
         "intraday_stocks.py",
         "positional_options.py",
+        "positional_stocks.py",
         "system_health.py",
         "data/account.py",
         "data/calendar_stats.py",
@@ -198,12 +199,14 @@ def test_the_dashboards_directory_is_what_we_think_it_is():
         "data/intraday_options.py",
         "data/multi_leg.py",
         "data/positional.py",
+        "data/positional_stocks.py",
         "data/stocks.py",
         "data/strategy_scope.py",
         "pages/1_Intraday_Options.py",
         "pages/2_Positional_Options.py",
         "pages/3_Intraday_Stocks.py",
         "pages/4_System_Health.py",
+        "pages/5_Positional_Stocks.py",
     }
 
 
