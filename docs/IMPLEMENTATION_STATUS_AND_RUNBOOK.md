@@ -2665,6 +2665,14 @@ Everything else in D102 stands: 3 or more consecutive frozen runs, SELL_ALL of t
 | **D131** | **Any error loading or binding a positional_stocks YAML is a clean refusal** | Phase 5-fix2 (audit R8-1, a regression from D126). The duplicate-key parse turns any exception into `RunRefused("configuration: <file>: …")`: `yaml.YAMLError`, the `ValueError` PyYAML raises for an invalid date (`2026-02-30`), the `TypeError` for an unhashable (list) key, or anything else. `RunConfig.from_config` wraps the whole binding the same way, naming the strategy file. `load_run_config` backs `default_environment`. decide and fetch then refuse with the D117 report and alert, a dry run only prints, and `check_config` reports a problem line. There is no traceback. |
 | **D132** | **`check_config` warns about the paper runtimes only when theirs fail** | Phase 5-fix2 (audit R8-3). "intraday_options and positional_options would refuse to start" is appended only to a failure of one of those runtimes' own `discover_strategies`, as with a YAML syntax error in any strategy file. A problem confined to positional_stocks, such as `strategy_id: wsr2`, is reported without it. |
 | **D133** | **The execution note states the run's own start** | Phase 5-fix2 (audit R8-4). For example "orders execute at Wed 24 Jun open: this run started Tue 23 Jun 10:00, after that session's open". When the run started before any open on its own day (a weekend, a holiday or before 09:15), the ending names the open it missed: "…, after Mon 22 Jun's open". |
+| **D134** | **Phase 6 is built in a separate worktree, and every command proves which checkout it runs** | Phase 6 (spec 11.1 v1.3.2, 15). The live dashboard LaunchAgent and both paper runtimes run from `/Volumes/Trading/algo_trading`, so Phase 6 lives in `/Volumes/Trading/algo_trading-dashboard` on `strategy-wsr1-dashboard`, and the live folder's branch is never switched. **The trap:** `.venv` holds an *editable* install (`__editable___algo_trading_0_1_0_finder`) that maps `dashboards`, `runtimes`, `common` and `strategies` to the **live** folder. Every command therefore runs from the worktree as `PYTHONPATH=<worktree> .venv/bin/python -m …`. Proved on 28 Sep with `python -c` and a throwaway pytest probe: both resolve to the worktree (the root `conftest.py` puts the rootdir first even for a bare `pytest`, but nothing relies on that). `test_the_suite_imports_the_dashboard_from_this_checkout` pins it. **Side effect of the directory name:** 4 existing tests in `test_launchd_plists.py` assert `"dashboard" not in plan`, and the plan prints paths under `…/algo_trading-dashboard/`. They fail at this path **on the unmodified base commit `dc1092c` too** (verified by stashing every Phase 6 change). The suite gate for Phase 6 is therefore run on an exact export of the worktree at a neutral path. `generate_plists --check` likewise reports the autostart and dashboard plists as drifted *from the worktree only*, because they embed the project root. |
+| **D135** | **The page's read path, and what it may import** | Phase 6. The book is opened only through `dashboards._shared.run_bounded` (`connect_readonly`, `mode=ro`). Positions and pending orders come from `StockRepository.positions(conn)` / `pending_orders(conn)` on that read-only connection. The repository is built around `_NoDatabase`, whose `connect()` raises, so a read that ever fell back to its own database would fail instead of opening a write connection. **`run_config`, `report` and `weekly_run` are not imported**: each loads `common.authentication.bootstrap` (AuthBootstrap) through `strategies.…pacing` → `common.authentication.token_cache`. The page reads both `enabled` flags and `capital`, `max_positions`, `committed_cap_pct`, `brakes.dd1_pct` and `dd2_pct` through the shared `common.config` loaders onto `RulesParameters` defaults. A contract test holds them equal to `RunConfig.from_config` for the committed YAML and a changed variant. `INDEX_SYMBOL`, `LABEL_PREFIX`, the agents' short names and `NEEDS_QUALITY` are literals pinned to the runtime's own by a test. `latest_complete_week` is `weekly_run.target_week`'s loop over the runtime's `is_week_complete`, pinned equal at five instants. **Modules the page still loads (not constructed, no call):** `common.broker.dhan_live` and the rest of `common.broker`, through the mandated `_shared.py` (every existing page loads them); and `common.engine`, `common.feed`, `common.market_data.adapter` / `.recorded` and `common.notifications.telegram`, through the strategy's own `trading_calendar` (`common.engine`'s package `__init__`), the same modules the decide run loads. **Never loaded** (fresh-interpreter test): `fetch.py`, `weekly_run`, `run_config`, `common.market_data.dhan`, `dhan_historical`, `scrip_master`, the whole `common.authentication` package, `dhanhq`, `common.retention`, either paper runtime and `orchestration.auto_start`. |
+| **D136** | **Marks come from the report, and only for the latest COMPLETED week** | Phase 6 (operator-approved). The mark is the week's close over the freeze factor, or the R5-1 mark close. Rule-side values are not persisted anywhere else, so the mark, unrealised ₹ and weeks held are read from the newest decision report's section 4. They are used only when that report's title week equals the latest COMPLETED run's `iso_week`; otherwise the page shows "—" and "no report for week W (the newest decision report, X, is for Y)". Unrealised % is that ₹ ÷ (`average_cost` × `shares_held`), a display ratio only. |
+| **D137** | **"Committed" on the page is held positions only** | Phase 6 (operator-approved). Σ `Position.committed` of held positions ÷ `committed_cap`, labelled "held positions". Pending BUY_T1 entries are shown as a count (they hold a slot and a commitment until they fill) and are **not** added in. The rules' full figure is computed inside `decide_week` and not persisted, so adding it here would be a second implementation. |
+| **D138** | **Every state is said plainly, and nothing unreadable is shown as zero** | Phase 6 (operator addition). **No `positional_stocks.db`:** every tab says "Not started yet" and points to the go-live checklist, with no table except Overview's LaunchAgent table. **Locked past the read's busy timeout:** "Book busy — refresh". In WAL mode a writer never blocks this reader, so busy is rare; a rollback-journal `EXCLUSIVE` lock produces it in the tests. **Corrupt DB:** the reason is shown. **Corrupt `journal.csv`** (wrong header, wrong field count, not UTF-8): a message in that section only. **Every value parsed from report text has a contract test** that renders a real report through `runtimes.positional_stocks.report` with the item present: section 4 mark, unrealised and "no bar N week(s)"; section 8 "freeze lifted with neither an acknowledgement nor a rescale"; the preview's "Fetch failed (N), treated as stale". A section, table header or line the parser cannot read is shown as "could not read <item> from <file>", and the operator-action total then reads "could not be counted", never 0. |
+| **D139** | **Home.py is not changed** | Phase 6 (operator decision in plan mode). The page is `dashboards/pages/5_Positional_Stocks.py`, reached from Streamlit's sidebar. Adding a Home card would have changed three existing tests (two pin three category links; `test_stock_config.py` pins positional_stocks out of `_CATEGORIES`). The only existing test changed is `test_dashboard.py`'s directory guard, which gains the three new files. |
+| **D140** | **What a read leaves on disk: SQLite's own empty sidecars** | Phase 6, measured. A `mode=ro` connection to a WAL database whose `-wal`/`-shm` were removed at the writer's clean close re-creates them: a **0-byte `-wal`** and the `-shm` index. The database file itself is byte- and mtime-identical, and nothing else changes. Every existing page's `connect_readonly` does the same (this is backlog item R6-6's behaviour, in a shared file). `test_the_page_writes_nothing` allows exactly this and nothing more: it also turns every write-mode `open`, `socket.connect`, `subprocess.Popen` and `os.system` into an error while the page renders. An empty `-wal` is harmless to the next decide run, and the backup's `read_only_uri` treats it as empty. |
+| **D141** | **The demo book has no closed trade: the real data holds none through W39** | Phase 6 acceptance. The 12-week replay through 2026-W39, with an all-PASS `quality_gate.csv` on a scratch copy, gives 9 open positions and 9 fills, but no exit. The regime is Red through W30, so the first entries are W31/W32, and none has reached a stop, a partial or a time exit by W39. A 26-week replay gives the same book: every week before W31 is Red with 0 taken. Nothing was fabricated. The closed-trade path (journal table, totals) is exercised on the fixture book in `test_dashboard_positional_stocks_*.py`, where A stops out. |
 
 #### D22 in detail: the rebuilt premium-candle mapping
 
@@ -15057,6 +15065,25 @@ A snapshot is taken before every writing decide run: `data/backups/positional_st
   ```
   The flags work before or after the subcommand (D124). Remove them with the same `--agent` arguments on `uninstall --execute`; that works even if the strategy file is broken (D125). A plain `install` never touches them. `logs --agent positional_stocks_fetch` names their log files and the reports directory (D127).
 
+### Dashboard (Phase 6, read-only)
+
+**Where it is:** the **Positional Stocks** page in the existing dashboard's sidebar (`dashboards/pages/5_Positional_Stocks.py`). Home is unchanged (D139). The page only reads: the book through the dashboard's read-only helper, and `journal.csv`, the reports, `data/backups/` and the daily cache as files. It never writes or shells out, and never calls Dhan, `launchctl` or the network. It reads fresh on every reload.
+
+| Tab | Shows | Source |
+|---|---|---|
+| Overview | Regime, equity, cash, peak, drawdown, brakes, new-entry block; open positions vs slots; committed (held positions); last decide run and last preview; **operator actions** with what to do; both `enabled` flags; whether each agent's plist is in `~/Library/LaunchAgents` | `stock_equity`, `stock_weekly_runs`, reviews and funnel, the reports, the YAML, a file check |
+| Positions & orders | Levels, shares, average cost, mark, unrealised ₹ / %, weeks held, frozen and the week's review reason; pending orders with levels and `catch_up` | The repository on the read-only connection; marks from the latest report (D136) |
+| Trades & performance | Closed trades and totals from `journal.csv`; the 25 newest fills with `late_fill` / not traded / `catch_up` | `journal.csv`, `stock_fills` |
+| Equity | Weekly equity and peak; drawdown % with the brake 1 / brake 2 levels | `stock_equity`, the configured `dd1_pct` / `dd2_pct` |
+| Latest report | The newest decision report, and the newest preview when it is newer | The report files |
+| Health | Weekly runs; recent `-refused.md` / `-preview-failed.md`; backups; NIFTY's last cached session against the calendar's expected session | Runs table, report files, `data/backups/`, the cache |
+
+What the messages mean:
+- **"Not started yet"** in every tab: there is no `positional_stocks.db`. Nothing has gone wrong; see the go-live checklist above.
+- **"Book busy — refresh"**: a weekly run held the database past the read's 5-second timeout. Reload in a moment. The run is never affected (D138).
+- **"could not read <item> from <file>"**: a report section the page could not parse. The operator-action total then says "could not be counted"; read the report itself (Latest report tab).
+- **Marks "—"** with "no report for week W": the newest decision report is not for the latest completed week. The book's own values are still shown.
+
 ### Verification (27 September 2026)
 
 - Full suite (Mac): **4,497 passed, 18 skipped** (4 m 42 s), 4,515 collected.
@@ -15233,3 +15260,61 @@ It found 2 MEDIUM and 2 LOW findings, fixed here (**D130–D133**). Spec **v1.3.
 Every live gate is untouched, no `mode: live` reached any committed YAML, no
 `EgressIpProvider` was added or chosen, and `OPERATIONAL LIVE ACTIVATION
 ELIGIBLE` remains **NO — BLOCKED**.
+
+---
+
+## `wsr1_weekly_stochrsi` Phase 6 — read-only dashboard page (28 September 2026)
+
+Spec **v1.3.2** section 11.1, operator-approved. Built in the worktree `/Volumes/Trading/algo_trading-dashboard` on `strategy-wsr1-dashboard` (D134). The live folder only received the spec commit, and its branch was never switched.
+
+| # | Commit | Branch | Contents |
+|---|---|---|---|
+| 0 | `dc1092c` | `strategy-wsr1-weekly-stochrsi` (live folder) | Spec v1.3.2 (operator's text, committed alone) |
+| 1 | see `git log` | `strategy-wsr1-dashboard` | The page, its read model and tests |
+| 2 | this one | `strategy-wsr1-dashboard` | This runbook |
+
+### What was added
+
+- `dashboards/pages/5_Positional_Stocks.py`: the shim, the same pattern as the others.
+- `dashboards/positional_stocks.py`: the page. Six tabs: Overview, Positions & orders, Trades & performance, Equity, Latest report, Health.
+- `dashboards/data/positional_stocks.py`: the read model (D135–D138, D140).
+- `tests/unit/test_dashboard_positional_stocks_data.py` (42 tests) and `tests/unit/test_dashboard_positional_stocks_page.py` (9 tests).
+
+No shared or runtime file changed. `Home.py` is unchanged (D139), and so is every other dashboard page.
+
+### Hard rules and the test that holds each
+
+| Rule | Test |
+|---|---|
+| Read-only | `test_the_page_writes_nothing`: every file byte- and mtime-identical after a real page load, except SQLite's own empty sidecars (D140), while write-mode `open`, `socket.connect`, `subprocess.Popen` and `os.system` raise. `test_the_repository_guard_refuses_a_write_capable_fallback`. The existing AST guards in `test_dashboard.py` (no broker, feed, `Database`, `subprocess`, module-level streamlit or host clock) now cover the new files |
+| No trading logic re-derived | `test_every_book_value_is_the_persisted_one`, `test_marks_are_the_reports_own` (against the run's own `ReportData`), `test_operator_actions_equal_the_runs_own_count` (against `telegram_summary.operator_actions`), `test_config_values_equal_the_runs_binding`, `test_latest_complete_week_is_the_runs_target_week`, `test_constants_are_the_runtimes_own` |
+| Report-text contracts (operator addition) | `test_contract_section_4_…`, `test_contract_section_8_silent_lift`, `test_contract_preview_fetch_failed`, `test_contract_title`, `test_contract_section_4_with_no_position`, each on a report rendered by `runtimes.positional_stocks.report`. There are 8 unrecognised-text cases, and three "could not read … never zero" tests (sections 4 and 8, the preview) plus one on the page |
+| Never loads network code | `test_the_page_never_loads_network_code` (fresh interpreter; D135 lists what is and is not loaded) |
+| Never disturbs a run | `test_a_dashboard_read_never_disturbs_a_decide_run`: an open read transaction plus a polling thread during a decide run. Identical `dump()` and `journal.csv` to an undisturbed twin; every read is the old state, the new state or busy |
+| Missing / locked / corrupt | `test_no_database_is_not_started`, `test_a_locked_book_is_busy`, `test_a_corrupt_database_is_unreadable_not_a_traceback`, `test_a_corrupt_journal_is_a_message_and_the_rest_renders` (3 cases), with AppTest versions for not-started, busy and a corrupt journal |
+| Before go-live | `test_before_go_live_every_tab_says_not_started` |
+
+### Existing tests changed, and why
+
+- `tests/unit/test_dashboard.py::test_the_dashboards_directory_is_what_we_think_it_is`: +3 file names (the three new files). Nothing else.
+
+### Part C — acceptance on this Mac (28 September 2026)
+
+1. **Demo book.** `prepare_workdir(scratch, source=/Volumes/Trading/algo_trading)` (reads only). Then `quality_gate.csv` in the scratch copy is replaced by 200 PASS rows, and `replay(weeks=12, through=2026-W39)` runs. Every week exits 0. The book has 9 open positions, 9 BUY_T1 fills, equity ₹10,04,610.48 at W39 and drawdown 1.33%, with **no closed trade** (D141). The checkpointed `positional_stocks.db`, the 12 reports, `journal.csv`, 11 backups and the daily cache were copied to the **worktree's** `data/` (all gitignored, verified with `git check-ignore`). The live folder's `data/` still has no `positional_stocks.db`.
+2. **Served** from the worktree on port 8502 (headless). The live dashboard on 8501 and its LaunchAgent were not touched.
+3. **Text summaries** of each tab, for the demo book and for an empty project, were given to the operator with this phase's report.
+
+### Verification (28 September 2026)
+
+- Full suite from the worktree (`PYTHONPATH=<worktree> .venv/bin/python -m pytest`): **4,612 passed, 19 skipped, 4 failed**, 4,635 collected (4,571 after Phase 5-fix2, + 51 new tests, + 13 new parametrised cases of `test_dashboard.py`'s AST guards over the three new files; one of those is the by-design skip for the shim). **pytest's exit code is 1.** All 4 failures are in `test_launchd_plists.py` and are bound to the checkout's path, not to this phase (D134):
+  - `test_naming_the_agents_selects_only_them` asserts `"dashboard" not in plan`, and the worktree's name contains "dashboard";
+  - the 3 `test_an_unusable_strategy_file_leaves_the_default_agents_untouched[…]` cases need `generate_plists --check` to see no drift, and the committed plists embed `/Volumes/Trading/algo_trading`.
+- **Proof:** the same 4 fail on the unmodified base `dc1092c` at the worktree path (every Phase 6 change stashed). The 3 fail on `dc1092c` exported to a neutral scratch path. An exact export of this phase at that neutral path gives **4,612 passed, 20 skipped, 3 failed** (the naming test passes there). `test_launchd_plists.py` run in `/Volumes/Trading/algo_trading` (HEAD `dc1092c`, the branch's base) gives **65 passed**. `git diff dc1092c -- orchestration scripts config tests/unit/test_launchd_plists.py` is empty.
+- The 51 new tests pass under `TZ=UTC` and `TZ=America/New_York`.
+- `ruff check .` is clean, and the five new or changed files are `ruff format`-clean (the repo-wide count of unformatted files is 168 before and after). `mypy` (strict) is clean across 279 source files, and the two new test modules also type-check.
+- `scripts/assert_no_live_config_committed.py`: OK. `test_stock_isolation.py`: passes. `python -m runtimes.positional_stocks.check_config`: OK.
+- Nothing under `data/` was staged; nothing was installed.
+
+Every live gate is untouched, no `mode: live` reached any committed YAML, no
+`EgressIpProvider` was added or chosen, nothing was installed or scheduled, and
+`OPERATIONAL LIVE ACTIVATION ELIGIBLE` remains **NO — BLOCKED**.
