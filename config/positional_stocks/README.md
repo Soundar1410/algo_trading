@@ -16,22 +16,23 @@ would stop `intraday_options` and `positional_options` from starting at all.
 
 `symbol, isin, company, industry, nifty100, group, on_exit, as_of`
 
-Seeded with the 200 NIFTY 200 constituents as of **2026-07-22**, taken from an
-NSE constituent list. All 200 resolve against the Dhan scrip master.
+The 200 NIFTY 200 constituents as of **2026-09-30** (`as_of`), rebuilt from
+NSE's post-reconstitution constituent lists (runbook D148). All 200 resolve
+against the Dhan scrip master.
 
-**Two columns are unfilled and need the operator before Phase 4:**
+- `symbol`, `isin`, `company`, `industry` — from NSE's NIFTY 200 list;
+  `industry` is NSE's Industry column.
+- `nifty100` — `true` for the 100 symbols on NSE's NIFTY 100 list, `false`
+  otherwise. Spec 4.3 restricts Red-regime entries to `nifty100` symbols. A
+  blank still reads as `false`, and the loader warns with a count.
+- `group` — from the operator-approved promoter-group mapping. Blank means "its
+  own promoter group" (spec 6.3), for a standalone company. PSUs are blank
+  unless the company is the promoter of another listed PSU (e.g. `PFC` /
+  `RECLTD`, `ONGC` / `HINDPETRO`). The max-1-position-per-promoter-group limit
+  of spec 4.12 binds per group.
 
-- `nifty100` — blank, which the loader reads as `false`. That is the
-  fail-closed reading: spec 4.3 restricts Red-regime entries to `nifty100`
-  symbols, so an unfilled row is simply never eligible in Red. The loader warns
-  with a count, and `UniverseFile.symbols_missing_nifty100` carries the list.
-- `group` — blank means "its own promoter group" (spec 6.3), which is correct
-  for a standalone company and wrong for, say, the Adani or Tata names. Until
-  it is filled, the max-1-position-per-promoter-group limit of spec 4.12 binds
-  only per symbol.
-
-`as_of` is 2026-07-22, which **pre-dates the end-September NIFTY 200
-reconstitution**. Refresh the file before relying on membership.
+**Rebuild after each March/September NIFTY reconstitution** from NSE's NIFTY
+200 and NIFTY 100 lists, re-applying the mapping, then run `check_config`.
 
 `on_exit` is `hold` for every row: a held symbol later removed from the file
 exits as normal and takes no further adds.
