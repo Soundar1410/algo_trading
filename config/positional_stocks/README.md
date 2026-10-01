@@ -32,7 +32,9 @@ against the Dhan scrip master.
   of spec 4.12 binds per group.
 
 **Rebuild after each March/September NIFTY reconstitution** from NSE's NIFTY
-200 and NIFTY 100 lists, re-applying the mapping, then run `check_config`.
+200 and NIFTY 100 lists: carry group and on_exit over from the committed row
+for retained symbols, review groups for new symbols only, update the pinned
+test in test_wsr1_inputs.py, then run check_config and the full suite.
 
 `on_exit` is `hold` for every row: a held symbol later removed from the file
 exits as normal and takes no further adds.

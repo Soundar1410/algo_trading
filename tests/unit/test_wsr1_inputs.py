@@ -9,12 +9,14 @@ operator did not approve.
 The one deliberate permission is a blank ``nifty100``, which reads as ``false``.
 That is the fail-closed reading, because the flag only ever *widens* what may
 be entered (spec 4.3 restricts Red-regime entries to ``nifty100`` symbols), and
-the shipped universe file is seeded from a constituent list that does not carry
-it. ``test_a_blank_nifty100_reads_as_false_and_is_reported`` pins both halves.
+the shipped universe file (rebuilt in D148) carries it on every row;
+test_the_committed_universe_has_nifty100_and_groups_filled pins that.
+``test_a_blank_nifty100_reads_as_false_and_is_reported`` pins both halves.
 """
 
 from __future__ import annotations
 
+import logging
 from datetime import date
 from pathlib import Path
 
@@ -459,15 +461,44 @@ def test_the_committed_universe_file_loads_and_has_two_hundred_rows() -> None:
     assert "BAJAJ-AUTO" in universe.by_symbol
 
 
-def test_the_committed_universe_is_honest_about_its_unfilled_columns() -> None:
-    """Seeded from a constituent list that carries neither flag. Both are the
-    operator's to fill before Phase 4, and until then the loader reports them
-    rather than the run assuming they were considered."""
-    universe = load_universe(REPO_UNIVERSE / "universe.csv")
+def test_the_committed_universe_has_nifty100_and_groups_filled(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Pins the file rebuilt in D148; update it at each universe rebuild."""
+    with caplog.at_level("WARNING"):
+        universe = load_universe(REPO_UNIVERSE / "universe.csv")
+        committed_warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        # The control: the same capture does see the blank-nifty100 warning, so
+        # "no warning" above cannot pass merely because nothing is captured.
+        load_universe(_universe(tmp_path, "RELIANCE,INE002A01018,R,Oil,,,hold,2026-09-30"))
+        control_warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
 
-    assert len(universe.symbols_missing_nifty100) == 200
-    assert universe.nifty100_symbols == (), "nothing is eligible in a Red regime yet"
-    assert len(universe.symbols_missing_group) == 200
+    assert committed_warnings == []
+    assert len(control_warnings) == 1
+    assert "blank nifty100" in control_warnings[0].getMessage()
+
+    assert universe.symbols_missing_nifty100 == ()
+    assert len(universe.nifty100_symbols) == 100
+
+    grouped = [row for row in universe.rows if row.group]
+    assert len(grouped) == 72
+    assert len({row.group for row in grouped}) == 25
+    assert len(universe.symbols_missing_group) == 128
+
+    by_symbol = universe.by_symbol
+    for symbol, group in (
+        ("LT", "LNT"),
+        ("LTF", "LNT"),
+        ("LTM", "LNT"),
+        ("TATACAP", "TATA"),
+        ("CGPOWER", "MURUGAPPA"),
+        ("VAML", "VEDANTA"),
+        ("RECLTD", "PFC"),
+    ):
+        assert by_symbol[symbol].group == group, symbol
+    assert by_symbol["KOTAKBANK"].group is None
+
+    assert {row.as_of for row in universe.rows} == {date(2026, 9, 30)}
 
 
 def test_the_committed_universe_holds_every_symbol_on_removal() -> None:
