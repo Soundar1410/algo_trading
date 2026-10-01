@@ -343,7 +343,7 @@ def test_no_database_is_not_started(tmp_path: Path) -> None:
     assert view.book is None and view.positions == () and view.actions == ()
     assert "Not started yet" in view.state_detail
     assert "go-live checklist" in view.state_detail
-    assert view.config.runtime_enabled is False and view.config.strategy_enabled is False
+    assert view.config.runtime_enabled is True and view.config.strategy_enabled is True
 
 
 def test_a_corrupt_database_is_unreadable_not_a_traceback(book: Root) -> None:
@@ -428,7 +428,7 @@ def test_config_values_equal_the_runs_binding(tmp_path: Path) -> None:
         .replace("committed_cap_pct: 100", "committed_cap_pct: 80")
         .replace("dd1_pct: 10,", "dd1_pct: 12.5,")
         .replace("dd2_pct: 20,", "dd2_pct: 25,")
-        .replace("\nenabled: false", "\nenabled: true"),
+        .replace("\nenabled: true", "\nenabled: false"),
     ):
         strategy.write_text(text)
         bound = RunConfig.from_config(root.path / "config")
@@ -441,7 +441,7 @@ def test_config_values_equal_the_runs_binding(tmp_path: Path) -> None:
         assert shown.committed_cap == bound.params.committed_cap
         assert shown.dd1_pct == bound.params.dd1_pct
         assert shown.dd2_pct == bound.params.dd2_pct
-    assert shown.max_positions == 8 and shown.strategy_enabled is True
+    assert shown.max_positions == 8 and shown.strategy_enabled is False
 
 
 def test_a_broken_config_is_a_message(tmp_path: Path) -> None:

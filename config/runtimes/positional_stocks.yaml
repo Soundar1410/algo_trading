@@ -9,11 +9,9 @@
 # --mode fetch|decide`), scheduled only by their own two LaunchAgents, which
 # ship generated but NOT installed.
 #
-# `enabled: false` here AND in the strategy file: BOTH gate the job (D115).
-# While either is false, fetch and every writing decide run refuse (exit 1,
-# alerted); --dry-run and the replay harness still run. Go-live is one
-# operator commit setting both to true — after the spec 16 go-live checklist
-# (runbook "Operator guide"). PAPER ONLY: live_execution_allowed stays false.
+# Enabled for paper on 1 Oct 2026 (D150). Set either flag back to false to
+# stop the job: fetch and writing decide runs then refuse (exit 1, alerted).
+# Both flags gate the job (D115). PAPER ONLY: live_execution_allowed stays false.
 #
 # This file and config/strategies/positional_stocks/wsr1_weekly_stochrsi.yaml
 # must always land in the same commit: common/config/loader.py scans every
@@ -21,7 +19,7 @@
 # stop intraday_options and positional_options from starting.
 
 runtime_id: positional_stocks
-enabled: false
+enabled: true
 live_execution_allowed: false
 shared_market_feed: false
 database: data/operational/positional_stocks.db

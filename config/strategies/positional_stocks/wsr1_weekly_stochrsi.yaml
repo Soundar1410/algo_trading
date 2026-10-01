@@ -1,9 +1,10 @@
 # wsr1_weekly_stochrsi — weekly Stoch RSI swing entries on NIFTY 200 cash
 # equities, with a three-tranche averaging plan (spec v1.3, section 12).
 #
-# PAPER ONLY. `enabled: false` here AND in config/runtimes/positional_stocks.yaml:
-# both gate the job (D115). The operator's go-live commit sets both to true in
-# one commit; installing the two LaunchAgents is the second, separate switch.
+# PAPER ONLY. Enabled for paper on 1 Oct 2026 (D150). Set either flag back to
+# false to stop the job: fetch and writing decide runs then refuse (exit 1,
+# alerted). Both flags (here and in config/runtimes/positional_stocks.yaml) gate
+# the job (D115).
 #
 # Every value below is bound strictly by runtimes/positional_stocks/run_config.py:
 # an unknown key, or a key whose value the code does not implement (the stoch
@@ -11,7 +12,7 @@
 
 strategy_id: wsr1_weekly_stochrsi
 runtime_id: positional_stocks
-enabled: false
+enabled: true
 mode: paper
 live_approved: false
 engine: stock_portfolio_engine

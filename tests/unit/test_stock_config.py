@@ -2,7 +2,7 @@
 for the existing runtimes.
 
 * ``RunConfig.from_config`` loads exactly today's ``RulesParameters`` defaults,
-  the v1.3 schedule and both ``enabled: false`` flags; any unknown, missing,
+  the v1.3 schedule and both ``enabled: true`` flags (go-live, D150); any unknown, missing,
   mistyped or non-configurable value refuses the run.
 * ``discover_strategies`` for ``intraday_options`` and ``positional_options``,
   ``RUNTIMES``, the paper-safety check, every dashboard reader of
@@ -59,10 +59,10 @@ def test_the_committed_values_are_todays_defaults_and_the_v1_3_schedule() -> Non
         "SUNDAY 10:00",
     ]
     assert config.schedule.decide.text() == "MONDAY 08:30"
-    assert (config.runtime_enabled, config.strategy_enabled) == (False, False)
+    assert (config.runtime_enabled, config.strategy_enabled) == (True, True)
     assert config.mode == "paper" and config.index_symbol == "NIFTY"
     assert (config.decide_deadline_minutes, config.fetch_deadline_minutes) == (5.0, 20.0)
-    assert config.disabled_reason() == "runtime positional_stocks is disabled in config"
+    assert config.disabled_reason() is None
 
 
 def _edit(root: Path, edit: Callable[[dict[str, Any]], None]) -> None:
