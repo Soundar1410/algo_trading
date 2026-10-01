@@ -4,13 +4,14 @@
 - Work strictly phase by phase. After each phase, STOP and wait for my review. Never jump ahead.
 - Use Plan Mode: show the plan before writing any file.
 - PAPER MODE ONLY for operational activation. **Phase 10 controlled-live CODE infrastructure is hardened and remains fully disabled.** The production entrypoint runs broker-authoritative mode-transition reads plus parent admission preflight; a spawned live worker independently forces fresh token/account/static-IP/database/connectivity/confirmation preflight, starts the live order-update stream, idempotently recovers broker-confirmed orders/trades, rebuilds broker-authoritative account state, continuously enforces the account loss emergency latch, and requires a final broker-flat reconciliation before clean shutdown. `DhanLiveBroker`, account-wide reservation/MTM/rate limiting, reconciliation, migration checksum/restore validation, the audited confirmation issue/revoke workflow, and the one-live-worker controlled-rollout lease are tested only with deterministic mocks/fakes (no real Dhan network or order-placement call was made). No production `EgressIpProvider` is shipped: configuration resolves an operator-approved `module:attribute` plugin and missing/invalid providers fail closed. Every committed config value separately keeps every live gate disabled (`global.live_trading_enabled: false`, `live_execution_allowed: false`, `live_approved: false`, no `mode: live` in committed YAML — enforced by `scripts/assert_no_live_config_committed.py`). **`OPERATIONAL LIVE ACTIVATION ELIGIBLE` remains NO — BLOCKED**: the 30-day paper evaluation, a separately specified second real paper strategy, EMA-specific minimum-quantity approval, static-IP/provider setup, live auth revalidation, and separate approval to flip gates remain outstanding. Do not flip a committed live gate or add/choose a production `EgressIpProvider` without that separate approval.
-- Real strategies, all `enabled: true` and all `mode: paper` as of 8 September
+- Real strategies, all `enabled: true` and all `mode: paper` as of 1 October
   2026 — `intraday_options`: `c921_ema_cross_buy`, `c509_ema_cross_buy`,
   `c521_ema_cross_buy`, `st12_supertrend_buy`, `st05_supertrend_buy`,
   `straddle_920`, `rolling_strangle_otm1`; `positional_options`:
-  `weekly_delta_neutral`. (`skeleton_fixture` is disabled and not real.)
-  Verify against `config/strategies/**` rather than trusting this list — it has
-  gone stale before.
+  `weekly_delta_neutral`; `positional_stocks`: `wsr1_weekly_stochrsi`
+  (weekly batch job, enabled 1 October 2026, D150). (`skeleton_fixture` is
+  disabled and not real.) Verify against `config/strategies/**` rather than
+  trusting this list — it has gone stale before.
 - Two rename events, both forced by the same defect: `common.execution.
   correlation.strategy_token()` truncates a sanitised `strategy_id` to 4
   characters, and the supervisor refuses to admit two strategies whose tokens
@@ -28,7 +29,8 @@
   room. See docs/IMPLEMENTATION_STATUS_AND_RUNBOOK.md for both root causes and
   the cutover sequencing (rename only with a flat book and the supervisor
   stopped — recovery filters strictly by the current `strategy_id`).
-- New runtime `positional_stocks` (approved 20 September 2026, Phase 0 only).
+- New runtime `positional_stocks` (approved 20 September 2026; Phases 0-6 built
+  and reviewed; enabled for paper on 1 October 2026, D150).
   One strategy, `wsr1_weekly_stochrsi`, engine kind `stock_portfolio_engine`
   (the already-reserved `EngineKind` value — do **not** add a new one). It is a
   **run-to-completion weekly batch job** in two modes (`fetch`, `decide`): no tick
@@ -36,14 +38,19 @@
   makes no Dhan call at all. **It is scheduled by its own two LaunchAgents, has no
   `scripts/_runtimes.py::RUNTIMES` entry, and must never be routed through
   `orchestration.auto_start`** — do not add a registry entry and do not modify
-  shared auto-start code for it. Both plists ship **generated but uninstalled**;
-  nothing runs on a schedule until the operator installs and enables them.
-  **PAPER ONLY**, and shipped `enabled: false` at both the runtime and strategy
-  layer. Authoritative spec: `strategies/positional_stocks/wsr1_weekly_stochrsi/
+  shared auto-start code for it. Both plists are generated in the repo and were
+  installed on the Mac on 1 October 2026 (D150); remove them with
+  `install_launch_agents uninstall --agent positional_stocks_fetch --agent positional_stocks_decide --execute`.
+  **PAPER ONLY**, and `enabled: true` at both the runtime and strategy layer
+  since 1 October 2026; both flags gate the job (D115), so setting either to
+  false stops it. Authoritative spec: `strategies/positional_stocks/wsr1_weekly_stochrsi/
   WSR1_WEEKLY_STOCH_RSI_SPEC.md`; architecture doc section "Positional stocks —
-  scoped, paper only". **The approval covers Phase 0 (documents) only** — each
-  later phase in that spec's section 15 needs its own approval before any code,
-  config, migration or test is written.
+  scoped, paper only". **Any further change to its code, config, migrations,
+  schedule or tests needs its own approval first**; `0001` is frozen, so a
+  schema change needs a new migration. The weekly operator files
+  (`quality_gate.csv`, `results_calendar.csv`, `corporate_actions.csv`,
+  `gap_acknowledgements.csv`) are the operator's routine per the runbook
+  Operator guide.
 - `config/runtimes/<id>.yaml` and `config/strategies/<id>/*.yaml` for a new runtime
   must land in the **same commit**. `common/config/loader.py`'s
   `resolve_runtime_strategies` scans all of `config/strategies/**` and raises for a
