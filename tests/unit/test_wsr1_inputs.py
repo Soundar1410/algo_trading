@@ -507,15 +507,30 @@ def test_the_committed_universe_holds_every_symbol_on_removal() -> None:
     assert {row.on_exit for row in universe.rows} == {OnExit.HOLD}
 
 
-def test_the_committed_quality_gate_is_empty_and_admits_nothing() -> None:
+def test_the_committed_quality_gate_loads_cleanly() -> None:
+    """From W40 these files are maintained by the operator's weekly routine
+    (runbook Operator guide, steps 2-3). Row validity is covered by the loader
+    tests, not pinned here."""
     gate = load_quality_gate(REPO_UNIVERSE / "quality_gate.csv")
 
-    assert len(gate) == 0
-    assert gate.status_on("RELIANCE", date(2026, 9, 21)) is None
+    assert gate.path == REPO_UNIVERSE / "quality_gate.csv"
 
 
-def test_the_committed_results_calendar_loads_and_is_empty() -> None:
-    calendar = load_results_calendar(REPO_UNIVERSE / "results_calendar.csv")
+def test_the_committed_results_calendar_loads_cleanly(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """From W40 these files are maintained by the operator's weekly routine
+    (runbook Operator guide, steps 2-3). Row validity is covered by the loader
+    tests, not pinned here."""
+    with caplog.at_level("WARNING"):
+        calendar = load_results_calendar(REPO_UNIVERSE / "results_calendar.csv")
+        committed_warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        # The control: the same capture does see the absent-file warning, so
+        # "no warning" above cannot pass merely because nothing is captured.
+        missing = load_results_calendar(tmp_path / "results_calendar.csv")
+        control_warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
 
     assert calendar.absent is False
-    assert len(calendar) == 0
+    assert committed_warnings == []
+    assert missing.absent is True
+    assert len(control_warnings) == 1
